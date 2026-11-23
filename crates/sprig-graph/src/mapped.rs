@@ -492,22 +492,12 @@ pub fn parse_create(sql: &str) -> Result<Option<CreatePropertyGraph>> {
     }))
 }
 
-/// Runs SQL for a mapped store (the gateway's connection, as `sprig_ctl`
-/// after the privilege checks on each source table).
+/// Runs SQL for a mapped store (the gateway's in-process engine SQL, after
+/// the privilege checks on each source table).
 #[async_trait]
 pub trait SqlRunner: Send {
     /// The rows of `sql`.
     async fn rows(&mut self, sql: &str, params: Vec<MyValue>) -> Result<Vec<Row>>;
-}
-
-#[async_trait]
-impl SqlRunner for mysql_async::Conn {
-    async fn rows(&mut self, sql: &str, params: Vec<MyValue>) -> Result<Vec<Row>> {
-        use mysql_async::prelude::Queryable;
-        self.exec(sql, mysql_async::Params::Positional(params))
-            .await
-            .map_err(crate::catalog::backend_error)
-    }
 }
 
 /// A mapped graph over one schema, read-only.
@@ -678,13 +668,6 @@ impl<'c> MappedStore<'c> {
             def,
             stats: StoreStats::default(),
         }
-    }
-
-    /// The statement listing `table`'s columns in `schema`
-    /// (`information_schema`), to resolve "every column".
-    #[must_use]
-    pub fn columns_sql() -> &'static str {
-        "SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION"
     }
 
     fn t(&self, table: &str) -> String {

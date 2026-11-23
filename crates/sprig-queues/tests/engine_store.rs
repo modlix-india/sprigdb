@@ -539,3 +539,30 @@ async fn change_ids_outlive_other_ledger_rows_in_both_stores() {
         assert_eq!(s.purge_ledger(i64::MAX, i64::MAX).await.unwrap(), 3);
     }
 }
+
+/// The newest lane states are a cache of what the tenant's log wrote: when
+/// this node takes the tenant's unit again, the cache is rebuilt from the
+/// store, so an owner fenced meanwhile (here by a second store instance
+/// standing in for another leader) is refused.
+#[tokio::test]
+async fn the_lane_cache_rebuilds_when_the_unit_is_led_again() {
+    let d = Dir::new("lead");
+    let e = engine(&d.0);
+    let a = EngineQueues::new(e.clone(), Durability::Local).store(42, 1);
+    let b = EngineQueues::new(e.clone(), Durability::Local).store(42, 1);
+    assert_eq!(a.claim(5, 0).await.unwrap().epoch, 1);
+    // Elsewhere, a new owner claims the lane (epoch 2) through the log.
+    assert_eq!(b.claim(5, 0).await.unwrap().epoch, 2);
+    let w = WriteBatch {
+        queue: 5,
+        lane: 0,
+        epoch: 1,
+        ..WriteBatch::default()
+    };
+    // The old owner's cache still says epoch 1 (a write now would pass the
+    // fence and put epoch 1 back); this node takes the tenant's unit again,
+    // and the cache is rebuilt from the stored state.
+    e.lead(Engine::unit_of_tenant(42));
+    assert!(matches!(a.write(&w).await, Err(StoreError::Fenced)));
+    a.write(&WriteBatch { epoch: 2, ..w }).await.unwrap();
+}

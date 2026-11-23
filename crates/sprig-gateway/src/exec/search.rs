@@ -2067,9 +2067,7 @@ impl<'a> ExplainSink<'a> {
                     .columns
                     .iter()
                     .enumerate()
-                    .map(|(i, c)| {
-                        super::router::binary::text_value(c, text.get(i).copied().flatten())
-                    })
+                    .map(|(i, c)| super::binary_text::text_value(c, text.get(i).copied().flatten()))
                     .collect();
                 self.inner.row(RowValues::Binary(&values)).await
             }
@@ -2158,7 +2156,7 @@ impl<'a> ToBinary<'a> {
             .columns
             .iter()
             .enumerate()
-            .map(|(i, c)| super::router::binary::text_value(c, v.get(i).copied().flatten()))
+            .map(|(i, c)| super::binary_text::text_value(c, v.get(i).copied().flatten()))
             .collect();
         self.inner.row(RowValues::Binary(&values)).await
     }

@@ -133,7 +133,13 @@ pub struct GatewayQueues {
     live: LiveSettings,
     dc: DcId,
     engine: Option<Arc<QueueEngine>>,
+    /// The ready gateways' 0-9-1 listeners by their engine's Raft id, as
+    /// last read (at most once a second).
+    relays: std::sync::Mutex<Option<(std::time::Instant, Relays)>>,
 }
+
+/// 0-9-1 listeners (`host:port`) by engine Raft id.
+type Relays = Vec<(u64, String)>;
 
 impl std::fmt::Debug for GatewayQueues {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -161,6 +167,7 @@ impl GatewayQueues {
             live,
             dc,
             engine: None,
+            relays: std::sync::Mutex::new(None),
         }
     }
 
@@ -248,8 +255,63 @@ impl GatewayQueues {
     }
 }
 
+impl GatewayQueues {
+    /// The 0-9-1 listener of the gateway whose engine has Raft id `node`.
+    async fn listener_of(&self, node: u64) -> Option<String> {
+        let fresh = |c: &Option<(std::time::Instant, Relays)>| {
+            c.as_ref()
+                .filter(|(at, _)| at.elapsed() < std::time::Duration::from_secs(1))
+                .map(|(_, v)| v.clone())
+        };
+        let cached = fresh(
+            &self
+                .relays
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        let list = if let Some(v) = cached {
+            v
+        } else {
+            {
+                let peers = self.tenants.as_ref()?.peers.get()?;
+                let v: Relays = peers
+                    .gateways()
+                    .await
+                    .ok()?
+                    .into_iter()
+                    .filter(|r| r.state == crate::registry::GatewayState::Ready)
+                    .filter_map(|r| {
+                        let port = r.listeners.get("amqp")?;
+                        Some((r.raft_node?, format!("{}:{port}", r.addr)))
+                    })
+                    .collect();
+                *self
+                    .relays
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Some((std::time::Instant::now(), v.clone()));
+                v
+            }
+        };
+        list.into_iter().find(|(n, _)| *n == node).map(|(_, a)| a)
+    }
+}
+
 #[async_trait]
 impl QueueBackend for GatewayQueues {
+    /// On replicated engines a tenant's queues, catalog changes and
+    /// messages commit only where its unit is led: a connection that
+    /// logged in elsewhere is relayed to that gateway.
+    async fn serve_elsewhere(&self, principal: &Principal) -> Option<String> {
+        self.engine.as_ref()?;
+        let crate::node_engine::UnitLeader::Node(node) =
+            crate::node_engine::tenant_leader(principal.tenant_id)
+        else {
+            return None;
+        };
+        self.listener_of(node).await
+    }
+
     async fn open_vhost(
         &self,
         principal: &Principal,

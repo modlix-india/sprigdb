@@ -19,6 +19,11 @@ use crate::locks::{LockConfig, LockTable, TxnId};
 use crate::log::{Durability, Payload};
 use crate::store::Cf;
 
+pub(super) mod cross;
+
+pub(crate) use cross::Committed;
+use cross::Share;
+
 const VIEW_SHARDS: usize = 16;
 /// How often (in commits) the GC watermark is pushed to the store side.
 const WATERMARK_EVERY: u64 = 1024;
@@ -107,6 +112,8 @@ pub struct TxnShared {
     recovered: OnceLock<()>,
     /// Prepared (XA) transactions, by XID.
     prepared: Mutex<HashMap<Vec<u8>, PreparedTxn>>,
+    /// Commits across units not yet finished.
+    pub(crate) cross: cross::CrossTable,
     /// Status counters.
     pub stats: TxnStats,
 }
@@ -170,6 +177,7 @@ impl TxnShared {
             releaser: OnceLock::new(),
             recovered: OnceLock::new(),
             prepared: Mutex::new(HashMap::new()),
+            cross: cross::CrossTable::default(),
             stats: TxnStats::default(),
         }
     }
@@ -188,9 +196,20 @@ impl TxnShared {
     /// Folds in a timestamp found in recovered data, so new commits are
     /// above it.
     pub fn observe(&self, ts: Ts) {
+        // Under the in-flight latch, and never past a commit still in
+        // flight: a read view must not open above a commit whose versions
+        // aren't readable yet.
+        let mut g = lock_or_recover(&self.inflight);
         self.hlc.observe(ts);
         let now = self.hlc.now();
-        self.visible_ts.fetch_max(now.0, Ordering::AcqRel);
+        g.done_max = g.done_max.max(now);
+        let visible = match g.open.keys().next() {
+            Some(oldest) => Ts(oldest.0.saturating_sub(1)).min(now),
+            None => now,
+        };
+        self.visible_ts.fetch_max(visible.0, Ordering::AcqRel);
+        drop(g);
+        self.published.notify_all();
     }
 
     /// The lock table.
@@ -291,6 +310,24 @@ impl TxnShared {
         }
     }
 
+    /// Forgets the prepared transactions recorded in `unit` and releases
+    /// their locks (not one a session is finishing right now): the unit's
+    /// leadership moved, and its store holds their records.
+    pub(crate) fn forget_xa_of(&self, unit: u64) {
+        let gone: Vec<PreparedTxn> = {
+            let mut p = lock_or_recover(&self.prepared);
+            let xids: Vec<Vec<u8>> = p
+                .iter()
+                .filter(|(_, t)| t.home == unit && !t.finishing)
+                .map(|(x, _)| x.clone())
+                .collect();
+            xids.into_iter().filter_map(|x| p.remove(&x)).collect()
+        };
+        for t in gone {
+            self.locks.release_all(t.id);
+        }
+    }
+
     /// Lists a prepared transaction read back after a restart.
     pub(crate) fn xa_restore(&self, xid: &[u8], prepared: PreparedTxn) {
         lock_or_recover(&self.prepared).insert(xid.to_vec(), prepared);
@@ -329,6 +366,14 @@ impl TxnShared {
         rts
     }
 
+    /// Opens a read view at `rts` (a replica's view of a unit it doesn't
+    /// lead: see `Engine::follower_read`).
+    pub(crate) fn open_view_at(&self, txn: TxnId, rts: Ts) -> Ts {
+        let mut shard = lock_or_recover(&self.views[shard_of(txn)]);
+        *shard.entry(rts).or_insert(0) += 1;
+        rts
+    }
+
     pub(crate) fn close_view(&self, txn: TxnId, rts: Ts) {
         let mut shard = lock_or_recover(&self.views[shard_of(txn)]);
         if let Some(n) = shard.get_mut(&rts) {
@@ -337,6 +382,21 @@ impl TxnShared {
                 shard.remove(&rts);
             }
         }
+    }
+
+    /// Keeps every version a reader at `at` needs, like an open read view
+    /// at `at`, until [`TxnShared::release_versions`] with the same `at`
+    /// (holds count). The change log's consumers hold their position so
+    /// they can read before-images. A hold below the GC watermark already
+    /// reached keeps nothing that compaction has dropped.
+    pub fn hold_versions(&self, at: Ts) {
+        let mut shard = lock_or_recover(&self.views[0]);
+        *shard.entry(at).or_insert(0) += 1;
+    }
+
+    /// Releases one [`TxnShared::hold_versions`] at `at`.
+    pub fn release_versions(&self, at: Ts) {
+        self.close_view(0, at);
     }
 
     /// The timestamp at or below which only the newest version of each key
@@ -373,11 +433,6 @@ impl TxnShared {
     }
 
     /// [`TxnShared::commit_writes`], with log notes in the same entry.
-    ///
-    /// Each write goes to the unit its key belongs to, notes to the unit
-    /// that carries them. Writes to one unit are one log entry; writes to
-    /// several are one entry per unit, proposed as one atomic write, all at
-    /// one commit timestamp.
     pub(crate) fn commit_writes_noted(
         &self,
         path: &dyn CommitPath,
@@ -387,7 +442,39 @@ impl TxnShared {
         also_delete: Option<&[u8]>,
         notes: &[super::transaction::Extra],
     ) -> Result<(Ts, DurableTicket)> {
+        let done = self.commit_full(
+            path,
+            txn,
+            writes,
+            durability,
+            also_delete,
+            notes,
+            &DurableTicket::Ready,
+        )?;
+        Ok((done.cts, done.ticket.max(done.later)))
+    }
+
+    /// Commits a transaction's writes and notes.
+    ///
+    /// Each write goes to the unit its key belongs to, notes to the unit
+    /// that carries them. Writes to one unit are one log entry. Writes to
+    /// several commit through the protocol across units (module `cross`), all at
+    /// one commit timestamp. `dep` is what the transaction read while it
+    /// was pending: on a log whose units become durable independently, it
+    /// must be durable before the commit is written to another unit.
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+    pub(crate) fn commit_full(
+        &self,
+        path: &dyn CommitPath,
+        txn: TxnId,
+        writes: Vec<(Bytes, Option<Bytes>)>,
+        durability: Option<Durability>,
+        also_delete: Option<&[u8]>,
+        notes: &[super::transaction::Extra],
+        dep: &DurableTicket,
+    ) -> Result<Committed> {
         use super::transaction::Extra;
+        self.drive_cross(path);
         let notes_unit = path.notes_unit();
         let mut parts: BTreeMap<u64, UnitPart<'_>> = BTreeMap::new();
         for (k, v) in writes {
@@ -402,13 +489,47 @@ impl TxnShared {
         }
         for n in notes {
             let u = match n {
-                Extra::Note(_) => notes_unit,
+                Extra::Note(None, _) => notes_unit,
+                Extra::Note(Some(t), _) => path.unit_of(&t.to_be_bytes()),
                 Extra::Put(_, k, _) | Extra::Delete(_, k) => path.unit_of(k),
             };
             parts.entry(u).or_default().extras.push(n);
         }
         if parts.is_empty() {
             parts.entry(notes_unit).or_default();
+        }
+        if parts.len() > 1 {
+            let first = (!notes.is_empty()).then_some(notes_unit);
+            let shares: BTreeMap<u64, Share> = parts
+                .into_iter()
+                .map(|(u, p)| {
+                    (
+                        u,
+                        Share {
+                            writes: p.writes,
+                            extras: p.extras.into_iter().cloned().collect(),
+                            delete: p.delete.map(<[u8]>::to_vec),
+                            locks: Vec::new(),
+                        },
+                    )
+                })
+                .collect();
+            let done = self.commit_across(path, txn, shares, durability, first, dep)?;
+            self.wait_visible(done.cts);
+            let n = self.stats.commits.fetch_add(1, Ordering::Relaxed) + 1;
+            self.prune(path);
+            if n.is_multiple_of(WATERMARK_EVERY) {
+                path.set_gc_watermark(self.gc_watermark(self.hlc.physical_ms()));
+            }
+            return Ok(done);
+        }
+        // A read of another unit's pending version must be durable first,
+        // unless the log makes entries durable in order across units.
+        if let Some(&u) = parts.keys().next()
+            && waits_beyond(dep, u)
+            && !self.ordered(path)
+        {
+            path.settle(dep)?;
         }
         let latches: Vec<Arc<Mutex<()>>> = parts.keys().map(|u| self.latch(*u)).collect();
         let (cts, tickets) = {
@@ -434,7 +555,7 @@ impl TxnShared {
                 }
                 for n in &part.extras {
                     match n {
-                        Extra::Note(b) => p.note(b),
+                        Extra::Note(_, b) => p.note(b),
                         Extra::Put(cf, k, v) => p.put(*cf, k, v),
                         Extra::Delete(cf, k) => p.delete(*cf, k),
                     }
@@ -487,9 +608,13 @@ impl TxnShared {
         let n = self.stats.commits.fetch_add(1, Ordering::Relaxed) + 1;
         self.prune(path);
         if n.is_multiple_of(WATERMARK_EVERY) {
-            path.set_gc_watermark(self.gc_watermark(SystemClock.now_ms()));
+            path.set_gc_watermark(self.gc_watermark(self.hlc.physical_ms()));
         }
-        Ok((cts, ticket))
+        Ok(Committed {
+            cts,
+            ticket,
+            later: DurableTicket::Ready,
+        })
     }
 
     /// `unit`'s commit latch.
@@ -615,6 +740,15 @@ fn release_loop(held: &Weak<HeldQueue>, locks: &Weak<LockTable>) {
                 l.release_all(txn);
             }
         }
+    }
+}
+
+/// Whether `dep` waits on a log entry of a unit other than `unit`.
+fn waits_beyond(dep: &DurableTicket, unit: u64) -> bool {
+    match dep {
+        DurableTicket::Ready | DurableTicket::Watch(..) => false,
+        DurableTicket::Log(t) => t.unit().0 != unit,
+        DurableTicket::Many(_) => true,
     }
 }
 

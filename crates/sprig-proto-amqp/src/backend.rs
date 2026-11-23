@@ -301,6 +301,15 @@ pub trait QueueBackend: Send + Sync + 'static {
     async fn max_message_bytes(&self, _principal: &Principal, _vhost: &str) -> Option<u64> {
         None
     }
+
+    /// The 0-9-1 listener (`host:port`) of the gateway that serves
+    /// `principal`'s connections when it isn't this one (the gateway whose
+    /// engine leads the tenant's data): a password login is then relayed
+    /// there whole, byte for byte, after this gateway checked it. `None`
+    /// (the default): served here.
+    async fn serve_elsewhere(&self, _principal: &Principal) -> Option<String> {
+        None
+    }
 }
 
 /// One virtual host, as one connection uses it.

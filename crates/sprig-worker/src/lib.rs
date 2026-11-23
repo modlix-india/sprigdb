@@ -16,7 +16,6 @@ pub mod ai_retrieval;
 // The asynchronous graph mirror applier and the `queue.change_exchange`
 // forwarders.
 pub mod change_exchange;
-pub mod graph_mirror;
 pub mod inherit;
 // The key-value expiry and old-generation sweeper.
 pub mod kv_sweep;
@@ -268,6 +267,9 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
             .map(sprig_catalog::records::remote::PeerPems::from_config)
             .transpose()?,
     );
+    // Migrations run here keep each tenant's catalog format in its
+    // records too (EC-90).
+    sprig_catalog::migrate::mirror_formats(sinks::catalog_records());
     // The copy worker: one job per tenant tree, through the shared
     // reader.
     let inherit_env = Arc::new(
@@ -284,15 +286,9 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
                 .named("copy_worker"),
         ),
     );
-    // The graph mirror applier: one job per tenant, through the shared
-    // reader's view of the edge tables.
-    let graph_mirror_env = graph_mirror::GraphMirrorEnv {
-        dc: dc_logic.clone(),
-        pools: Arc::clone(&env.pools),
-        locator: Arc::clone(&env.locator),
-        clusters: graph_mirror::shared_view(&shared_feed),
-        maps: sprig_shard::ShardMapCache::spawn(dc_logic.clone())?,
-    };
+    // Shard maps, for embedded columns' and retrieval indexes' chunk
+    // tables.
+    let shard_maps = sprig_shard::ShardMapCache::spawn(dc_logic.clone())?;
     // Sink tasks, on the same pools, with the global tier
     // (platform connections) and the master key file (credentials).
     let sinks_env = sinks::SinksEnv::new(
@@ -391,7 +387,7 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
                     .named("ai_embed"),
                 ..env.clone()
             },
-            maps: graph_mirror_env.maps.clone(),
+            maps: shard_maps.clone(),
         })))
         // Retrieval indexes: one job per index, the same machinery.
         .with_handler(Arc::new(ai_retrieval::AiRetrieval(ai_embed::EmbedEnv {
@@ -401,7 +397,7 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
                     .named("ai_retrieval"),
                 ..env.clone()
             },
-            maps: graph_mirror_env.maps.clone(),
+            maps: shard_maps.clone(),
         })))
         // Scheduled runs read definers' tenant subtrees from the global
         // tier.
@@ -413,9 +409,9 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
             ..env
         })))
         .with_handler(Arc::new(inherit::InheritCopy(inherit_env)))
-        .with_handler(Arc::new(graph_mirror::GraphMirror(graph_mirror_env)))
         .with_handler(Arc::new(sinks::SinkTask(sinks_env)))
         .with_handler(Arc::new(queue_forwarder::QueueForwarder(forwarder_env)))
+        .with_handler(Arc::new(msg_triggers::ChangeTrigger(msg_env.clone())))
         .with_handler(Arc::new(msg_triggers::QueueTrigger(msg_env)))
         .with_handler(Arc::new(kv_sweep::KvSweep {
             pools: Arc::new(

@@ -64,6 +64,7 @@ use sprig_common::Result;
 
 pub use durable::DurableTicket;
 pub use hlc::Ts;
+pub use shared::cross::{CrossFault, CrossFaults, CrossStage};
 pub use shared::{TxnShared, TxnStats};
 pub use transaction::{
     AbortReason, CommitTicket, InsertLock, InsertProbe, InterruptHandle, LockRequest, Locked,
@@ -276,6 +277,50 @@ pub trait CommitPath: Send + Sync {
         let _ = unit;
         self.applied_index()
     }
+    /// The epoch under which this node leads `unit` (0: it doesn't): it
+    /// changes each time the node takes the unit's leadership, so a cache
+    /// of the unit's state built under another epoch is rebuilt. A path
+    /// with one unit always leads it, under one epoch.
+    fn leader_epoch_of(&self, unit: u64) -> u64 {
+        let _ = unit;
+        1
+    }
+    /// Whether the log makes entries durable in the order they were
+    /// proposed, across units (see `Consensus::durable_in_order`): a commit
+    /// across units then queues all its steps at once.
+    fn durable_in_order(&self) -> bool {
+        false
+    }
+    /// Blocks until `ticket` is durable. A path whose log its caller steps
+    /// (the simulator's) writes and syncs it meanwhile.
+    ///
+    /// # Errors
+    /// The log failed first.
+    fn settle(&self, ticket: &DurableTicket) -> Result<()> {
+        ticket.wait()
+    }
+    /// Whether a read may land on a replica that doesn't lead the data's
+    /// unit (a replicated engine): reads then ask
+    /// [`CommitPath::follower_read`] once per unit.
+    fn follows(&self) -> bool {
+        false
+    }
+    /// Before a read of `unit`: `Some(ts)` on a replica that doesn't lead
+    /// it, once the replica holds everything the leader had committed, with
+    /// the timestamp a read view must take to see it; `None` where reads
+    /// use the node's own view.
+    ///
+    /// # Errors
+    /// The replica could not catch up with the leader (retryable).
+    fn follower_read(&self, unit: u64) -> Result<Option<Ts>> {
+        let _ = unit;
+        Ok(None)
+    }
+    /// Asks for `unit`'s leadership to move to this node (a commit across
+    /// units found it led elsewhere). Nothing by default.
+    fn request_lead(&self, unit: u64) {
+        let _ = unit;
+    }
     /// Tells the store side the oldest timestamp readers may still need.
     fn set_gc_watermark(&self, _ts: Ts) {}
     /// The highest commit timestamp recovered from the log, if this path
@@ -336,6 +381,44 @@ impl CommitPath for Engine {
 
     fn applied_index_of(&self, unit: u64) -> u64 {
         self.consensus().applied_index(UnitId(unit))
+    }
+
+    fn leader_epoch_of(&self, unit: u64) -> u64 {
+        self.leader_epoch(UnitId(unit))
+    }
+
+    fn durable_in_order(&self) -> bool {
+        self.consensus().durable_in_order()
+    }
+
+    fn settle(&self, ticket: &DurableTicket) -> Result<()> {
+        if !self.config().log.manual {
+            return ticket.wait();
+        }
+        // A stepped log: write, then sync, until the ticket is durable.
+        while !ticket.is_durable() {
+            if !self.log().step() {
+                self.log().sync_now();
+                if !ticket.is_durable() {
+                    return Err(errors::outcome_lost());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn follows(&self) -> bool {
+        self.is_replicated()
+    }
+
+    fn follower_read(&self, unit: u64) -> Result<Option<Ts>> {
+        Engine::follower_read(self, UnitId(unit))
+    }
+
+    fn request_lead(&self, unit: u64) {
+        if let Some(r) = self.replicated_log() {
+            r.request_lead(UnitId(unit));
+        }
     }
 
     fn set_gc_watermark(&self, ts: Ts) {

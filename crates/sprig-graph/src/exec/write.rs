@@ -715,7 +715,7 @@ impl Exec<'_> {
 }
 
 /// A duplicate key: a uniqueness constraint refused the row.
-pub(crate) fn is_duplicate(e: &SprigError) -> bool {
+fn is_duplicate(e: &SprigError) -> bool {
     matches!(
         e.kind,
         sprig_common::ErrorKind::Backend { errno: 1062, .. }

@@ -28,8 +28,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::json;
-use sprig_catalog::CatalogLocator;
-use sprig_catalog::pool_wait::Bounded as _;
+use sprig_catalog::RecordStore;
 use sprig_common::Result;
 use sprig_feed::subs::Subscription;
 use sprig_logic::LogicStore;
@@ -55,7 +54,7 @@ impl fmt::Display for LogicTick {
 
 /// See the module docs.
 pub struct LogicLoop {
-    locator: Arc<dyn CatalogLocator>,
+    records: Arc<dyn RecordStore>,
     /// `logic.schedule_misfire_seconds`.
     pub misfire: Duration,
 }
@@ -67,11 +66,11 @@ impl fmt::Debug for LogicLoop {
 }
 
 impl LogicLoop {
-    /// A loop reaching tenant catalogs through `locator`.
+    /// A loop reaching tenants' logic catalogs in `records`.
     #[must_use]
-    pub fn new(locator: Arc<dyn CatalogLocator>) -> Self {
+    pub fn new(records: Arc<dyn RecordStore>) -> Self {
         Self {
-            locator,
+            records,
             misfire: Duration::from_secs(300),
         }
     }
@@ -169,19 +168,17 @@ impl LogicLoop {
             if e.next_fire_ms > now {
                 continue;
             }
-            let ep = match self.locator.writer(e.tenant).await {
-                Ok(ep) => ep,
+            let mut tx = match self.records.begin(e.tenant).await {
+                Ok(tx) => tx,
                 Err(err) => {
                     tracing::warn!(tenant = %e.tenant, error = %err, "schedule's catalog unreachable");
                     continue;
                 }
             };
-            let Ok(mut c) = ep.pool.get_conn_bounded().await else {
-                continue;
-            };
-            let store = LogicStore::new(ep.store.schema());
+            let c = &mut *tx;
+            let store = LogicStore::default();
             let (tick, next) = match schedule::tick(
-                &mut c,
+                c,
                 &store,
                 e.module_id,
                 now,
@@ -222,8 +219,9 @@ impl LogicLoop {
                         }
                         Err(err) => {
                             let _ = store
-                                .run_ended(&mut c, e.module_id, &run.to_bytes(), "error")
+                                .run_ended(c, e.module_id, &run.to_bytes(), "error")
                                 .await;
+                            let _ = tx.commit().await;
                             return Err(err);
                         }
                     }
@@ -232,7 +230,7 @@ impl LogicLoop {
                     tracing::info!(tenant = %e.tenant, module = e.module_id, ?tick, "schedule passed");
                     let _ = store
                         .log(
-                            &mut c,
+                            c,
                             e.module_id,
                             None,
                             "warn",
@@ -242,6 +240,10 @@ impl LogicLoop {
                         .await;
                 }
                 Tick::Nothing | Tick::Running => {}
+            }
+            if let Err(err) = tx.commit().await {
+                tracing::warn!(tenant = %e.tenant, module = e.module_id, error = %err, "schedule tick not recorded");
+                continue;
             }
             match next {
                 Some(n) if n != e.next_fire_ms => {

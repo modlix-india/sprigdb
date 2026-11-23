@@ -31,6 +31,7 @@ pub mod cursors;
 pub mod diag;
 /// Collections stored on the storage engine.
 pub mod engine;
+pub mod engine_changes;
 pub mod explain;
 pub mod failpoint;
 pub mod feed_relay;

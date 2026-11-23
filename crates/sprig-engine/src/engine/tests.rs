@@ -278,11 +278,21 @@ fn each_tenant_is_its_own_unit() {
         crate::txn::DurableTicket::Many(p) if p.len() == 2
     ));
     tk.wait().unwrap();
-    assert_eq!(c.durable_index(UnitId(42)), 6);
-    assert_eq!(c.durable_index(UnitId(43)), 2);
+    // The anchor (42) holds the commit point (6), then the record's
+    // deletion; the participant (43) its prepare record (2) and its
+    // resolution (3).
+    assert!(c.durable_index(UnitId(42)) >= 6);
+    assert_eq!(c.durable_index(UnitId(43)), 3);
     assert_eq!(get_in(&e, 42, 100).as_deref(), Some(&b"x"[..]));
     assert_eq!(get_in(&e, 43, 100).as_deref(), Some(&b"y"[..]));
-    // Both versions carry the one commit timestamp.
+    // Both versions carry the one commit timestamp (read from the store,
+    // so wait for the apply: the ticket is durability only).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while (c.applied_index(UnitId(42)) < 6 || c.applied_index(UnitId(43)) < 3)
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
     let ts = |tenant| {
         let lo = row_key_in(tenant, 100);
         let mut it = e.store().iter(
@@ -298,9 +308,10 @@ fn each_tenant_is_its_own_unit() {
     assert_eq!(get_in(&e, 43, 100).as_deref(), Some(&b"y"[..]));
     let units: Vec<UnitId> = e.units().into_iter().map(|(u, _)| u).collect();
     assert!(units.contains(&UnitId(42)) && units.contains(&UnitId(43)));
-    // New commits continue each unit's own sequence.
+    // New commits continue each unit's own sequence (after the record's
+    // deletion at 7).
     let t = put(&e, 200, "z", Durability::Local);
-    assert_eq!(t.log_ticket().unwrap().index(), 7);
+    assert_eq!(t.log_ticket().unwrap().index(), 8);
 }
 
 /// A read view sees every commit below it on every unit, even when
@@ -344,6 +355,7 @@ fn read_views_are_consistent_across_units() {
 /// every tenant) opens: the node unit continues unit 1's index sequence
 /// and takes its observer floors.
 #[test]
+#[allow(clippy::too_many_lines)]
 fn a_one_unit_data_directory_moves_to_units() {
     let dir = TempDir::new("legacy");
     let c = cfg(dir.path(), StoreKind::Rocks);
@@ -388,6 +400,11 @@ fn a_one_unit_data_directory_moves_to_units() {
     let e = Engine::open(c.clone()).unwrap();
     assert_eq!(e.log_floor("streams"), Some(7));
     assert_eq!(e.last_applied(), 9);
+    // The node unit's log holds none of what it applied (it came from the
+    // old unit): the log still counts it as applied and durable, so an
+    // observer flushing up to it isn't told the log is behind.
+    assert_eq!(e.consensus().applied_index(NODE_UNIT), 9);
+    assert_eq!(e.consensus().durable_index(NODE_UNIT), 9);
     let mut moved = KeyPrefix {
         tenant: 5,
         shard: 0,

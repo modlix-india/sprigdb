@@ -289,7 +289,7 @@ impl CatalogExtension for Items {
             quote(tx.schema())
         );
         let rows: Vec<(u32, String)> = tx
-            .conn()
+            .conn()?
             .exec(sql, (since.unwrap_or(0),))
             .await
             .map_err(|e| sprig_common::SprigError::internal(e.to_string()))?;

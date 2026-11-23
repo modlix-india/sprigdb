@@ -14,6 +14,14 @@
 //!   only if missing, so one gateway coordinates a group at a time. When
 //!   the lease is lost, every group of this gateway is dropped (its members
 //!   get `NOT_COORDINATOR`) and a later request takes a new lease.
+//! - **Replicated engines.** A tenant's streams and groups commit only on
+//!   its unit's Raft leader, so Metadata names the gateway leading it
+//!   (found by the `raft_node` of the gateway records) as every
+//!   partition's leader and the controller, FindCoordinator names it for
+//!   every group, and a gateway that doesn't lead gives its coordinator
+//!   leases up (the leader takes a group over at once). Writes that land
+//!   elsewhere get `NOT_LEADER_OR_FOLLOWER` / `NOT_CONTROLLER` /
+//!   `NOT_COORDINATOR`, and the client asks Metadata again.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -63,7 +71,29 @@ pub struct GatewayCluster {
     /// across an etcd call (a slow etcd answer would hold every group's
     /// heartbeat, join and timer behind one group's lease request).
     granting: tokio::sync::Mutex<()>,
-    brokers: Mutex<Option<(Instant, Vec<BrokerNode>)>>,
+    brokers: Mutex<Option<Brokers>>,
+}
+
+/// The broker list as last read, with each replicated gateway's Raft id.
+#[derive(Clone)]
+struct Brokers {
+    at: Instant,
+    nodes: Vec<BrokerNode>,
+    /// (Raft id, broker id) of the ready gateways whose engine replicates.
+    raft: Vec<(u64, i32)>,
+}
+
+/// Where a tenant's unit is led, for Kafka routing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lead {
+    /// No gateway alone (a one-node engine, or a unit not started yet).
+    Any,
+    /// This gateway.
+    Here,
+    /// Another gateway: its broker id.
+    Broker(i32),
+    /// Not known now (an election), or led by a gateway that isn't ready.
+    Unknown,
 }
 
 impl std::fmt::Debug for GatewayCluster {
@@ -181,12 +211,43 @@ impl Cluster for GatewayCluster {
     }
 
     async fn brokers(&self, _p: &Principal) -> Vec<BrokerNode> {
-        if let Some((at, b)) = self
+        self.broker_list().await.nodes
+    }
+
+    async fn tenant_leader(&self, p: &Principal) -> Option<i32> {
+        match self.lead_of(p.tenant_id).await {
+            Lead::Here => Some(self.node_id()),
+            Lead::Broker(b) => Some(b),
+            Lead::Any | Lead::Unknown => None,
+        }
+    }
+}
+
+impl GatewayCluster {
+    /// Where `tenant`'s unit is led: on replicated engines a tenant's
+    /// streams and consumer groups commit only on its unit's leader.
+    async fn lead_of(&self, tenant: u64) -> Lead {
+        match crate::node_engine::tenant_leader(tenant) {
+            crate::node_engine::UnitLeader::Any => Lead::Any,
+            crate::node_engine::UnitLeader::Here => Lead::Here,
+            crate::node_engine::UnitLeader::Unknown => Lead::Unknown,
+            crate::node_engine::UnitLeader::Node(id) => self
+                .broker_list()
+                .await
+                .raft
+                .iter()
+                .find(|(r, _)| *r == id)
+                .map_or(Lead::Unknown, |(_, b)| Lead::Broker(*b)),
+        }
+    }
+
+    async fn broker_list(&self) -> Brokers {
+        if let Some(b) = self
             .brokers
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .as_ref()
-            && at.elapsed() < BROKERS_TTL
+            && b.at.elapsed() < BROKERS_TTL
         {
             return b.clone();
         }
@@ -201,9 +262,17 @@ impl Cluster for GatewayCluster {
             }
         };
         let me = self.registrar.record();
-        let mut out: Vec<BrokerNode> = records
+        let ready: Vec<_> = records
             .into_iter()
             .filter(|r| r.state == GatewayState::Ready)
+            .collect();
+        let raft = ready
+            .iter()
+            .filter(|r| r.listeners.contains_key("kafka"))
+            .filter_map(|r| Some((r.raft_node?, i32::from(r.slot))))
+            .collect();
+        let mut out: Vec<BrokerNode> = ready
+            .into_iter()
             .filter_map(|r| {
                 let port = *r.listeners.get("kafka")?;
                 // Its own public name first (`[gateway]
@@ -225,9 +294,13 @@ impl Cluster for GatewayCluster {
             })
             .collect();
         out.sort_by_key(|b| b.node_id);
-        *self.brokers.lock().unwrap_or_else(PoisonError::into_inner) =
-            Some((Instant::now(), out.clone()));
-        out
+        let b = Brokers {
+            at: Instant::now(),
+            nodes: out,
+            raft,
+        };
+        *self.brokers.lock().unwrap_or_else(PoisonError::into_inner) = Some(b.clone());
+        b
     }
 }
 
@@ -235,6 +308,22 @@ impl Cluster for GatewayCluster {
 impl Leases for GatewayCluster {
     async fn acquire(&self, k: &GroupKey) -> Result<LeaseState, StoreError> {
         let key = self.key(k)?;
+        // On replicated engines a group's rows commit only on the tenant
+        // unit's leader: elsewhere the group isn't coordinated (members are
+        // sent to the leader), and the leader takes the group over from a
+        // gateway that no longer leads.
+        let lead = self.lead_of(k.tenant).await;
+        match lead {
+            Lead::Any | Lead::Here => {}
+            Lead::Broker(b) => {
+                self.release(k).await;
+                return Ok(LeaseState::Elsewhere(b));
+            }
+            Lead::Unknown => {
+                self.release(k).await;
+                return Ok(LeaseState::Elsewhere(-1));
+            }
+        }
         let current = {
             let h = self.held.lock().await;
             if h.keys.contains(k) {
@@ -282,7 +371,9 @@ impl Leases for GatewayCluster {
             // of this gateway (a restart) or a lease this gateway lost. Its
             // key would otherwise answer NOT_COORDINATOR to every member,
             // pointed back here, until its lease ran out (up to 10 s).
-            if node == self.node_id() && kv.lease != Some(lease) {
+            // The tenant's unit is led here: a holder elsewhere can't
+            // commit the group's rows any more, so take the group over.
+            if (node == self.node_id() || lead == Lead::Here) && kv.lease != Some(lease) {
                 let r = self
                     .store
                     .txn(Txn {
@@ -318,6 +409,12 @@ impl Leases for GatewayCluster {
     }
 
     async fn confirm(&self, k: &GroupKey, epoch: u64) -> bool {
+        if matches!(
+            self.lead_of(k.tenant).await,
+            Lead::Broker(_) | Lead::Unknown
+        ) {
+            return false;
+        }
         let h = self.held.lock().await;
         h.epoch == epoch && h.keys.contains(k)
     }

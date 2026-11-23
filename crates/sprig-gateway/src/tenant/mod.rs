@@ -29,7 +29,6 @@ pub mod catalog_records;
 pub mod ddl;
 pub mod ddl_owners;
 pub mod locator;
-pub mod lookups_sql;
 pub mod names;
 pub mod password;
 pub mod pins_sql;
@@ -202,8 +201,6 @@ impl TenantServices {
             Arc::new(sprig_inherit::InheritExtension),
             // Inherited messaging objects.
             Arc::new(sprig_inherit::msg::MsgExtension),
-            // Table groups, for the router.
-            Arc::new(crate::exec::router::ShardingExtension),
             // Engine-backed databases and their tables' definitions.
             Arc::new(crate::engine::catalog::EngineExtension),
             // Collections, their indexes and field columns.
@@ -213,6 +210,9 @@ impl TenantServices {
         ];
         // The auth modules read this node's engine records.
         let records: Arc<dyn RecordStore> = Arc::new(catalog_records::EngineRecords::default());
+        // Migrations run here keep each tenant's catalog format in its
+        // records too, where cache loads read it (EC-90).
+        sprig_catalog::migrate::mirror_formats(Arc::clone(&records));
         let source = MariaSource::new(Arc::clone(&dyn_locator), extensions)?
             .with_records(Arc::clone(&records));
         let feed = DirectoryWatch::start(Arc::clone(&global))?;

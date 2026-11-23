@@ -120,6 +120,64 @@ impl Overlay {
             .collect()
     }
 
+    /// Moves the versions of `keys` at `ts` from entry `from` to entry `to`
+    /// (a commit's versions in another unit, once that unit's own entry
+    /// carries them). Returns how many moved.
+    pub fn retarget<'a>(
+        &self,
+        keys: impl IntoIterator<Item = &'a Bytes>,
+        ts: Ts,
+        from: &DurableTicket,
+        to: &DurableTicket,
+    ) -> usize {
+        let Some(unit) = from.unit_key() else {
+            return 0;
+        };
+        let index = from.index();
+        let mut m = self.write();
+        let mut n = 0;
+        for k in keys {
+            if let Some(vs) = m.get_mut(k) {
+                for v in vs.iter_mut() {
+                    if v.ts == ts && v.index() == index && v.ticket.unit_key() == Some(unit) {
+                        v.ticket = to.clone();
+                        n += 1;
+                    }
+                }
+            }
+        }
+        n
+    }
+
+    /// Drops every pending version of a key in `range` (a unit whose
+    /// leadership changed here: what is still pending was proposed under an
+    /// older leader and is either applied already or never will be).
+    /// Returns how many it dropped.
+    pub fn remove_range(&self, range: &KeyRange) -> usize {
+        if self.is_empty() {
+            return 0;
+        }
+        let mut m = self.write();
+        let gone: Vec<Bytes> = m
+            .range::<[u8], _>((
+                Bound::Included(range.start.as_slice()),
+                match &range.end {
+                    Some(e) => Bound::Excluded(e.as_slice()),
+                    None => Bound::Unbounded,
+                },
+            ))
+            .map(|(k, _)| k.clone())
+            .collect();
+        let mut n = 0;
+        for k in gone {
+            if let Some(vs) = m.remove(&k) {
+                n += vs.len();
+            }
+        }
+        self.versions.fetch_sub(n, Ordering::AcqRel);
+        n
+    }
+
     /// Drops the versions of one applied commit: entry `index` of `unit`
     /// (the unit as [`DurableTicket`] names it; `u64::MAX` for a ticket of
     /// no unit).

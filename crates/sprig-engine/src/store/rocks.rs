@@ -29,8 +29,9 @@ use rust_rocksdb::compaction_filter_factory::{CompactionFilterContext, Compactio
 use rust_rocksdb::{
     BlockBasedIndexType, BlockBasedOptions, BottommostLevelCompaction, Cache, ColumnFamily,
     ColumnFamilyDescriptor, CompactOptions, CompactionDecision, DB, DBCompactionStyle,
-    DBCompressionType, DBRawIteratorWithThreadMode, ErrorKind, FlushOptions, Options, ReadOptions,
-    ReadTier as RocksTier, SliceTransform, WriteBatch, WriteBufferManager, WriteOptions,
+    DBCompressionType, DBRawIteratorWithThreadMode, ErrorKind, FlushOptions,
+    IngestExternalFileOptions, Options, ReadOptions, ReadTier as RocksTier, SliceTransform,
+    SstFileWriter, WriteBatch, WriteBufferManager, WriteOptions,
 };
 use sprig_common::{Result, SprigError};
 
@@ -115,6 +116,9 @@ pub struct RocksStore {
     db: DB,
     cache: Cache,
     wbm: WriteBufferManager,
+    /// The data column family's options, for SST files written to be
+    /// ingested ([`RocksStore::write_sst`]).
+    sst_opts: Options,
 }
 
 impl std::fmt::Debug for RocksStore {
@@ -341,11 +345,13 @@ impl RocksStore {
             })
             .collect::<Vec<_>>();
         let db = DB::open_cf_descriptors(&db_opts, path, cfs).map_err(|e| rocks_err(&e, "open"))?;
+        let sst_opts = cf_options(&opts.tuning, opts.memtable_bytes, &cache, &wbm, None);
         Ok(Self {
             point_iters: PointIters::new(),
             db,
             cache,
             wbm,
+            sst_opts,
         })
     }
 
@@ -389,6 +395,34 @@ impl RocksStore {
             .ok()
             .flatten()
             .unwrap_or(0)
+    }
+
+    /// Writes `entries` (ascending keys of the data column family) into a
+    /// new SST file at `path`, with the data column family's table options,
+    /// so the file can be ingested as it is.
+    ///
+    /// # Errors
+    /// RocksDB failed to write the file.
+    pub fn write_sst(&self, path: &Path, entries: &[(Vec<u8>, Vec<u8>)]) -> Result<()> {
+        let mut w = SstFileWriter::create(&self.sst_opts);
+        w.open(path).map_err(|e| rocks_err(&e, "sst open"))?;
+        for (k, v) in entries {
+            w.put(k, v).map_err(|e| rocks_err(&e, "sst put"))?;
+        }
+        w.finish().map_err(|e| rocks_err(&e, "sst finish"))
+    }
+
+    /// Moves SST files into `cf` (they become part of the store at once,
+    /// durable, without a rewrite).
+    ///
+    /// # Errors
+    /// RocksDB refused the files.
+    pub fn ingest_sst(&self, cf: Cf, paths: &[std::path::PathBuf]) -> Result<()> {
+        let mut o = IngestExternalFileOptions::default();
+        o.set_move_files(true);
+        self.db
+            .ingest_external_file_cf_opts(self.cf(cf), &o, paths.to_vec())
+            .map_err(|e| rocks_err(&e, "ingest"))
     }
 
     /// RocksDB's statistics dump, when statistics are on.

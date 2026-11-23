@@ -25,10 +25,12 @@
 //! pool timeout) is 39030, also definite; anything after sending leaves the
 //! outcome unknown for the reconciler.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use sprig_catalog::ddl::{
-    DdlExecutor, Effect, MariaExecutor, PhysicalDdl, PhysicalObject, SchemaInfo, ShardTarget,
+    DTX_TABLE, DdlExecutor, Effect, MariaExecutor, PhysicalDdl, PhysicalObject, SchemaInfo,
+    ShardTarget,
 };
 use sprig_catalog::pool_wait::Bounded as _;
 use sprig_catalog::store::{DatabaseRow, ObjectKind};
@@ -57,6 +59,11 @@ pub struct GatewayDdl<'a> {
     /// (a `SET_ANY_DEFINER` holder's): views then run as
     /// `sprig_ctl` with it too, like stored programs.
     definer: Option<(String, String)>,
+    /// Every database is the engine's and has no MariaDB schema: a
+    /// `CREATE` or `ALTER DATABASE` keeps the character set and
+    /// collation it resolves here, for the catalog to read back
+    /// ([`DdlExecutor::schema`]).
+    databases: std::sync::Mutex<HashMap<SchemaName, SchemaInfo>>,
 }
 
 /// The rows the backends' OK packets reported for one DDL statement:
@@ -125,6 +132,7 @@ impl<'a> GatewayDdl<'a> {
             version: None,
             rows: None,
             definer: None,
+            databases: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -735,6 +743,21 @@ impl DdlExecutor for GatewayDdl<'_> {
         {
             return self.stored_program(stmt, mode.as_deref()).await;
         }
+        // A database's schema exists only in the catalog: nothing of an
+        // engine database is on MariaDB, and no session uses the schema.
+        if matches!(stmt.effect, Effect::CreateSchema | Effect::AlterSchema) {
+            let info = database_charset(&stmt.sql)?;
+            self.databases
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(stmt.schema, info);
+            return Ok(());
+        }
+        // Nor does the decision table of transactions on MariaDB.
+        if matches!(&stmt.effect, Effect::Create { kind: ObjectKind::Table, name } if name == DTX_TABLE)
+        {
+            return Ok(());
+        }
         if stmt.effect.on_schema() {
             return self.ctl.execute(stmt).await;
         }
@@ -776,7 +799,16 @@ impl DdlExecutor for GatewayDdl<'_> {
     }
 
     async fn schema(&self, schema: &SchemaName) -> Result<Option<SchemaInfo>> {
-        self.ctl.schema(schema).await
+        let made = self
+            .databases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(schema)
+            .cloned();
+        match made {
+            Some(info) => Ok(Some(info)),
+            None => self.ctl.schema(schema).await,
+        }
     }
 
     async fn show_create(
@@ -808,6 +840,54 @@ impl DdlExecutor for GatewayDdl<'_> {
     async fn busy(&self, schema: &SchemaName) -> Result<bool> {
         self.ctl.busy(schema).await
     }
+}
+
+/// The character set and collation a `CREATE` or `ALTER DATABASE`
+/// (`sql`, as the catalog writes it: `... CHARACTER SET cs COLLATE c`)
+/// gives the database, resolved as MariaDB 11.8 does: a character set's
+/// default collation, a collation's character set, the server's
+/// `utf8mb4` default when neither is named. 1115 for a character set and
+/// 1273 for a collation the engine doesn't have, 1253 when they don't go
+/// together.
+fn database_charset(sql: &str) -> Result<SchemaInfo> {
+    use crate::engine::define::{charset_name, collation, default_collation};
+    let word_after = |key: &str| {
+        let at = sql.find(key)? + key.len();
+        sql[at..].split_whitespace().next().map(str::to_owned)
+    };
+    let charset = word_after(" CHARACTER SET ");
+    let collate = word_after(" COLLATE ");
+    let cs = match &charset {
+        Some(c) => Some(charset_name(c).ok_or_else(|| {
+            SprigError::standard(1115, *b"42000", format!("Unknown character set: '{c}'"))
+        })?),
+        None => None,
+    };
+    let coll = match &collate {
+        Some(c) => Some(collation(c).ok_or_else(|| {
+            SprigError::standard(1273, *b"HY000", format!("Unknown collation: '{c}'"))
+        })?),
+        None => None,
+    };
+    let (charset, collation) = match (cs, coll) {
+        (Some(cs), Some((name, of))) => {
+            if of != cs {
+                return Err(SprigError::standard(
+                    1253,
+                    *b"42000",
+                    format!("COLLATION '{name}' is not valid for CHARACTER SET '{cs}'"),
+                ));
+            }
+            (cs.to_owned(), name)
+        }
+        (Some(cs), None) => (cs.to_owned(), default_collation(cs).to_owned()),
+        (None, Some((name, of))) => (of.to_owned(), name),
+        (None, None) => (
+            "utf8mb4".to_owned(),
+            default_collation("utf8mb4").to_owned(),
+        ),
+    };
+    Ok(SchemaInfo { charset, collation })
 }
 
 /// The wait for shard jobs: a split, merge or shard move holds
@@ -1150,6 +1230,44 @@ impl DdlExecutor for ShardedDdl<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A database's character set and collation resolve as MariaDB's do.
+    #[test]
+    fn database_charsets_resolve_as_mariadb() {
+        let r = |sql: &str| super::database_charset(sql).map(|i| (i.charset, i.collation));
+        let pair = |a: &str, b: &str| (a.to_owned(), b.to_owned());
+        assert_eq!(
+            r("CREATE DATABASE IF NOT EXISTS `t1_d1_g1_s1`").unwrap(),
+            pair("utf8mb4", "utf8mb4_uca1400_ai_ci")
+        );
+        assert_eq!(
+            r("CREATE DATABASE IF NOT EXISTS `t1_d1_g1_s1` CHARACTER SET latin1").unwrap(),
+            pair("latin1", "latin1_swedish_ci")
+        );
+        assert_eq!(
+            r("ALTER DATABASE `t1_d1_g1_s1` COLLATE utf8mb4_bin").unwrap(),
+            pair("utf8mb4", "utf8mb4_bin")
+        );
+        assert_eq!(
+            r("ALTER DATABASE `t1_d1_g1_s1` CHARACTER SET utf8 COLLATE utf8mb3_bin").unwrap(),
+            pair("utf8mb3", "utf8mb3_bin")
+        );
+        let code = |sql: &str| {
+            super::database_charset(sql)
+                .unwrap_err()
+                .protocol()
+                .mysql_errno
+        };
+        assert_eq!(
+            code("CREATE DATABASE `t1_d1_g1_s1` CHARACTER SET nope"),
+            1115
+        );
+        assert_eq!(code("CREATE DATABASE `t1_d1_g1_s1` COLLATE nope_ci"), 1273);
+        assert_eq!(
+            code("CREATE DATABASE `t1_d1_g1_s1` CHARACTER SET latin1 COLLATE utf8mb4_bin"),
+            1253
+        );
+    }
 
     /// The backends' `Records:` info lines are summed;
     /// a statement without one (a rename) leaves none.

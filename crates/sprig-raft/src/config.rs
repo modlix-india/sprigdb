@@ -43,6 +43,14 @@ pub struct RaftConfig {
     /// being added). Off: groups exist only through
     /// [`crate::Node::create_group`].
     pub auto_create: bool,
+    /// The voters every group starts with on a cluster whose members are
+    /// fixed (every node holds every unit, until placement decides per
+    /// unit). Not empty: a member that hears about a group it doesn't hold
+    /// (a candidate's vote request, a leader's append) creates it with
+    /// these voters, exactly as [`crate::Node::create_group`] would, so a
+    /// unit needs creating on one member only. A node not listed creates
+    /// nothing this way.
+    pub static_voters: Vec<crate::NodeId>,
 }
 
 impl Default for RaftConfig {
@@ -61,6 +69,7 @@ impl Default for RaftConfig {
             compact_after: 1024,
             snapshot_retry_ticks: 30,
             auto_create: true,
+            static_voters: Vec::new(),
         }
     }
 }

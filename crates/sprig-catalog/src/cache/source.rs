@@ -177,24 +177,42 @@ impl MariaSource {
                 }
                 None => None,
             };
-            let mut tx = ep.store.begin_snapshot(&ep.pool).await?;
-            let format: FormatState = match ep.store.internal(&mut tx, FORMAT_KEY).await? {
+            // The catalog format: the records' copy when the migrator
+            // keeps one (`migrate::mirror_formats`), then no MariaDB
+            // snapshot is opened; the MariaDB row otherwise.
+            let rec_format = match rec.as_mut() {
+                Some(r) => CoreRecords::internal(&mut **r, FORMAT_KEY).await?,
+                None => None,
+            };
+            let mut tx = match rec_format {
+                Some(_) => None,
+                None => Some(ep.store.begin_snapshot(&ep.pool).await?),
+            };
+            let raw = match (rec_format, tx.as_mut()) {
+                (Some(v), _) => Some(v),
+                (None, Some(t)) => ep.store.internal(t, FORMAT_KEY).await?,
+                (None, None) => None,
+            };
+            let format: FormatState = match raw {
                 Some(v) => serde_json::from_value(v)
                     .map_err(|e| SprigError::internal(format!("bad {FORMAT_KEY}: {e}")))?,
                 None => FormatState::new(),
             };
             check_readable(&format, &self.supports)?;
             let since = prev.map(|p| p.version);
-            let snapshot = match rec.as_mut() {
-                Some(r) => CoreRecords::snapshot(&mut **r, since).await?,
-                None => ep.store.snapshot_in(&mut tx, since).await?,
+            let snapshot = match (rec.as_mut(), tx.as_mut()) {
+                (Some(r), _) => CoreRecords::snapshot(&mut **r, since).await?,
+                (None, Some(t)) => ep.store.snapshot_in(t, since).await?,
+                (None, None) => {
+                    return Err(SprigError::internal("a catalog load without a source"));
+                }
             };
             let full = snapshot.since.is_none();
             let mut ext = Vec::new();
             {
                 let on_records = rec.is_some();
                 let mut stx = SnapshotTx::new(
-                    &mut tx,
+                    tx.as_mut(),
                     &ep.store,
                     snapshot.versions,
                     rec.as_mut()
@@ -216,7 +234,9 @@ impl MariaSource {
                     ext.push((e.module(), e.load(&mut stx, since, prev_state).await?));
                 }
             }
-            tx.commit().await.map_err(map_err)?;
+            if let Some(t) = tx {
+                t.commit().await.map_err(map_err)?;
+            }
             if let Some(r) = rec {
                 let _ = r.rollback().await;
             }

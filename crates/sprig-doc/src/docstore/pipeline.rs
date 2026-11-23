@@ -599,7 +599,12 @@ impl DocStore {
                         let Some(cur) = self.lock_current(&mut t, &c, &idk, &Pred::True).await? else {
                             continue;
                         };
-                        self.replace_doc(&mut t, &c, &idk, &cur, &new).await?;
+                        let op = if when_matched == "replace" {
+                            sprig_engine::observe::hint::HintOp::Replace
+                        } else {
+                            sprig_engine::observe::hint::HintOp::Update
+                        };
+                        self.replace_doc(&mut t, &c, &idk, &cur, &new, op).await?;
                     }
                     None => match when_not.as_str() {
                         "insert" => {

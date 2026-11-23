@@ -98,10 +98,16 @@ pub const VERSION_LEN: usize = 8;
 /// The reserved tenant id under which unversioned engine bookkeeping lives.
 pub const META_TENANT: u64 = u64::MAX;
 
-/// Objects from this id up hold unversioned keys inside a tenant's range
-/// (queue messages): no commit timestamp suffix, outside MVCC, ignored by
-/// the version GC and the clock. Ordinary objects never get ids this high.
+/// Objects from this id up to [`UNVERSIONED_OBJECT_END`] hold unversioned
+/// keys inside a tenant's range (queue messages): no commit timestamp
+/// suffix, outside MVCC, ignored by the version GC and the clock. Ordinary
+/// objects never get ids this high.
 pub const UNVERSIONED_OBJECT_MIN: u32 = 0x5100_0000;
+
+/// The end (exclusive) of the unversioned objects. Objects above it are
+/// versioned again: the Redis databases (`0x5244_0000` up) store versions
+/// like any table.
+pub const UNVERSIONED_OBJECT_END: u32 = 0x5200_0000;
 
 /// The object of a tenant's queue messages (`'Q'`), an unversioned object.
 pub const QUEUES_OBJECT: u32 = UNVERSIONED_OBJECT_MIN;
@@ -115,7 +121,9 @@ pub fn is_unversioned(key: &[u8]) -> bool {
     }
     key.get(12..16)
         .and_then(|o| o.try_into().ok())
-        .is_some_and(|o: [u8; 4]| u32::from_be_bytes(o) >= UNVERSIONED_OBJECT_MIN)
+        .is_some_and(|o: [u8; 4]| {
+            (UNVERSIONED_OBJECT_MIN..UNVERSIONED_OBJECT_END).contains(&u32::from_be_bytes(o))
+        })
 }
 
 /// The fixed head of every logical key.
@@ -350,6 +358,26 @@ pub mod value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_queue_objects_are_unversioned() {
+        let key = |object: u32| {
+            KeyPrefix {
+                tenant: 7,
+                shard: 0,
+                object,
+                kind: kind::PRIMARY,
+                index: 0,
+            }
+            .to_vec()
+        };
+        assert!(is_unversioned(&key(QUEUES_OBJECT)));
+        assert!(is_unversioned(&META_TENANT.to_be_bytes()));
+        // Tables, graphs and Redis databases are versioned.
+        assert!(!is_unversioned(&key(1)));
+        assert!(!is_unversioned(&key(0x4752_0000)));
+        assert!(!is_unversioned(&key(0x5244_0000)));
+    }
 
     #[test]
     fn versions_sort_newest_first() {

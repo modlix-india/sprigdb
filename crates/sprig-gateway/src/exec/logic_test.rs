@@ -22,7 +22,6 @@ use std::time::Instant;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use sprig_catalog::CatalogLocator;
-use sprig_catalog::pool_wait::Bounded as _;
 use sprig_common::{Result, SprigCode, SprigError};
 use sprig_logic::engine::bridge::{self as eb, DbBridge, DbOp, Reply};
 use sprig_logic::engine::kirun::Host;
@@ -271,11 +270,10 @@ impl PassSession {
             }
         } else {
             let name = req.name.clone().unwrap_or_default();
-            let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
-                SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
-            })?;
+            let mut conn = svc.records.begin(tenant).await?;
             let l =
-                testrun::load(&mut conn, &store, row.db_id.0, &kind, &name, req.version).await?;
+                testrun::load(&mut *conn, &store, row.db_id.0, &kind, &name, req.version).await?;
+            drop(conn);
             let callable = matches!(kind.as_str(), "function" | "procedure");
             let object_ok = callable && {
                 use sprig_auth::authz::{Action, Target};
@@ -459,7 +457,7 @@ impl PassSession {
                     biased;
                     r = &mut run => break r,
                     Some((op, reply)) = rx.recv() => {
-                        let r = self.test_db(cx, &store, &ep, row.db_id.0, &row.name, op, wire, &rec).await;
+                        let r = self.test_db(cx, &store, (&svc.records, tenant), row.db_id.0, &row.name, op, wire, &rec).await;
                         let _ = reply.send(r);
                     }
                 }
@@ -584,7 +582,10 @@ impl PassSession {
         &mut self,
         cx: &mut ExecCtx<'_>,
         store: &sprig_logic::LogicStore,
-        ep: &sprig_catalog::CatalogEndpoint,
+        (records, tenant): (
+            &Arc<dyn sprig_catalog::RecordStore>,
+            sprig_common::ids::TenantId,
+        ),
         db_id: u32,
         db_name: &str,
         op: DbOp,
@@ -626,11 +627,8 @@ impl PassSession {
                 };
                 let found = match id {
                     Some(id) => {
-                        let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
-                            SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable")
-                                .with_source(e)
-                        })?;
-                        store.callable(&mut conn, id, &n).await?.is_some()
+                        let mut conn = records.begin(tenant).await?;
+                        store.callable(&mut *conn, id, &n).await?.is_some()
                     }
                     None => false,
                 };

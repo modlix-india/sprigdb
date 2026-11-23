@@ -1,8 +1,7 @@
 //! The pass-through executor: every request of a session goes, as MySQL
 //! text or binary protocol, to the login's cluster through the session's
 //! [`BackendSession`], and the response streams back through the
-//! [relay engine](relay). For tenants with sharded tables the
-//! [router](router) works behind the same [`Executor`] trait.
+//! [relay engine](relay).
 //!
 //! | Request | Backend |
 //! |---|---|
@@ -42,10 +41,10 @@ mod retrieval;
 pub(crate) use retrieval::KEY_JSON_HINT as RETRIEVE_KEY_JSON_HINT;
 mod fence;
 // A mover's fence never reaches clients as 1146 or 1049.
+pub(crate) mod binary_text;
 mod fence_retry;
 mod follow;
 pub mod relay;
-pub(crate) mod router;
 pub mod settings;
 pub mod split;
 pub mod stmt;
@@ -89,6 +88,8 @@ pub mod sinks;
 mod graph_ddl;
 // Triggers on streams and queues, and `sprig.commit_offset`.
 pub(crate) mod msg_trigger;
+// After-commit triggers on engine tables, run from the change log.
+mod change_trigger;
 mod offsets;
 // Row images checked against a subscriber's
 // privileges and row-level security (gRPC, SSE and WebSocket change
@@ -207,11 +208,9 @@ impl Executor for PassThrough {
             wl: None,
             wl_multi: false,
             wl_text: None,
-            router: router::RouterState::default(),
             packet_limit: None,
             placement_memo: follow::PlacementMemo::default(),
             traffic: None,
-            point_memo: point::PointMemo::default(),
             status: status::SessionStatus::default(),
             globals_applied: false,
             column_change_running: false,
@@ -246,9 +245,6 @@ pub struct PassSession {
     /// capture fingerprints this, as MySQL's digests show the client's
     /// statement.
     wl_text: Option<Vec<u8>>,
-    /// The router: the session's connections to other clusters and the
-    /// transaction coordinator, for tenants with sharded tables.
-    router: router::RouterState,
     /// The session's packet limit, answered
     /// for `max_allowed_packet` in mixed selects and `SHOW VARIABLES`.
     packet_limit: Option<u64>,
@@ -258,8 +254,6 @@ pub struct PassSession {
     placement_memo: follow::PlacementMemo,
     /// The session's own traffic counter (`count_traffic`).
     traffic: Option<crate::dc::SessionTraffic>,
-    /// Point reads: the tenant's statements found unrouted (`point`).
-    point_memo: point::PointMemo,
     /// The tenant's `compat.global.*` defaults were given to the session:
     /// at its first request, and again after a reset.
     globals_applied: bool,
@@ -377,18 +371,25 @@ impl PassSession {
     /// tenant session opens it in the schema of its current logical
     /// database.
     fn bs(&mut self, cx: &ExecCtx<'_>) -> &mut BackendSession {
-        // Sprig 2PC's relay path: every connection of the tenant to a
-        // cluster with relays goes through its relay writer.
-        let relay = self.relay_tenant();
+        // An engine database has no MariaDB schema: a statement that still
+        // goes to MariaDB runs there with no default database. Worked out
+        // only for a new session (this is asked several times per
+        // statement).
+        let engine_current = self.bs.is_none()
+            && self.tenant.as_deref().is_some_and(|ts| {
+                ts.current
+                    .as_deref()
+                    .or(cx.db)
+                    .is_some_and(|d| self.engine_database_named(d))
+            });
         let backends = &self.backends;
         let target = &self.target;
         let persona = self.persona;
         let ts = self.tenant.as_deref();
         let keep = self.keep_idle;
-        let bs = self.bs.get_or_insert_with(|| {
-            // Asked several times per statement: the schema only for a
-            // new session.
+        self.bs.get_or_insert_with(|| {
             let schema = match ts {
+                Some(_) if engine_current => None,
                 Some(ts) => ts.schema_of(ts.current.as_deref().or(cx.db)),
                 None => cx.db.map(str::to_owned),
             };
@@ -401,7 +402,6 @@ impl PassSession {
                     mariadb_caps: mariadb_caps(persona, cx.proto.caps),
                     collation: cx.proto.collation,
                     schema,
-                    relay,
                     tenant,
                     ..SessionOpts::default()
                 },
@@ -410,12 +410,7 @@ impl PassSession {
             // quiet (`SessionExec::keep_idle`).
             bs.set_keep(keep);
             bs
-        });
-
-        if bs.relay() != relay {
-            bs.set_relay(relay);
-        }
-        bs
+        })
     }
 
     fn backend_caps(&self, cx: &ExecCtx<'_>) -> Caps {
@@ -440,11 +435,6 @@ impl PassSession {
             }
         } else {
             s |= StatusFlags::AUTOCOMMIT;
-        }
-        // A transaction the router's coordinator holds (its branches are
-        // other connections).
-        if self.router.in_txn() {
-            s |= StatusFlags::IN_TRANS;
         }
         // A transaction on the storage engine, which the session holds.
         s |= self.engine_txn_flags();
@@ -546,11 +536,7 @@ impl PassSession {
     async fn prepare(&mut self, cx: &mut ExecCtx<'_>, sql: Bytes) -> Result<ExecSummary> {
         let (sql, renames) = self.session_rewrites(sql, cx.session.id.0);
         let info = StmtInfo::classify(&sql);
-        // Sharded tables are prepared in one shard's schema.
-        let prepared = match self.prepare_meta(cx, &info, &sql).await {
-            Some(r) => r?,
-            None => self.bs(cx).prepare(&info, &sql).await?,
-        };
+        let prepared = self.bs(cx).prepare(&info, &sql).await?;
         let mut meta_params = prepared.param_defs.clone();
         let mut meta_columns = prepared.columns.clone();
         relay::rename_all(&mut meta_columns, &renames);
@@ -644,11 +630,11 @@ impl PassSession {
                 let sql_l: Vec<String> = values.iter().map(search::param_literal).collect();
                 let cy_l = values
                     .iter()
-                    .map(router::graph::cypher_param)
+                    .map(graph_ddl::cypher_param)
                     .collect::<Result<Vec<String>>>()?;
                 std::str::from_utf8(&text)
                     .ok()
-                    .and_then(|t| sprig_router::graph::bind_params(t, &sql_l, &cy_l))
+                    .and_then(|t| sprig_graph::graph_table::bind_params(t, &sql_l, &cy_l))
                     .map(Bytes::from)
                     .ok_or_else(|| {
                         SprigError::standard(
@@ -781,46 +767,6 @@ impl PassSession {
                 r => r?,
             }
         }
-        // A sharded tenant's statement is routed (see
-        // `router::PassSession::routed_execute`).
-        let mut sql = sql;
-        let mut slot = None;
-        if self.tenant.is_some() {
-            match self
-                .routed_execute(cx, &sql, logical.as_deref(), &values, cursor, out)
-                .await?
-            {
-                router::ExecRoute::Answered => {
-                    return Ok(ExecSummary {
-                        status: None,
-                        prepared: None,
-                        db: None,
-                    });
-                }
-                router::ExecRoute::Done(status) => {
-                    return Ok(ExecSummary {
-                        status,
-                        prepared: None,
-                        db: None,
-                    });
-                }
-                router::ExecRoute::Normal(text, sl) => {
-                    if let Some(t) = text {
-                        sql = Bytes::from(t);
-                    }
-                    if !matches!(sl, router::ExecSlot::Main) {
-                        let _ = self.bs(cx);
-                        self.exec_slot_in(&sl).await?;
-                        self.router.probe = if matches!(sl, router::ExecSlot::Branch(..)) {
-                            router::Probe::Any
-                        } else {
-                            router::Probe::Off
-                        };
-                        slot = Some(sl);
-                    }
-                }
-            }
-        }
         let tail = ExecTail {
             mapper,
             logical,
@@ -836,27 +782,7 @@ impl PassSession {
             client_bound,
             backend_caps,
         };
-        let r = self.exec_tail(cx, stmt, params, tail, out).await;
-        let Some(sl) = slot else {
-            return r;
-        };
-        self.router.probe = router::Probe::Off;
-        self.exec_slot_out(&sl);
-        let held = self.router.hit.take();
-        match (r, held) {
-            (Err(e), _) => Err(self.exec_failed(&sl, e).await),
-            (Ok(_), Some(e)) => {
-                let e = self.exec_failed(&sl, e).await;
-                let e = self.map_error(e);
-                out.error(&e).await?;
-                Ok(ExecSummary {
-                    status: None,
-                    prepared: None,
-                    db: None,
-                })
-            }
-            (ok, None) => ok,
-        }
+        self.exec_tail(cx, stmt, params, tail, out).await
     }
 
     /// The execute on `self.bs` (the session's connection, or the one a
@@ -905,21 +831,6 @@ impl PassSession {
             // Pin before routing, so FETCH finds the same connection.
             bs.open_cursor();
         }
-        // A write on a branch that records its
-        // redo is recorded with its values written in.
-        if bs.recording() {
-            let cs = bs
-                .vars()
-                .vars
-                .get("character_set_client")
-                .cloned()
-                .unwrap_or_else(|| "utf8mb4".to_owned());
-            let lits: Vec<sprig_router::ParamLit> =
-                values.iter().map(|v| router::param_lit(v, &cs)).collect();
-            if let Some(t) = sprig_router::render_params(&String::from_utf8_lossy(&sql), &lits) {
-                bs.bind_text(t);
-            }
-        }
         let mut backend_id = 0u32;
         let mut build = |b: &BackendStmt| {
             backend_id = b.id;
@@ -937,15 +848,6 @@ impl PassSession {
                 self.wl_finish(cx, pending, l, &ran);
             }
             return Err(e);
-        }
-        // A routed statement on a coordinator branch: an ERR goes to the
-        // coordinator before the client.
-        if self.router.probe_first(bs).await? {
-            return Ok(ExecSummary {
-                status: None,
-                prepared: None,
-                db: None,
-            });
         }
         let r = Relay {
             more: false,
@@ -1344,20 +1246,13 @@ impl SessionExec for PassSession {
         if let Some(wl) = self.wl.as_mut() {
             wl.reset();
         }
-        self.router.reset().await;
         match self.bs.as_mut() {
             Some(bs) => bs.reset().await,
             None => Ok(()),
         }
     }
 
-    fn take_cut_commit(&mut self) -> Option<Result<()>> {
-        self.router.take_cut_commit()
-    }
-
     async fn abandoned(&mut self, _cx: &mut ExecCtx<'_>, why: Abandon) {
-        // The router's statements on other connections too.
-        self.router.abandon_in_flight(DRAIN_TIMEOUT).await;
         // On the storage engine: a killed statement is undone and its
         // transaction stays open; a lost client's transaction is rolled back.
         match why {
@@ -1404,7 +1299,11 @@ impl SessionExec for PassSession {
     }
 
     fn engine_database(&self, name: &str) -> bool {
-        self.engine_database_named(name)
+        // Every new database is an engine database (SE79): one the catalog
+        // doesn't have yet (a MongoDB or Redis front end's first use makes
+        // it) is the engine's too; only a database made earlier on
+        // MariaDB stays there.
+        self.engine_database_named(name) || self.unknown_database(name)
     }
 
     fn row_policy_docs(&self) -> Option<std::sync::Arc<crate::tenant::rls::DocViews>> {
@@ -1431,8 +1330,8 @@ impl SessionExec for PassSession {
     fn holds_tenant_privilege(&self, action: sprig_auth::authz::Action) -> Option<bool> {
         // `$currentOp` with `allUsers` needs `PROCESS`.
         let ts = self.tenant.as_deref()?;
-        let cat = ts.catalog()?;
-        let p = crate::tenant::authz::privileges(ts, cat);
+        let cat = Self::session_catalog(ts)?;
+        let p = crate::tenant::authz::privileges(ts, &cat);
         Some(p.unrestricted() || p.allows(action, sprig_auth::authz::Target::Tenant))
     }
 
@@ -1467,7 +1366,6 @@ impl SessionExec for PassSession {
         self.stmts.clear();
         metrics::gauge!("sprig_mysql_prepared_statements", "persona" => self.persona.as_str())
             .decrement(n);
-        self.router.close().await;
         self.engine_end();
         if let Some(bs) = self.bs.as_mut() {
             bs.close().await;

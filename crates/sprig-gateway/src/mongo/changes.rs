@@ -370,13 +370,13 @@ pub enum Images {
 
 impl Images {
     /// Whether the event carries the image at all.
-    fn wanted(self) -> bool {
+    pub(crate) fn wanted(self) -> bool {
         self != Self::Off
     }
 
     /// Whether this mode needs the collection's
     /// `changeStreamPreAndPostImages`.
-    fn needs_option(self) -> bool {
+    pub(crate) fn needs_option(self) -> bool {
         matches!(self, Self::WhenAvailable | Self::Required)
     }
 }
@@ -473,11 +473,14 @@ pub trait TableNames: Send + Sync + std::fmt::Debug {
 
 /// One item of a stream's queue.
 #[derive(Debug)]
-enum Item {
+pub(crate) enum Item {
     Event(Box<Document>, String),
     Progress(String),
     Invalidate(Box<Document>, String),
     Failed(MongoError),
+    /// An event read from the change log, with the bytes it holds of the
+    /// stream's buffer (given back when the client takes it).
+    Sized(Box<Document>, String, usize),
 }
 
 /// An open change stream.
@@ -494,11 +497,27 @@ pub struct ChangeStream {
     pub policies: u64,
     /// The tenant (its `serverStatus` counters).
     tenant: u64,
+    /// Gives back a taken event's buffer bytes (change-log streams).
+    release: Option<Release>,
+}
+
+/// Gives back buffer bytes; called again with `None` when the stream
+/// closes.
+#[derive(Clone)]
+pub(crate) struct Release(pub(crate) Arc<dyn Fn(Option<usize>) + Send + Sync>);
+
+impl std::fmt::Debug for Release {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Release")
+    }
 }
 
 impl Drop for ChangeStream {
     fn drop(&mut self) {
         self.stop.cancel();
+        if let Some(r) = &self.release {
+            (r.0)(None);
+        }
     }
 }
 
@@ -995,6 +1014,7 @@ impl ChangeFeed {
             done: false,
             policies,
             tenant,
+            release: None,
         }
     }
 }
@@ -1049,6 +1069,29 @@ async fn run(
 }
 
 impl ChangeStream {
+    /// A stream over items another reader sends (the change log's, for
+    /// engine collections).
+    pub(crate) fn from_parts(
+        rx: mpsc::Receiver<Item>,
+        stop: CancellationToken,
+        token: String,
+        pipeline: Vec<Document>,
+        policies: u64,
+        tenant: u64,
+        release: Option<Release>,
+    ) -> Self {
+        Self {
+            rx,
+            stop,
+            token,
+            pipeline,
+            done: false,
+            policies,
+            tenant,
+            release,
+        }
+    }
+
     /// Whether the stream ended (invalidated or failed).
     #[must_use]
     pub fn done(&self) -> bool {
@@ -1090,17 +1133,32 @@ impl ChangeStream {
                     self.token = t;
                     out.push(*d);
                 }
+                Item::Sized(d, t, n) => {
+                    if let Some(r) = &self.release {
+                        (r.0)(Some(n));
+                    }
+                    self.token = t;
+                    out.push(*d);
+                }
                 Item::Progress(t) => {
                     self.token = t;
                 }
                 Item::Invalidate(d, t) => {
                     self.token.clone_from(&t);
-                    out.push(*d);
-                    out.push(doc! {
+                    // The invalidate carries its cause's times; an empty
+                    // cause (a stream resumed after it) adds nothing.
+                    let mut inv = doc! {
                         "_id": token_doc(&t),
                         "operationType": "invalidate",
-                        "clusterTime": Timestamp { time: 0, increment: 0 },
-                    });
+                        "clusterTime": d.get("clusterTime").cloned().unwrap_or(Bson::Timestamp(Timestamp { time: 0, increment: 0 })),
+                    };
+                    if let Some(w) = d.get("wallTime") {
+                        inv.insert("wallTime", w.clone());
+                    }
+                    if !d.is_empty() {
+                        out.push(*d);
+                    }
+                    out.push(inv);
                     self.done = true;
                     break;
                 }
@@ -1119,8 +1177,22 @@ impl ChangeStream {
                 stage_bytes: 104_857_600,
                 now: DateTime::now(),
             };
+            let ids: Vec<Bson> = out.iter().filter_map(|d| d.get("_id").cloned()).collect();
             for s in &self.pipeline {
                 out = agg::run_stage(out, s, &lim)?;
+            }
+            // The token is the event's `_id`: a pipeline that changes or
+            // removes it ends the stream, as on MongoDB.
+            if out
+                .iter()
+                .any(|d| d.get("_id").is_none_or(|i| !ids.contains(i)))
+            {
+                self.done = true;
+                return Err(MongoError::new(
+                    280,
+                    "Encountered an event whose _id field, which contains the resume token, was modified by the pipeline. Modifying the _id field of an event makes it impossible to resume the stream from that point. Only transformations that retain the unmodified _id field are allowed.",
+                )
+                .label("NonResumableChangeStreamError"));
             }
         }
         // An event past the BSON limit ends the stream, as on MongoDB
@@ -1229,6 +1301,38 @@ pub fn check_pipeline(stages: &[Document]) -> std::result::Result<(), MongoError
                 | "$replaceRoot"
                 | "$replaceWith"
         ) {
+            const KNOWN: [&str; 24] = [
+                "$group",
+                "$sort",
+                "$limit",
+                "$skip",
+                "$lookup",
+                "$unwind",
+                "$facet",
+                "$bucket",
+                "$bucketAuto",
+                "$count",
+                "$out",
+                "$merge",
+                "$geoNear",
+                "$graphLookup",
+                "$sample",
+                "$sortByCount",
+                "$unionWith",
+                "$densify",
+                "$fill",
+                "$setWindowFields",
+                "$redact",
+                "$changeStream",
+                "$documents",
+                "$collStats",
+            ];
+            if !KNOWN.contains(&name) {
+                return Err(MongoError::new(
+                    40324,
+                    format!("Unrecognized pipeline stage name: '{name}'"),
+                ));
+            }
             return Err(MongoError::new(
                 code::FAILED_TO_PARSE,
                 format!("{name} is not permitted in a $changeStream pipeline"),

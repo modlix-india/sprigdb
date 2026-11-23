@@ -67,6 +67,7 @@ pub mod amqp;
 pub mod backend;
 // The Bolt listener on 7687.
 pub mod bolt;
+pub mod changelog;
 pub mod dc;
 // The in-process SQL backend (the storage engine's first prototype).
 pub(crate) mod engine;
@@ -100,12 +101,12 @@ pub mod registry;
 pub mod search;
 pub mod session;
 pub mod sink_peer;
+pub(crate) mod table_changes;
 pub mod tenant;
 pub mod tls;
 // Workers' runs of triggers on streams and queues.
 pub mod triggers;
 pub mod workload;
-pub mod write_load;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -142,6 +143,17 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
     // newest formats; a missing catalog (a tenant being deleted) is never
     // made again here, without its owner mark.
     sprig_catalog::migrate::never_create_schemas();
+    // One replica of several takes part in replication from the start,
+    // not from its first client.
+    // Opening it blocks (the store, the Raft log): off the runtime's
+    // threads, which the permit loop and the stall watchdog share.
+    if node_engine::replicated_from_env() {
+        tokio::task::spawn_blocking(node_engine::engine)
+            .await
+            .map_err(|e| {
+                sprig_common::SprigError::internal(format!("opening the storage engine: {e}"))
+            })??;
+    }
     let registry = Registry::global()?;
     let dc = ctx.config.node.dc.clone();
     let sctx = SettingCtx::process(&dc);
@@ -216,6 +228,7 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
         load: registry::Load::default(),
         kafka_host: ctx.config.gateway.kafka_advertise_host.clone(),
         degraded: std::collections::BTreeMap::new(),
+        raft_node: node_engine::raft_id_from_env(),
     });
     let lease_live = live.clone();
     let lease_dc = dc.clone();
@@ -913,6 +926,8 @@ fn logins(
         }
         LoginModeConfig::Catalog => {
             let tenants = tenant::TenantServices::start(live, backends, sessions, clock.clone())?;
+            // A replica's cached catalogs follow what replication applies.
+            node_engine::follow_catalogs(tenants.cache.clone())?;
             let resolver = if let Some(p) = &cfg.backends_file {
                 tenant::backends::TenantBackends::open(p, Arc::clone(&tenants.locator))?
             } else {

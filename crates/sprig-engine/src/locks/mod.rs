@@ -232,6 +232,10 @@ struct State {
     gaps: HashMap<Bytes, HashMap<TxnId, GapSet>>,
     inserters: Vec<InsertWaiter>,
     last_deadlock: Option<DeadlockReport>,
+    /// Transactions that held or waited for locks of a unit whose
+    /// leadership left this node: their next lock request, wait or commit
+    /// fails with 1213.
+    doomed: HashSet<TxnId>,
 }
 
 /// The per-unit lock table.
@@ -241,6 +245,8 @@ pub struct LockTable {
     /// How many (index, transaction) pairs hold gap locks. Zero lets an
     /// insert skip its gap check without taking the latch.
     gap_sets: AtomicUsize,
+    /// `State::doomed`'s size: zero lets every check skip the latch.
+    doomed: AtomicUsize,
     /// Status counters.
     pub stats: LockStats,
 }
@@ -265,8 +271,57 @@ impl LockTable {
             state: Mutex::new(State::default()),
             config,
             gap_sets: AtomicUsize::new(0),
+            doomed: AtomicUsize::new(0),
             stats: LockStats::default(),
         }
+    }
+
+    /// The unit whose keys fall in `range` stopped being led here: every
+    /// transaction holding or waiting for a record or gap lock in it is
+    /// doomed (its wait ends now; its next lock request or commit fails
+    /// with 1213, and its rollback releases its locks). Returns them.
+    pub fn doom_range(&self, range: &crate::keys::KeyRange) -> Vec<TxnId> {
+        let mut guard = self.lock();
+        let st = &mut *guard;
+        let mut hit: HashSet<TxnId> = HashSet::new();
+        let upper = match &range.end {
+            Some(e) => Bound::Excluded(Bytes::copy_from_slice(e)),
+            None => Bound::Unbounded,
+        };
+        for (_, kl) in st
+            .keys
+            .range((Bound::Included(Bytes::copy_from_slice(&range.start)), upper))
+        {
+            hit.extend(kl.granted.iter().map(|(t, _)| *t));
+            hit.extend(kl.waiters.iter().map(|w| w.txn));
+        }
+        for (index, holders) in &st.gaps {
+            if range.contains(index) {
+                hit.extend(holders.keys().copied());
+            }
+        }
+        for w in &st.inserters {
+            if range.contains(&w.key) {
+                hit.insert(w.txn);
+            }
+        }
+        let mut out: Vec<TxnId> = hit.into_iter().collect();
+        out.sort_unstable();
+        for t in &out {
+            if st.doomed.insert(*t) {
+                self.doomed.fetch_add(1, Ordering::AcqRel);
+            }
+            if let Some(slot) = Self::withdraw(st, *t) {
+                slot.set(SlotState::Interrupted(Interrupt::Kill));
+            }
+        }
+        out
+    }
+
+    /// Whether `txn` was doomed by [`LockTable::doom_range`].
+    #[must_use]
+    pub fn is_doomed(&self, txn: TxnId) -> bool {
+        self.doomed.load(Ordering::Acquire) > 0 && self.lock().doomed.contains(&txn)
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -964,6 +1019,9 @@ impl LockTable {
     pub fn release_all(&self, txn: TxnId) {
         let mut guard = self.lock();
         let st = &mut *guard;
+        if self.doomed.load(Ordering::Acquire) > 0 && st.doomed.remove(&txn) {
+            self.doomed.fetch_sub(1, Ordering::AcqRel);
+        }
         if !st.txns.contains_key(&txn) {
             return;
         }

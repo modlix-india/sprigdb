@@ -98,13 +98,25 @@ impl GatewayData {
         ) || g.allows(action, Target::Database { db_key: &db_key })
     }
 
+    /// Whether `cat`'s names compare in lower case.
+    pub(crate) fn lctn_of(&self, cat: &TenantCatalog) -> bool {
+        self.lctn(cat)
+    }
+
     /// The tenant's catalog.
     pub(crate) async fn catalog_of(&self, p: &Principal) -> Option<Arc<TenantCatalog>> {
-        self.svc
+        match self
+            .svc
             .cache
             .get(TenantId(p.tenant_id), Freshness::Latest)
             .await
-            .ok()
+        {
+            Ok(c) => Some(c),
+            Err(e) => {
+                tracing::debug!(tenant = p.tenant_id, error = %e, "kafka: tenant catalog unavailable");
+                None
+            }
+        }
     }
 
     /// Whether `p`'s tenant has a database `db` stored on the engine.

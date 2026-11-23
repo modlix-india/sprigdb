@@ -4,13 +4,9 @@
 //! `ALTER GRAPH` answers 39901.
 //!
 //! SQL/PGQ's `GRAPH_TABLE (g MATCH ... COLUMNS (...))` in any statement:
-//! in a single `SELECT` (or `EXPLAIN FORMAT=SPRIG SELECT`) each call
-//! becomes a placeholder and the router path binds its rows and plans the
-//! statement (`Plan::Graph`: `exec::router::graph`); in other
-//! statements each one runs as a Cypher read through
-//! [`GatewayGraphs::query_read`] and is replaced by its rows as a derived
-//! table before the pipeline, and the rewritten statement runs
-//! as usual.
+//! each call runs as a Cypher read through [`GatewayGraphs::query_read`]
+//! and is replaced by its rows as a derived table before the pipeline,
+//! and the rewritten statement runs as usual.
 //!
 //! `CREATE GRAPH` needs `CREATE` on the database, `DROP GRAPH` needs
 //! `DROP` on the graph or its database; `CREATE PROPERTY
@@ -37,24 +33,23 @@ fn mentions_graph(text: &[u8]) -> bool {
 }
 
 fn mentions_graph_table(text: &[u8]) -> bool {
-    std::str::from_utf8(text).is_ok_and(sprig_router::graph::mentions)
+    std::str::from_utf8(text).is_ok_and(sprig_graph::graph_table::mentions)
 }
 
 /// A graph value as the router takes it.
-fn lit(v: &sprig_graph::value::Value) -> sprig_router::GraphLit {
+fn lit(v: &sprig_graph::value::Value) -> sprig_graph::graph_table::GraphLit {
     use sprig_graph::value::Value;
     match v {
-        Value::Null => sprig_router::GraphLit::Null,
-        Value::Int(i) => sprig_router::GraphLit::Int(*i),
-        Value::String(s) => sprig_router::GraphLit::Str(s.clone()),
-        other => sprig_router::GraphLit::Other(sprig_graph::pgq::literal(other)),
+        Value::Null => sprig_graph::graph_table::GraphLit::Null,
+        Value::Int(i) => sprig_graph::graph_table::GraphLit::Int(*i),
+        Value::String(s) => sprig_graph::graph_table::GraphLit::Str(s.clone()),
+        other => sprig_graph::graph_table::GraphLit::Other(sprig_graph::pgq::literal(other)),
     }
 }
 
 impl PassSession {
-    /// `GRAPH_TABLE` in a statement: a single `SELECT` continues with
-    /// placeholders for the router path to bind; any other
-    /// statement runs each call now and continues with its rows in place.
+    /// `GRAPH_TABLE` in a statement: each call runs now and the statement
+    /// continues with its rows in place.
     /// `None` when the text has none.
     pub(super) async fn tenant_graph_table(
         &mut self,
@@ -71,18 +66,11 @@ impl PassSession {
         let Ok(sql) = std::str::from_utf8(text) else {
             return Ok(None);
         };
-        let calls = match sprig_router::graph::find(sql) {
+        let calls = match sprig_graph::graph_table::find(sql) {
             Ok(v) if v.is_empty() => return Ok(None),
             Ok(v) => v,
             Err(e) => return Ok(Some(self.fail(out, &e).await?)),
         };
-        if let Some((pending, placeheld)) = super::router::graph::placeholders(sql, calls.clone()) {
-            self.router.graph = Some(pending);
-            let placeheld = Bytes::from(placeheld);
-            let r = Box::pin(self.tenant_text(cx, &placeheld, attrs, more, format, out)).await;
-            self.router.graph = None;
-            return r.map(Some);
-        }
         let rewritten: Result<String> = async {
             let Some(ts) = self.tenant.as_deref() else {
                 return Err(SprigError::internal("no tenant"));
@@ -102,9 +90,9 @@ impl PassSession {
                 let o = graphs
                     .query_read(&cat, grants.as_deref(), &user, &db, &c.graph, &c.cypher)
                     .await?;
-                let rows: Vec<Vec<sprig_router::GraphLit>> =
+                let rows: Vec<Vec<sprig_graph::graph_table::GraphLit>> =
                     o.rows.iter().map(|r| r.iter().map(lit).collect()).collect();
-                let body = sprig_router::graph::rows_sql(&c.columns, &rows);
+                let body = sprig_graph::graph_table::rows_sql(&c.columns, &rows);
                 if body.len() > sprig_graph::pgq::MAX_INLINE_BYTES {
                     return Err(sprig_graph::exec::budget_error(
                         "rows",
@@ -259,7 +247,7 @@ impl PassSession {
                 if_exists,
             } => {
                 let db = pick(db)?;
-                let g = match graphs.resolve(&cat, &db, &name).await {
+                let g = match graphs.resolve(&cat, &db, &name) {
                     Ok(g) => g,
                     Err(e) if e.code() == Some(SprigCode::GraphNotFound) && if_exists => None,
                     Err(e) => return Err(e),
@@ -280,5 +268,69 @@ impl PassSession {
                 Ok(())
             }
         }
+    }
+}
+
+/// A prepared statement's value as a Cypher literal, for a `?` inside a
+/// `GRAPH_TABLE` call: numbers as numbers, text as a
+/// quoted string, dates and times as their text; a value Cypher can't
+/// write (NaN, infinity, bytes that aren't UTF-8) is refused.
+///
+/// # Errors
+/// 1210 for such a value.
+pub(crate) fn cypher_param(p: &sprig_proto_mysql::command::BoundParam) -> Result<String> {
+    use sprig_proto_mysql::Value;
+    use sprig_proto_mysql::command::ParamValue;
+    let bad = |what: &str| {
+        SprigError::standard(
+            1210,
+            *b"HY000",
+            format!("Incorrect arguments to EXECUTE: {what} can't be a GRAPH_TABLE parameter"),
+        )
+    };
+    let quote = |t: &str| {
+        let mut o = String::with_capacity(t.len() + 2);
+        o.push('\'');
+        for c in t.chars() {
+            match c {
+                '\'' => o.push_str("\\'"),
+                '\\' => o.push_str("\\\\"),
+                _ => o.push(c),
+            }
+        }
+        o.push('\'');
+        o
+    };
+    let float = |f: f64| {
+        if f.is_finite() {
+            Ok(format!("{f:?}"))
+        } else {
+            Err(bad("a NaN or infinite number"))
+        }
+    };
+    let ParamValue::Value(v) = &p.value else {
+        return Ok("null".to_owned());
+    };
+    match v {
+        Value::Null => Ok("null".to_owned()),
+        Value::Int(i) => Ok(i.to_string()),
+        Value::UInt(u) => Ok(u.to_string()),
+        Value::Float(f) => float(f64::from(*f)),
+        Value::Double(f) => float(*f),
+        Value::Bytes(b) => std::str::from_utf8(b)
+            .map(quote)
+            .map_err(|_| bad("bytes that aren't UTF-8")),
+        Value::DateTime(d) => Ok(quote(&format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:06}",
+            d.year, d.month, d.day, d.hour, d.minute, d.second, d.micro
+        ))),
+        Value::Time(t) => Ok(quote(&format!(
+            "{}{}:{:02}:{:02}.{:06}",
+            if t.negative { "-" } else { "" },
+            u64::from(t.days) * 24 + u64::from(t.hour),
+            t.minute,
+            t.second,
+            t.micro
+        ))),
     }
 }

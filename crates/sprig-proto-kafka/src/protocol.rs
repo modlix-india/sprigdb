@@ -72,6 +72,7 @@ pub mod err {
     pub const INVALID_REPLICA_ASSIGNMENT: i16 = 39;
     pub const INVALID_CONFIG: i16 = 40;
     pub const INVALID_REQUEST: i16 = 42;
+    pub const NOT_CONTROLLER: i16 = 41;
     pub const POLICY_VIOLATION: i16 = 44;
     pub const OUT_OF_ORDER_SEQUENCE_NUMBER: i16 = 45;
     pub const DUPLICATE_SEQUENCE_NUMBER: i16 = 46;

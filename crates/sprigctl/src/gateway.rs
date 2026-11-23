@@ -1,5 +1,11 @@
 //! `sprigctl gateway list|show|drain` (the Admin API's
 //! `Gateways` service): the DC's registered gateways, and draining one.
+//! `sprigctl gateway replace-replica` replaces a lost replica of the
+//! storage engine's units: sent to a surviving gateway's own HTTP endpoint
+//! (`--endpoint`), which moves each unit's leadership to itself and puts
+//! the new node (started with `SPRIGDB_ENGINE_RAFT_JOIN=true`) in place of
+//! the lost one. Run it against each survivor so every one learns the new
+//! node's address; the first does the work.
 //! Any gateway answers; a drain reaches the named gateway through the peer
 //! service, which then finishes its work, closes its listeners and exits.
 //! A gateway with a part off (its record's `degraded`, such as a peer
@@ -34,6 +40,55 @@ pub(crate) fn group() -> Command {
                 .about("Drain a gateway: readiness off, listeners closed, work finished, exit")
                 .arg(id()),
         )
+        .subcommand(
+            Command::new("replace-replica")
+                .about(
+                    "Replace a lost engine replica with a new node, on the gateway at --endpoint",
+                )
+                .arg(
+                    Arg::new("dead")
+                        .long("dead")
+                        .required(true)
+                        .value_parser(clap::value_parser!(u64))
+                        .help("Raft id of the lost node"),
+                )
+                .arg(
+                    Arg::new("new")
+                        .long("new")
+                        .required(true)
+                        .value_parser(clap::value_parser!(u64))
+                        .help(
+                            "Raft id of the new node (started with SPRIGDB_ENGINE_RAFT_JOIN=true)",
+                        ),
+                )
+                .arg(
+                    Arg::new("new-addr")
+                        .long("new-addr")
+                        .help("The new node's Raft address, host:port"),
+                )
+                .arg(
+                    Arg::new("timeout")
+                        .long("timeout")
+                        .value_parser(clap::value_parser!(u64))
+                        .default_value("120")
+                        .help("Seconds to wait per unit"),
+                ),
+        )
+}
+
+/// The text `replace-replica` prints for the gateway's report.
+fn replace_text(v: &Value) -> String {
+    let n = |k: &str| v[k].as_array().map_or(0, Vec::len);
+    let mut out = format!(
+        "replaced in {} unit(s); {} already had the new replica; {} failed\n",
+        n("replaced"),
+        v["already"].as_u64().unwrap_or(0),
+        n("failed")
+    );
+    for f in v["failed"].as_array().map_or(&[][..], Vec::as_slice) {
+        let _ = writeln!(out, "  unit {}: {}", f[0], f[1].as_str().unwrap_or(""));
+    }
+    out
 }
 
 fn row(g: &Value) -> [String; 6] {
@@ -130,6 +185,19 @@ pub(crate) async fn run(c: &AdminClient, group: &ArgMatches, out: Output) -> Res
                 }
             });
         }
+        "replace-replica" => {
+            let num = |k: &str| sub.get_one::<u64>(k).copied().unwrap_or(0);
+            let mut body = serde_json::json!({
+                "dead": num("dead"),
+                "new": num("new"),
+                "timeout_seconds": num("timeout"),
+            });
+            if let Some(a) = sub.get_one::<String>("new-addr") {
+                body["new_addr"] = Value::String(a.clone());
+            }
+            let v: Value = c.post("/admin/v1/engine/replicas:replace", &body).await?;
+            print(out, &v, replace_text);
+        }
         other => return Err(Failed(format!("unknown subcommand {other}"))),
     }
     Ok(())
@@ -138,6 +206,26 @@ pub(crate) async fn run(c: &AdminClient, group: &ArgMatches, out: Output) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replace_replica_report() {
+        let v = serde_json::json!({"replaced": [7, 8], "already": 1,
+            "failed": [[9, "its leadership didn't move here in time"]]});
+        let t = replace_text(&v);
+        assert!(t.starts_with("replaced in 2 unit(s); 1 already"), "{t}");
+        assert!(t.contains("unit 9: its leadership"), "{t}");
+        let m = group().try_get_matches_from([
+            "gateway",
+            "replace-replica",
+            "--dead",
+            "1",
+            "--new",
+            "4",
+            "--new-addr",
+            "h:1",
+        ]);
+        assert!(m.is_ok());
+    }
 
     #[test]
     fn a_degraded_gateway_says_which_part_and_why() {

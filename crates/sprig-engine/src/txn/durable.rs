@@ -213,6 +213,16 @@ impl DurableTicket {
         }
     }
 
+    /// The log ticket on `unit`, if this waits on that unit's log.
+    #[must_use]
+    pub fn log_of(&self, unit: u64) -> Option<&Ticket> {
+        match self {
+            DurableTicket::Log(t) if t.unit().0 == unit => Some(t),
+            DurableTicket::Many(ts) => ts.iter().find_map(|t| t.log_of(unit)),
+            _ => None,
+        }
+    }
+
     /// Whether the client may be answered now.
     #[must_use]
     pub fn is_durable(&self) -> bool {

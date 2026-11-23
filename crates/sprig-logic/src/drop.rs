@@ -29,10 +29,9 @@
 //! A plain SQL routine of the same name (no logic module) is ordinary
 //! DDL, not handled here.
 
+use sprig_catalog::records::RecordTx;
 use std::sync::Arc;
 
-use mysql_async::Conn;
-use mysql_async::prelude::Queryable;
 use serde::Serialize;
 use sprig_common::ids::TenantId;
 use sprig_common::{Result, SprigCode, SprigError};
@@ -361,20 +360,6 @@ impl Dependents {
     }
 }
 
-fn map_err(e: mysql_async::Error) -> SprigError {
-    SprigError::new(
-        SprigCode::CatalogUnavailable,
-        "the logic catalog is unreachable",
-    )
-    .with_source(e)
-}
-
-/// Whether a missing table or column means "none" (a catalog without the
-/// sinks module, or an older one).
-fn absent(e: &mysql_async::Error) -> bool {
-    matches!(e, mysql_async::Error::Server(s) if s.code == 1146 || s.code == 1054)
-}
-
 /// Whether `source` holds a call of `name` (`db` qualified or not):
 /// `db.call("name"` in JavaScript or Lua, a `Sprig.Db.Call` step naming it
 /// in KIRun.
@@ -400,47 +385,21 @@ pub fn calls(source: &str, db: &str, name: &str) -> bool {
 /// # Errors
 /// The catalog's.
 pub async fn dependents(
-    c: &mut Conn,
+    c: &mut dyn RecordTx,
     store: &LogicStore,
     db_id: u32,
     db_name: &str,
     m: &ModuleRow,
 ) -> Result<Dependents> {
-    let s = sprig_common::names::quote(store.schema());
-    let mut d = Dependents::default();
-    let r: std::result::Result<Vec<(u64, String)>, _> = c
-        .exec(
-            format!(
-                "SELECT m.module_id, m.name FROM {s}.logic_schedules sc JOIN {s}.logic_modules m \
-                 ON m.module_id = sc.module_id WHERE sc.target_module_id = ? AND m.state <> 'dropped' \
-                 ORDER BY m.name"
-            ),
-            (m.module_id,),
-        )
-        .await;
-    d.schedules = match r {
-        Err(e) if absent(&e) => Vec::new(),
-        r => r.map_err(map_err)?,
+    let mut d = Dependents {
+        schedules: store.schedulers_of(c, m.module_id).await?,
+        ..Dependents::default()
     };
     // Sinks naming it as their transform are the catalog's sink records:
     // the caller fills `sinks` from its catalog snapshot.
     d.columns = computed_columns(c, store, m.module_id).await?;
     // Other live modules of the database whose active code calls it.
-    let r: std::result::Result<Vec<(String, String, String)>, _> = c
-        .exec(
-            format!(
-                "SELECT m.kind, m.name, v.source FROM {s}.logic_modules m JOIN {s}.logic_versions v \
-                 ON v.module_id = m.module_id AND v.version = m.active_version \
-                 WHERE m.db_id = ? AND m.state <> 'dropped' AND m.module_id <> ? ORDER BY m.name"
-            ),
-            (db_id, m.module_id),
-        )
-        .await;
-    let others = match r {
-        Err(e) if absent(&e) => Vec::new(),
-        r => r.map_err(map_err)?,
-    };
-    for (kind, name, source) in others {
+    for (kind, name, source) in store.active_sources(c, db_id, m.module_id).await? {
         if calls(&source, db_name, &m.name) {
             d.callers.push(format!("{kind} {name}"));
         }
@@ -454,35 +413,20 @@ pub async fn dependents(
 /// # Errors
 /// The catalog's.
 pub async fn computed_columns(
-    c: &mut Conn,
+    c: &mut dyn RecordTx,
     store: &LogicStore,
     module_id: u64,
 ) -> Result<Vec<(u64, String)>> {
-    let s = sprig_common::names::quote(store.schema());
     let mut out = Vec::new();
-    let r: std::result::Result<Vec<(u64, Option<u64>, String)>, _> = c
-        .exec(
-            format!(
-                "SELECT binding_id, object_id, column_name FROM {s}.logic_bindings \
-                 WHERE module_id = ? AND column_name IS NOT NULL AND state = 'active'"
-            ),
-            (module_id,),
-        )
-        .await;
-    let cols = match r {
-        Err(e) if absent(&e) => Vec::new(),
-        r => r.map_err(map_err)?,
-    };
-    for (b, obj, col) in cols {
-        let table: Option<String> = match obj {
-            Some(o) => c
-                .exec_first(
-                    format!("SELECT name FROM {s}.objects WHERE object_id = ?"),
-                    (o,),
-                )
-                .await
-                .ok()
-                .flatten(),
+    for (b, obj, col) in store.column_bindings(c, module_id).await? {
+        let table = match obj {
+            Some(o) => {
+                sprig_catalog::store::rec::CoreRecords::object(c, sprig_common::ids::ObjectId(o))
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|r| r.name)
+            }
             None => None,
         };
         out.push((
@@ -526,33 +470,23 @@ pub fn routine_objects(m: &ModuleRow, versions: &[u64]) -> Vec<(String, String)>
 /// # Errors
 /// The catalog's or the DC tier's.
 pub async fn module_dropped(
-    c: &mut Conn,
+    c: &mut dyn RecordTx,
     store: &LogicStore,
     dc: &Arc<dyn MetaStore>,
     tenant: TenantId,
     m: &ModuleRow,
     catalog_version: u64,
 ) -> Result<()> {
-    let schema = store.schema().to_owned();
     if matches!(m.kind.as_str(), "function" | "procedure") {
-        crate::rollout::clear(c, &schema, m.module_id).await?;
-        let s = sprig_common::names::quote(&schema);
-        c.exec_drop(
-            format!(
-                "UPDATE {s}.logic_bindings SET state = 'dropping' WHERE module_id = ? \
-                 AND column_name IS NOT NULL"
-            ),
-            (m.module_id,),
-        )
-        .await
-        .map_err(map_err)?;
+        crate::rollout::clear(c, m.module_id).await?;
+        store.drop_column_bindings(c, m.module_id).await?;
     }
     let binding = store.binding(c, m.module_id).await?;
     store.mark_dropped(c, m.module_id, catalog_version).await?;
     match cleanup_of(&m.kind, binding.as_ref()) {
         Cleanup::MessageIndex => {
             if let Some(b) = &binding {
-                if let Some(def) = crate::messages::source(c, &schema, b.binding_id)
+                if let Some(def) = crate::messages::source(c, b.binding_id)
                     .await?
                     .and_then(|s| s.fanin_definition())
                 {

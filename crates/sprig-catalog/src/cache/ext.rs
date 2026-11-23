@@ -23,7 +23,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use mysql_async::Transaction;
-use sprig_common::Result;
+use sprig_common::{Result, SprigError};
 
 use sprig_common::ids::ObjectId;
 
@@ -49,7 +49,7 @@ pub trait ExtState: Any + Send + Sync + fmt::Debug {
 /// [`SnapshotTx::conn`] is a MariaDB snapshot of the catalog schema, for
 /// the tables the MariaDB data paths keep there.
 pub struct SnapshotTx<'a> {
-    tx: &'a mut Transaction<'static>,
+    tx: Option<&'a mut Transaction<'static>>,
     store: &'a Store,
     versions: Versions,
     records: Option<&'a mut (dyn RecordTx + 'static)>,
@@ -67,7 +67,7 @@ impl fmt::Debug for SnapshotTx<'_> {
 
 impl<'a> SnapshotTx<'a> {
     pub(crate) fn new(
-        tx: &'a mut Transaction<'static>,
+        tx: Option<&'a mut Transaction<'static>>,
         store: &'a Store,
         versions: Versions,
         records: Option<&'a mut (dyn RecordTx + 'static)>,
@@ -111,8 +111,14 @@ impl<'a> SnapshotTx<'a> {
     }
 
     /// The connection, inside the snapshot.
-    pub fn conn(&mut self) -> &mut Transaction<'static> {
+    ///
+    /// # Errors
+    /// `Internal` when the load opened no MariaDB snapshot (a catalog on
+    /// records whose format is in its records reads nothing from MariaDB).
+    pub fn conn(&mut self) -> Result<&mut Transaction<'static>> {
         self.tx
+            .as_deref_mut()
+            .ok_or_else(|| SprigError::internal("this catalog load opened no MariaDB snapshot"))
     }
 
     /// The catalog schema (`t<tenant>_sprig`), for qualifying tables.
@@ -149,7 +155,7 @@ impl<'a> SnapshotTx<'a> {
     pub async fn objects_by_ids(&mut self, ids: &[ObjectId]) -> Result<Vec<ObjectRow>> {
         match self.core_records() {
             Some(r) => CoreRecords::objects_by_ids(r, ids).await,
-            None => self.store.objects_by_ids(self.tx, ids).await,
+            None => self.store.objects_by_ids(self.conn()?, ids).await,
         }
     }
 
@@ -160,7 +166,7 @@ impl<'a> SnapshotTx<'a> {
     pub async fn objects(&mut self) -> Result<Vec<ObjectRow>> {
         match self.core_records() {
             Some(r) => CoreRecords::objects_since(r, None).await,
-            None => self.store.objects_since(self.tx, None).await,
+            None => self.store.objects_since(self.conn()?, None).await,
         }
     }
 
@@ -171,7 +177,7 @@ impl<'a> SnapshotTx<'a> {
     pub async fn databases(&mut self) -> Result<Vec<DatabaseRow>> {
         match self.core_records() {
             Some(r) => CoreRecords::databases_since(r, None).await,
-            None => self.store.databases_since(self.tx, None).await,
+            None => self.store.databases_since(self.conn()?, None).await,
         }
     }
 
@@ -188,7 +194,7 @@ impl<'a> SnapshotTx<'a> {
             Some(r) => CoreRecords::schema_version(r, object, version).await,
             None => Ok(self
                 .store
-                .schema_versions(self.tx, object)
+                .schema_versions(self.conn()?, object)
                 .await?
                 .into_iter()
                 .find(|v| v.version == version)),

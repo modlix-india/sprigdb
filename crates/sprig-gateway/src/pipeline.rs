@@ -359,8 +359,9 @@ pub trait SessionExec: Send {
     }
 
     /// Whether the tenant's logical database `name` is placed on the
-    /// storage engine (`storage.placement = 'engine'`). The Redis front end
-    /// asks it for the database holding its Redis databases.
+    /// storage engine (`storage.placement = 'engine'`), or doesn't exist yet
+    /// (a new database is the engine's). The Redis and MongoDB front ends
+    /// ask it.
     fn engine_database(&self, _name: &str) -> bool {
         false
     }

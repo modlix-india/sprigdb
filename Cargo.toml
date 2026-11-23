@@ -30,7 +30,6 @@ sprig-binlog = { path = "crates/sprig-binlog" }
 sprig-catalog = { path = "crates/sprig-catalog" }
 # The mover (chapter 10) and the R0 sharding pieces it moves (chapter 15).
 sprig-shard = { path = "crates/sprig-shard" }
-sprig-router = { path = "crates/sprig-router" }
 sprig-txn = { path = "crates/sprig-txn" }
 sprig-mover = { path = "crates/sprig-mover" }
 # The change feed (chapter 38); the mover writes its handoff records.

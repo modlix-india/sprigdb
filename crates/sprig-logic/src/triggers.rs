@@ -163,19 +163,8 @@ pub fn map_check_error(e: SprigError) -> SprigError {
 ///
 /// # Errors
 /// 39070 or a backend error.
-pub async fn load_checks(c: &mut mysql_async::Conn, catalog_schema: &str) -> Result<usize> {
-    use mysql_async::prelude::Queryable;
-    let q = sprig_common::names::quote(catalog_schema);
-    let rows: Vec<(u64, u64, String, Option<String>)> = c
-        .query(format!(
-            "SELECT b.binding_id, m.active_version, m.name, \
-             JSON_UNQUOTE(JSON_EXTRACT(v.placement, '$.check_message')) \
-             FROM {q}.logic_bindings b JOIN {q}.logic_modules m ON m.module_id = b.module_id \
-             JOIN {q}.logic_versions v ON v.module_id = m.module_id AND v.version = m.active_version \
-             WHERE b.enforcement = 'check' AND m.state = 'active'"
-        ))
-        .await
-        .map_err(crate::deploy::conn_err)?;
+pub async fn load_checks(c: &mut dyn sprig_catalog::records::RecordTx) -> Result<usize> {
+    let rows = crate::LogicStore::default().check_validations(c).await?;
     let n = rows.len();
     for (b, v, name, msg) in rows {
         remember_check(

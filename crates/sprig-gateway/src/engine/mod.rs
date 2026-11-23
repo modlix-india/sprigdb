@@ -208,11 +208,12 @@ impl Pace {
 /// The SQL backend over the node's engine.
 pub(crate) struct Engine {
     eng: sprig_engine::Engine,
-    /// Next `AUTO_INCREMENT` value per (tenant, object).
-    autoinc: Mutex<HashMap<(u64, u32), u64>>,
+    /// `AUTO_INCREMENT` counters per (tenant, object).
+    autoinc: Mutex<HashMap<(u64, u32), AutoInc>>,
     /// Next hidden row number per (tenant, object, row generation), for
-    /// tables without a primary key.
-    rowids: Mutex<HashMap<(u64, u32, u16), u64>>,
+    /// tables without a primary key, with the leader epoch it was seeded
+    /// under.
+    rowids: Mutex<HashMap<RowIdKey, (u64, u64)>>,
     /// Each table's key index numbers, per (tenant, object), for the index
     /// identities they were given for.
     spaces: RwLock<Spaces>,
@@ -258,6 +259,19 @@ fn object_of(def: &TableDef) -> Result<u32> {
         .map_err(|_| not_on_engine("a table whose object id needs more than 32 bits"))
 }
 
+/// A hidden row number counter's key: (tenant, object, row generation).
+type RowIdKey = (u64, u32, u16);
+
+/// A table's `AUTO_INCREMENT` counter in memory.
+#[derive(Debug, Clone, Copy)]
+struct AutoInc {
+    /// The next value to give.
+    next: u64,
+    /// The leader epoch of the tenant's unit the counter was loaded under:
+    /// a counter from another epoch is loaded again from the stored rows.
+    epoch: u64,
+}
+
 /// Where the `AUTO_INCREMENT` counter of an empty table starts: the
 /// definition's `AUTO_INCREMENT=n` option, or 1 after a `TRUNCATE` under
 /// this definition.
@@ -292,18 +306,64 @@ impl Engine {
         Tx::begin_session(&self.eng, opts)
     }
 
+    /// The leader epoch under which this node leads `tenant`'s unit.
+    ///
+    /// # Errors
+    /// The node doesn't lead it (retryable: the tenant moved).
+    fn epoch_of(&self, tenant: u64) -> Result<u64> {
+        match self
+            .eng
+            .leader_epoch(sprig_engine::Engine::unit_of_tenant(tenant))
+        {
+            0 => {
+                let mut e =
+                    SprigError::internal(format!("this node doesn't lead tenant {tenant}'s data"));
+                e.retryable = true;
+                Err(e)
+            }
+            e => Ok(e),
+        }
+    }
+
+    /// The counter of `def` as the stored rows have it: after the largest
+    /// stored value, at or above the table's start.
+    ///
+    /// A node that takes the tenant's leadership loads it again (a new
+    /// epoch). The old leader's open transactions end with its leadership,
+    /// and the new one takes the leadership only once it has applied every
+    /// entry the old one committed, so every value in a row that can still
+    /// commit is in the store.
+    fn load_autoinc(&self, sp: &Space, def: &TableDef, epoch: u64) -> Result<AutoInc> {
+        // The table's `AUTO_INCREMENT=n` option is where an empty table
+        // starts.
+        let next = (self.max_autoinc(sp, def)? + 1).max(start_of(sp, def));
+        Ok(AutoInc { next, epoch })
+    }
+
+    /// `c` from memory, loaded again when missing or of another epoch.
+    fn autoinc_of<'a>(
+        &self,
+        m: &'a mut HashMap<(u64, u32), AutoInc>,
+        sp: &Space,
+        def: &TableDef,
+    ) -> Result<&'a mut AutoInc> {
+        let epoch = self.epoch_of(sp.tenant)?;
+        let key = (sp.tenant, sp.object);
+        if m.get(&key).is_none_or(|c| c.epoch != epoch) {
+            let c = self.load_autoinc(sp, def, epoch)?;
+            m.insert(key, c);
+        }
+        m.get_mut(&key)
+            .ok_or_else(|| SprigError::internal("the AUTO_INCREMENT counter went missing"))
+    }
+
     /// The next `AUTO_INCREMENT` value of `def`, reserved.
     fn next_autoinc(&self, sp: &Space, def: &TableDef) -> Result<u64> {
         let mut m = self.autoinc.lock().unwrap_or_else(PoisonError::into_inner);
-        let key = (sp.tenant, sp.object);
-        let next = match m.get(&key) {
-            Some(n) => *n,
-            // The table's `AUTO_INCREMENT=n` option is where an empty
-            // table starts.
-            None => (self.max_autoinc(sp, def)? + 1).max(start_of(sp, def)),
-        };
-        m.insert(key, next + 1);
-        Ok(next)
+        let c = self.autoinc_of(&mut m, sp, def)?;
+        let id = c.next;
+        c.next = id.saturating_add(1);
+        Ok(id)
     }
 
     /// The next hidden row number of a table without a primary key,
@@ -311,10 +371,17 @@ impl Engine {
     /// number stored (the last row key); after that the counter lives in
     /// memory. Numbers are never given twice in a generation of the rows,
     /// so a rolled-back insert leaves a gap, as InnoDB's row ids do.
+    ///
+    /// A node that takes the tenant's leadership seeds again from the
+    /// stored rows: the old leader's open transactions were ended with its
+    /// leadership, so no number it gave is in a row still to commit. A
+    /// number of a deleted last row may be given again; nothing outside
+    /// the table ever sees these numbers.
     fn next_rowid(&self, sp: &Space) -> Result<u64> {
         let key = (sp.tenant, sp.object, sp.layout.row_gen);
+        let epoch = self.epoch_of(sp.tenant)?;
         let mut m = self.rowids.lock().unwrap_or_else(PoisonError::into_inner);
-        let next = if let Some(n) = m.get(&key) {
+        let next = if let Some((n, _)) = m.get(&key).filter(|(_, e)| *e == epoch) {
             *n
         } else {
             let mut tx = self.begin(TxnOptions::default())?;
@@ -329,30 +396,27 @@ impl Engine {
                 None => 1,
             }
         };
-        m.insert(key, next + 1);
+        m.insert(key, (next + 1, epoch));
         Ok(next)
     }
 
     /// An explicit value moves the counter past it.
-    fn seen_autoinc(&self, sp: &Space, def: &TableDef, v: &Datum) {
+    ///
+    /// # Errors
+    /// Loading the counter failed.
+    fn seen_autoinc(&self, sp: &Space, def: &TableDef, v: &Datum) -> Result<()> {
         let v = match v {
             Datum::Int(i) => match u64::try_from(*i) {
                 Ok(u) if u > 0 => u,
-                _ => return,
+                _ => return Ok(()),
             },
             Datum::UInt(u) => *u,
-            _ => return,
+            _ => return Ok(()),
         };
         let mut m = self.autoinc.lock().unwrap_or_else(PoisonError::into_inner);
-        let key = (sp.tenant, sp.object);
-        let cur = match m.get(&key) {
-            Some(n) => *n,
-            None => self
-                .max_autoinc(sp, def)
-                .map_or(1, |x| x + 1)
-                .max(start_of(sp, def)),
-        };
-        m.insert(key, cur.max(v.saturating_add(1)));
+        let c = self.autoinc_of(&mut m, sp, def)?;
+        c.next = c.next.max(v.saturating_add(1));
+        Ok(())
     }
 
     /// The largest stored value of the `AUTO_INCREMENT` column (read once
@@ -401,15 +465,17 @@ impl Engine {
             return Ok(None);
         }
         let sp = self.space(tenant, def).await?;
+        let epoch = self.epoch_of(tenant)?;
         let known = self
             .autoinc
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get(&(sp.tenant, sp.object))
+            .filter(|c| c.epoch == epoch)
             .copied();
         Ok(Some(match known {
-            Some(n) => n,
-            None => (self.max_autoinc(&sp, def)? + 1).max(start_of(&sp, def)),
+            Some(c) => c.next,
+            None => self.load_autoinc(&sp, def, epoch)?.next,
         }))
     }
 

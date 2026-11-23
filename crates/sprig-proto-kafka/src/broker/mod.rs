@@ -132,6 +132,16 @@ pub trait Cluster: Send + Sync + 'static {
     /// The ready gateways serving Kafka for `p`'s tenant, this one included
     /// when it is ready.
     async fn brokers(&self, p: &Principal) -> Vec<BrokerNode>;
+    /// The broker that leads `p`'s tenant data, when one gateway does
+    /// (its replicated unit's leader): Metadata names it as every
+    /// partition's leader and as the controller, and FindCoordinator as
+    /// every group's coordinator, so clients send their writes where they
+    /// can commit. `None` (the default): no such broker; partitions and
+    /// groups spread over the brokers.
+    async fn tenant_leader(&self, p: &Principal) -> Option<i32> {
+        let _ = p;
+        None
+    }
 }
 
 /// An authenticated connection, as handlers see it.

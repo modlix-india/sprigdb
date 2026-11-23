@@ -23,6 +23,7 @@ impl Broker {
         v: i16,
     ) -> Result<Reply, ConnError> {
         let brokers = self.cluster.brokers(&s.principal).await;
+        let lead = self.leading_broker(s, &brokers).await;
         let mut resp = MetadataResponse {
             brokers: brokers
                 .iter()
@@ -35,9 +36,11 @@ impl Broker {
                 })
                 .collect(),
             cluster_id: Some(self.cluster.cluster_id()),
-            // A stable gateway: the lowest broker id. Topic administration
-            // goes through any gateway anyway.
-            controller_id: brokers.iter().map(|b| b.node_id).min().unwrap_or(-1),
+            // The tenant's leading gateway when there is one (topic changes
+            // commit there); else a stable gateway, the lowest broker id.
+            controller_id: lead
+                .or_else(|| brokers.iter().map(|b| b.node_id).min())
+                .unwrap_or(-1),
             ..Default::default()
         };
         // v0: an empty list means all topics; v1+: null means all.
@@ -56,7 +59,8 @@ impl Broker {
         match wanted {
             None => {
                 for t in &all {
-                    resp.topics.push(self.topic_metadata(s, t, &brokers).await);
+                    resp.topics
+                        .push(self.topic_metadata(s, t, &brokers, lead).await);
                 }
             }
             Some(list) => {
@@ -67,7 +71,8 @@ impl Broker {
                         (None, true) => None,
                     };
                     if let Some(t) = found {
-                        resp.topics.push(self.topic_metadata(s, t, &brokers).await);
+                        resp.topics
+                            .push(self.topic_metadata(s, t, &brokers, lead).await);
                     } else {
                         let code = match &want.name {
                             Some(n) if !legal_topic_name(n) => err::INVALID_TOPIC_EXCEPTION,
@@ -101,10 +106,12 @@ impl Broker {
         s: &Session,
         t: &TopicInfo,
         brokers: &[BrokerNode],
+        lead: Option<i32>,
     ) -> metadata_response::MetadataResponseTopic {
         let mut partitions = Vec::with_capacity(usize::try_from(t.partitions).unwrap_or(0));
+        let lead = lead.and_then(|l| brokers.iter().find(|b| b.node_id == l));
         for p in 0..t.partitions {
-            let leader = rendezvous(&partition_key(t.stream_id, p), brokers);
+            let leader = lead.or_else(|| rendezvous(&partition_key(t.stream_id, p), brokers));
             let epoch = match &self.data {
                 Some(d) => d.leader_epoch(&s.principal, t.stream_id, p).await,
                 None => 0,
@@ -151,6 +158,7 @@ impl Broker {
             vec![q.key.clone()]
         };
         let brokers = self.cluster.brokers(&s.principal).await;
+        let lead = self.leading_broker(s, &brokers).await;
         let mut out = Vec::with_capacity(keys.len());
         for key in keys {
             let mut c = find_coordinator_response::Coordinator {
@@ -184,7 +192,12 @@ impl Broker {
                     tenant: s.principal.tenant_id,
                     group: key.clone(),
                 };
-                let holder = self.groups.leases().holder(&gk).await.ok().flatten();
+                // The tenant's leading gateway first: a group's rows
+                // commit only there.
+                let holder = match lead {
+                    Some(l) => Some(l),
+                    None => self.groups.leases().holder(&gk).await.ok().flatten(),
+                };
                 let node = holder
                     .and_then(|h| brokers.iter().find(|b| b.node_id == h))
                     .or_else(|| rendezvous(&group_key(gk.tenant, &gk.group), &brokers));
@@ -210,6 +223,14 @@ impl Broker {
             resp.port = c.port;
         }
         body(&resp, v)
+    }
+
+    /// The tenant's leading broker, when it is one of `brokers`.
+    async fn leading_broker(&self, s: &Session, brokers: &[BrokerNode]) -> Option<i32> {
+        self.cluster
+            .tenant_leader(&s.principal)
+            .await
+            .filter(|l| brokers.iter().any(|b| b.node_id == *l))
     }
 
     pub(super) fn init_producer_id(

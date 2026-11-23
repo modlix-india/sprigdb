@@ -46,6 +46,8 @@ use std::fmt::Write as _;
 use self::expr::{E, quote_name, quote_str};
 use self::lex::{T, Tok};
 use self::types::{CsSpec, Ty};
+// Character set names and defaults, for database-level DDL.
+pub(crate) use self::types::{charset_name, collation, default_collation};
 
 /// Why reading or checking a definition failed.
 #[derive(Debug)]

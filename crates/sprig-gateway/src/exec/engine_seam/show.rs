@@ -42,6 +42,13 @@ impl PassSession {
         let Some(info) = described.or_else(|| classify(sql, &toks, false)) else {
             return self.engine_infoschema(sql).await;
         };
+        // An engine database has no MariaDB schema to ask.
+        if info.kind == ShowKind::CreateDatabase {
+            let if_not_exists = toks
+                .iter()
+                .any(|t| t.bytes(sql).eq_ignore_ascii_case(b"EXISTS"));
+            return self.engine_show_create_database(&info, if_not_exists);
+        }
         if !matches!(
             info.kind,
             ShowKind::CreateTable | ShowKind::Columns | ShowKind::Index | ShowKind::Tables
@@ -66,6 +73,43 @@ impl PassSession {
         self.engine_show_of(&info).await
     }
 
+    /// `SHOW CREATE DATABASE` of an engine database, from its catalog row;
+    /// `None`: not the engine's.
+    fn engine_show_create_database(
+        &self,
+        info: &sprig_sql::names::show::ShowInfo,
+        if_not_exists: bool,
+    ) -> Option<Result<Answer>> {
+        let ts = self.tenant.as_deref()?;
+        let cat = Arc::clone(ts.catalog()?);
+        let eng = catalog::of(&cat)?;
+        let schema_name = info.schema.clone()?;
+        let schema: SchemaName = schema_name.parse().ok()?;
+        if schema.tenant() != ts.tenant {
+            return None;
+        }
+        let db: DbId = schema.db()?;
+        if !eng.dbs.contains(&db) {
+            return None;
+        }
+        let row = cat.databases.get(db)?;
+        let (charset, collation) = if row.default_charset.is_empty() {
+            ("utf8mb4", define::default_collation("utf8mb4"))
+        } else {
+            (row.default_charset.as_str(), row.default_collation.as_str())
+        };
+        let text = format!(
+            "CREATE DATABASE {}`{}` /*!40100 DEFAULT CHARACTER SET {charset} COLLATE {collation} */",
+            if if_not_exists {
+                "/*!32312 IF NOT EXISTS*/ "
+            } else {
+                ""
+            },
+            schema_name.replace('`', "``"),
+        );
+        Some(Ok(show::create_database(&schema_name, &text)))
+    }
+
     /// The engine's answer to one `SHOW` about a table or the tables of a
     /// database (no `WHERE`); `None`: not the engine's.
     async fn engine_show_of(
@@ -78,7 +122,12 @@ impl PassSession {
         let lctn = ts.lower_case_table_names();
         let schema_name = match &info.schema {
             Some(s) => s.clone(),
-            None => self.bs.as_ref()?.vars().schema.clone()?,
+            // The session's current database: the backend session's schema,
+            // or (an engine database has none on MariaDB) its own.
+            None => match self.bs.as_ref().and_then(|b| b.vars().schema.clone()) {
+                Some(s) => s,
+                None => ts.schema_of(self.current_logical().as_deref())?,
+            },
         };
         let schema: SchemaName = schema_name.parse().ok()?;
         if schema.tenant() != ts.tenant {

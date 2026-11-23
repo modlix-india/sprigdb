@@ -137,22 +137,13 @@ pub fn cpu<R>(size: usize, f: impl FnOnce() -> R) -> R {
 pub const GRAPH_SLOT_WAIT: Duration = Duration::from_millis(250);
 
 /// The process's graph limits, from the `graph.*` settings
-/// ([`GraphLimits::apply`]): slots and their wait here, the session pool
-/// and spare connections in [`crate::graphs`].
+/// ([`GraphLimits::apply`]): slots and their wait.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GraphLimits {
     /// `graph.slots` (0: the CPUs, at least 4).
     pub slots: usize,
     /// `graph.slot_wait_ms`.
     pub slot_wait: Duration,
-    /// `graph.session_pool`.
-    pub session_pool: usize,
-    /// `graph.spares`.
-    pub spares: usize,
-    /// `graph.spares_per_read`.
-    pub spares_per_read: usize,
-    /// `graph.spare_wait_ms`.
-    pub spare_wait: Duration,
 }
 
 impl Default for GraphLimits {
@@ -160,10 +151,6 @@ impl Default for GraphLimits {
         Self {
             slots: 0,
             slot_wait: GRAPH_SLOT_WAIT,
-            session_pool: 96,
-            spares: 32,
-            spares_per_read: 3,
-            spare_wait: Duration::from_millis(50),
         }
     }
 }
@@ -179,10 +166,6 @@ impl GraphLimits {
         Self {
             slots: n(&s::SLOTS),
             slot_wait: Duration::from_millis(get(&s::SLOT_WAIT_MS)),
-            session_pool: n(&s::SESSION_POOL),
-            spares: n(&s::SPARES),
-            spares_per_read: n(&s::SPARES_PER_READ),
-            spare_wait: Duration::from_millis(get(&s::SPARE_WAIT_MS)),
         }
     }
 

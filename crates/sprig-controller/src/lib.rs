@@ -96,7 +96,6 @@ pub mod graph_views;
 // Job standbys kept current by the mover.
 pub mod standby;
 // The graph mirror applier jobs.
-pub mod graph_mirror_loop;
 // `queue.change_exchange` forwarders.
 pub mod change_exchange_loop;
 // Embedded columns' embedding jobs.
@@ -270,6 +269,9 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
                 .map(sprig_catalog::records::remote::PeerPems::from_config)
                 .transpose()?,
         ));
+    // Bootstrap's and the contract pass's migrations keep each tenant's
+    // catalog format in its records too (EC-90).
+    sprig_catalog::migrate::mirror_formats(Arc::clone(&auth_records));
     if CATALOG_RECORDS.set(Arc::clone(&auth_records)).is_err() {
         tracing::warn!("catalog records were set before the controller started");
     }
@@ -320,8 +322,6 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
         auth_catalog,
         Arc::clone(&clock),
     ));
-    let catalog_locator: Arc<dyn sprig_catalog::CatalogLocator> = Arc::new(locator.clone());
-    let logic_locator = Arc::clone(&catalog_locator);
     // The AI assistants' exact payloads past `ai.audit_payload_days`.
     let ai_purge = ai_admin::AiPurgeLoop::new(
         Directory::new(Arc::clone(&stores.global)),
@@ -588,9 +588,8 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
             settings.live.clone(),
         )?))
         // After-commit trigger jobs and schedules.
-        .with_loop(Loop::new(logic_loop::LogicLoop::new(logic_locator)))
+        .with_loop(Loop::new(logic_loop::LogicLoop::new(Arc::clone(&auth_records))))
         .with_loop(Loop::new(inherit_loop::InheritLoop))
-        .with_loop(Loop::new(graph_mirror_loop::GraphMirrorLoop))
         .with_loop(Loop::new(change_exchange_loop::ChangeExchangeLoop))
         .with_loop(Loop::new(ai_embed_loop::AiEmbedLoop))
         .with_loop(Loop::new(search_loop::SearchPlacementLoop))
@@ -797,6 +796,7 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
             .with_graphs(Arc::new(graph_views::GraphViews::new(Arc::clone(
                 &auth_records,
             ))))
+            .with_logic(Arc::clone(&auth_records))
             .with_failover(Arc::clone(&failover))
             .with_residency(residency)
             .with_search_catalog(versioner.clone())

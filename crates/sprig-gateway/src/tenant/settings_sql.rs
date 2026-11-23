@@ -670,7 +670,6 @@ pub fn inline_view(
 }
 
 /// [`inline_view`] for SprigDB's view `information_schema.<name>`
-/// (`SPRIG_LOOKUP_INDEXES` uses it too).
 ///
 /// # Errors
 /// As [`inline_view`].

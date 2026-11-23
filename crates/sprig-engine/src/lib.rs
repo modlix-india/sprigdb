@@ -24,18 +24,22 @@ pub mod budget;
 pub mod config;
 mod engine;
 pub mod keys;
+pub mod leader;
 pub mod locks;
 pub mod log;
 pub mod observe;
+pub mod repl;
 pub mod row;
+pub mod snapshot;
 pub mod store;
 pub mod txn;
 
-pub use config::{EngineConfig, StoreKind};
-pub use engine::{Engine, EngineStats, NODE_UNIT, VersionGc, unit_of_key};
+pub use config::{EngineClock, EngineConfig, StoreKind};
+pub use engine::{Engine, EngineStats, NODE_UNIT, VersionGc, WeakEngine, unit_of_key};
 pub use keys::Ts;
 pub use log::{Durability, UnitId};
 pub use observe::ApplyObserver;
+pub use repl::ReplicatedLog;
 pub use store::{Cf, Read};
 
 #[cfg(test)]

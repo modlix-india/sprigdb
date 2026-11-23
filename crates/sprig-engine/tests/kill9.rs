@@ -3,6 +3,11 @@
 //! SIGKILL at a random moment, recovers the engine in-process, and checks
 //! that every acknowledged commit is there and no commit is partial.
 //!
+//! The load is mixed: each commit writes two rows, of one tenant or of two
+//! (two units, one atomic log write), and some commits use the relaxed
+//! durability class (not acknowledged before a sync, but still never
+//! partial).
+//!
 //! Rounds: `SPRIG_KILL9_ROUNDS` (default 5). The child is this same test
 //! binary, run with `SPRIG_KILL9_CHILD=<dir>`.
 
@@ -30,10 +35,24 @@ fn cfg(dir: &Path) -> EngineConfig {
     c
 }
 
+/// The tenant of a commit's row: side 1 is the thread's tenant, side 2
+/// another tenant for most commits.
+fn tenant(thread: u32, i: u32, side: u8) -> u64 {
+    if side == 1 {
+        100 + u64::from(thread)
+    } else {
+        100 + u64::from((thread + i) % 16)
+    }
+}
+
+fn relaxed(i: u32) -> bool {
+    i % 5 == 4
+}
+
 /// Two rows per commit: `(round, thread, i, side)`.
 fn key(round: u32, thread: u32, i: u32, side: u8) -> Vec<u8> {
     let mut k = KeyPrefix {
-        tenant: 9,
+        tenant: tenant(thread, i, side),
         shard: 0,
         object: u32::from(side),
         kind: kind::PRIMARY,
@@ -59,9 +78,14 @@ fn kill9_child() {
             let (e, out) = (e.clone(), Arc::clone(&out));
             std::thread::spawn(move || {
                 for i in 0.. {
+                    let d = if relaxed(i) {
+                        Durability::LocalRelaxed
+                    } else {
+                        Durability::Local
+                    };
                     let mut tx = e
                         .begin(TxnOptions {
-                            durability: Some(Durability::Local),
+                            durability: Some(d),
                             ..TxnOptions::default()
                         })
                         .unwrap();
@@ -69,7 +93,10 @@ fn kill9_child() {
                         .unwrap();
                     tx.put(key(round, t, i, 2), vec![b'b'; 200]).unwrap();
                     let tk = tx.commit().unwrap();
-                    tk.log_ticket().unwrap().wait().unwrap();
+                    if relaxed(i) {
+                        continue;
+                    }
+                    tk.wait().unwrap();
                     let mut o = out.lock().unwrap();
                     writeln!(o, "ACK {t} {i}").unwrap();
                     o.flush().unwrap();
@@ -102,6 +129,7 @@ fn kill9_loop() {
         .unwrap_or(5);
     let dir: PathBuf =
         std::env::temp_dir().join(format!("sprig-engine-kill9-{}", std::process::id()));
+    let mut cross = 0usize;
     let _ = std::fs::remove_dir_all(&dir);
     let exe = std::env::current_exe().unwrap();
     let mut seed = u64::from(std::process::id()) | 1;
@@ -145,6 +173,10 @@ fn kill9_loop() {
             "round {round}: the child acknowledged nothing"
         );
         total_acked += acked.len();
+        cross += acked
+            .iter()
+            .filter(|&&(t, i)| tenant(t, i, 1) != tenant(t, i, 2))
+            .count();
         let e = Engine::open(cfg(&dir)).unwrap();
         for &(t, i) in &acked {
             assert!(
@@ -167,6 +199,8 @@ fn kill9_loop() {
             acked.len()
         );
     }
-    eprintln!("kill9: {rounds} rounds, {total_acked} acknowledged commits, 0 lost");
+    eprintln!(
+        "kill9: {rounds} rounds, {total_acked} acknowledged commits ({cross} across two units), 0 lost, 0 partial"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

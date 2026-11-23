@@ -46,6 +46,8 @@
 
 pub mod config;
 pub mod consensus;
+pub mod engine_node;
+pub mod engine_snap;
 pub mod error;
 mod lease;
 mod logger;
@@ -66,6 +68,8 @@ pub type NodeId = u64;
 
 pub use config::RaftConfig;
 pub use consensus::{RaftConsensus, UnitMachine, UnitSnapshots};
+pub use engine_node::{EngineNode, EngineNodeOptions};
+pub use engine_snap::EngineSnapshots;
 pub use error::RaftError;
 pub use logstore::{EngineLogStore, LogStore, MemLogStore};
 pub use node::{GroupStatus, Node, NodeOptions, NodeStats, Observer, Waiter};

@@ -37,7 +37,6 @@ use bytes::Bytes;
 use serde_json::{Value, json};
 use sprig_catalog::CatalogLocator;
 use sprig_catalog::ddl::{database_key, object_key};
-use sprig_catalog::pool_wait::Bounded as _;
 use sprig_catalog::store::ObjectKind;
 use sprig_common::{Result, SprigCode, SprigError};
 use sprig_logic::declare::{Declaration, SourceKind};
@@ -214,15 +213,6 @@ impl PassSession {
         let svc = Arc::clone(ts.services());
         let tenant = ts.tenant;
         let ep = svc.locator.writer(tenant).await?;
-        let catalog_conn = || {
-            let pool = ep.pool.clone();
-            async move {
-                pool.get_conn_bounded().await.map_err(|e| {
-                    SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable")
-                        .with_source(e)
-                })
-            }
-        };
         let source_db = src.db.clone().unwrap_or_else(|| db.clone());
         let (source_db_row, object_id) = match src.kind {
             SourceKind::Stream => {
@@ -273,20 +263,10 @@ impl PassSession {
         // database, through `sprig_ctl`, with the definer as `DEFINER`.
         let streams = sprig_logic::service::StreamList::new();
         let template = ts.schema_of(Some(&db));
-        let layout = super::router::ddl_layout(ts);
         let shard_list: Vec<(String, sprig_common::ids::ClusterId)> = {
-            let from_layout = match (&layout, &template) {
-                (Some(l), Some(t)) => l(t, None),
-                (Some(l), None) => sprig_catalog::ddl::shard_schemas(tenant, &row)
-                    .first()
-                    .map(ToString::to_string)
-                    .and_then(|f| l(&f, None)),
-                _ => None,
-            };
-            match (from_layout.filter(|v| !v.is_empty()), template) {
-                (Some(v), _) => v,
-                (None, Some(t)) => vec![(t, self.target.cluster.clone())],
-                (None, None) => Vec::new(),
+            match template {
+                Some(t) => vec![(t, self.target.cluster.clone())],
+                None => Vec::new(),
             }
         };
         let single_shard = shard_list.len() == 1;
@@ -308,11 +288,11 @@ impl PassSession {
         // Taken after the chain's loads above and given back before the
         // fan-in attach below, which take catalog connections of their own
         // from the same pool (4 per cluster).
-        let mut conn = catalog_conn().await?;
+        let mut conn = svc.records.begin(tenant).await?;
         let deployed = sprig_logic::messages::deploy(
             &decl,
             sprig_logic::messages::MsgTarget {
-                catalog: &mut conn,
+                catalog: &mut *conn,
                 catalog_schema: ep.store.schema(),
                 catalog_version: cat.version,
                 db_id: row.db_id.0,
@@ -325,6 +305,7 @@ impl PassSession {
             },
         )
         .await?;
+        conn.commit().await?;
         shards.release();
         let notes = deployed.notes();
         messages::put_index(
@@ -368,6 +349,9 @@ impl PassSession {
         let reply = if let Some(rp) = &req.replay {
             // A dead letter's replay.
             self.run_replay(cx, &req, rp).await
+        } else if super::change_trigger::is_change_source(&req.source) {
+            // An after-commit trigger on an engine table.
+            self.run_change_trigger(cx, &req).await
         } else if req.record.is_some() {
             RunReply::failed(&SprigError::internal(
                 "triggers on streams aren't served: streams are stored on the engine",
@@ -413,11 +397,11 @@ impl PassSession {
     }
 
     /// One statement through this session; its error returned.
-    async fn trigger_stmt(&mut self, cx: &mut ExecCtx<'_>, sql: &str) -> Result<()> {
+    pub(super) async fn trigger_stmt(&mut self, cx: &mut ExecCtx<'_>, sql: &str) -> Result<()> {
         self.run_checked(cx, sql, false).await.map(|_| ())
     }
 
-    async fn rollback_quietly(&mut self, cx: &mut ExecCtx<'_>) {
+    pub(super) async fn rollback_quietly(&mut self, cx: &mut ExecCtx<'_>) {
         if let Err(e) = self.trigger_stmt(cx, "ROLLBACK").await {
             tracing::debug!(error = %e, "trigger run: ROLLBACK failed");
         }
@@ -427,7 +411,7 @@ impl PassSession {
     /// `ctx.record` or `ctx.message`: the version's `db` calls go through
     /// this session, in its transaction.
     #[allow(clippy::too_many_lines)]
-    async fn run_version(
+    pub(super) async fn run_version(
         &mut self,
         cx: &mut ExecCtx<'_>,
         req: &RunRequest,
@@ -477,18 +461,9 @@ impl PassSession {
         {
             v
         } else {
-            let ep = svc.locator.writer(tenant).await?;
-            let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
-                SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
-            })?;
-            sprig_logic::invoke::load_any(
-                &mut conn,
-                ep.store.schema(),
-                tenant.0,
-                req.source.module_id,
-                req.version,
-            )
-            .await?
+            let mut conn = svc.records.begin(tenant).await?;
+            sprig_logic::invoke::load_any(&mut *conn, tenant.0, req.source.module_id, req.version)
+                .await?
         };
         // A compiled version runs in MariaDB; a record it hands back (39876)
         // runs below, in the engine tier.
@@ -532,7 +507,11 @@ impl PassSession {
             sprig_logic::engine::Program::Kirun(p) => p.params().to_vec(),
             _ => Vec::new(),
         };
-        let args = sprig_logic::messages::args_for(&v.runtime, &params, &event, &ctx);
+        let args = if super::change_trigger::is_change_source(&req.source) {
+            super::change_trigger::args(&v.runtime, &params, &v.signature, &event, &mut ctx)
+        } else {
+            sprig_logic::messages::args_for(&v.runtime, &params, &event, &ctx)
+        };
         let wire = Wire {
             persona: self.persona,
             caps: cx.proto.caps,
@@ -606,11 +585,8 @@ impl PassSession {
             return r.clone();
         }
         let svc = Arc::clone(ts.services());
-        let ep = svc.locator.writer(ts.tenant).await.ok()?;
-        let mut conn = ep.pool.get_conn_bounded().await.ok()?;
-        let r = sprig_logic::rollout::get(&mut conn, ep.store.schema(), module)
-            .await
-            .ok()?;
+        let mut conn = svc.records.begin(ts.tenant).await.ok()?;
+        let r = sprig_logic::rollout::get(&mut *conn, module).await.ok()?;
         if let Ok(mut m) = ROLLOUTS.lock() {
             m.insert((tenant, module), (std::time::Instant::now(), r.clone()));
         }
@@ -621,7 +597,7 @@ impl PassSession {
     /// or, in a rollout, the candidate when the event's key falls in its
     /// share ([`sprig_logic::rollout::key_picks_candidate`]). With the
     /// module when it is in a rollout, so the run is counted.
-    async fn pick_version(
+    pub(super) async fn pick_version(
         &mut self,
         req: &RunRequest,
         event: &Value,
@@ -644,7 +620,7 @@ impl PassSession {
 
     /// Counts a run of a trigger in a rollout (the automatic rollback
     /// reads the numbers).
-    async fn count_run(
+    pub(super) async fn count_run(
         &mut self,
         cx: &mut ExecCtx<'_>,
         counted: Option<u64>,
@@ -785,6 +761,7 @@ impl PassSession {
             }
         }
         let arg = match req.source.kind {
+            _ if super::change_trigger::is_change_source(&req.source) => "trigger",
             SourceKind::Stream => "record",
             SourceKind::Queue => "message",
         };
@@ -998,20 +975,17 @@ impl PassSession {
         // a reject, which the queue dead-letters through its exchange when
         // it has one.
         let written = async {
-            let ep = {
+            let mut conn = {
                 let ts = self
                     .tenant
                     .as_deref()
                     .ok_or_else(|| SprigError::internal("no tenant"))?;
-                ts.services().locator.writer(tenant).await?
+                ts.services().records.begin(tenant).await?
             };
-            let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
-                SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
-            })?;
-            let store = sprig_logic::LogicStore::new(ep.store.schema());
+            let store = sprig_logic::LogicStore::default();
             store
                 .put_dead_letter(
-                    &mut conn,
+                    &mut *conn,
                     req.source.binding_id,
                     req.version,
                     &format!("m{message_id}"),
@@ -1024,7 +998,7 @@ impl PassSession {
                 .await?;
             let _ = store
                 .log(
-                    &mut conn,
+                    &mut *conn,
                     req.source.module_id,
                     Some(req.version),
                     "error",
@@ -1038,7 +1012,7 @@ impl PassSession {
                     ),
                 )
                 .await;
-            Ok::<(), SprigError>(())
+            conn.commit().await
         }
         .await;
         match written {

@@ -15,8 +15,6 @@
 
 use std::sync::Arc;
 
-use sprig_catalog::CatalogLocator;
-use sprig_catalog::pool_wait::Bounded as _;
 use sprig_common::{Result, SprigCode, SprigError};
 use sprig_logic::placement::{EXPLAIN_COLUMNS, ExplainFunction, explain_stored};
 use sprig_proto_mysql::StatusFlags;
@@ -24,10 +22,6 @@ use sprig_proto_mysql::StatusFlags;
 use super::PassSession;
 use super::tenant::Step;
 use crate::pipeline::{ExecCtx, ResultSink};
-
-fn catalog_err(e: mysql_async::Error) -> SprigError {
-    SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
-}
 
 impl PassSession {
     /// Answers `EXPLAIN FUNCTION | PROCEDURE` (module docs).
@@ -118,18 +112,12 @@ impl PassSession {
             }
         }
         let svc = Arc::clone(ts.services());
-        let ep = svc.locator.writer(ts.tenant).await?;
-        let store = sprig_logic::LogicStore::new(ep.store.schema());
-        let mut conn = ep.pool.get_conn_bounded().await.map_err(catalog_err)?;
-        let module = match store
-            .module(&mut conn, row.db_id.0, e.kind.as_str(), &e.name)
-            .await
-        {
-            Ok(m) => m,
-            // No logic tables yet: no module.
-            Err(err) if format!("{err:?}").contains("1146") => None,
-            Err(err) => return Err(err),
-        };
+        let store = sprig_logic::LogicStore::default();
+        let mut conn = svc.records.begin(ts.tenant).await?;
+        let conn = &mut *conn;
+        let module = store
+            .module(conn, row.db_id.0, e.kind.as_str(), &e.name)
+            .await?;
         let m = module.ok_or_else(|| {
             SprigError::new(
                 SprigCode::LogicNotFound,
@@ -137,12 +125,12 @@ impl PassSession {
             )
         })?;
         let mut out = Vec::new();
-        for v in store.versions(&mut conn, m.module_id).await? {
+        for v in store.versions(conn, m.module_id).await? {
             if matches!(v.state.as_str(), "retired" | "superseded") {
                 continue;
             }
             let plsql = if e.sql {
-                store.plsql(&mut conn, m.module_id, v.version).await?
+                store.plsql(conn, m.module_id, v.version).await?
             } else {
                 None
             };

@@ -310,7 +310,7 @@ impl AdminApi {
     }
 
     /// Whether the controller accepts `authorization` for admin calls.
-    async fn authorized(&self, authorization: Option<&str>) -> Result<()> {
+    pub(crate) async fn authorized(&self, authorization: Option<&str>) -> Result<()> {
         let r = self
             .forward(&Method::GET, "/admin/v1/dcs", authorization, Bytes::new())
             .await?;

@@ -1,8 +1,7 @@
 //! SQL/PGQ's `GRAPH_TABLE`: the values of a call's rows as SQL literals.
 //!
-//! Finding the calls in a statement, their Cypher, the placeholders and
-//! binding the rows are the router's (`sprig_router::graph`,
-//! `Plan::Graph`); this module only writes graph values as SQL: integers,
+//! Finding the calls in a statement and their Cypher are
+//! [`crate::graph_table`]'s; this module only writes graph values as SQL: integers,
 //! floats, strings and booleans as themselves, `NULL`, and nodes,
 //! relationships, paths, lists, maps and temporal values as their JSON or
 //! text form (native properties come out as JSON unless cast). The rows are bounded by [`MAX_INLINE_BYTES`] (39903 past it).

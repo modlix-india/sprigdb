@@ -28,6 +28,11 @@ const DEAD_COMMITS_PER_PASS: usize = 25;
 pub async fn pass<U: Unit>(unit: &U, space: Space, limit: usize) -> StoreResult<usize> {
     let now = unit.now_ms();
     let (lo, hi) = space.expiry_due(now);
+    // Only the unit's leader deletes: a replica that doesn't lead it
+    // applies the leader's deletes instead.
+    if unit.leader_epoch(&lo) == 0 {
+        return Ok(0);
+    }
     let due: Vec<(i64, Bytes)> = {
         let mut b = unit.begin(Vec::new()).await?;
         let got = b.scan(&lo, &hi, limit)?;

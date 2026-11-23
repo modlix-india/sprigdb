@@ -79,7 +79,8 @@ use std::time::{Duration, Instant};
 
 use sprig_catalog::bootstrap::{
     BootstrapProgress, BootstrapStep, CatalogClaim, catalog_owner, claim_catalog, create_catalog,
-    drop_catalog, read_progress, tenant_schema_ids, write_progress,
+    drop_catalog, read_progress, read_progress_records, tenant_schema_ids, write_progress,
+    write_progress_records,
 };
 use sprig_catalog::migrate::MigrateOpts;
 use sprig_catalog::placement::ShardMap;
@@ -650,6 +651,7 @@ where
     }
 
     /// [`bootstrap`](Self::bootstrap), with this tenant's turn held.
+    #[allow(clippy::too_many_lines)] // checks, catalog (records or schema), steps
     async fn bootstrap_once(&self, id: TenantId, guard: &[Cmp]) -> Result<Bootstrapped> {
         let entry =
             self.directory.get(id).await?.ok_or_else(|| {
@@ -682,29 +684,49 @@ where
         let pool = self.locator.pools().writer(&cluster).await?;
         let store = Store::new(self.locator.schema(id));
         let mark = owner_mark(&b);
-        match claim_catalog(&pool, store.schema(), &mark).await? {
-            CatalogClaim::Created | CatalogClaim::Ours => {}
-            CatalogClaim::Foreign(found) => {
-                return Err(self
-                    .refuse_foreign_catalog(&b, &cluster, store.schema(), &found, guard)
-                    .await);
+        // Under the real naming the catalog is engine records only: no
+        // `t<id>_sprig` until a module beyond the core one first needs it
+        // (EC-124). A test's naming keeps the schema made here.
+        let records_only = store.schema() == SchemaName::catalog(id).to_string();
+        if records_only {
+            self.migrator
+                .bootstrap_records(&*crate::catalog_records(), id, &mark)
+                .await?;
+        } else {
+            match claim_catalog(&pool, store.schema(), &mark).await? {
+                CatalogClaim::Created | CatalogClaim::Ours => {}
+                CatalogClaim::Foreign(found) => {
+                    return Err(self
+                        .refuse_foreign_catalog(&b, &cluster, store.schema(), &found, guard)
+                        .await);
+                }
             }
+            let opts = MigrateOpts {
+                applied_by: format!("controller:{}", self.dc),
+                ..MigrateOpts::default()
+            };
+            create_catalog(&pool, store.schema(), &self.migrator, &opts).await?;
         }
-        let opts = MigrateOpts {
-            applied_by: format!("controller:{}", self.dc),
-            ..MigrateOpts::default()
-        };
-        create_catalog(&pool, store.schema(), &self.migrator, &opts).await?;
         let progress = |step| {
-            write_progress(
-                &pool,
-                &store,
-                step,
-                &cluster,
-                &placement,
-                &considered,
-                self.clock.wall(),
-            )
+            let (pool, store, cluster, placement, considered) =
+                (&pool, &store, &cluster, &placement, &considered);
+            let at = self.clock.wall();
+            async move {
+                if records_only {
+                    write_progress_records(
+                        &*crate::catalog_records(),
+                        id,
+                        step,
+                        cluster,
+                        placement,
+                        considered,
+                        at,
+                    )
+                    .await
+                } else {
+                    write_progress(pool, store, step, cluster, placement, considered, at).await
+                }
+            }
         };
         progress(BootstrapStep::Migrated).await?;
         match self.tree.sync_entry(&b).await? {
@@ -921,6 +943,12 @@ where
     }
 
     async fn recorded_placement(&self, id: TenantId, c: &ClusterId) -> Option<BootstrapProgress> {
+        if let Ok(Some(p)) = read_progress_records(&*crate::catalog_records(), id).await {
+            return Some(p);
+        }
+        if let Ok(Some(_)) = sprig_catalog::migrate::lazy_schema(id).await {
+            return None;
+        }
         let pool = self.locator.pools().writer(c).await.ok()?;
         read_progress(&pool, &Store::new(self.locator.schema(id)))
             .await
@@ -1038,9 +1066,14 @@ where
         // 2. The catalog: hooks, the live-database guard, its database ids.
         let mark = owner_mark(e.body());
         let catalog_cluster = self.locator.cluster_of(id).await?;
+        // A tenant bootstrapped without its catalog schema that never made
+        // it, nor backend accounts (EC-124), has nothing on MariaDB.
+        let on_mariadb = sprig_catalog::migrate::lazy_schema(id)
+            .await?
+            .is_none_or(|l| l.mariadb);
         let mut catalog: Option<CatalogEndpoint> = None;
         let mut db_ids = std::collections::BTreeSet::new();
-        if let Some(c) = &catalog_cluster {
+        if let Some(c) = catalog_cluster.as_ref().filter(|_| on_mariadb) {
             let ep = CatalogEndpoint {
                 pool: self.locator.pools().writer(c).await?,
                 store: Store::new(self.locator.schema(id)),
@@ -1074,7 +1107,7 @@ where
         // 3. Every cluster of the DC, by exact names. Only under the real
         //    naming: a test's catalog naming says nothing about who owns
         //    `t<id>_` names on a shared server.
-        if self.locator.schema(id) == SchemaName::catalog(id).to_string() {
+        if on_mariadb && self.locator.schema(id) == SchemaName::catalog(id).to_string() {
             let finished: Vec<JobId> = settled.finished.iter().map(|(r, _)| r.job_id).collect();
             for c in self.locator.pools().sweepable().await? {
                 let pool = self.locator.pools().writer(&c).await?;
@@ -1112,7 +1145,7 @@ where
         if let Some(ep) = &catalog {
             drop_catalog(&ep.pool, &ep.store).await?;
         }
-        if catalog.is_some() || catalog_cluster.is_none() {
+        if catalog.is_some() || catalog_cluster.is_none() || !on_mariadb {
             cleanup::delete_catalog_records(id).await?;
         }
         // 5. Finished job records, then the tenant's keys in the DC tier
@@ -1134,7 +1167,7 @@ where
         //    yet may have made one of the tenant's backend accounts again
         //    after step 3 (a session's statement, a new login). Look again
         //    a little later, by exact names, accounts only.
-        if self.locator.schema(id) == SchemaName::catalog(id).to_string() {
+        if on_mariadb && self.locator.schema(id) == SchemaName::catalog(id).to_string() {
             let pools = Arc::clone(self.locator.pools());
             tokio::spawn(async move {
                 for wait in LATE_ACCOUNT_SWEEPS {

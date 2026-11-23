@@ -7,9 +7,9 @@
 //! - `deploy <file> --db <db> --gateway <url>`: sends `CREATE OR REPLACE
 //!   PROCEDURE ... LANGUAGE kirun AS '...'` through a gateway as the user
 //!   in the URL, and prints the notes the deploy left;
-//! - `list` and `show <name>` read the tenant's logic catalog directly,
-//!   `--catalog mysql://...@host:port/t<tenant>_sprig` (an operator's
-//!   connection), until the Admin API serves them.
+//! - `list --tenant t` and `show <name> --tenant t`: the tenant's logic
+//!   modules, through the Admin API (`/admin/v1/tenants/{t}/logic/...`);
+//!   `logs` and `dead-letters` take `--tenant` too;
 //!
 //! - `logs [name] [--limit n] [--follow]`: what after-commit triggers and
 //!   schedules did (`logic_log`), oldest first;
@@ -25,11 +25,13 @@
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use mysql_async::prelude::Queryable;
 use mysql_async::{Conn, Opts};
-use sprig_logic::LogicStore;
+use serde_json::{Value, json};
 use sprig_logic::declare::TierPref;
 use sprig_logic_compile::ir::Ty;
 use sprig_logic_compile::{Options, Runtime, StaticColumns, compile};
 
+use crate::client::AdminClient;
+use crate::settings::escape;
 use crate::{Failed, Output};
 
 /// `sprigctl logic`.
@@ -41,10 +43,10 @@ pub(crate) fn group() -> Command {
             .help("A KIRun definition (.json)")
     };
     let catalog = || {
-        Arg::new("catalog")
-            .long("catalog")
+        Arg::new("tenant")
+            .long("tenant")
             .required(true)
-            .help("The tenant's catalog: mysql://user:pass@host:port/t<tenant>_sprig")
+            .help("The tenant")
     };
     Command::new("logic")
         .about("Logic functions")
@@ -184,10 +186,10 @@ fn dl_change(name: &'static str, about: &'static str) -> Command {
                 .value_parser(clap::value_parser!(u64)),
         )
         .arg(
-            Arg::new("catalog")
-                .long("catalog")
+            Arg::new("tenant")
+                .long("tenant")
                 .required(true)
-                .help("The tenant's catalog: mysql://user:pass@host:port/t<tenant>_sprig"),
+                .help("The tenant"),
         )
 }
 
@@ -236,7 +238,7 @@ async fn conn(url: &str) -> Result<Conn, Failed> {
 
 /// Runs `sprigctl logic <sub>`.
 #[allow(clippy::too_many_lines)]
-pub(crate) async fn run(sub: &ArgMatches, out: Output) -> Result<(), Failed> {
+pub(crate) async fn run(api: &AdminClient, sub: &ArgMatches, out: Output) -> Result<(), Failed> {
     match sub.subcommand() {
         Some(("compile", m)) => {
             let (_, text) = read(m)?;
@@ -335,11 +337,7 @@ pub(crate) async fn run(sub: &ArgMatches, out: Output) -> Result<(), Failed> {
             Ok(())
         }
         Some(("list", m)) => {
-            let (mut c, store) = catalog(m).await?;
-            let rows = store
-                .modules(&mut c, None)
-                .await
-                .map_err(|e| e.to_string())?;
+            let rows: Vec<Value> = api.get(&format!("{}/modules", base(m))).await?;
             if out == Output::Json {
                 println!(
                     "{}",
@@ -353,105 +351,104 @@ pub(crate) async fn run(sub: &ArgMatches, out: Output) -> Result<(), Failed> {
                 for r in rows {
                     println!(
                         "{:<8} {:<6} {:<24} {:<10} {:<10} {:<8} {}",
-                        r.module_id,
-                        r.db_id,
-                        r.name,
-                        r.kind,
-                        r.runtime,
-                        r.tier_pref,
-                        r.active_version
-                            .map_or_else(|| "-".to_owned(), |v| v.to_string())
+                        r["module_id"],
+                        r["db_id"],
+                        st(&r, "name"),
+                        st(&r, "kind"),
+                        st(&r, "runtime"),
+                        st(&r, "tier_pref"),
+                        opt(&r["active_version"])
                     );
                 }
             }
-            let _ = c.disconnect().await;
             Ok(())
         }
         Some(("show", m)) => {
-            let (mut c, store) = catalog(m).await?;
             let name = m.get_one::<String>("name").cloned().unwrap_or_default();
-            let modules = store
-                .modules(&mut c, None)
-                .await
-                .map_err(|e| e.to_string())?;
-            let Some(module) = modules.into_iter().find(|r| r.name == name) else {
-                return Err(format!("no logic module {name}").into());
-            };
-            let versions = store
-                .versions(&mut c, module.module_id)
-                .await
-                .map_err(|e| e.to_string())?;
+            let v: Value = api
+                .get(&format!("{}/modules/{}", base(m), escape(&name)))
+                .await?;
             if out == Output::Json {
-                let v = serde_json::json!({"module": module, "versions": versions});
                 println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
             } else {
+                let module = &v["module"];
                 println!(
                     "{} {} (module {}, {}, active version {})",
-                    module.kind,
-                    module.name,
-                    module.module_id,
-                    module.runtime,
-                    module
-                        .active_version
-                        .map_or_else(|| "-".to_owned(), |v| v.to_string())
+                    st(module, "kind"),
+                    st(module, "name"),
+                    module["module_id"],
+                    st(module, "runtime"),
+                    opt(&module["active_version"])
                 );
-                for v in versions {
+                for v in v["versions"].as_array().into_iter().flatten() {
                     println!(
                         "  v{} {} tier {} ({})",
-                        v.version, v.state, v.tier, v.compiler_version
+                        v["version"],
+                        st(v, "state"),
+                        st(v, "tier"),
+                        st(v, "compiler_version")
                     );
-                    for r in v.placement["reasons"].as_array().into_iter().flatten() {
+                    for r in v["placement"]["reasons"].as_array().into_iter().flatten() {
                         println!("    reason {} at {}: {}", r["code"], r["at"], r["detail"]);
                     }
                 }
             }
-            let _ = c.disconnect().await;
             Ok(())
         }
-        Some(("logs", m)) => logs(m, out).await,
-        Some(("dead-letters", m)) => dead_letters(m, out).await,
+        Some(("logs", m)) => logs(api, m, out).await,
+        Some(("dead-letters", m)) => dead_letters(api, m, out).await,
         _ => Err("not available in this version".to_owned().into()),
     }
 }
 
-async fn logs(m: &ArgMatches, out: Output) -> Result<(), Failed> {
-    let (mut c, store) = catalog(m).await?;
-    let module = match m.get_one::<String>("name") {
-        Some(n) => {
-            let all = store
-                .modules(&mut c, None)
-                .await
-                .map_err(|e| e.to_string())?;
-            Some(
-                all.into_iter()
-                    .find(|r| r.name == *n)
-                    .ok_or_else(|| format!("no logic module {n}"))?
-                    .module_id,
-            )
-        }
-        None => None,
-    };
+/// `/admin/v1/tenants/{tenant}/logic`.
+fn base(m: &ArgMatches) -> String {
+    let tenant = m.get_one::<String>("tenant").cloned().unwrap_or_default();
+    format!("/admin/v1/tenants/{}/logic", escape(&tenant))
+}
+
+fn st(v: &Value, k: &str) -> String {
+    v[k].as_str().unwrap_or_default().to_owned()
+}
+
+fn opt(v: &Value) -> String {
+    if v.is_null() {
+        "-".to_owned()
+    } else {
+        v.to_string()
+    }
+}
+
+async fn logs(api: &AdminClient, m: &ArgMatches, out: Output) -> Result<(), Failed> {
     let limit = m.get_one::<u32>("limit").copied().unwrap_or(50);
     let follow = m.get_flag("follow");
+    let module = m
+        .get_one::<String>("name")
+        .map(|n| format!("&module={}", escape(n)))
+        .unwrap_or_default();
     let mut after = 0u64;
     loop {
-        let rows = store
-            .logs(&mut c, module, after, limit)
-            .await
-            .map_err(|e| e.to_string())?;
+        let rows: Vec<Value> = api
+            .get(&format!(
+                "{}/logs?after={after}&limit={limit}{module}",
+                base(m)
+            ))
+            .await?;
         for r in &rows {
-            after = after.max(r.log_id);
+            after = after.max(r["log_id"].as_u64().unwrap_or(0));
             if out == Output::Json {
                 println!("{}", serde_json::to_string(r).unwrap_or_default());
             } else {
                 println!(
                     "{} {:<5} {:<8} module {} {}{}",
-                    r.at,
-                    r.level,
-                    r.source,
-                    r.module_id,
-                    r.version.map_or_else(String::new, |v| format!("v{v} ")),
-                    r.message
+                    st(r, "at"),
+                    st(r, "level"),
+                    st(r, "source"),
+                    r["module_id"],
+                    r["version"]
+                        .as_u64()
+                        .map_or_else(String::new, |v| format!("v{v} ")),
+                    st(r, "message")
                 );
             }
         }
@@ -460,23 +457,25 @@ async fn logs(m: &ArgMatches, out: Output) -> Result<(), Failed> {
         }
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
-    let _ = c.disconnect().await;
     Ok(())
 }
 
-async fn dead_letters(m: &ArgMatches, out: Output) -> Result<(), Failed> {
+async fn dead_letters(api: &AdminClient, m: &ArgMatches, out: Output) -> Result<(), Failed> {
     match m.subcommand() {
         Some(("list", m)) => {
-            let (mut c, store) = catalog(m).await?;
-            let rows = store
-                .dead_letters(
-                    &mut c,
-                    m.get_one::<u64>("binding").copied(),
-                    m.get_one::<String>("state").map(String::as_str),
-                    m.get_one::<u32>("limit").copied().unwrap_or(100),
-                )
-                .await
-                .map_err(|e| e.to_string())?;
+            let mut q = format!(
+                "limit={}",
+                m.get_one::<u32>("limit").copied().unwrap_or(100)
+            );
+            if let Some(b) = m.get_one::<u64>("binding") {
+                use std::fmt::Write as _;
+                let _ = write!(q, "&binding={b}");
+            }
+            if let Some(s) = m.get_one::<String>("state") {
+                q.push_str("&state=");
+                q.push_str(&escape(s));
+            }
+            let rows: Vec<Value> = api.get(&format!("{}/dead-letters?{q}", base(m))).await?;
             if out == Output::Json {
                 println!(
                     "{}",
@@ -490,20 +489,23 @@ async fn dead_letters(m: &ArgMatches, out: Output) -> Result<(), Failed> {
                 for r in rows {
                     println!(
                         "{:<6} {:<8} {:<4} {:<10} {:<8} {:<20} {:<28} {} {}",
-                        r.dl_id,
-                        r.binding_id,
-                        r.version,
-                        r.state,
-                        r.attempts,
-                        r.last_failed_at,
-                        format!("{} {}", r.event["op"].as_str().unwrap_or(""), r.event_key),
-                        r.error_code,
-                        r.error_message
+                        r["dl_id"],
+                        r["binding_id"],
+                        r["version"],
+                        st(&r, "state"),
+                        r["attempts"],
+                        st(&r, "last_failed_at"),
+                        format!(
+                            "{} {}",
+                            r["event"]["op"].as_str().unwrap_or(""),
+                            st(&r, "event_key")
+                        ),
+                        r["error_code"],
+                        st(&r, "error_message")
                     );
-                    println!("       row {}", r.event["row"]);
+                    println!("       row {}", r["event"]["row"]);
                 }
             }
-            let _ = c.disconnect().await;
             Ok(())
         }
         Some((verb @ ("replay" | "discard"), m)) => {
@@ -516,49 +518,32 @@ async fn dead_letters(m: &ArgMatches, out: Output) -> Result<(), Failed> {
             if ids.is_empty() && !m.get_flag("all") {
                 return Err("name dead letter ids, or --all".to_owned().into());
             }
-            let (mut c, store) = catalog(m).await?;
-            let binding = m.get_one::<u64>("binding").copied();
+            let body = json!({"binding": m.get_one::<u64>("binding"), "ids": ids});
+            let v: Value = api
+                .post(&format!("{}/dead-letters:{verb}", base(m)), &body)
+                .await?;
             if verb == "replay" {
                 // After-commit triggers' dead letters, and those of
                 // triggers on streams and queues, go back to their
                 // jobs, which run them in order with the active version.
-                let (n, left) = store
-                    .replay_dead_letters(&mut c, binding, &ids)
-                    .await
-                    .map_err(|e| e.to_string())?;
                 println!(
-                    "{n} dead letters queued for replay (the trigger's worker runs them in order)"
+                    "{} dead letters queued for replay (the trigger's worker runs them in order)",
+                    v["replaying"]
                 );
+                let left = v["skipped"].as_u64().unwrap_or(0);
                 if left > 0 {
                     println!(
                         "{left} dead letters of other kinds of triggers stay dead: they can't \
                          be replayed; discard them"
                     );
                 }
-                let _ = c.disconnect().await;
                 return Ok(());
             }
-            let n = store
-                .set_dead_letters(&mut c, binding, &ids, "dead", "discarded")
-                .await
-                .map_err(|e| e.to_string())?;
-            println!("{n} dead letters discarded");
-            let _ = c.disconnect().await;
+            println!("{} dead letters discarded", v["discarded"]);
             Ok(())
         }
         _ => Err("dead-letters takes list, replay or discard"
             .to_owned()
             .into()),
     }
-}
-
-async fn catalog(m: &ArgMatches) -> Result<(Conn, LogicStore), Failed> {
-    let url = m.get_one::<String>("catalog").cloned().unwrap_or_default();
-    let opts = Opts::from_url(&url).map_err(|e| format!("bad URL: {e}"))?;
-    let schema = opts
-        .db_name()
-        .map(str::to_owned)
-        .ok_or_else(|| "--catalog needs the catalog schema as its database".to_owned())?;
-    let c = Conn::new(opts).await.map_err(|e| Failed(e.to_string()))?;
-    Ok((c, LogicStore::new(&schema)))
 }

@@ -270,15 +270,15 @@ impl GraphStore for MemStore {
         &mut self,
         ids: &[u64],
         keys: Option<&[String]>,
-        filter: &[(String, sprig_router::graph_route::CmpOp, f64)],
+        filter: &[(String, crate::store::CmpOp, f64)],
     ) -> Result<Vec<NodeRow>> {
-        use sprig_router::graph_route::CmpOp;
+        use crate::store::CmpOp;
         let mut rows = self.nodes(ids).await?;
         // As MariaDB does it: a JSON number against the number; anything
         // else (missing, strings) fails.
         rows.retain(|n| {
             filter.iter().all(|(k, op, x)| {
-                if let Some(id) = k.strip_prefix(sprig_router::graph_route::LABEL_KEY) {
+                if let Some(id) = k.strip_prefix(crate::store::LABEL_KEY) {
                     return id.parse::<u32>().is_ok_and(|id| n.labels.contains(&id));
                 }
                 let v = n.props.get(k).and_then(serde_json::Value::as_f64);

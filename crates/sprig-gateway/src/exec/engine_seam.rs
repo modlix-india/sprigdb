@@ -79,6 +79,8 @@ pub(super) mod diag;
 mod fast;
 // General SELECTs (joins, grouping, subqueries) through the planner.
 mod general;
+// `SET` of session variables kept in the gateway.
+mod setvars;
 mod show;
 // Multi-table and subquery UPDATE and DELETE.
 mod write;
@@ -358,9 +360,9 @@ impl PassSession {
     }
 
     /// Whether MariaDB holds a transaction of this session (its own
-    /// connection's, or the router's across shards).
+    /// connection's).
     fn backend_in_txn(&self) -> bool {
-        self.bs.as_ref().is_some_and(|b| b.pins().in_transaction()) || self.router.in_txn()
+        self.bs.as_ref().is_some_and(|b| b.pins().in_transaction())
     }
 
     /// The session's variables as the engine path needs them, read again
@@ -492,13 +494,36 @@ impl PassSession {
         let Some(ts) = self.tenant.as_deref() else {
             return false;
         };
-        let Some(cat) = ts.catalog() else {
+        let Some(cat) = Self::session_catalog(ts) else {
             return false;
         };
-        catalog::of(cat).is_some_and(|eng| {
+        catalog::of(&cat).is_some_and(|eng| {
             cat.database(&database_key(name, ts.lower_case_table_names()))
                 .is_some_and(|d| eng.dbs.contains(&d.db_id))
         })
+    }
+
+    /// Whether the tenant's catalog (loaded) has no database `name`.
+    /// `false` when it can't tell (no tenant session, no catalog yet).
+    pub(super) fn unknown_database(&self, name: &str) -> bool {
+        let Some(ts) = self.tenant.as_deref() else {
+            return false;
+        };
+        let Some(cat) = Self::session_catalog(ts) else {
+            return false;
+        };
+        cat.database(&database_key(name, ts.lower_case_table_names()))
+            .is_none()
+    }
+
+    /// The session's catalog; before the session has loaded one (a MongoDB
+    /// or Redis connection's first command), the tenant's cached one.
+    pub(super) fn session_catalog(
+        ts: &crate::tenant::session::TenantSession,
+    ) -> Option<Arc<TenantCatalog>> {
+        ts.catalog()
+            .cloned()
+            .or_else(|| ts.services().cache.cached(ts.tenant))
     }
 
     /// Binds `text`: a plan when it is one engine table's statement.
@@ -1778,6 +1803,10 @@ impl PassSession {
         format: RowFormat,
         out: &mut dyn ResultSink,
     ) -> Result<Option<Step>> {
+        // A `SET` of session variables the gateway keeps.
+        if let Some(step) = Box::pin(self.engine_set(cx, cat, sql, more, out)).await? {
+            return Ok(Some(step));
+        }
         if let Some(ctl) = control::parse(sql) {
             return Box::pin(self.engine_control(cx, cat, current, ctl, more, out)).await;
         }

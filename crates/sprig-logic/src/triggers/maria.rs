@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use mysql_async::prelude::Queryable;
 use mysql_async::{Conn, Pool};
-use sprig_catalog::CatalogLocator;
+use sprig_catalog::records::RecordStore;
 use sprig_common::ids::{ClusterId, TenantId};
 use sprig_common::names::quote;
 use sprig_common::{Result, SprigCode, SprigError};
@@ -53,7 +53,7 @@ struct Cached {
 /// more than the active version is rolled back, as a gateway does for
 /// calls.
 pub struct CatalogVersions {
-    locator: Arc<dyn CatalogLocator>,
+    records: Arc<dyn RecordStore>,
     tenant: TenantId,
     module_id: u64,
     cached: Mutex<Option<Cached>>,
@@ -64,9 +64,9 @@ pub struct CatalogVersions {
 impl CatalogVersions {
     /// Versions of `module_id` in `tenant`'s catalog.
     #[must_use]
-    pub fn new(locator: Arc<dyn CatalogLocator>, tenant: TenantId, module_id: u64) -> Self {
+    pub fn new(records: Arc<dyn RecordStore>, tenant: TenantId, module_id: u64) -> Self {
         Self {
-            locator,
+            records,
             tenant,
             module_id,
             cached: Mutex::new(None),
@@ -126,14 +126,11 @@ impl CatalogVersions {
         {
             return Ok((c.active.clone(), c.candidate.clone()));
         }
-        let ep = self.locator.writer(self.tenant).await?;
-        let mut c = ep.pool.get_conn().await.map_err(|e| {
-            SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
-        })?;
-        let schema = ep.store.schema().to_owned();
-        let store = LogicStore::new(&schema);
+        let mut tx = self.records.begin(self.tenant).await?;
+        let c = &mut *tx;
+        let store = LogicStore::default();
         let m = store
-            .module_by_id(&mut c, self.module_id)
+            .module_by_id(c, self.module_id)
             .await?
             .filter(|m| m.state == "active")
             .ok_or_else(|| {
@@ -156,9 +153,9 @@ impl CatalogVersions {
                 .filter_map(|p| p["name"].as_str().map(str::to_owned))
                 .collect()
         };
-        let (sig, _) = store.version_signature(&mut c, self.module_id, v).await?;
+        let (sig, _) = store.version_signature(c, self.module_id, v).await?;
         let active = (v, params(&sig));
-        let mut rollout = crate::rollout::get(&mut c, &schema, self.module_id)
+        let mut rollout = crate::rollout::get(c, self.module_id)
             .await?
             .filter(|r| r.active_version == v);
         if let Some(r) = rollout.clone() {
@@ -170,9 +167,9 @@ impl CatalogVersions {
                     .map(|(ver, a)| ((self.module_id, ver), a))
                     .collect();
             if !counted.is_empty() {
-                crate::rollout::flush(&mut c, &schema, &counted).await?;
+                crate::rollout::flush(c, &counted).await?;
             }
-            let stats = crate::rollout::stats(&mut c, &schema, self.module_id).await?;
+            let stats = crate::rollout::stats(c, self.module_id).await?;
             let why = stats
                 .iter()
                 .find(|s| s.version == r.candidate_version)
@@ -182,8 +179,8 @@ impl CatalogVersions {
                 });
             if let Some(why) = why {
                 crate::messages::rollout_change(
-                    &mut c,
-                    &schema,
+                    c,
+                    "",
                     self.module_id,
                     &m.name,
                     crate::rollout::RolloutOp::Abort,
@@ -193,7 +190,7 @@ impl CatalogVersions {
                 .await?;
                 let _ = store
                     .log(
-                        &mut c,
+                        c,
                         self.module_id,
                         Some(r.candidate_version),
                         "warn",
@@ -211,12 +208,13 @@ impl CatalogVersions {
         let candidate = match rollout {
             Some(r) => {
                 let (csig, _) = store
-                    .version_signature(&mut c, self.module_id, r.candidate_version)
+                    .version_signature(c, self.module_id, r.candidate_version)
                     .await?;
                 Some(((r.candidate_version, params(&csig)), r.spec()))
             }
             None => None,
         };
+        tx.commit().await?;
         *self.cached.lock().unwrap_or_else(PoisonError::into_inner) = Some(Cached {
             at: Instant::now(),
             active: active.clone(),
@@ -469,8 +467,8 @@ impl Apply for MariaApply {
 /// Dead letters and logs in the tenant's catalog, and the checkpoint in
 /// the subscription.
 pub struct CatalogOutcomes {
-    /// The tenant's catalog.
-    pub locator: Arc<dyn CatalogLocator>,
+    /// The tenant's catalog records.
+    pub records: Arc<dyn RecordStore>,
     /// The tenant.
     pub tenant: TenantId,
     /// The binding.
@@ -485,12 +483,11 @@ pub struct CatalogOutcomes {
 }
 
 impl CatalogOutcomes {
-    async fn catalog(&self) -> Result<(Conn, LogicStore)> {
-        let ep = self.locator.writer(self.tenant).await?;
-        let c = ep.pool.get_conn().await.map_err(|e| {
-            SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
-        })?;
-        Ok((c, LogicStore::new(ep.store.schema())))
+    async fn catalog(&self) -> Result<(Box<dyn sprig_catalog::records::RecordTx>, LogicStore)> {
+        Ok((
+            self.records.begin(self.tenant).await?,
+            LogicStore::default(),
+        ))
     }
 }
 
@@ -511,7 +508,7 @@ impl Outcomes for CatalogOutcomes {
             .unwrap_or_default();
         store
             .put_dead_letter(
-                &mut c,
+                &mut *c,
                 self.binding_id,
                 version,
                 &ev.key,
@@ -521,7 +518,8 @@ impl Outcomes for CatalogOutcomes {
                 u32::from(errno(err)),
                 &err.message,
             )
-            .await
+            .await?;
+        c.commit().await
     }
 
     async fn ack(&self, token: &ResumeToken, events: u64) -> Result<()> {
@@ -552,10 +550,14 @@ impl Outcomes for CatalogOutcomes {
     async fn log(&self, level: &str, message: &str) {
         match self.catalog().await {
             Ok((mut c, store)) => {
-                if let Err(e) = store
-                    .log(&mut c, self.module_id, None, level, "trigger", message)
+                let r = match store
+                    .log(&mut *c, self.module_id, None, level, "trigger", message)
                     .await
                 {
+                    Ok(()) => c.commit().await,
+                    Err(e) => Err(e),
+                };
+                if let Err(e) = r {
                     tracing::warn!(error = %e, "can't write logic_log");
                 }
             }
@@ -636,37 +638,37 @@ pub async fn register(
 /// # Errors
 /// Catalog errors.
 pub async fn replay(
-    locator: &dyn CatalogLocator,
+    records: &dyn RecordStore,
     tenant: TenantId,
     binding_id: u64,
     module_id: u64,
     apply: &dyn Apply,
 ) -> Result<u64> {
-    let ep = locator.writer(tenant).await?;
-    let mut c = ep.pool.get_conn().await.map_err(|e| {
-        SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
-    })?;
-    let store = LogicStore::new(ep.store.schema());
-    let rows = store
-        .dead_letters(&mut c, Some(binding_id), Some("replaying"), 100)
-        .await?;
+    let store = LogicStore::default();
+    let rows = {
+        let mut c = records.begin(tenant).await?;
+        let rows = store
+            .dead_letters(&mut *c, Some(binding_id), Some("replaying"), 100)
+            .await?;
+        c.commit().await?;
+        rows
+    };
     let mut n = 0;
     for r in rows {
         let ev = TriggerEvent::from_json(&r.event)?;
-        match apply.apply(&ev).await {
+        let applied = apply.apply(&ev).await;
+        // Each outcome is recorded in its own transaction (the run itself
+        // can take as long as the trigger's budget).
+        let mut tx = records.begin(tenant).await?;
+        let c = &mut *tx;
+        match applied {
             Ok(_) => {
                 store
-                    .set_dead_letters(
-                        &mut c,
-                        Some(binding_id),
-                        &[r.dl_id],
-                        "replaying",
-                        "replayed",
-                    )
+                    .set_dead_letters(c, Some(binding_id), &[r.dl_id], "replaying", "replayed")
                     .await?;
                 let _ = store
                     .log(
-                        &mut c,
+                        c,
                         module_id,
                         Some(apply.version()),
                         "info",
@@ -674,12 +676,13 @@ pub async fn replay(
                         &format!("dead letter {} (event {}) replayed", r.dl_id, r.event_key),
                     )
                     .await;
+                tx.commit().await?;
                 n += 1;
             }
             Err(e) => {
                 store
                     .put_dead_letter(
-                        &mut c,
+                        c,
                         binding_id,
                         apply.version(),
                         &r.event_key,
@@ -690,6 +693,7 @@ pub async fn replay(
                         &e.message,
                     )
                     .await?;
+                tx.commit().await?;
                 // Keep key order: stop at the first failure.
                 break;
             }

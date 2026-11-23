@@ -27,7 +27,6 @@ use sprig_auth::admin::NewUser;
 use sprig_auth::authz::privilege::{Action, ActionSet, PrivName, parse_privilege};
 use sprig_auth::authz::store::{AuthzStore, Grantee, PrivTarget};
 use sprig_catalog::ddl::{database_key, object_key};
-use sprig_catalog::pool_wait::Bounded as _;
 use sprig_catalog::store::{Namespace, ObjectKind};
 use sprig_catalog::version::VersionKind;
 use sprig_catalog::{CatalogLocator, ChangeOpts, TenantCatalog};
@@ -43,10 +42,6 @@ use sprig_logic::messages::{self, MsgIndex};
 
 use super::{RUN_AS_USER, catalog};
 use crate::tenant::TenantServices;
-
-fn cat_err(e: mysql_async::Error) -> SprigError {
-    SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
-}
 
 /// The trigger definitions reaching the member whose source is the queue
 /// definition `queue`.
@@ -150,15 +145,12 @@ async fn ensure_for(
     let t = src.tenant;
     let cat = catalog(svc, t).await?;
     let st = super::state_of(&cat);
-    let ep = svc.locator.writer(t).await?;
-    let schema = ep.store.schema().to_owned();
     let mstore = MsgStore::new(Arc::clone(&svc.records), t);
     let dc = svc.locator.dc_store();
     let mut settled = true;
     for g in triggers {
         let key = g.key();
         let disabled = chain.disabled(key);
-        let mut conn = ep.pool.get_conn_bounded().await.map_err(cat_err)?;
         let row = match st.instances.get(&key) {
             Some(i) => Some((**i).clone()),
             None => mstore.instance(key).await?,
@@ -177,7 +169,7 @@ async fn ensure_for(
             // The job ends at its next check (a module that isn't active),
             // keeping its position; ENABLE resumes there.
             if let (Some(b), Some(m)) = (binding, module) {
-                set_module_state(&mut conn, &schema, m, "disabled").await?;
+                set_module_state(&svc.records, t, m, false).await?;
                 messages::delete_index(dc.as_ref(), t, b).await?;
             }
             continue;
@@ -195,7 +187,7 @@ async fn ensure_for(
         {
             // Up to date; make sure it runs (ENABLE after a DISABLE).
             if let Some(m) = module {
-                set_module_state(&mut conn, &schema, m, "active").await?;
+                set_module_state(&svc.records, t, m, true).await?;
             }
             if !messages::indexed(dc.as_ref(), t, b).await? {
                 messages::put_index(
@@ -258,10 +250,6 @@ async fn ensure_for(
         } else {
             Vec::new()
         };
-        // The account and the deploy take catalog connections of their own
-        // from the same pool (4 per cluster); this one isn't held across
-        // them (with the stream's, a first publish needed 3 at once).
-        drop(conn);
         let run_as = ensure_run_as(svc, t, &g, binding.is_none(), &extra).await?;
         let deployed = match deploy(svc, t, &g, &text, src, run_as).await {
             Ok(d) => d,
@@ -274,7 +262,6 @@ async fn ensure_for(
             }
             Err(e) => return Err(e),
         };
-        let mut conn = ep.pool.get_conn_bounded().await.map_err(cat_err)?;
         let physical = json!({
             "binding": deployed.binding_id,
             "module": deployed.module_id,
@@ -283,7 +270,7 @@ async fn ensure_for(
             "source": src.kind.as_str(),
             "stream": src.object_id,
         });
-        set_module_state(&mut conn, &schema, deployed.module_id, "active").await?;
+        set_module_state(&svc.records, t, deployed.module_id, true).await?;
         mstore
             .set_instance(
                 key,
@@ -316,22 +303,16 @@ const CLAIM_ABANDONED_MS: u64 = 30_000;
 /// Sets a module's state (`active` or `disabled`); the trigger job of a
 /// module that isn't active ends at its next check.
 async fn set_module_state(
-    conn: &mut mysql_async::Conn,
-    schema: &str,
+    records: &Arc<dyn sprig_catalog::RecordStore>,
+    t: TenantId,
     module: u64,
-    state: &str,
+    enabled: bool,
 ) -> Result<()> {
-    use mysql_async::prelude::Queryable;
-    conn.exec_drop(
-        format!(
-            "UPDATE {}.logic_modules SET state = ? WHERE module_id = ? AND state IN ('active', \
-             'disabled')",
-            sprig_common::names::quote(schema)
-        ),
-        (state, module),
-    )
-    .await
-    .map_err(cat_err)
+    let mut tx = records.begin(t).await?;
+    sprig_logic::LogicStore::default()
+        .set_module_state(&mut *tx, module, enabled)
+        .await?;
+    tx.commit().await
 }
 
 /// Deploys `text` in `t` as the trigger of `src`, as `run_as`.
@@ -357,18 +338,11 @@ async fn deploy(
         .cloned()
         .ok_or_else(|| SprigError::internal("an instance without its database"))?;
     let ep = svc.locator.writer(t).await?;
-    let mut conn = ep.pool.get_conn_bounded().await.map_err(cat_err)?;
+    let mut conn = svc.records.begin(t).await?;
     // A member's own trigger of the name shadows the inherited one.
-    let store = sprig_logic::LogicStore::new(ep.store.schema());
-    let _ = sprig_catalog::Migrator::new(&[sprig_logic::catalog::LOGIC_MODULE])?
-        .run(
-            &mut conn,
-            ep.store.schema(),
-            &sprig_catalog::migrate::MigrateOpts::existing(),
-        )
-        .await?;
+    let store = sprig_logic::LogicStore::default();
     if let Some(m) = store
-        .module(&mut conn, db_row.db_id.0, "trigger", &decl.name)
+        .module(&mut *conn, db_row.db_id.0, "trigger", &decl.name)
         .await?
         && m.created_by != run_as.0
     {
@@ -378,10 +352,10 @@ async fn deploy(
         )));
     }
     let tname = super::tenant_name(svc, t).await?;
-    messages::deploy(
+    let deployed = messages::deploy(
         &decl,
         messages::MsgTarget {
-            catalog: &mut conn,
+            catalog: &mut *conn,
             catalog_schema: ep.store.schema(),
             catalog_version: cat.version,
             db_id: db_row.db_id.0,
@@ -393,7 +367,9 @@ async fn deploy(
             compile: None,
         },
     )
-    .await
+    .await?;
+    conn.commit().await?;
+    Ok(deployed)
 }
 
 /// The actions of a `GRANTS` item's privilege names.

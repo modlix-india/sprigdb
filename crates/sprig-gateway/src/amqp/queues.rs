@@ -271,8 +271,17 @@ impl GatewayMq {
 impl MqCatalog for GatewayMq {
     async fn open(&self, p: &Principal, vhost: &str) -> Result<VhostRef, MqError> {
         let db = self.database(vhost);
-        let cat = self.catalog(p.tenant_id, Freshness::Latest).await?;
+        let mut cat = self.catalog(p.tenant_id, Freshness::Latest).await?;
         let lctn = self.lctn(&cat);
+        // Vhost `/`'s database (`amqp.default_vhost_database`, `mq`) is
+        // made on first use, as RabbitMQ has `/` from the start; any other
+        // vhost needs its database to exist.
+        if vhost == "/" && cat.database(&database_key(&db, lctn)).is_none() {
+            cat = crate::inherited::ensure_database(&self.svc, TenantId(p.tenant_id), &db)
+                .await
+                .map_err(unavailable)?;
+            tracing::info!(tenant = p.tenant_id, %db, "AMQP: created the database of vhost /");
+        }
         let Some(row) = cat.database(&database_key(&db, lctn)) else {
             return Err(MqError::not_found(format!(
                 "vhost '{vhost}' not found: the tenant has no database '{db}' (amqp.default_vhost_database maps '/')"

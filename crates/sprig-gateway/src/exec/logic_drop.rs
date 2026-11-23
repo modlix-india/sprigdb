@@ -43,8 +43,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use sprig_catalog::CatalogLocator;
-use sprig_catalog::pool_wait::Bounded as _;
 use sprig_common::{Result, SprigCode, SprigError};
 use sprig_logic::catalog::ModuleRow;
 use sprig_logic::declare::Kind;
@@ -63,10 +61,6 @@ use crate::tenant::session::LocalWarning;
 /// How long after an `ENABLE` its index entry is checked again: past a
 /// running job's next check of the module (every 5 s).
 const REENABLE_RECHECK: std::time::Duration = std::time::Duration::from_secs(7);
-
-fn catalog_err(e: mysql_async::Error) -> SprigError {
-    SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
-}
 
 impl PassSession {
     /// A `DROP` of a logic module; `None` when it names no logic module
@@ -191,15 +185,13 @@ impl PassSession {
         };
         let svc = Arc::clone(ts.services());
         let tenant = ts.tenant;
-        let ep = svc.locator.writer(tenant).await?;
-        let store = sprig_logic::LogicStore::new(ep.store.schema());
-        let mut conn = ep.pool.get_conn_bounded().await.map_err(catalog_err)?;
+        let store = sprig_logic::LogicStore::default();
+        let mut conn = svc.records.begin(tenant).await?;
         let module = match store
-            .module(&mut conn, row.db_id.0, d.kind.as_str(), &d.name)
+            .module(&mut *conn, row.db_id.0, d.kind.as_str(), &d.name)
             .await
         {
             Ok(m) => m,
-            Err(e) if format!("{e:?}").contains("1146") => None,
             Err(e) => return Err(e),
         };
         let Some(m) = module else {
@@ -251,14 +243,14 @@ impl PassSession {
         let mut also: Vec<ModuleRow> = Vec::new();
         if matches!(d.kind, Kind::Function | Kind::Procedure) {
             let mut deps =
-                sprig_logic::drop::dependents(&mut conn, &store, row.db_id.0, &row.name, &m)
+                sprig_logic::drop::dependents(&mut *conn, &store, row.db_id.0, &row.name, &m)
                     .await?;
             deps.sinks = sinks_using(ts.catalog(), row.db_id.0, &row.name, &m.name);
             if let Some(e) = deps.refusal(d.kind, &d.name, d.cascade) {
                 return Err(e);
             }
             for (id, name) in &deps.schedules {
-                if let Some(s) = store.module_by_id(&mut conn, *id).await? {
+                if let Some(s) = store.module_by_id(&mut *conn, *id).await? {
                     also.push(s);
                     notes.push(format!("schedule {name} dropped with it (CASCADE)"));
                 }
@@ -278,9 +270,9 @@ impl PassSession {
         }
         // A validation's CHECK constraints go through the DDL path's ALTER
         // TABLE, as the deploy added them.
-        let binding = store.binding(&mut conn, m.module_id).await?;
+        let binding = store.binding(&mut *conn, m.module_id).await?;
         let versions: Vec<u64> = store
-            .versions(&mut conn, m.module_id)
+            .versions(&mut *conn, m.module_id)
             .await?
             .iter()
             .map(|v| v.version)
@@ -307,7 +299,7 @@ impl PassSession {
                 // holds no transaction).
                 drop(conn);
                 self.drop_alter(cx, &alter).await?;
-                conn = ep.pool.get_conn_bounded().await.map_err(catalog_err)?;
+                conn = svc.records.begin(tenant).await?;
             }
         }
         // Every shard: routines, packages, MariaDB triggers.
@@ -327,7 +319,7 @@ impl PassSession {
         }
         for s in &also {
             let vs: Vec<u64> = store
-                .versions(&mut conn, s.module_id)
+                .versions(&mut *conn, s.module_id)
                 .await?
                 .iter()
                 .map(|v| v.version)
@@ -340,11 +332,17 @@ impl PassSession {
         }
         let dc = svc.locator.dc_store();
         for s in &also {
-            sprig_logic::drop::module_dropped(&mut conn, &store, &dc, tenant, s, catalog.version)
+            sprig_logic::drop::module_dropped(&mut *conn, &store, &dc, tenant, s, catalog.version)
                 .await?;
         }
-        sprig_logic::drop::module_dropped(&mut conn, &store, &dc, tenant, &m, catalog.version)
+        sprig_logic::drop::module_dropped(&mut *conn, &store, &dc, tenant, &m, catalog.version)
             .await?;
+        conn.commit().await?;
+        // An after-commit trigger on an engine table holds old row versions
+        // in the node's change log; its drop lets them go.
+        if m.kind == "trigger" {
+            super::change_trigger::release_module(&svc, tenant, m.module_id).await;
+        }
         notes.insert(
             0,
             format!(
@@ -390,16 +388,13 @@ impl PassSession {
         };
         let svc = Arc::clone(ts.services());
         let tenant = ts.tenant;
-        let ep = svc.locator.writer(tenant).await?;
-        let schema = ep.store.schema().to_owned();
-        let store = sprig_logic::LogicStore::new(&schema);
-        let mut conn = ep.pool.get_conn_bounded().await.map_err(catalog_err)?;
+        let store = sprig_logic::LogicStore::default();
+        let mut conn = svc.records.begin(tenant).await?;
         let module = match store
-            .module(&mut conn, row.db_id.0, Kind::Trigger.as_str(), &a.name)
+            .module(&mut *conn, row.db_id.0, Kind::Trigger.as_str(), &a.name)
             .await
         {
             Ok(m) => m,
-            Err(e) if format!("{e:?}").contains("1146") => None,
             Err(e) => return Err(e),
         };
         let not_found = || {
@@ -420,17 +415,19 @@ impl PassSession {
         // (a stream record's or queue message's, an after-commit row's).
         if let Some(op) = &a.rollout {
             let at = (tenant.0, m.module_id);
-            return alter_rollout(&mut conn, &schema, at, a, op, catalog.version, &who).await;
+            let r = alter_rollout(&mut *conn, at, a, op, catalog.version, &who).await?;
+            conn.commit().await?;
+            return Ok(r);
         }
-        let binding = store.binding(&mut conn, m.module_id).await?;
+        let binding = store.binding(&mut *conn, m.module_id).await?;
         if let Some(b) = binding.as_ref().filter(|b| b.timing == "after_commit") {
             let dc = svc.locator.dc_store();
-            let changed = after_commit_toggle(&mut conn, &store, &dc, tenant, b, &m, a).await?;
+            let changed = after_commit_toggle(&mut *conn, &store, &dc, tenant, b, &m, a).await?;
             let state = if a.enable { "enabled" } else { "disabled" };
             let note = if changed {
                 if let Err(e) = store
                     .log(
-                        &mut conn,
+                        &mut *conn,
                         m.module_id,
                         m.active_version,
                         "info",
@@ -453,24 +450,27 @@ impl PassSession {
             } else {
                 format!("trigger {} was already {state}", a.name)
             };
+            conn.commit().await?;
             tracing::info!(%tenant, binding = b.binding_id, trigger = %a.name, state, "after-commit trigger altered");
             return Ok(vec![note]);
         }
-        let (b, src) = message_source(&mut conn, &store, &schema, &catalog, a, m.module_id).await?;
+        let (b, src) = message_source(&mut *conn, &store, &catalog, a, m.module_id).await?;
         let changed = store
-            .set_module_state(&mut conn, m.module_id, a.enable)
+            .set_module_state(&mut *conn, m.module_id, a.enable)
             .await?;
         let index = MsgIndex {
             tenant,
             binding: b.binding_id,
             kind: src.kind,
         };
-        set_indexed(&svc, &ep.pool, schema, m.module_id, index, a.enable).await?;
+        conn.commit().await?;
+        set_indexed(&svc, tenant, m.module_id, index, a.enable).await?;
         let state = if a.enable { "enabled" } else { "disabled" };
         let note = if changed {
+            let mut conn = svc.records.begin(tenant).await?;
             if let Err(e) = store
                 .log(
-                    &mut conn,
+                    &mut *conn,
                     m.module_id,
                     m.active_version,
                     "info",
@@ -481,6 +481,7 @@ impl PassSession {
             {
                 tracing::warn!(error = %e, "logic_log line not written");
             }
+            conn.commit().await?;
             toggled_note(a, &src, state)
         } else {
             format!("trigger {} was already {state}", a.name)
@@ -571,15 +572,13 @@ impl PassSession {
             }
         }
         let svc = Arc::clone(ts.services());
-        let ep = svc.locator.writer(ts.tenant).await?;
-        let store = sprig_logic::LogicStore::new(ep.store.schema());
-        let mut conn = ep.pool.get_conn_bounded().await.map_err(catalog_err)?;
+        let store = sprig_logic::LogicStore::default();
+        let mut conn = svc.records.begin(ts.tenant).await?;
         let module = match store
-            .module(&mut conn, row.db_id.0, d.kind.as_str(), &d.name)
+            .module(&mut *conn, row.db_id.0, d.kind.as_str(), &d.name)
             .await
         {
             Ok(m) => m,
-            Err(e) if format!("{e:?}").contains("1146") => None,
             Err(e) => return Err(e),
         };
         let m = module.ok_or_else(|| {
@@ -589,7 +588,7 @@ impl PassSession {
             )
         })?;
         let mut deps =
-            sprig_logic::drop::dependents(&mut conn, &store, row.db_id.0, &row.name, &m).await?;
+            sprig_logic::drop::dependents(&mut *conn, &store, row.db_id.0, &row.name, &m).await?;
         deps.sinks = sinks_using(ts.catalog(), row.db_id.0, &row.name, &m.name);
         Ok(deps.rows())
     }
@@ -621,8 +620,7 @@ impl PassSession {
 /// rollout's next stage, promotion or end (`sprig_logic::messages`).
 /// `(tenant, module)` names the trigger.
 async fn alter_rollout(
-    conn: &mut mysql_async::Conn,
-    schema: &str,
+    conn: &mut dyn sprig_catalog::RecordTx,
     (tenant, module_id): (u64, u64),
     a: &AlterTrigger,
     op: &std::result::Result<sprig_logic::rollout::RolloutOp, String>,
@@ -634,7 +632,7 @@ async fn alter_rollout(
         .map_err(|msg| SprigError::new(SprigCode::LogicSyntax, msg))?;
     let note = sprig_logic::messages::rollout_change(
         conn,
-        schema,
+        "",
         module_id,
         &a.name,
         op,
@@ -666,8 +664,7 @@ fn toggled_note(a: &AlterTrigger, src: &sprig_logic::messages::SourceRow, state:
 /// module, within 5 s, and its consumer group or queue keeps the position).
 async fn set_indexed(
     svc: &Arc<crate::tenant::TenantServices>,
-    pool: &mysql_async::Pool,
-    schema: String,
+    tenant: sprig_common::ids::TenantId,
     module_id: u64,
     index: MsgIndex,
     enable: bool,
@@ -682,14 +679,14 @@ async fn set_indexed(
     // A job that read the module as disabled just before this may still
     // remove the entry as it ends: put it back once that job's last check
     // has passed.
-    let (locator, pool) = (Arc::clone(&svc.locator), pool.clone());
+    let (locator, records) = (Arc::clone(&svc.locator), Arc::clone(&svc.records));
     tokio::spawn(async move {
         tokio::time::sleep(REENABLE_RECHECK).await;
-        let Ok(mut c) = pool.get_conn_bounded().await else {
+        let Ok(mut c) = records.begin(tenant).await else {
             return;
         };
-        let active = sprig_logic::LogicStore::new(&schema)
-            .module_by_id(&mut c, module_id)
+        let active = sprig_logic::LogicStore::default()
+            .module_by_id(&mut *c, module_id)
             .await
             .ok()
             .flatten()
@@ -716,7 +713,7 @@ async fn set_indexed(
 /// `ENABLE` makes the module active first, then the subscription (a job
 /// starts at the checkpoint). Whether the module's state changed.
 async fn after_commit_toggle(
-    conn: &mut mysql_async::Conn,
+    conn: &mut dyn sprig_catalog::RecordTx,
     store: &sprig_logic::LogicStore,
     dc: &Arc<dyn sprig_meta::MetaStore>,
     tenant: sprig_common::ids::TenantId,
@@ -769,9 +766,8 @@ fn may_alter_trigger(
 /// handled before) and not an inherited trigger's instance (its
 /// definition's overrides would undo the change: 39862).
 async fn message_source(
-    conn: &mut mysql_async::Conn,
+    conn: &mut dyn sprig_catalog::RecordTx,
     store: &sprig_logic::LogicStore,
-    schema: &str,
     catalog: &sprig_catalog::TenantCatalog,
     a: &AlterTrigger,
     module_id: u64,
@@ -796,7 +792,7 @@ async fn message_source(
             ),
         ));
     };
-    let Some(src) = messages::source(conn, schema, b.binding_id).await? else {
+    let Some(src) = messages::source(conn, b.binding_id).await? else {
         return Err(SprigError::new(
             SprigCode::LogicNotFound,
             format!("no trigger {}", a.name),

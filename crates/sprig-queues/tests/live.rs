@@ -60,18 +60,20 @@ fn uniq(p: &str) -> String {
 async fn amqp() -> Option<Connection> {
     let addr = var("SPRIG_AMQP_ADDR")?;
     let (u, p) = (var("SPRIG_AMQP_USER")?, var("SPRIG_AMQP_PASSWORD")?);
+    let mut last = None;
     for _ in 0..60 {
-        if let Ok(c) = Connection::connect(
+        match Connection::connect(
             &format!("amqp://{u}:{p}@{addr}/%2f"),
             ConnectionProperties::default(),
         )
         .await
         {
-            return Some(c);
+            Ok(c) => return Some(c),
+            Err(e) => last = Some(e),
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    panic!("can't connect to {addr}");
+    panic!("can't connect to {addr}: {last:?}");
 }
 
 async fn sql() -> Option<mysql_async::Conn> {

@@ -1055,6 +1055,35 @@ impl SinksStore {
         Ok(true)
     }
 
+    /// Replaces the task's source part under its epoch (a `CHANGES OF`
+    /// task's change position); a stale task writes nothing: `false`.
+    ///
+    /// # Errors
+    /// The record store's.
+    pub async fn save_task_part(
+        &self,
+        sink: SinkId,
+        task_no: TaskNo,
+        epoch: TaskEpoch,
+        part: &Value,
+    ) -> Result<bool> {
+        let pk = Pk::new().u64(sink.0).u32(task_no.0);
+        let mut tx = self.records.begin(self.tenant).await?;
+        let Some(mut r) = TASKS
+            .get_for_update::<TaskRec>(&mut *tx, &pk)
+            .await?
+            .filter(|r| r.epoch == epoch.0)
+        else {
+            let _ = tx.rollback().await;
+            return Ok(false);
+        };
+        r.source_part = part.clone();
+        r.updated_at_ms = now_ms();
+        TASKS.put(&mut *tx, &pk, &r).await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
     /// Writes one dead letter.
     ///
     /// # Errors

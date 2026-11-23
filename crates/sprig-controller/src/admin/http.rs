@@ -122,6 +122,24 @@ fn routes(app: Arc<App>) -> Router {
         )
         .route("/admin/v1/tenants/{name}/graphs", get(list_graphs))
         .route("/admin/v1/tenants/{name}/graphs/{graph}", get(show_graph))
+        .route("/admin/v1/tenants/{name}/logic/modules", get(logic_modules))
+        .route(
+            "/admin/v1/tenants/{name}/logic/modules/{module}",
+            get(logic_module),
+        )
+        .route("/admin/v1/tenants/{name}/logic/logs", get(logic_logs))
+        .route(
+            "/admin/v1/tenants/{name}/logic/dead-letters",
+            get(logic_dead_letters),
+        )
+        .route(
+            "/admin/v1/tenants/{name}/logic/dead-letters:replay",
+            post(logic_replay),
+        )
+        .route(
+            "/admin/v1/tenants/{name}/logic/dead-letters:discard",
+            post(logic_discard),
+        )
         .route(
             "/admin/v1/tenants/{name}/pin",
             post(pin_tenant_cluster).delete(unpin_tenant_cluster),
@@ -1204,6 +1222,100 @@ async fn list_graphs(
     let r = async {
         authorize(&app, &headers)?;
         app.svc.list_graphs(&name).await
+    };
+    respond(r.await)
+}
+
+async fn logic_modules(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    UrlPath(name): UrlPath<String>,
+) -> Response {
+    let r = async {
+        authorize(&app, &headers)?;
+        app.svc.logic_modules(&name).await
+    };
+    respond(r.await)
+}
+
+async fn logic_module(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    UrlPath((name, module)): UrlPath<(String, String)>,
+) -> Response {
+    let r = async {
+        authorize(&app, &headers)?;
+        app.svc.logic_module(&name, &module).await
+    };
+    respond(r.await)
+}
+
+async fn logic_logs(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    UrlPath(name): UrlPath<String>,
+    uri: Uri,
+) -> Response {
+    let r = async {
+        authorize(&app, &headers)?;
+        let q: super::logic_admin::LogsQuery = query(&uri)?;
+        app.svc
+            .logic_logs(
+                &name,
+                q.module.as_deref(),
+                super::logic_admin::num(q.after.as_ref(), "after")?.unwrap_or(0),
+                super::logic_admin::num(q.limit.as_ref(), "limit")?.unwrap_or(50),
+            )
+            .await
+    };
+    respond(r.await)
+}
+
+async fn logic_dead_letters(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    UrlPath(name): UrlPath<String>,
+    uri: Uri,
+) -> Response {
+    let r = async {
+        authorize(&app, &headers)?;
+        let q: super::logic_admin::DeadLettersQuery = query(&uri)?;
+        app.svc
+            .logic_dead_letters(
+                &name,
+                super::logic_admin::num(q.binding.as_ref(), "binding")?,
+                q.state.as_deref(),
+                super::logic_admin::num(q.limit.as_ref(), "limit")?.unwrap_or(100),
+            )
+            .await
+    };
+    respond(r.await)
+}
+
+async fn logic_replay(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    UrlPath(name): UrlPath<String>,
+    body: Bytes,
+) -> Response {
+    let r = async {
+        authorize(&app, &headers)?;
+        let c: super::logic_admin::DeadLetterChange = parse(&body, true)?;
+        app.svc.logic_replay(&name, &c).await
+    };
+    respond(r.await)
+}
+
+async fn logic_discard(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    UrlPath(name): UrlPath<String>,
+    body: Bytes,
+) -> Response {
+    let r = async {
+        authorize(&app, &headers)?;
+        let c: super::logic_admin::DeadLetterChange = parse(&body, true)?;
+        app.svc.logic_discard(&name, &c).await
     };
     respond(r.await)
 }

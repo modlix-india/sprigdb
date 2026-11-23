@@ -61,7 +61,6 @@ sprig-settings.workspace = true
 # The tenant map a cutover holds and flips.
 sprig-shard.workspace = true
 # The router.
-sprig-router.workspace = true
 # The session's backend connection as a transaction branch.
 sprig-txn.workspace = true
 sprig-sql.workspace = true
@@ -87,6 +86,8 @@ sprig-proto-redis = { path = "../sprig-proto-redis" }
 sprig-kv = { path = "../sprig-kv" }
 # SprigDB's storage engine (one per node), and the Redis databases on it.
 sprig-engine = { path = "../sprig-engine" }
+# Replicated engine units: the node joins its tenant units' Raft groups at start.
+sprig-raft = { path = "../sprig-raft" }
 # The SQL planner and executor that general SELECTs on engine tables run on.
 sprig-plan.workspace = true
 sprig-exec.workspace = true

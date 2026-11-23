@@ -74,13 +74,6 @@ impl PassSession {
         self.engine_streams(cx, text, more, format, cat, out).await
     }
 
-    /// Whether `sql` publishes into a stream through the prepared-statement
-    /// path: never; prepared statements on streams answer 1235.
-    #[allow(clippy::unused_self)]
-    pub(super) fn stream_publish(&self, _sql: &[u8]) -> bool {
-        false
-    }
-
     /// `COM_STMT_PREPARE` of a publish into a stream: none (see
     /// [`Self::stream_publish`]).
     #[allow(clippy::unused_self)]

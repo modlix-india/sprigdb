@@ -126,6 +126,19 @@ pub fn errno(e: &SprigError) -> Option<u16> {
     }
 }
 
+/// 1213: the unit's leadership left this node while the transaction held
+/// or waited for its locks; it is rolled back and can be retried (on the
+/// new leader).
+#[must_use]
+pub fn leader_lost() -> SprigError {
+    SprigError::standard(
+        ER_LOCK_DEADLOCK,
+        *b"40001",
+        "Deadlock found when trying to get lock; try restarting transaction (the data's leader \
+         changed)",
+    )
+}
+
 /// The log failed before the outcome was durable: the transaction did not
 /// happen. Reported as 1213 so clients and ORMs retry it.
 #[must_use]

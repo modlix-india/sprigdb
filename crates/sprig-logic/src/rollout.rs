@@ -42,22 +42,21 @@
 //!
 //! **Numbers and the automatic rollback.** Gateways count calls, errors
 //! and a latency histogram per version (`Stats`) and add them to
-//! `logic_version_stats` every few seconds. After adding, a gateway
+//! the version's numbers (records) every few seconds. After adding, a gateway
 //! compares the candidate with the active version ([`verdict`]): with at
 //! least [`MIN_CALLS`] candidate calls, an error rate above twice the
 //! active one's and above 1%, or (both with [`MIN_CALLS`]) a p95 above
 //! twice the active one's, aborts the rollout as `ROLLOUT ABORT` would,
-//! and says why in `logic_log`. Counting starts again for both versions
+//! and says why in the run log. Counting starts again for both versions
 //! when a rollout starts.
 //!
 //! As built there is no soak timer: each stage is set by hand (or by
 //! `sprigctl logic deploy --rollout`), and the automatic rollback is the
 //! guard while it runs.
 
-use mysql_async::Conn;
-use mysql_async::prelude::Queryable;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sprig_catalog::records::{Pk, RecordTx, RowTable};
 use sprig_common::{Result, SprigCode, SprigError};
 use sprig_logic_compile::ir::{EventDef, Function, Param, Ty};
 
@@ -68,53 +67,8 @@ pub const MIN_CALLS: u64 = 20;
 /// last bucket holds everything slower.
 pub const BUCKETS_MS: [u64; 11] = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 5000];
 
-/// Migration 6: `by_key` holds `key` (a trigger's record key) and
-/// `key:<position>` (a function's argument) too.
-pub const DDL_ROLLOUTS_BY_KEY: &str =
-    "ALTER TABLE logic_rollouts MODIFY by_key VARCHAR(80) NOT NULL DEFAULT 'user'";
-
-/// `logic_rollouts`: one row per module with a candidate (migration 5).
-pub const DDL_ROLLOUTS: &str = "CREATE TABLE IF NOT EXISTS logic_rollouts (
-  module_id         BIGINT UNSIGNED NOT NULL,
-  active_version    BIGINT UNSIGNED NOT NULL,
-  candidate_version BIGINT UNSIGNED NOT NULL,
-  pct               TINYINT UNSIGNED NOT NULL,
-  by_key            ENUM('user','tenant') NOT NULL DEFAULT 'user',
-  started_at        DATETIME(6)     NOT NULL,
-  changed_at        DATETIME(6)     NOT NULL,
-  PRIMARY KEY (module_id)
-) ENGINE=InnoDB";
-
-/// `logic_version_stats`: calls, errors and latency per version, as
-/// gateways add them (migration 5).
-pub const DDL_STATS: &str = "CREATE TABLE IF NOT EXISTS logic_version_stats (
-  module_id BIGINT UNSIGNED NOT NULL,
-  version   BIGINT UNSIGNED NOT NULL,
-  calls     BIGINT UNSIGNED NOT NULL DEFAULT 0,
-  errors    BIGINT UNSIGNED NOT NULL DEFAULT 0,
-  total_us  BIGINT UNSIGNED NOT NULL DEFAULT 0,
-  hist      VARCHAR(512)    NOT NULL DEFAULT '',
-  since     DATETIME(6)     NOT NULL,
-  updated   DATETIME(6)     NOT NULL,
-  PRIMARY KEY (module_id, version)
-) ENGINE=InnoDB";
-
 fn syntax(m: impl Into<String>) -> SprigError {
     SprigError::new(SprigCode::LogicSyntax, m)
-}
-
-fn map_err(e: mysql_async::Error) -> SprigError {
-    SprigError::new(
-        SprigCode::CatalogUnavailable,
-        "the logic catalog is unreachable",
-    )
-    .with_source(e)
-}
-
-/// A tenant whose catalog has no rollout tables yet (they come with its
-/// first deploy after this version) has no rollouts.
-fn missing_table(e: &mysql_async::Error) -> bool {
-    matches!(e, mysql_async::Error::Server(s) if s.code == 1146)
 }
 
 /// What a caller's pick is keyed on.
@@ -362,171 +316,138 @@ impl Rollout {
     }
 }
 
-fn q(schema: &str) -> String {
-    sprig_common::names::quote(schema)
+/// Rollouts by module.
+const ROLLOUTS: RowTable = RowTable::new(crate::catalog::MODULE, "rollouts");
+/// Call numbers by module and version.
+const STATS: RowTable = RowTable::new(crate::catalog::MODULE, "stats");
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RollRec {
+    module_id: u64,
+    active_version: u64,
+    candidate_version: u64,
+    pct: u8,
+    by_key: String,
+    started_us: u64,
 }
 
-/// Records a rollout's stage (a new candidate resets both versions'
-/// numbers), and its `candidate_version` and `candidate_pct`.
+impl RollRec {
+    fn rollout(&self) -> Rollout {
+        Rollout {
+            module_id: self.module_id,
+            active_version: self.active_version,
+            candidate_version: self.candidate_version,
+            pct: self.pct,
+            by: RolloutBy::parse(&self.by_key).unwrap_or_default(),
+            started_at: iso(self.started_us),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StatRec {
+    calls: u64,
+    errors: u64,
+    total_us: u64,
+    hist: [u64; 12],
+    since_us: u64,
+}
+
+fn now_us() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX))
+}
+
+/// `us` as `YYYY-MM-DDThh:mm:ss.ffffffZ`.
+fn iso(us: u64) -> String {
+    let (t, f) = crate::catalog::utc_text(us);
+    format!("{}T{}.{f:06}Z", &t[..10], &t[11..])
+}
+
+/// Starts or changes `module_id`'s rollout of `candidate` over `active`
+/// (a new pair of versions starts its numbers again).
 ///
 /// # Errors
-/// 39070 or a backend error.
+/// The record store's.
 pub async fn put(
-    c: &mut Conn,
-    schema: &str,
+    c: &mut dyn RecordTx,
     module_id: u64,
     active: u64,
     candidate: u64,
     spec: RolloutSpec,
 ) -> Result<()> {
-    let s = q(schema);
-    let prev: Option<(u64, u64)> = c
-        .exec_first(
-            format!(
-                "SELECT active_version, candidate_version FROM {s}.logic_rollouts WHERE module_id = ?"
-            ),
-            (module_id,),
-        )
-        .await
-        .map_err(map_err)?;
-    let fresh = prev != Some((active, candidate));
+    let pk = Pk::new().u64(module_id);
+    let prev = ROLLOUTS.get_for_update::<RollRec>(c, &pk).await?;
+    let fresh = prev
+        .as_ref()
+        .is_none_or(|p| (p.active_version, p.candidate_version) != (active, candidate));
     if fresh {
-        c.exec_drop(
-            format!("DELETE FROM {s}.logic_version_stats WHERE module_id = ?"),
-            (module_id,),
-        )
-        .await
-        .map_err(map_err)?;
+        for (spk, _) in STATS.scan::<StatRec>(c, &pk).await? {
+            STATS.delete(c, &spk).await?;
+        }
     }
-    c.exec_drop(
-        format!(
-            "INSERT INTO {s}.logic_rollouts (module_id, active_version, candidate_version, pct, by_key, \
-             started_at, changed_at) VALUES (?, ?, ?, ?, ?, UTC_TIMESTAMP(6), UTC_TIMESTAMP(6)) \
-             ON DUPLICATE KEY UPDATE pct = VALUES(pct), by_key = VALUES(by_key), \
-             changed_at = VALUES(changed_at), \
-             started_at = IF(active_version = VALUES(active_version) AND \
-               candidate_version = VALUES(candidate_version), started_at, VALUES(started_at)), \
-             active_version = VALUES(active_version), candidate_version = VALUES(candidate_version)"
-        ),
-        (module_id, active, candidate, spec.pct, spec.by.stored()),
-    )
-    .await
-    .map_err(map_err)?;
-    c.exec_drop(
-        format!(
-            "UPDATE {s}.logic_modules SET candidate_version = ?, candidate_pct = ? WHERE module_id = ?"
-        ),
-        (candidate, spec.pct, module_id),
-    )
-    .await
-    .map_err(map_err)?;
-    c.exec_drop(
-        format!(
-            "UPDATE {s}.logic_versions SET state = 'rolling_out' WHERE module_id = ? AND version = ?"
-        ),
-        (module_id, candidate),
-    )
-    .await
-    .map_err(map_err)
+    let started_us = match (&prev, fresh) {
+        (Some(p), false) => p.started_us,
+        _ => now_us(),
+    };
+    let rec = RollRec {
+        module_id,
+        active_version: active,
+        candidate_version: candidate,
+        pct: spec.pct,
+        by_key: spec.by.stored(),
+        started_us,
+    };
+    ROLLOUTS.put(c, &pk, &rec).await?;
+    crate::LogicStore::set_candidate(c, module_id, Some((candidate, spec.pct))).await?;
+    crate::LogicStore::set_versions_state(c, module_id, Some(candidate), None, "rolling_out").await
 }
 
-/// Ends a module's rollout, if it has one (the candidate, unless it was
-/// just activated, goes back to `superseded`).
+/// Ends `module_id`'s rollout: the candidate goes back to superseded.
+/// Returns the rollout it ended.
 ///
 /// # Errors
-/// 39070 or a backend error.
-pub async fn clear(c: &mut Conn, schema: &str, module_id: u64) -> Result<Option<Rollout>> {
-    let prev = get(c, schema, module_id).await?;
-    let s = q(schema);
+/// The record store's.
+pub async fn clear(c: &mut dyn RecordTx, module_id: u64) -> Result<Option<Rollout>> {
+    let prev = get(c, module_id).await?;
     if prev.is_some() {
-        c.exec_drop(
-            format!("DELETE FROM {s}.logic_rollouts WHERE module_id = ?"),
-            (module_id,),
-        )
-        .await
-        .map_err(map_err)?;
+        ROLLOUTS.delete(c, &Pk::new().u64(module_id)).await?;
     }
-    c.exec_drop(
-        format!(
-            "UPDATE {s}.logic_modules SET candidate_version = NULL, candidate_pct = 0 WHERE module_id = ?"
-        ),
-        (module_id,),
-    )
-    .await
-    .map_err(map_err)?;
-    c.exec_drop(
-        format!(
-            "UPDATE {s}.logic_versions SET state = 'superseded' WHERE module_id = ? AND state = 'rolling_out'"
-        ),
-        (module_id,),
-    )
-    .await
-    .map_err(map_err)?;
+    crate::LogicStore::set_candidate(c, module_id, None).await?;
+    crate::LogicStore::set_versions_state(c, module_id, None, Some("rolling_out"), "superseded")
+        .await?;
     Ok(prev)
 }
 
-type RolloutTuple = (u64, u64, u64, u8, String, String);
-
-fn rollout_of(t: RolloutTuple) -> Rollout {
-    Rollout {
-        module_id: t.0,
-        active_version: t.1,
-        candidate_version: t.2,
-        pct: t.3,
-        by: RolloutBy::parse(&t.4).unwrap_or_default(),
-        started_at: t.5,
-    }
-}
-
-const ROLLOUT_COLS: &str = "module_id, active_version, candidate_version, pct, CAST(by_key AS CHAR), \
-     DATE_FORMAT(started_at, '%Y-%m-%dT%H:%i:%s.%fZ')";
-
-/// A module's rollout.
+/// `module_id`'s rollout.
 ///
 /// # Errors
-/// 39070 or a backend error.
-pub async fn get(c: &mut Conn, schema: &str, module_id: u64) -> Result<Option<Rollout>> {
-    let r: std::result::Result<Option<RolloutTuple>, _> = c
-        .exec_first(
-            format!(
-                "SELECT {ROLLOUT_COLS} FROM {}.logic_rollouts WHERE module_id = ?",
-                q(schema)
-            ),
-            (module_id,),
-        )
-        .await;
-    match r {
-        Err(e) if missing_table(&e) => Ok(None),
-        r => Ok(r.map_err(map_err)?.map(rollout_of)),
-    }
+/// The record store's.
+pub async fn get(c: &mut dyn RecordTx, module_id: u64) -> Result<Option<Rollout>> {
+    Ok(ROLLOUTS
+        .get::<RollRec>(c, &Pk::new().u64(module_id))
+        .await?
+        .map(|r| r.rollout()))
 }
 
-/// Every rollout of the tenant, with each module's database and name,
-/// for the gateway's cache.
+/// Every rollout of a live function or procedure, with its database and
+/// name.
 ///
 /// # Errors
-/// 39070 or a backend error.
-pub async fn all(c: &mut Conn, schema: &str) -> Result<Vec<(u32, String, Rollout)>> {
-    type T = (u32, String, u64, u64, u64, u8, String, String);
-    let s = q(schema);
-    let r: std::result::Result<Vec<T>, _> = c
-        .query(format!(
-            "SELECT m.db_id, m.name, r.module_id, r.active_version, r.candidate_version, r.pct, \
-             CAST(r.by_key AS CHAR), DATE_FORMAT(r.started_at, '%Y-%m-%dT%H:%i:%s.%fZ') \
-             FROM {s}.logic_rollouts r JOIN {s}.logic_modules m ON m.module_id = r.module_id \
-             WHERE m.state = 'active' AND m.kind IN ('function', 'procedure')"
-        ))
-        .await;
-    match r {
-        Err(e) if missing_table(&e) => Ok(Vec::new()),
-        r => Ok(r
-            .map_err(map_err)?
-            .into_iter()
-            .map(|(db, name, m, a, cand, p, by, at)| {
-                (db, name, rollout_of((m, a, cand, p, by, at)))
-            })
-            .collect()),
+/// The record store's.
+pub async fn all(c: &mut dyn RecordTx) -> Result<Vec<(u32, String, Rollout)>> {
+    let store = crate::LogicStore::new("");
+    let mut out = Vec::new();
+    for r in ROLLOUTS.rows::<RollRec>(c, &Pk::new()).await? {
+        if let Some(m) = store.module_by_id(c, r.module_id).await?
+            && m.state == "active"
+            && matches!(m.kind.as_str(), "function" | "procedure")
+        {
+            out.push((m.db_id, m.name, r.rollout()));
+        }
     }
+    Ok(out)
 }
 
 /// Calls of one version counted by one gateway since its last flush.
@@ -556,49 +477,30 @@ impl Acc {
     }
 }
 
-fn hist_text(h: &[u64; 12]) -> String {
-    h.iter().map(u64::to_string).collect::<Vec<_>>().join(",")
-}
-
-fn hist_parse(s: &str) -> [u64; 12] {
-    let mut h = [0u64; 12];
-    for (i, x) in s.split(',').take(12).enumerate() {
-        h[i] = x.trim().parse().unwrap_or(0);
-    }
-    h
-}
-
-/// Adds one gateway's counts to `logic_version_stats`.
+/// Adds one gateway's counts to the versions' numbers.
 ///
 /// # Errors
-/// 39070 or a backend error.
-pub async fn flush(c: &mut Conn, schema: &str, rows: &[((u64, u64), Acc)]) -> Result<()> {
-    let s = q(schema);
+/// The record store's.
+pub async fn flush(c: &mut dyn RecordTx, rows: &[((u64, u64), Acc)]) -> Result<()> {
     for ((module, version), a) in rows {
-        let prev: Option<String> = c
-            .exec_first(
-                format!(
-                    "SELECT hist FROM {s}.logic_version_stats WHERE module_id = ? AND version = ? FOR UPDATE"
-                ),
-                (module, version),
-            )
-            .await
-            .map_err(map_err)?;
-        let mut h = prev.as_deref().map(hist_parse).unwrap_or_default();
-        for (x, y) in h.iter_mut().zip(a.hist) {
+        let pk = Pk::new().u64(*module).u64(*version);
+        let mut st = STATS
+            .get_for_update::<StatRec>(c, &pk)
+            .await?
+            .unwrap_or(StatRec {
+                calls: 0,
+                errors: 0,
+                total_us: 0,
+                hist: [0; 12],
+                since_us: now_us(),
+            });
+        st.calls += a.calls;
+        st.errors += a.errors;
+        st.total_us += a.total_us;
+        for (x, y) in st.hist.iter_mut().zip(a.hist) {
             *x += y;
         }
-        c.exec_drop(
-            format!(
-                "INSERT INTO {s}.logic_version_stats (module_id, version, calls, errors, total_us, hist, since, updated) \
-                 VALUES (?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(6), UTC_TIMESTAMP(6)) ON DUPLICATE KEY UPDATE \
-                 calls = calls + VALUES(calls), errors = errors + VALUES(errors), \
-                 total_us = total_us + VALUES(total_us), hist = VALUES(hist), updated = VALUES(updated)"
-            ),
-            (module, version, a.calls, a.errors, a.total_us, hist_text(&h)),
-        )
-        .await
-        .map_err(map_err)?;
+        STATS.put(c, &pk, &st).await?;
     }
     Ok(())
 }
@@ -641,30 +543,24 @@ fn p95(h: &[u64; 12], calls: u64) -> Option<u64> {
     None
 }
 
-/// The numbers of every version of `module_id` that has any.
+/// The numbers of `module_id`'s versions, newest first.
 ///
 /// # Errors
-/// 39070 or a backend error.
-pub async fn stats(c: &mut Conn, schema: &str, module_id: u64) -> Result<Vec<VersionStats>> {
-    type T = (u64, u64, u64, u64, String, String);
-    let r: std::result::Result<Vec<T>, _> = c
-        .exec(
-            format!(
-                "SELECT version, calls, errors, total_us, hist, DATE_FORMAT(since, '%Y-%m-%dT%H:%i:%s.%fZ') \
-                 FROM {}.logic_version_stats WHERE module_id = ? ORDER BY version DESC",
-                q(schema)
-            ),
-            (module_id,),
-        )
-        .await;
-    let rows = match r {
-        Err(e) if missing_table(&e) => Vec::new(),
-        r => r.map_err(map_err)?,
-    };
+/// The record store's.
+pub async fn stats(c: &mut dyn RecordTx, module_id: u64) -> Result<Vec<VersionStats>> {
+    let mut rows: Vec<(u64, u64, u64, u64, [u64; 12], String)> = STATS
+        .scan::<StatRec>(c, &Pk::new().u64(module_id))
+        .await?
+        .into_iter()
+        .filter_map(|(pk, s)| {
+            let v = u64::from_be_bytes(pk.0.get(pk.0.len().checked_sub(8)?..)?.try_into().ok()?);
+            Some((v, s.calls, s.errors, s.total_us, s.hist, iso(s.since_us)))
+        })
+        .collect();
+    rows.reverse();
     Ok(rows
         .into_iter()
-        .map(|(version, calls, errors, total_us, hist, since)| {
-            let h = hist_parse(&hist);
+        .map(|(version, calls, errors, total_us, h, since)| {
             #[allow(clippy::cast_precision_loss)]
             let (rate, mean) = if calls == 0 {
                 (0.0, 0.0)
@@ -849,7 +745,6 @@ mod tests {
         assert_eq!((a.calls, a.errors), (100, 2));
         assert_eq!(a.hist.iter().sum::<u64>(), 100);
         assert_eq!(p95(&a.hist, a.calls), Some(10));
-        assert_eq!(hist_parse(&hist_text(&a.hist)), a.hist);
         let vs = |calls, errors, p95_ms| VersionStats {
             version: 1,
             calls,

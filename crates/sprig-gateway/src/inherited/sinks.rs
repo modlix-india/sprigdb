@@ -1660,8 +1660,8 @@ impl Host for DeployHost {
     }
 
     async fn function_source(&mut self, db: u32, name: &str) -> Result<Option<(String, String)>> {
-        let (mut c, schema) = self.conn().await?;
-        Ok(sprig_sinks::transform::source_of(&mut c, &schema, db, name)
+        let mut c = self.svc.records.begin(self.cat.tenant).await?;
+        Ok(sprig_sinks::transform::source_of(&mut *c, db, name)
             .await?
             .map(|(runtime, _, source, _)| (runtime, source)))
     }

@@ -19,9 +19,6 @@
 //!   path), and the backend connection reads through the session's policy
 //!   views as every statement does
 //!   ([`BackendSession::execute`](crate::backend::BackendSession::execute));
-//! - **routing**: a tenant with grouped tables goes through the router:
-//!   always the general path. Whether it has any is kept per (catalog
-//!   version, home, map generation);
 //! - **state**: the backend session syncs its variables (`max_statement_time`
 //!   of `maxTimeMS`, the schema) and routes the read (writer, or a replica
 //!   that has the session's writes) as for any statement.
@@ -33,7 +30,6 @@
 
 use bytes::Bytes;
 use sprig_common::Result;
-use sprig_common::ids::{ClusterId, DcId};
 use sprig_proto_mysql::ColumnDef;
 use sprig_proto_mysql::client::PacketKind;
 use sprig_proto_mysql::command::ExecuteParams;
@@ -43,13 +39,6 @@ use super::stmt::execute_payload;
 use crate::backend::BackendStmt;
 use crate::backend::classify::StmtClass;
 use crate::pipeline::{ExecCtx, PointRead, StmtRef};
-
-/// What decided that the tenant's statements aren't routed, kept per
-/// (catalog version, home, map generation).
-#[derive(Debug, Default)]
-pub(super) struct PointMemo {
-    unrouted: Option<(u64, DcId, u64, ClusterId)>,
-}
 
 impl PassSession {
     /// [`SessionExec::point_read`](crate::pipeline::SessionExec::point_read);
@@ -68,7 +57,7 @@ impl PassSession {
         // A session in a transaction (the router's or the backend's), with
         // a recording branch or with state pinned to its connection, and
         // one whose tenant defaults aren't applied yet: the general path.
-        if !self.globals_applied || self.router.in_txn() {
+        if !self.globals_applied {
             return fallback;
         }
         if self
@@ -88,9 +77,9 @@ impl PassSession {
         {
             return fallback;
         }
-        let Ok(cat) = ts.refresh().await else {
+        if ts.refresh().await.is_err() {
             return fallback;
-        };
+        }
         let persona = self.persona;
         let Ok(s) = self.stmts.get_mut(stmt) else {
             return fallback;
@@ -122,14 +111,6 @@ impl PassSession {
         }
         let (sql, info, logical) = (s.sql.clone(), s.info.clone(), s.logical.clone());
         let columns: Vec<(u8, bool)> = s.columns.iter().map(binary_type).collect();
-        // Routing: kept per catalog version and map generation.
-        let key = (cat.version, home, generation, self.target.cluster.clone());
-        if self.point_memo.unrouted.as_ref() != Some(&key) {
-            if self.routes().await {
-                return fallback;
-            }
-            self.point_memo.unrouted = Some(key);
-        }
         if let Some(ts) = self.tenant.as_deref() {
             ts.services()
                 .locator

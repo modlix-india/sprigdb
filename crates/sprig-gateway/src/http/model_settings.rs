@@ -30,6 +30,20 @@ const DB_TENANT_DC: Scopes = Scopes(0b11_0110);
 /// Tenant (and its ancestors), dc and global.
 const TENANT_DC: Scopes = Scopes(0b11_0100);
 
+/// `analytics.max_concurrent_per_gateway`: analytic reads one gateway runs
+/// at once (read when the first one runs).
+pub static ANALYTICS_MAX_CONCURRENT: Setting<u64> = Setting {
+    key: "analytics.max_concurrent_per_gateway",
+    default: 8,
+    scopes: Scopes::PROCESS,
+    hard: HardBounds::range(1, 1024),
+    apply: Apply::Live,
+    operator_only: false,
+    owner: 35,
+    doc: "Queries per gateway",
+};
+sprig_settings::register!(ANALYTICS_MAX_CONCURRENT);
+
 macro_rules! key {
     ($(#[$doc:meta])* $name:ident: $t:ty = $key:literal, $default:expr, $scopes:expr, $hard:expr, $owner:literal, $text:literal) => {
         $(#[$doc])*
@@ -202,7 +216,7 @@ pub fn analytics_for(engine: &SqlEngine, caller: &Caller, database: &str) -> Ana
         max_groups: us(r.capped(&ANALYTICS_MAX_GROUPS)),
         timeout: Duration::from_secs(r.capped(&ANALYTICS_QUERY_TIMEOUT)),
         per_tenant: us(r.capped(&ANALYTICS_PER_TENANT)),
-        per_gateway: us(r.process(&sprig_router::settings::ANALYTICS_MAX_CONCURRENT)),
+        per_gateway: us(r.process(&ANALYTICS_MAX_CONCURRENT)),
     }
 }
 
@@ -258,7 +272,7 @@ pub fn analytics(src: &ApiSettingsSource) -> Analytics {
         max_groups: us(&ANALYTICS_MAX_GROUPS),
         timeout: Duration::from_secs(snap.get(&ANALYTICS_QUERY_TIMEOUT, &cx)),
         per_tenant: us(&ANALYTICS_PER_TENANT),
-        per_gateway: us(&sprig_router::settings::ANALYTICS_MAX_CONCURRENT),
+        per_gateway: us(&ANALYTICS_MAX_CONCURRENT),
     }
 }
 

@@ -182,15 +182,6 @@ impl GwHost<'_> {
         g.allows(a, Target::Tenant)
     }
 
-    async fn catalog_conn(&self) -> Result<(mysql_async::Conn, String)> {
-        let ts = self.ts().ok_or_else(|| SprigError::internal("no tenant"))?;
-        let ep = ts.services().locator.writer(self.cat.tenant).await?;
-        let conn = ep.pool.get_conn_bounded().await.map_err(|e| {
-            SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
-        })?;
-        Ok((conn, ep.store.schema().to_owned()))
-    }
-
     /// The tenant's sink records (tasks, live states).
     fn sinks_store(&self) -> Result<sprig_sinks::store::SinksStore> {
         let ts = self.ts().ok_or_else(|| SprigError::internal("no tenant"))?;
@@ -296,6 +287,17 @@ impl Host for GwHost<'_> {
             .get(name)
             .filter(|q| q.durable && q.temp_on.is_none())
             .map(|q| q.id)
+    }
+
+    // An engine table (`CHANGES OF t`): names compare as the tenant's
+    // `lower_case_table_names` says.
+    fn table(&self, db: u32, name: &str) -> Option<u64> {
+        let e = crate::engine::catalog::of(&self.cat)?;
+        e.table(sprig_common::ids::DbId(db), name, self.lctn())?
+            .as_ref()
+            .as_ref()
+            .ok()
+            .map(|d| d.object.0)
     }
 
     fn setting(&self, key: &str, db: u32) -> Option<String> {
@@ -493,8 +495,9 @@ impl Host for GwHost<'_> {
     }
 
     async fn function_source(&mut self, db: u32, name: &str) -> Result<Option<(String, String)>> {
-        let (mut c, schema) = self.catalog_conn().await?;
-        Ok(sprig_sinks::transform::source_of(&mut c, &schema, db, name)
+        let ts = self.ts().ok_or_else(|| SprigError::internal("no tenant"))?;
+        let mut c = ts.services().records.begin(self.cat.tenant).await?;
+        Ok(sprig_sinks::transform::source_of(&mut *c, db, name)
             .await?
             .map(|(runtime, _, source, _)| (runtime, source)))
     }
@@ -505,8 +508,9 @@ impl Host for GwHost<'_> {
         name: &str,
         version: Option<u64>,
     ) -> Result<Option<(String, u64, String, serde_json::Value)>> {
-        let (mut c, schema) = self.catalog_conn().await?;
-        sprig_sinks::transform::source_at(&mut c, &schema, db, name, version).await
+        let ts = self.ts().ok_or_else(|| SprigError::internal("no tenant"))?;
+        let mut c = ts.services().records.begin(self.cat.tenant).await?;
+        sprig_sinks::transform::source_at(&mut *c, db, name, version).await
     }
 
     async fn platform_granted(&mut self) -> Result<Vec<PlatformConnection>> {

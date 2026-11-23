@@ -128,9 +128,8 @@ impl PassSession {
         let Ok(cat) = ts.refresh().await else {
             return Ok(None);
         };
-        // A child tenant's adopted shares, and tables the advisor grouped
-        // (routed): the long way.
-        if !cat.ancestry.is_empty() || crate::exec::router::layout::Layouts::has_groups(&cat) {
+        // A child tenant's adopted shares: the long way.
+        if !cat.ancestry.is_empty() {
             return Ok(None);
         }
         let Some(eng) = catalog::of(&cat) else {

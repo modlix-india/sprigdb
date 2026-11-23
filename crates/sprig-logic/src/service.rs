@@ -7,14 +7,12 @@
 //! offline suite in `sprig-logic-compile`. Earlier versions' routines stay
 //! in the shard schema; nothing contracts them yet.
 
-use mysql_async::Conn;
 use serde::Serialize;
-use sprig_catalog::migrate::MigrateOpts;
-use sprig_catalog::{Migrator, Store};
+use sprig_catalog::records::RecordTx;
 use sprig_common::{Result, SprigCode, SprigError};
 use sprig_logic_compile::{Options, Reason, StaticColumns, compile, sql};
 
-use crate::catalog::{LOGIC_MODULE, LogicStore, ModuleRow, NewVersion};
+use crate::catalog::{LogicStore, ModuleRow, NewVersion};
 use crate::declare::Declaration;
 use crate::deploy::{self, Session, WrapperSpec};
 use crate::placement::{self, Placement, Tier};
@@ -22,7 +20,7 @@ use crate::placement::{self, Placement, Tier};
 /// Where a declaration deploys.
 pub struct Target<'a> {
     /// The tenant's catalog writer.
-    pub catalog: &'a mut Conn,
+    pub catalog: &'a mut dyn RecordTx,
     /// `t<tenant>_sprig`.
     pub catalog_schema: &'a str,
     /// The catalog version the session saw.
@@ -520,7 +518,7 @@ pub async fn deploy(
 /// # Errors
 /// 39875; the catalog's.
 async fn computed_dependents(
-    c: &mut Conn,
+    c: &mut dyn RecordTx,
     store: &LogicStore,
     prev: &ModuleRow,
     f: &sprig_logic_compile::Function,
@@ -602,6 +600,10 @@ pub struct At<'a> {
     /// The database's streams, for a compiled `db.publish`
     /// ([`crate::calls::Env::with_streams`]).
     pub streams: StreamList,
+    /// The database has no MariaDB schema (an engine database): an
+    /// engine-tier version gets no wrapper routines there; the gateway
+    /// answers its `CALL` and `SELECT f(...)` from the records.
+    pub no_mariadb: bool,
 }
 
 /// Streams by name: what a compiled `db.publish` writes, or why it can't.
@@ -622,9 +624,6 @@ pub async fn deploy_at(
     creator: Option<Creator<'_>>,
     at: At<'_>,
 ) -> Result<Outcome> {
-    Migrator::new(&[LOGIC_MODULE])?
-        .run(t.catalog, t.catalog_schema, &MigrateOpts::default())
-        .await?;
     let store = LogicStore::new(t.catalog_schema);
     let kind = d.kind.as_str();
     let existing = store.module(t.catalog, t.db_id, kind, &d.name).await?;
@@ -649,10 +648,12 @@ pub async fn deploy_at(
             m
         }
         None => ModuleRow {
-            module_id: Store::new(t.catalog_schema)
-                .next_object_id(t.catalog)
-                .await?
-                .0,
+            module_id: sprig_catalog::store::rec::CoreRecords::next_ids(
+                t.catalog,
+                sprig_catalog::store::Counter::Object,
+                1,
+            )
+            .await?,
             db_id: t.db_id,
             name: d.name.clone(),
             kind: kind.to_owned(),
@@ -675,7 +676,7 @@ pub async fn deploy_at(
     };
     let cols = columns(session, t.shard_schema).await?;
     let env = crate::calls::Env::new(cols, at.db_name)
-        .with_callees(crate::calls::callees(t.catalog, t.catalog_schema, t.db_id).await?)
+        .with_callees(crate::calls::callees(t.catalog, t.db_id).await?)
         .with_streams(&at.streams);
     let opts = Options {
         module_id: module.module_id,
@@ -727,7 +728,6 @@ pub async fn deploy_at(
     if let (Some(prev), Some(f)) = (&previous, &compiled.ir) {
         crate::calls::check_callers(
             t.catalog,
-            t.catalog_schema,
             t.db_id,
             crate::calls::NewVersion {
                 module_id: prev.module_id,
@@ -1015,6 +1015,12 @@ pub async fn deploy_at(
         }
         (None, _, _) => None,
     };
+    let plan = if at.no_mariadb && placed.tier == Tier::Engine {
+        select_fn = None;
+        None
+    } else {
+        plan
+    };
     let plan = match (plan, &creator) {
         (Some(mut p), Some(c)) => {
             p.definer = Some(c.definer.clone());
@@ -1053,15 +1059,7 @@ pub async fn deploy_at(
     };
     let staged = stage.as_ref().map(|(spec, _)| *spec);
     if let Some((spec, av)) = &stage {
-        crate::rollout::put(
-            t.catalog,
-            t.catalog_schema,
-            module.module_id,
-            av.version,
-            version,
-            *spec,
-        )
-        .await?;
+        crate::rollout::put(t.catalog, module.module_id, av.version, version, *spec).await?;
         rollout_notes.push(format!(
             "version {version} is the candidate for {}% of callers (by {}); version {} answers the rest. \
              ALTER {} {} ROLLOUT TO n | PROMOTE | ABORT",
@@ -1076,8 +1074,7 @@ pub async fn deploy_at(
             .activate(t.catalog, module.module_id, version, t.catalog_version)
             .await?;
         if matches!(d.kind, Kind::Function | Kind::Procedure)
-            && let Some(r) =
-                crate::rollout::clear(t.catalog, t.catalog_schema, module.module_id).await?
+            && let Some(r) = crate::rollout::clear(t.catalog, module.module_id).await?
         {
             rollout_notes.push(format!(
                 "the rollout of version {} ended; version {version} is active",
@@ -1229,10 +1226,12 @@ async fn module_for(
         }
         None => (
             ModuleRow {
-                module_id: Store::new(t.catalog_schema)
-                    .next_object_id(t.catalog)
-                    .await?
-                    .0,
+                module_id: sprig_catalog::store::rec::CoreRecords::next_ids(
+                    t.catalog,
+                    sprig_catalog::store::Counter::Object,
+                    1,
+                )
+                .await?,
                 db_id: t.db_id,
                 name: d.name.clone(),
                 kind: kind.to_owned(),
@@ -1263,9 +1262,6 @@ pub async fn deploy_bound(
     b: &Bind<'_>,
     shards: &mut dyn ShardSessions,
 ) -> Result<Pending> {
-    Migrator::new(&[LOGIC_MODULE])?
-        .run(t.catalog, t.catalog_schema, &MigrateOpts::default())
-        .await?;
     let store = LogicStore::new(t.catalog_schema);
     let (module, exists) = module_for(d, &mut t, &store).await?;
     let version = store.next_version(t.catalog, module.module_id).await?;
@@ -1289,7 +1285,7 @@ pub async fn deploy_bound(
         columns(s, &first).await?
     };
     let env = crate::calls::Env::new(cols, b.db_name)
-        .with_callees(crate::calls::callees(t.catalog, t.catalog_schema, t.db_id).await?)
+        .with_callees(crate::calls::callees(t.catalog, t.db_id).await?)
         .with_streams(&b.streams);
     let cols = &env.cols;
     if !sprig_logic_compile::Columns::has_table(cols, table) {
@@ -1753,7 +1749,7 @@ async fn deploy_schedule(
 /// Catalog errors; a shard's error while retiring (the new version is
 /// active by then).
 pub async fn finish(
-    catalog: &mut Conn,
+    catalog: &mut dyn RecordTx,
     catalog_schema: &str,
     catalog_version: u64,
     p: &Pending,
@@ -1770,18 +1766,10 @@ pub async fn finish(
     }
     if let Some((active, spec)) = p.staged {
         // The candidate: the active version keeps the other rows.
-        crate::rollout::put(
-            catalog,
-            catalog_schema,
-            p.module_id,
-            active,
-            p.version,
-            spec,
-        )
-        .await?;
+        crate::rollout::put(catalog, p.module_id, active, p.version, spec).await?;
     } else {
         if p.kind == Kind::Trigger {
-            crate::rollout::clear(catalog, catalog_schema, p.module_id).await?;
+            crate::rollout::clear(catalog, p.module_id).await?;
         }
         store
             .activate(catalog, p.module_id, p.version, catalog_version)
@@ -1809,7 +1797,7 @@ pub async fn finish(
 /// Undoes a bound deploy whose `ALTER TABLE` failed: drops the new
 /// version's routines on every shard and marks it `failed`.
 pub async fn abort(
-    catalog: &mut Conn,
+    catalog: &mut dyn RecordTx,
     catalog_schema: &str,
     p: &Pending,
     shards: &mut dyn ShardSessions,

@@ -13,7 +13,7 @@
 //! ([`StreamData::append_batch`]); fetch returns stored batches as they
 //! are ([`StreamData::read_batches`]).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -91,7 +91,23 @@ fn terr(code: i16, message: impl Into<String>) -> TopicError {
 }
 
 fn internal(e: &SprigError) -> TopicError {
+    // On a replica that doesn't lead the tenant's unit, a topic change
+    // can't commit here: NOT_CONTROLLER sends the client to Metadata's
+    // controller, the unit's leader.
+    if e.code() == Some(SprigCode::ShardMoved) {
+        return terr(err::NOT_CONTROLLER, e.to_string());
+    }
     terr(err::UNKNOWN_SERVER_ERROR, e.to_string())
+}
+
+/// A refused append: on a replica that doesn't lead the tenant's unit,
+/// `NOT_LEADER_OR_FOLLOWER` (the client refreshes Metadata, which names the
+/// leader, and retries there); otherwise a storage error.
+fn append_err(e: &SprigError) -> TopicError {
+    if e.code() == Some(SprigCode::ShardMoved) {
+        return terr(err::NOT_LEADER_OR_FOLLOWER, e.to_string());
+    }
+    terr(err::KAFKA_STORAGE_ERROR, e.to_string())
 }
 
 fn split(name: &str) -> std::result::Result<(&str, &str), TopicError> {
@@ -112,11 +128,15 @@ fn unknown(name: &str) -> TopicError {
 pub struct EngineStreams {
     log: SegLog,
     records: StreamRecords,
-    /// Topic records by (tenant, name), as last read or written here.
-    cache: Mutex<HashMap<(u64, String), TopicRecord>>,
-    /// Tenants whose topic records were read since the start (their
-    /// policies are set).
-    loaded: Mutex<HashSet<u64>>,
+    engine: Engine,
+    /// Topic records by (tenant, name), as last read or written here, with
+    /// the generation of that read or write.
+    cache: Mutex<HashMap<(u64, String), (TopicRecord, u64)>>,
+    /// Tenants whose topic records were read (their policies are set), with
+    /// the tenant unit's leader epoch at that read.
+    loaded: Mutex<HashMap<u64, u64>>,
+    /// Generations of cache reads and writes.
+    generation: std::sync::atomic::AtomicU64,
     /// Inherited values of new streams' settings.
     defaults: TopicDefaults,
 }
@@ -149,12 +169,15 @@ fn ticket_of(p: Pending, partition: i32, count: usize) -> AppendTicket {
     }
 }
 
-fn pending_of(t: &AppendTicket) -> Pending {
+/// The pending append of a ticket from [`ticket_of`]: its entry is in
+/// `tenant`'s unit.
+fn pending_of(t: &AppendTicket, tenant: u64) -> Pending {
     let mut i = [0u8; 8];
     i.copy_from_slice(&t.first_event[..8]);
     let mut s = [0u8; 4];
     s.copy_from_slice(&t.first_event[8..12]);
     Pending {
+        unit: sprig_engine::Engine::unit_of_tenant(tenant).0,
         index: u64::from_be_bytes(i),
         slot: u32::from_be_bytes(s),
     }
@@ -192,8 +215,10 @@ impl EngineStreams {
         let s = Self {
             records: StreamRecords::with_first_id(engine.clone(), FIRST_STREAM_ID),
             log,
+            engine: engine.clone(),
             cache: Mutex::new(HashMap::new()),
-            loaded: Mutex::new(HashSet::new()),
+            loaded: Mutex::new(HashMap::new()),
+            generation: std::sync::atomic::AtomicU64::new(0),
             defaults,
         };
         for t in s.log.tenants() {
@@ -230,20 +255,61 @@ impl EngineStreams {
         }
     }
 
-    fn remember(&self, tenant: u64, r: &TopicRecord) {
-        self.log.set_policy(tenant, r.stream_id, self.policy_of(r));
-        lock(&self.cache).insert((tenant, r.name.clone()), r.clone());
+    fn next_gen(&self) -> u64 {
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            + 1
     }
 
-    /// Reads a tenant's topic records once, setting their policies.
+    fn remember(&self, tenant: u64, r: &TopicRecord) {
+        self.log.set_policy(tenant, r.stream_id, self.policy_of(r));
+        let g = self.next_gen();
+        lock(&self.cache).insert((tenant, r.name.clone()), (r.clone(), g));
+    }
+
+    /// Reads a tenant's topic records, setting their policies: once, where
+    /// this node's commits are the only ones (a one-node engine, or while
+    /// it leads the tenant's unit: again whenever it takes the unit, since
+    /// another leader may have changed them). On a replica that doesn't
+    /// lead the unit every call reads them (through the read barrier):
+    /// they change through replication, not through this node.
     fn load(&self, tenant: u64) -> Result<()> {
-        if lock(&self.loaded).contains(&tenant) {
+        let unit = Engine::unit_of_tenant(tenant);
+        let replicated = self.engine.is_replicated_unit(unit);
+        let epoch = if replicated {
+            self.engine.leader_epoch(unit)
+        } else {
+            0
+        };
+        if lock(&self.loaded)
+            .get(&tenant)
+            .is_some_and(|e| *e == epoch && (!replicated || epoch > 0))
+        {
             return Ok(());
         }
-        for r in self.records.topics(tenant)? {
-            self.remember(tenant, &r);
+        let started = self.next_gen();
+        let recs = self.records.topics(tenant)?;
+        for r in &recs {
+            self.log.set_policy(tenant, r.stream_id, self.policy_of(r));
         }
-        lock(&self.loaded).insert(tenant);
+        let g = self.next_gen();
+        {
+            let mut c = lock(&self.cache);
+            // Gone from the records, unless written here since the read
+            // began (a create racing this read).
+            c.retain(|(t, n), (_, at)| {
+                *t != tenant || *at > started || recs.iter().any(|r| r.name == *n)
+            });
+            for r in recs {
+                match c.get(&(tenant, r.name.clone())) {
+                    Some((_, at)) if *at > started => {}
+                    _ => {
+                        c.insert((tenant, r.name.clone()), (r, g));
+                    }
+                }
+            }
+        }
+        lock(&self.loaded).insert(tenant, epoch);
         Ok(())
     }
 
@@ -256,7 +322,7 @@ impl EngineStreams {
         let mut v: Vec<TopicRecord> = lock(&self.cache)
             .iter()
             .filter(|((t, _), _)| *t == tenant)
-            .map(|(_, r)| r.clone())
+            .map(|(_, (r, _))| r.clone())
             .collect();
         v.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(v)
@@ -268,7 +334,9 @@ impl EngineStreams {
     /// The records can't be read.
     pub fn topic(&self, tenant: u64, name: &str) -> Result<Option<TopicRecord>> {
         self.load(tenant)?;
-        Ok(lock(&self.cache).get(&(tenant, name.to_owned())).cloned())
+        Ok(lock(&self.cache)
+            .get(&(tenant, name.to_owned()))
+            .map(|(r, _)| r.clone()))
     }
 
     /// One topic record by stream id.
@@ -279,8 +347,8 @@ impl EngineStreams {
         self.load(tenant)?;
         Ok(lock(&self.cache)
             .iter()
-            .find(|((t, _), r)| *t == tenant && r.stream_id == id)
-            .map(|(_, r)| r.clone()))
+            .find(|((t, _), (r, _))| *t == tenant && r.stream_id == id)
+            .map(|(_, (r, _))| r.clone()))
     }
 
     /// Creates a stream; `Ok(None)` when the name is taken.
@@ -1099,7 +1167,9 @@ impl StreamData for RoutedData {
         if !is_engine_stream(t.stream_id) {
             return self.inner()?.sequenced(p, t, ticket, deadline).await;
         }
-        self.eng.outcome(pending_of(ticket), deadline).await
+        self.eng
+            .outcome(pending_of(ticket, p.tenant_id), deadline)
+            .await
     }
 
     async fn bounds(
@@ -1243,7 +1313,7 @@ impl StreamData for RoutedData {
         let pending = self
             .eng
             .propose(key(p.tenant_id, t.stream_id, partition), batch)
-            .map_err(|e| terr(err::KAFKA_STORAGE_ERROR, e.to_string()))?;
+            .map_err(|e| append_err(&e))?;
         Ok(ticket_of(pending, partition, count))
     }
 

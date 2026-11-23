@@ -13,7 +13,7 @@
 //! `sprigctl logic rollback <name> [--to-version n]` sends the statement
 //! through a gateway, as `sprigctl logic deploy` sends declarations.
 
-use mysql_async::Conn;
+use sprig_catalog::records::RecordTx;
 use sprig_common::{Result, SprigCode, SprigError};
 
 use crate::catalog::LogicStore;
@@ -173,7 +173,7 @@ fn sql_type(ir: &str) -> &'static str {
 /// 39862 for a version that never deployed.
 pub async fn resolve(
     store: &LogicStore,
-    c: &mut Conn,
+    c: &mut dyn RecordTx,
     db_id: u32,
     r: &Rollback,
 ) -> Result<(Declaration, u64)> {
@@ -191,7 +191,7 @@ pub async fn resolve(
     let to = match r.rollout {
         None => r.to,
         Some(op) => {
-            let ro = crate::rollout::get(c, store.schema(), module.module_id)
+            let ro = crate::rollout::get(c, module.module_id)
                 .await?
                 .ok_or_else(|| {
                     not_found(format!(

@@ -357,6 +357,127 @@ impl Ceiling {
 /// Set by [`never_create_schemas`].
 static NEVER_CREATE: AtomicBool = AtomicBool::new(false);
 
+/// Set by [`mirror_formats`]: where each tenant's `sprig.catalog_format`
+/// is kept besides its MariaDB catalog.
+static FORMAT_RECORDS: std::sync::OnceLock<Arc<dyn crate::records::RecordStore>> =
+    std::sync::OnceLock::new();
+
+/// From now on, every migration run in this process writes the tenant's
+/// new `sprig.catalog_format` into the tenant's catalog records too
+/// (before its MariaDB row), where cache loads read it without opening a
+/// MariaDB snapshot (EC-90). Set once, at process start; later calls are
+/// ignored. A catalog schema not named `t<id>_sprig` isn't mirrored.
+pub fn mirror_formats(records: Arc<dyn crate::records::RecordStore>) {
+    let _ = FORMAT_RECORDS.set(records);
+}
+
+/// The tenant of a catalog schema named `t<id>_sprig`.
+fn tenant_of(schema: &str) -> Option<sprig_common::ids::TenantId> {
+    schema
+        .strip_prefix('t')?
+        .strip_suffix("_sprig")?
+        .parse()
+        .ok()
+        .map(sprig_common::ids::TenantId)
+}
+
+/// Writes `state` as `schema`'s format into its records ([`mirror_formats`]).
+async fn mirror_format(schema: &str, state: &FormatState, version: u64) -> Result<()> {
+    let (Some(records), Some(tenant)) = (FORMAT_RECORDS.get(), tenant_of(schema)) else {
+        return Ok(());
+    };
+    let value = serde_json::to_value(state)
+        .map_err(|e| SprigError::internal(format!("encoding catalog format: {e}")))?;
+    let mut tx = records.begin(tenant).await?;
+    crate::store::rec::CoreRecords::put_internal(
+        &mut *tx,
+        FORMAT_KEY,
+        &value,
+        version,
+        std::time::SystemTime::now(),
+    )
+    .await?;
+    tx.commit().await
+}
+
+/// Records key of a tenant whose catalog schema `t<id>_sprig` is made
+/// only when something first needs it (bootstrap since EC-124): a
+/// [`LazySchema`].
+pub const SCHEMA_KEY: &str = "sprig.catalog_schema";
+
+/// A tenant's [`SCHEMA_KEY`] record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LazySchema {
+    /// The owner mark the schema is made with (bootstrap's).
+    pub mark: String,
+    /// Whether anything of the tenant may be on MariaDB: its catalog
+    /// schema, or backend accounts. Set before either is made; tenant
+    /// cleanup purges MariaDB only when it is.
+    pub mariadb: bool,
+}
+
+/// `tenant`'s [`LazySchema`] record, `None` for a tenant bootstrapped with
+/// its schema (or when this process keeps no records: [`mirror_formats`]).
+///
+/// # Errors
+/// The records' errors; `Internal` for a bad record.
+pub async fn lazy_schema(tenant: sprig_common::ids::TenantId) -> Result<Option<LazySchema>> {
+    let Some(records) = FORMAT_RECORDS.get() else {
+        return Ok(None);
+    };
+    let mut tx = records.begin(tenant).await?;
+    let v = crate::store::rec::CoreRecords::internal(&mut *tx, SCHEMA_KEY).await;
+    let _ = tx.rollback().await;
+    v?.map(serde_json::from_value)
+        .transpose()
+        .map_err(|e| SprigError::internal(format!("bad {SCHEMA_KEY}: {e}")))
+}
+
+async fn put_lazy(
+    records: &dyn crate::records::RecordStore,
+    tenant: sprig_common::ids::TenantId,
+    l: &LazySchema,
+) -> Result<()> {
+    let value = serde_json::to_value(l)
+        .map_err(|e| SprigError::internal(format!("encoding {SCHEMA_KEY}: {e}")))?;
+    let mut tx = records.begin(tenant).await?;
+    crate::store::rec::CoreRecords::put_internal(
+        &mut *tx,
+        SCHEMA_KEY,
+        &value,
+        0,
+        std::time::SystemTime::now(),
+    )
+    .await?;
+    tx.commit().await
+}
+
+/// Notes that `tenant` is about to have something on MariaDB (its catalog
+/// schema, backend accounts), so its cleanup purges MariaDB. Nothing for
+/// a tenant without a [`LazySchema`] record (cleanup always purges it).
+///
+/// # Errors
+/// The records' errors.
+pub async fn note_mariadb_use(tenant: sprig_common::ids::TenantId) -> Result<()> {
+    let Some(records) = FORMAT_RECORDS.get() else {
+        return Ok(());
+    };
+    match lazy_schema(tenant).await? {
+        Some(l) if !l.mariadb => {
+            put_lazy(
+                &**records,
+                tenant,
+                &LazySchema {
+                    mark: l.mark,
+                    mariadb: true,
+                },
+            )
+            .await
+        }
+        _ => Ok(()),
+    }
+}
+
 /// From now on, no migration run in this process creates a missing schema,
 /// whatever its [`MigrateOpts::create_schema`] says: each refuses as
 /// [`MigrateOpts::existing`] does (39072). For processes whose migrations
@@ -612,6 +733,62 @@ impl Migrator {
         })
     }
 
+    /// Every module of this migrator at its newest format.
+    #[must_use]
+    pub fn newest_state(&self) -> FormatState {
+        let mut state = FormatState::new();
+        for m in &self.modules {
+            let f = m
+                .migrations
+                .iter()
+                .fold(ModuleFormat::default(), ModuleFormat::after);
+            state.insert(m.name.to_owned(), f);
+        }
+        state
+    }
+
+    /// Bootstrap of a catalog kept in engine records (EC-124): writes the
+    /// format ([`Self::newest_state`]) and the tenant's [`LazySchema`]
+    /// record with `owner` as the mark into `records`; MariaDB is told
+    /// nothing. The schema `t<id>_sprig` is made, with that mark, by the
+    /// first migration run of a module beyond the core one. A rerun keeps
+    /// the record (and, once the schema is made, the format MariaDB's
+    /// runs keep).
+    ///
+    /// # Errors
+    /// The records' errors.
+    pub async fn bootstrap_records(
+        &self,
+        records: &dyn crate::records::RecordStore,
+        tenant: sprig_common::ids::TenantId,
+        owner: &str,
+    ) -> Result<FormatState> {
+        let state = self.newest_state();
+        let mut tx = records.begin(tenant).await?;
+        let found = crate::store::rec::CoreRecords::internal(&mut *tx, SCHEMA_KEY).await?;
+        let found: Option<LazySchema> = found.and_then(|v| serde_json::from_value(v).ok());
+        if found.as_ref().is_some_and(|l| l.mariadb) {
+            tx.rollback().await?;
+            return Ok(state);
+        }
+        let now = std::time::SystemTime::now();
+        if found.is_none() {
+            let l = LazySchema {
+                mark: owner.to_owned(),
+                mariadb: false,
+            };
+            let value = serde_json::to_value(&l)
+                .map_err(|e| SprigError::internal(format!("encoding {SCHEMA_KEY}: {e}")))?;
+            crate::store::rec::CoreRecords::put_internal(&mut *tx, SCHEMA_KEY, &value, 0, now)
+                .await?;
+        }
+        let value = serde_json::to_value(&state)
+            .map_err(|e| SprigError::internal(format!("encoding catalog format: {e}")))?;
+        crate::store::rec::CoreRecords::put_internal(&mut *tx, FORMAT_KEY, &value, 0, now).await?;
+        tx.commit().await?;
+        Ok(state)
+    }
+
     /// The same migrator with history times from `clock`.
     #[must_use]
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
@@ -654,6 +831,22 @@ impl Migrator {
         // named lock: the connection is reset when it goes back to its pool,
         // even a catalog pool that keeps its connections as they are.
         conn.reset_connection(true);
+        // A tenant bootstrapped without its schema (EC-124): a run of the
+        // core module alone (its tables' rows are engine records) needs
+        // none, made or not (a later run with another module brings the
+        // core tables along); a run with another module makes a missing
+        // one, with its mark, below.
+        if let Some(t) = tenant_of(schema)
+            && self.modules.iter().all(|m| m.name == CORE_MODULE.name)
+            && lazy_schema(t).await?.is_some()
+        {
+            return Ok(MigrateReport {
+                applied: Vec::new(),
+                blocked: Vec::new(),
+                delayed: Vec::new(),
+                state: self.newest_state(),
+            });
+        }
         if let Some(state) = self.up_to_date(conn, schema).await {
             return Ok(MigrateReport {
                 applied: Vec::new(),
@@ -735,6 +928,48 @@ impl Migrator {
         Some(state)
     }
 
+    /// Makes a lazy tenant's missing catalog schema ([`LazySchema`]) with
+    /// bootstrap's mark: noted first, so a crash in between still leaves
+    /// cleanup to drop it.
+    async fn make_lazy_schema(
+        &self,
+        conn: &mut Conn,
+        schema: &str,
+        t: sprig_common::ids::TenantId,
+        l: LazySchema,
+        opts: &MigrateOpts,
+    ) -> Result<()> {
+        let q = quote(schema);
+        if let Some(records) = FORMAT_RECORDS.get() {
+            put_lazy(
+                &**records,
+                t,
+                &LazySchema {
+                    mark: l.mark.clone(),
+                    mariadb: true,
+                },
+            )
+            .await?;
+        }
+        let made = conn
+            .query_drop(format!(
+                "CREATE DATABASE {q} CHARACTER SET utf8mb4 COLLATE utf8mb4_bin COMMENT '{}'",
+                l.mark.replace('\\', "\\\\").replace('\'', "''")
+            ))
+            .await;
+        match made {
+            Ok(()) => {
+                let modules: Vec<&str> = self.modules.iter().map(|m| m.name).collect();
+                tracing::info!(schema, by = %opts.applied_by, ?modules,
+                    "catalog schema made on first need");
+                Ok(())
+            }
+            // 1007: made by another run in between.
+            Err(mysql_async::Error::Server(e)) if e.code == 1007 => Ok(()),
+            Err(e) => Err(map_err(e)),
+        }
+    }
+
     async fn run_locked(
         &self,
         conn: &mut Conn,
@@ -754,7 +989,13 @@ impl Migrator {
             )
             .await
             .map_err(map_err)?;
-        if exists.unwrap_or(0) == 0 {
+        let lazy = match tenant_of(schema) {
+            Some(t) if exists.unwrap_or(0) == 0 => lazy_schema(t).await?.map(|l| (t, l)),
+            _ => None,
+        };
+        if let Some((t, l)) = lazy {
+            self.make_lazy_schema(conn, schema, t, l, opts).await?;
+        } else if exists.unwrap_or(0) == 0 {
             if !opts.create_schema || !schemas_created_here() {
                 return Err(SprigError::new(
                     SprigCode::TenantNotReady,
@@ -817,7 +1058,7 @@ impl Migrator {
                 }
                 current = current.after(m);
                 state.insert(module.name.to_owned(), current);
-                self.record(conn, opts, module.name, m, &state, overridden)
+                self.record(conn, schema, opts, module.name, m, &state, overridden)
                     .await?;
                 report.applied.push(r);
             }
@@ -872,9 +1113,11 @@ impl Migrator {
 
     /// Records `m` in `sprig.migration.<module>` and the new state in
     /// `sprig.catalog_format`, in one transaction.
+    #[allow(clippy::too_many_arguments)]
     async fn record(
         &self,
         conn: &mut Conn,
+        schema: &str,
         opts: &MigrateOpts,
         module: &str,
         m: &Migration,
@@ -901,6 +1144,10 @@ impl Migrator {
             let version: u64 = version
                 .and_then(|b| serde_json::from_slice(&b).ok())
                 .unwrap_or(0);
+            // The records' copy first: a failure after it leaves the
+            // records ahead, which a reader only takes as a newer format
+            // (the safe side of `check_readable`); the run is tried again.
+            mirror_format(schema, state, version).await?;
             let old: Option<Vec<u8>> = tx
                 .exec_first(
                     "SELECT value FROM settings WHERE scope_kind = 'tenant' AND scope_id = 0 \

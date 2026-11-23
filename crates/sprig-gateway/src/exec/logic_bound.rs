@@ -181,6 +181,21 @@ impl CtlShards {
     }
 }
 
+/// 39960 for a validation, after-commit trigger or schedule on an engine
+/// database (see [`PassSession::logic_prepare_bound`]).
+fn bound_not_on_engine(kind: Kind, db: &str) -> SprigError {
+    let what = match kind {
+        Kind::Validation => "a validation (the engine's pre-write hook isn't built yet)",
+        Kind::Trigger => "an after-commit trigger recompiled for a column change",
+        Kind::Schedule => "a schedule (the engine's schedule runner isn't built yet)",
+        Kind::Function | Kind::Procedure => "this routine",
+    };
+    SprigError::new(
+        SprigCode::NotOnEngine,
+        format!("{what} on database {db}, which is on the storage engine"),
+    )
+}
+
 fn now_ms() -> u64 {
     sprig_logic::triggers::maria::now_ms()
 }
@@ -276,14 +291,15 @@ impl BoundDeploy {
     /// Undoes the new version (its routines and triggers dropped on every
     /// shard, the version `failed`); the old one stays active.
     async fn abort(&mut self) {
-        if let Ok(mut conn) = self.ep.pool.get_conn_bounded().await {
+        if let Ok(mut conn) = self.svc.records.begin(self.tenant).await {
             service::abort(
-                &mut conn,
+                &mut *conn,
                 self.ep.store.schema(),
                 &self.pending,
                 &mut self.shards,
             )
             .await;
+            let _ = conn.commit().await;
         }
     }
 }
@@ -344,6 +360,19 @@ impl PassSession {
         cx: &mut ExecCtx<'_>,
         decl: Declaration,
     ) -> Result<Vec<String>> {
+        // An after-commit trigger on an engine table runs from the change
+        // log (`exec::change_trigger`).
+        if decl.kind == Kind::Trigger
+            && let Some(db) = decl
+                .table
+                .as_ref()
+                .and_then(|t| t.db.clone())
+                .or_else(|| decl.db.clone())
+                .or_else(|| self.current_logical())
+            && self.engine_database_named(&db)
+        {
+            return Box::pin(self.logic_deploy_change_trigger(decl, &db)).await;
+        }
         self.logic_deploy_bound_as(cx, decl, None).await
     }
 
@@ -377,6 +406,19 @@ impl PassSession {
         columns: Option<&sprig_logic::compiler::StaticColumns>,
     ) -> Result<BoundDeploy> {
         let current = self.current_logical();
+        // An engine database has no MariaDB schema to hold the routines and
+        // `BEFORE` triggers, and the engine tier's own runners for bound
+        // code aren't built yet: say so rather than fail on MariaDB.
+        if let Some(db) = decl
+            .table
+            .as_ref()
+            .and_then(|t| t.db.clone())
+            .or_else(|| decl.db.clone())
+            .or_else(|| current.clone())
+            && self.engine_database_named(&db)
+        {
+            return Err(bound_not_on_engine(decl.kind, &db));
+        }
         let Some(ts) = self.tenant.as_deref_mut() else {
             return Err(SprigError::internal("no tenant"));
         };
@@ -475,24 +517,10 @@ impl PassSession {
         let svc = Arc::clone(ts.services());
         let tenant = ts.tenant;
         let streams = sprig_logic::service::StreamList::new();
-        // The DDL layout's shards: the table's group, or every shard of the
-        // database; one shard (the template) for unsharded databases.
+        // The database's schema.
         let template = ts.schema_of(Some(&db));
-        let layout = super::router::ddl_layout(ts);
         let shard_list: Vec<(String, ClusterId)> = {
-            let from_layout = match (&layout, &template) {
-                (Some(l), Some(t)) => l(t, table.as_ref().map(|(n, _)| n.as_str())),
-                (Some(l), None) => {
-                    let first = sprig_catalog::ddl::shard_schemas(tenant, &row)
-                        .first()
-                        .map(ToString::to_string);
-                    first.and_then(|f| l(&f, table.as_ref().map(|(n, _)| n.as_str())))
-                }
-                _ => None,
-            };
-            if let Some(v) = from_layout.filter(|v| !v.is_empty()) {
-                v
-            } else {
+            {
                 {
                     let t = template.clone().ok_or_else(|| {
                         SprigError::new(
@@ -511,9 +539,7 @@ impl PassSession {
             locator: Arc::clone(&svc.locator),
         };
         let ep = svc.locator.writer(tenant).await?;
-        let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
-            SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
-        })?;
+        let mut conn = svc.records.begin(tenant).await?;
         let account = sprig_auth::authz::backend::account(tenant, user);
         let definer = format!("`{}`@`%`", account.replace('`', "``"));
         let first = shards.list[0].0.clone();
@@ -527,7 +553,7 @@ impl PassSession {
         let pending = service::deploy_bound(
             decl,
             Target {
-                catalog: &mut conn,
+                catalog: &mut *conn,
                 catalog_schema: ep.store.schema(),
                 catalog_version: catalog.version,
                 db_id: row.db_id.0,
@@ -549,6 +575,7 @@ impl PassSession {
             &mut shards,
         )
         .await?;
+        conn.commit().await?;
         Ok(BoundDeploy {
             pending,
             shards,
@@ -612,17 +639,16 @@ impl PassSession {
     /// feed subscription or a schedule's index is written. The client's
     /// notes.
     async fn logic_finish_bound(mut d: BoundDeploy) -> Result<Vec<String>> {
-        let mut conn = d.ep.pool.get_conn_bounded().await.map_err(|e| {
-            SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
-        })?;
+        let mut conn = d.svc.records.begin(d.tenant).await?;
         service::finish(
-            &mut conn,
+            &mut *conn,
             d.ep.store.schema(),
             d.catalog_version,
             &d.pending,
             &mut d.shards,
         )
         .await?;
+        conn.commit().await?;
         let BoundDeploy {
             pending,
             mut shards,
@@ -726,15 +752,12 @@ impl PassSession {
         };
         let svc = Arc::clone(ts.services());
         let tenant = ts.tenant;
-        let Ok(ep) = svc.locator.writer(tenant).await else {
+        let Ok(mut conn) = svc.records.begin(tenant).await else {
             return Ok(None);
         };
-        let Ok(mut conn) = ep.pool.get_conn_bounded().await else {
-            return Ok(None);
-        };
-        let store = LogicStore::new(ep.store.schema());
+        let store = LogicStore::default();
         // No logic catalog yet: nothing is bound.
-        let Ok(modules) = store.modules(&mut conn, Some(row.db_id.0)).await else {
+        let Ok(modules) = store.modules(&mut *conn, Some(row.db_id.0)).await else {
             return Ok(None);
         };
         let mut bound = Vec::new();
@@ -745,7 +768,7 @@ impl PassSession {
             let Some(v) = m.active_version else {
                 continue;
             };
-            let Ok(Some(b)) = store.binding(&mut conn, m.module_id).await else {
+            let Ok(Some(b)) = store.binding(&mut *conn, m.module_id).await else {
                 continue;
             };
             if b.object_id != Some(obj)
@@ -753,7 +776,7 @@ impl PassSession {
             {
                 continue;
             }
-            let source = store.source(&mut conn, m.module_id, v).await?;
+            let source = store.source(&mut *conn, m.module_id, v).await?;
             bound.push((m, source, b));
         }
         drop(conn);
@@ -1033,17 +1056,14 @@ impl PassSession {
             .map(|o| o.object_id.0);
         let svc = Arc::clone(ts.services());
         let tenant = ts.tenant;
-        let Ok(ep) = svc.locator.writer(tenant).await else {
+        let Ok(mut conn) = svc.records.begin(tenant).await else {
             return Ok(None);
         };
-        let Ok(mut conn) = ep.pool.get_conn_bounded().await else {
-            return Ok(None);
-        };
-        let store = LogicStore::new(ep.store.schema());
+        let store = LogicStore::default();
         let mut module = None;
         for kind in ["function", "procedure"] {
             match store
-                .module(&mut conn, row.db_id.0, kind, &call.function)
+                .module(&mut *conn, row.db_id.0, kind, &call.function)
                 .await
             {
                 Ok(Some(m)) => {
@@ -1065,11 +1085,11 @@ impl PassSession {
                     format!("{} has no active version", module.name),
                 )
             })?;
-            let source = store.source(&mut conn, module.module_id, v).await?;
+            let source = store.source(&mut *conn, module.module_id, v).await?;
             // The version's signature: JavaScript compiles only with its
             // declared parameter types.
             let (sig, _) = store
-                .version_signature(&mut conn, module.module_id, v)
+                .version_signature(&mut *conn, module.module_id, v)
                 .await?;
             let expr =
                 service::computed_column(&module.name, &module.runtime, &source, &sig, &call)?;
@@ -1105,11 +1125,9 @@ impl PassSession {
                 state: "active".to_owned(),
             };
             let put = async {
-                let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
-                    SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable")
-                        .with_source(e)
-                })?;
-                store.put_binding(&mut conn, &b).await
+                let mut conn = svc.records.begin(tenant).await?;
+                store.put_binding(&mut *conn, &b).await?;
+                conn.commit().await
             };
             if let Err(e) = put.await {
                 tracing::warn!(error = %e, "computed field's binding not recorded");
@@ -1135,13 +1153,10 @@ pub(super) fn map_validation(
         let svc = Arc::clone(ts.services());
         let tenant = ts.tenant;
         tokio::spawn(async move {
-            let Ok(ep) = svc.locator.writer(tenant).await else {
+            let Ok(mut c) = svc.records.begin(tenant).await else {
                 return;
             };
-            let Ok(mut c) = ep.pool.get_conn_bounded().await else {
-                return;
-            };
-            if let Err(e) = sprig_logic::triggers::load_checks(&mut c, ep.store.schema()).await {
+            if let Err(e) = sprig_logic::triggers::load_checks(&mut *c).await {
                 tracing::debug!(error = %e, "validation messages not loaded");
             }
         });
@@ -1158,13 +1173,9 @@ pub(super) fn warm_validations(ts: &crate::tenant::session::TenantSession) {
     let svc = Arc::clone(ts.services());
     let tenant = ts.tenant;
     tokio::spawn(async move {
-        let Ok(ep) = svc.locator.writer(tenant).await else {
+        let Ok(mut c) = svc.records.begin(tenant).await else {
             return;
         };
-        let Ok(mut c) = ep.pool.get_conn_bounded().await else {
-            return;
-        };
-        // No logic catalog yet is fine: nothing to load.
-        let _ = sprig_logic::triggers::load_checks(&mut c, ep.store.schema()).await;
+        let _ = sprig_logic::triggers::load_checks(&mut *c).await;
     });
 }

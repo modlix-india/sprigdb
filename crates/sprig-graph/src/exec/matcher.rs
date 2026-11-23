@@ -10,9 +10,9 @@ use sprig_common::{Result, SprigCode, SprigError};
 use super::{Exec, RELS, budget_error, pattern_vars};
 use crate::ast::{BinOp, Dir, Expr, NodePat, PathKind, PathPattern, RelPat};
 use crate::eval::{Row, eval, path_value};
+use crate::store::CmpOp;
 use crate::store::{EdgeRow, Link, NodeRow, Reach, Scan};
 use crate::value::{Node, Rel, Value, parse_element_id};
-use sprig_router::graph_route::CmpOp;
 
 const PATH_NODES: &str = " pn";
 const PATH_RELS: &str = " pr";
@@ -1491,11 +1491,7 @@ impl Exec<'_> {
         // A label the far node pattern requires: the reads leave out the
         // nodes without it (the gateway checks it again).
         if let Some(l) = label {
-            filter.push((
-                format!("{}{l}", sprig_router::graph_route::LABEL_KEY),
-                CmpOp::Eq,
-                0.0,
-            ));
+            filter.push((format!("{}{l}", crate::store::LABEL_KEY), CmpOp::Eq, 0.0));
         }
         let only = var.and_then(|v| self.only.get(v)).cloned();
         // A named far node nothing is known to need yet is bound without

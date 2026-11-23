@@ -23,7 +23,6 @@ mod late;
 mod matcher;
 mod stream;
 mod write;
-pub(crate) use write::is_duplicate;
 
 pub use stream::{RowSink, VecSink, run_stream, streamable};
 
@@ -37,9 +36,9 @@ use crate::ast::{
     BinOp, Clause, Explain, Expr, MapItem, PathPattern, Projection, Query, SubqueryKind,
 };
 use crate::eval::{Params, Row, eval};
+use crate::store::CmpOp;
 use crate::store::{EdgeRow, GraphStore, NodeRow};
 use crate::value::{Key, Node, Rel, Value, props_from_json};
-use sprig_router::graph_route::CmpOp;
 
 /// How variable-length hops expand (`graph.traversal_tier`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1998,6 +1997,8 @@ impl Exec<'_> {
                     self.b.tx_metadata.clone().unwrap_or_default(),
                 )]],
             ),
+            // Drivers and cypher-shell call it to check a connection.
+            "db.ping" => (vec!["success"], vec![vec![Value::Bool(true)]]),
             "dbms.components" => (
                 vec!["name", "versions", "edition"],
                 vec![vec![

@@ -66,6 +66,14 @@ pub trait Unit: Send + Sync + 'static {
     /// version.
     fn begin(&self, keys: Vec<Bytes>) -> impl Future<Output = StoreResult<Self::Batch>> + Send;
 
+    /// The leader epoch under which this node leads the unit holding
+    /// `key` (0: it doesn't). Memory caches of stored state (uid blocks)
+    /// built under another epoch are dropped.
+    fn leader_epoch(&self, key: &[u8]) -> u64 {
+        let _ = key;
+        1
+    }
+
     /// The unit's clock, in ms since the epoch: it decides expiry.
     fn now_ms(&self) -> i64 {
         std::time::SystemTime::now()

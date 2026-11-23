@@ -148,6 +148,33 @@ pub enum SqlOp {
         /// The messages.
         messages: Vec<PublishMessage>,
     },
+    /// A `CHANGES OF` sink's read of its engine tables' changes from the
+    /// gateway's change log, as the request's user (who needs `SELECT` on
+    /// each table): one result of rows `(token, object, op, key, before,
+    /// after, ts_ms, value)`, JSON text in `key`, `before`, `after` and
+    /// `value` (the change envelope), and the reply's `next`: the token
+    /// after everything read.
+    Changes {
+        /// The tables' object ids.
+        objects: Vec<u64>,
+        /// The resume token to read after; absent for the first read.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
+        /// Without a token: the first commit time to read (ms since the
+        /// epoch; 0 for the oldest change held). Changes committed before
+        /// it are always left out.
+        #[serde(default)]
+        from_ms: i64,
+        /// Bytes of change log read at most.
+        max_bytes: u64,
+        /// How long to wait for a change when none is there.
+        #[serde(default)]
+        wait_ms: u64,
+        /// The reader's key on the gateway (`<tenant>/<sink>/<task>`): the
+        /// gateway keeps it open between reads.
+        #[serde(default)]
+        consumer: String,
+    },
 }
 
 /// One message of [`SqlOp::PublishBatch`].
@@ -359,6 +386,9 @@ pub struct SqlReply {
     /// The error that stopped the request.
     #[serde(default)]
     pub error: Option<PeerError>,
+    /// [`SqlOp::Changes`]'s token after everything read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
 }
 
 impl SqlReply {
@@ -721,6 +751,7 @@ mod tests {
                 error: None,
             }],
             error: None,
+            next: None,
         };
         let back: SqlReply = serde_json::from_str(&serde_json::to_string(&reply).unwrap()).unwrap();
         assert_eq!(

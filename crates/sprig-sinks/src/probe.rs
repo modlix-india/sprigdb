@@ -609,8 +609,7 @@ pub async fn dry_run(
     sample: Vec<SinkRecord>,
 ) -> Result<Vec<DryRow>> {
     let opts = options(env, tenant, def).await?;
-    let (pool, schema) = env.catalog(tenant).await?;
-    let transform = crate::job::load_transform(&pool, &schema, def, &opts).await?;
+    let transform = crate::job::load_transform(env.records().as_ref(), tenant, def, &opts).await?;
     let prepare = SinkPrepare {
         condition: def
             .filter_sql

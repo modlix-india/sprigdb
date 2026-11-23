@@ -65,7 +65,22 @@ fn engine(dir: &Path) -> Engine {
     c.checkpoint_interval = Duration::ZERO;
     c.log.sync = SyncMode::Off;
     c.budget.engine_mb = 64;
-    Engine::open(c).unwrap()
+    // The engine of the run before can still be closing: the stream log's
+    // apply observer may hold the last handle on the log writer's thread,
+    // and the store's lock is free only when that thread lets it go.
+    let until = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match Engine::open(c.clone()) {
+            Ok(e) => return e,
+            Err(e)
+                if e.message.contains("lock hold by current process")
+                    && std::time::Instant::now() < until =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => panic!("{e}"),
+        }
+    }
 }
 
 fn open(dir: &Path) -> SegLog {

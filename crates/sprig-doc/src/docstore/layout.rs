@@ -33,6 +33,9 @@ const CAT_COLLECTIONS: u16 = 0;
 const CAT_RETRY: u16 = 1;
 /// Multikey facts under a collection's metadata kind.
 const MULTIKEY: u16 = 2;
+/// Database drop markers: a delete written when `dropDatabase` dropped a
+/// database's collections, so the change log shows the database's drop.
+const CAT_DB_DROPS: u16 = 3;
 
 /// The header byte of a stored document: format 1, no field directory.
 pub const DOC_FORMAT_1: u8 = 1;
@@ -119,6 +122,77 @@ pub fn retry_record(tenant: u64, lsid: &[u8], txn_number: i64) -> Vec<u8> {
 #[must_use]
 pub fn retry_records(tenant: u64) -> Vec<u8> {
     prefix(tenant, CATALOG, kind::META, CAT_RETRY)
+}
+
+/// The marker key of database `db`'s drop (only ever deleted).
+#[must_use]
+pub fn db_drop_marker(tenant: u64, db: &str) -> Vec<u8> {
+    let mut k = prefix(tenant, CATALOG, kind::META, CAT_DB_DROPS);
+    put_str(&mut k, db.as_bytes());
+    k
+}
+
+/// Reads one [`put_str`] string: the string and what follows.
+#[must_use]
+pub fn take_str(b: &[u8]) -> Option<(Vec<u8>, &[u8])> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == 0 {
+            match b.get(i + 1)? {
+                0 => return Some((out, &b[i + 2..])),
+                0xFF => {
+                    out.push(0);
+                    i += 2;
+                    continue;
+                }
+                _ => return None,
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    None
+}
+
+/// What a key of the catalog object's metadata is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CatalogKey {
+    /// Collection `coll` of `db`'s record.
+    Coll {
+        /// The database.
+        db: String,
+        /// The collection.
+        coll: String,
+    },
+    /// Database `db`'s drop marker.
+    DbDrop(String),
+    /// Something else.
+    Other,
+}
+
+/// What the catalog metadata key `index | user_key` names.
+#[must_use]
+pub fn catalog_key(index: u16, user_key: &[u8]) -> CatalogKey {
+    let s = |b: Vec<u8>| String::from_utf8(b).ok();
+    match index {
+        CAT_COLLECTIONS => {
+            let Some((db, rest)) = take_str(user_key) else {
+                return CatalogKey::Other;
+            };
+            let Some((coll, _)) = take_str(rest) else {
+                return CatalogKey::Other;
+            };
+            match (s(db), s(coll)) {
+                (Some(db), Some(coll)) => CatalogKey::Coll { db, coll },
+                _ => CatalogKey::Other,
+            }
+        }
+        CAT_DB_DROPS => take_str(user_key)
+            .and_then(|(db, _)| s(db))
+            .map_or(CatalogKey::Other, CatalogKey::DbDrop),
+        _ => CatalogKey::Other,
+    }
 }
 
 /// The keyspace of one collection.
@@ -234,5 +308,17 @@ mod tests {
         assert!(!c.starts_with(&coll_records(7, Some("a"))));
         assert_eq!(after_prefix(&[1, 0xFF]), vec![2]);
         assert!(retry_record(7, b"x", -1) < retry_record(7, b"x", 0));
+        let k = coll_record(7, "d\0b", "c");
+        let (_, user) = sprig_engine::keys::KeyPrefix::decode(&k).unwrap();
+        assert_eq!(
+            catalog_key(0, user),
+            CatalogKey::Coll {
+                db: "d\0b".into(),
+                coll: "c".into()
+            }
+        );
+        let k = db_drop_marker(7, "x");
+        let (p, user) = sprig_engine::keys::KeyPrefix::decode(&k).unwrap();
+        assert_eq!(catalog_key(p.index, user), CatalogKey::DbDrop("x".into()));
     }
 }

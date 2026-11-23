@@ -17,12 +17,11 @@
 //! database's shard schemas and went with them. Dead letters stay, as
 //! they do for a sink's `DROP SINK` without `WITH DEAD LETTERS`.
 
+use sprig_catalog::records::RecordTx;
 use std::sync::Arc;
 
-use mysql_async::Conn;
-use mysql_async::prelude::Queryable;
+use sprig_common::Result;
 use sprig_common::ids::TenantId;
-use sprig_common::{Result, SprigCode, SprigError};
 use sprig_feed::subs::Subscriptions;
 use sprig_meta::MetaStore;
 
@@ -56,37 +55,19 @@ pub fn cleanup_of(kind: &str, binding: Option<&BindingRow>) -> Cleanup {
 }
 
 /// Drops every live logic module of database `db_id` of `tenant` (see
-/// the module docs) and returns them. A catalog without the logic tables
-/// has none.
+/// the module docs) and returns them.
 ///
 /// # Errors
 /// The catalog's or the DC tier's; modules handled before the error stay
 /// dropped (a retry finds only the rest).
 pub async fn database_dropped(
-    c: &mut Conn,
+    c: &mut dyn RecordTx,
     schema: &str,
     dc: &Arc<dyn MetaStore>,
     tenant: TenantId,
     db_id: u32,
     catalog_version: u64,
 ) -> Result<Vec<ModuleRow>> {
-    let migrated: Option<u8> = c
-        .exec_first(
-            "SELECT 1 FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? \
-             AND TABLE_NAME = 'logic_modules'",
-            (schema,),
-        )
-        .await
-        .map_err(|e| {
-            SprigError::new(
-                SprigCode::CatalogUnavailable,
-                "the logic catalog is unreachable",
-            )
-            .with_source(e)
-        })?;
-    if migrated.is_none() {
-        return Ok(Vec::new());
-    }
     let store = LogicStore::new(schema);
     let modules = store.modules(c, Some(db_id)).await?;
     for m in &modules {
@@ -95,7 +76,7 @@ pub async fn database_dropped(
         match cleanup_of(&m.kind, binding.as_ref()) {
             Cleanup::MessageIndex => {
                 let Some(b) = &binding else { continue };
-                if let Some(def) = crate::messages::source(c, schema, b.binding_id)
+                if let Some(def) = crate::messages::source(c, b.binding_id)
                     .await?
                     .and_then(|s| s.fanin_definition())
                 {

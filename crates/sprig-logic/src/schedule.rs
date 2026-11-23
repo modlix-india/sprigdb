@@ -22,6 +22,7 @@
 //! or `next_fire_at` moved, and a job whose id isn't in the slot (a
 //! duplicate claim, a submit retried) exits without running.
 
+use sprig_catalog::records::RecordTx;
 use std::time::Duration;
 
 use mysql_async::Conn;
@@ -158,7 +159,7 @@ fn job_bytes(hex: &str) -> Option<[u8; 16]> {
 /// # Errors
 /// Catalog errors; 39873 for a stored cron text that no longer parses.
 pub async fn tick(
-    c: &mut Conn,
+    c: &mut dyn RecordTx,
     store: &LogicStore,
     module_id: u64,
     now_ms: u64,
@@ -236,7 +237,7 @@ pub struct RunEnd {
 /// # Errors
 /// Catalog errors (the run's own error is in [`RunEnd`]).
 pub async fn run(
-    catalog: &mut Conn,
+    catalog: &mut dyn RecordTx,
     store: &LogicStore,
     shard: &mut Conn,
     schema: &str,

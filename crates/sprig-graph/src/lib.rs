@@ -6,8 +6,8 @@
 //! - [`parser`] and [`ast`]: Cypher into the syntax tree the executor runs.
 //! - [`value`] and [`eval`]: Cypher values and the gateway evaluator.
 //! - [`store`]: what the executor needs from storage; [`mem`] in memory
-//!   with any number of shards, [`maria`] over MariaDB, [`engine`] on
-//!   SprigDB's own storage engine ([`engine_keys`]: its layout).
+//!   with any number of shards, [`engine`] on SprigDB's own storage engine
+//!   ([`engine_keys`]: its layout).
 //! - [`exec`]: matching, variable-length and shortest paths, projections and
 //!   writes under the budgets.
 //! - [`catalog`]: the `graph` catalog module and graph DDL.
@@ -16,15 +16,11 @@
 //! - [`bookmark`]: signed Bolt bookmarks.
 //! - [`schema`]: indexes and uniqueness constraints.
 //! - [`mapped`]: mapped graphs (`CREATE PROPERTY GRAPH`) over existing tables.
-//! - [`pgq`]: SQL/PGQ `GRAPH_TABLE` in SQL statements.
+//! - [`pgq`] and [`graph_table`]: SQL/PGQ `GRAPH_TABLE` in SQL statements.
 //! - [`gql`]: the GQL subset, rewritten into Cypher before parsing.
 //! - [`temporal`]: temporal and spatial values.
-//! - [`typed`]: typed storage: a table per label set and per relationship
-//!   type, a column per property key and value type.
 //! - [`access`]: per-label and per-type read grants.
 //! - [`semantic`]: compile-time semantic checks (the TCK's errors).
-//! - [`mirror`]: asynchronous mirrors: the applier's steps and the
-//!   freshness check.
 
 // An interpreter: evaluator and executor functions are one match or one
 // step-by-step walk each, with the short names of the algorithms.
@@ -39,10 +35,9 @@ pub mod engine_keys;
 pub mod eval;
 pub mod exec;
 pub mod gql;
+pub mod graph_table;
 pub mod mapped;
-pub mod maria;
 pub mod mem;
-pub mod mirror;
 pub mod neo4j;
 pub mod parser;
 pub mod pgq;
@@ -51,7 +46,6 @@ pub mod semantic;
 pub mod settings;
 pub mod store;
 pub mod temporal;
-pub mod typed;
 pub mod value;
 
 pub use exec::{Budgets, Output, RowSink, VecSink, run_stream, streamable};

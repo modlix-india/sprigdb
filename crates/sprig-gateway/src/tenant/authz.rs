@@ -93,7 +93,7 @@ use super::session::TenantSession;
 type Gate = Arc<tokio::sync::Mutex<()>>;
 
 /// What a reconcile was checked at: catalog version, auth version, and
-/// the shard placement's digest (`exec::router::placement_digest`).
+/// the row-level security enforcement digest.
 type Checked = (u64, u64, u64);
 
 /// A compiled set and what it was compiled at: auth and catalog
@@ -121,8 +121,8 @@ pub struct AuthzServices {
     /// Per tenant, cluster and backend account: a hash of the account's
     /// database-level grants this gateway last applied.
     db_grants: Mutex<HashMap<(TenantId, ClusterId), HashMap<String, u64>>>,
-    /// The snapshot versions and shard placement last compared, per
-    /// tenant and cluster, and when.
+    /// The snapshot versions last compared, per tenant and cluster, and
+    /// when.
     checked: Mutex<HashMap<(TenantId, ClusterId), (Checked, std::time::Instant)>>,
     /// Per tenant: what its clusters were last reconciled at.
     placed: Mutex<HashMap<TenantId, Checked>>,
@@ -136,6 +136,10 @@ pub struct AuthzServices {
     /// Tenants being deleted or deleted: their
     /// backend accounts are never made again here.
     gone: Mutex<HashSet<TenantId>>,
+    /// Tenants a session sent MariaDB a statement for, since this process
+    /// started: only their backend accounts are reconciled
+    /// ([`AuthzServices::ensure_needed`]).
+    needed: Mutex<HashSet<TenantId>>,
 }
 
 impl std::fmt::Debug for AuthzServices {
@@ -240,12 +244,10 @@ impl AuthzServices {
     /// accounts, or when nothing changed since the last reconcile.
     ///
     /// Table, column and routine grants name every schema holding the
-    /// object on the cluster, so the shard placement is part of what is
-    /// compared: when a split, merge, move, re-key or regroup changes it
-    /// (or the snapshot's catalog or auth version moves), the next
-    /// statement of any session of the tenant here reconciles this cluster
-    /// and every other cluster of the tenant this gateway reconciled or the
-    /// layout names. Every `auth.reconcile_interval_seconds` a cluster is
+    /// object on the cluster: when the snapshot's catalog or auth version
+    /// moves, the next statement of any session of the tenant here
+    /// reconciles this cluster and every other cluster of the tenant this
+    /// gateway reconciled. Every `auth.reconcile_interval_seconds` a cluster is
     /// compared with MariaDB's grants again even when nothing changed (the
     /// drift sweep).
     ///
@@ -261,26 +263,19 @@ impl AuthzServices {
         if self.per_user.load().is_none() {
             return Ok(());
         }
+        // Every database is the engine's, so MariaDB holds nothing of the
+        // tenant: its accounts are made only once one of its sessions
+        // still has to send MariaDB a statement.
+        if !lock(&self.needed).contains(&cat.tenant) {
+            return Ok(());
+        }
         self.refuse_gone(cat.tenant)?;
-        let placement = crate::exec::router::placement_digest(svc, cat);
         // A changed `rls.backend_enforcement` (a global value changes no
         // catalog version) narrows or widens grants now.
-        let digest =
-            placement.as_ref().map_or(0, |p| p.0) ^ super::rls::enforcement_digest(svc, cat);
+        let digest = super::rls::enforcement_digest(svc, cat);
         // Where the accounts log in from moves with the tenant's path and
-        // its clusters' relays, not the catalog: every cluster of the
-        // tenant follows a change (a read fanning out to another cluster
-        // logs in there without reconciling it first).
-        let mut clusters = vec![cluster.clone()];
-        for c in placement
-            .as_ref()
-            .map(|p| p.1.as_slice())
-            .unwrap_or_default()
-        {
-            if !clusters.contains(c) {
-                clusters.push(c.clone());
-            }
-        }
+        // its cluster's relay, not the catalog.
+        let clusters = vec![cluster.clone()];
         let mut hosts = std::collections::hash_map::DefaultHasher::new();
         for c in &clusters {
             (c, login_hosts(svc, cat, c).await.ok()).hash(&mut hosts);
@@ -302,21 +297,15 @@ impl AuthzServices {
             _ => false,
         };
         self.ensure_one(svc, cat, cluster, versions, sweep).await?;
-        // The placement, the grants or the catalog moved: the tenant's
-        // other clusters follow now, so a session already using one finds
-        // the new shards' grants there (and a REVOKE reaches them).
+        // The grants or the catalog moved: the tenant's other clusters
+        // follow now (a REVOKE reaches them).
         let moved = lock(&self.placed).insert(cat.tenant, versions) != Some(versions);
         if moved {
-            let mut others: Vec<ClusterId> = lock(&self.applied)
+            let others: Vec<ClusterId> = lock(&self.applied)
                 .keys()
                 .filter(|(t, c)| *t == cat.tenant && c != cluster)
                 .map(|(_, c)| c.clone())
                 .collect();
-            for c in placement.map(|p| p.1).unwrap_or_default() {
-                if &c != cluster && !others.contains(&c) {
-                    others.push(c);
-                }
-            }
             for c in others {
                 if let Err(e) = self.ensure_one(svc, cat, &c, versions, false).await {
                     tracing::warn!(tenant = %cat.tenant, cluster = %c, error = %e, "backend grants after a placement change not reconciled yet");
@@ -324,6 +313,27 @@ impl AuthzServices {
             }
         }
         Ok(())
+    }
+
+    /// [`Self::ensure`] before a session of the tenant sends MariaDB a
+    /// statement (a form the engine doesn't answer): from then on, in this
+    /// process, the tenant's backend accounts follow its catalog.
+    ///
+    /// # Errors
+    /// As [`Self::ensure`].
+    pub async fn ensure_needed(
+        &self,
+        svc: &TenantServices,
+        cat: &TenantCatalog,
+        cluster: &ClusterId,
+    ) -> Result<()> {
+        // A tenant bootstrapped without its catalog schema (EC-124) notes
+        // that it now has accounts on MariaDB, for its cleanup.
+        if !lock(&self.needed).contains(&cat.tenant) {
+            sprig_catalog::migrate::note_mariadb_use(cat.tenant).await?;
+        }
+        lock(&self.needed).insert(cat.tenant);
+        self.ensure(svc, cat, cluster).await
     }
 
     /// One cluster of [`Self::ensure`]; `sweep` compares with MariaDB even
@@ -362,11 +372,6 @@ impl AuthzServices {
                     tracing::warn!(tenant = %cat.tenant, %cluster, error = %e, "where the tenant's tables are wasn't read; table grants name the default schemas");
                 }
             }
-        }
-        // Accounts with table-level grants reach those tables' global
-        // lookup indexes.
-        if let Err(e) = super::lookups_sql::add_lookup_grants(svc, cat, cluster, &mut want).await {
-            tracing::warn!(tenant = %cat.tenant, %cluster, error = %e, "lookup tables' grants not placed; table-level users' writes to tables with lookups fail until the next reconcile");
         }
         // Accounts bound by a table's policies read it only through its
         // policy view.

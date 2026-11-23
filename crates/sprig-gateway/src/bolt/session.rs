@@ -1,98 +1,59 @@
-//! A logged-in Bolt session: statements,
-//! transactions, bookmarks and replica reads.
+//! A logged-in Bolt session: statements, transactions and bookmarks.
 //!
 //! - **Statements.** A `RUN` is parsed, its graph resolved (the default
-//!   graph made on its first write), its table privileges checked,
-//!   and run on a `sprig_ctl` connection of the tenant's cluster: one
-//!   MariaDB transaction per auto-commit `RUN`, or the explicit
-//!   transaction's. Reads whose rows don't depend on each other stream
-//!   ([`super::stream`]); the rest are computed whole, within
-//!   `bolt.max_buffered_result_mb` (39918).
-//! - **Bookmarks.** After a commit that wrote,
-//!   the session adds the connection's `@@last_gtid` to its causal target
-//!   (GTID positions per cluster) and answers a signed bookmark carrying
-//!   the whole target ([`sprig_graph::bookmark`]). Bookmarks a driver
-//!   passes (`BEGIN` or `RUN`'s `bookmarks`) are checked (39917 for a bad
-//!   or foreign one) and join the target.
-//! - **Replica reads** (read-your-writes). A read in `mode:
-//!   "r"` on a primary with replicas goes to a replica, taking turns, after
-//!   `MASTER_GTID_WAIT` for the target within `reads.gtid_wait_timeout_ms`;
-//!   a replica that doesn't catch up in time, or fails, leaves the read on
-//!   the writer, as does `reads.routing = writer`. Writes, and reads without
-//!   `mode: "r"`, use the writer.
+//!   graph made on its first write), its privileges checked, and run on
+//!   the graph's storage in the node's engine ([`engine`]): one engine
+//!   transaction per auto-commit `RUN`, or the explicit transaction's.
+//!   A mapped graph reads its tables in process. Reads whose rows don't
+//!   depend on each other stream ([`super::stream`]); the rest are computed
+//!   whole, within `bolt.max_buffered_result_mb` (39918).
+//! - **Bookmarks.** A commit is durable before it is answered, so any later
+//!   read on this node sees it: the session answers a signed bookmark
+//!   ([`sprig_graph::bookmark`]), and bookmarks a driver passes (`BEGIN` or
+//!   `RUN`'s `bookmarks`) are checked (39917 for a bad or foreign one).
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use mysql_async::prelude::Queryable;
 use sprig_auth::authz::Action;
 use sprig_auth::mysql::Principal;
 use sprig_catalog::{Freshness, TenantCatalog};
-use sprig_common::ids::{ClusterId, DcId, TenantId};
-use sprig_common::ids::{DbId, GroupId};
+use sprig_common::ids::{DcId, TenantId};
 use sprig_common::{Result, SprigCode, SprigError};
 use sprig_graph::access::{FilteredStore, Visible, Writable};
 use sprig_graph::ast::{Clause, Query};
 use sprig_graph::bookmark::{self, Bookmark};
-use sprig_graph::catalog::backend_error;
 use sprig_graph::eval::Params;
-use sprig_graph::maria::ShardConns;
-use sprig_graph::mirror::MirrorGate;
 use sprig_graph::store::GraphStore;
 use sprig_proto_bolt::PackValue;
 use sprig_proto_bolt::server::{BoltFailure, BoltSession, QueryResult};
-use sprig_txn::{BeginOptions, TxnCoordinator};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
 use super::stream::{CHANNEL_ROWS, ChanSink, Msg, Start, summary};
 use super::{
-    DEFAULT_GRAPH, ISOLATION, LOGICAL_DATABASE, MAX_BUFFERED_RESULT_MB, failure, from_pack, refuse,
-    to_pack,
+    DEFAULT_GRAPH, LOGICAL_DATABASE, MAX_BUFFERED_RESULT_MB, failure, from_pack, refuse, to_pack,
 };
-use crate::graphs::mirror::CatalogGate;
-use crate::graphs::txn::{CoordConns, GraphBackend, ReadConns, Touched, check_epochs};
-use crate::graphs::typed::StoreParts;
-use crate::graphs::{GatewayGraphs, GraphRef, RouteHolds};
-use crate::reads::GtidSet;
+use crate::graphs::{GatewayGraphs, GraphRef};
 
 mod engine;
 use engine::{EngineRun, EngineTx};
 
-/// What an explicit transaction runs on.
-enum TxConns {
-    /// `mode: "r"`: read-only transactions per cluster.
-    Read(ReadConns),
-    /// The transaction coordinator.
-    Write(Box<TxnCoordinator<GraphBackend>>),
-}
-
-/// An open transaction: its connections (away while a streamed result
-/// holds them), the graphs it wrote and the nodes it deleted.
+/// An open transaction.
 struct Tx {
-    conns: Option<TxConns>,
-    /// The connections, coming back from a streamed result.
-    back: Option<oneshot::Receiver<TxConns>>,
     db: Option<String>,
     timeout: Option<Duration>,
     /// `BEGIN`'s `tx_metadata`, for `CALL tx.getMetaData()`.
     metadata: Option<BTreeMap<String, sprig_graph::value::Value>>,
-    deleted: Vec<(GraphRef, Vec<u64>)>,
-    /// Graphs written, with the shards (and their epochs) written.
-    touched: Vec<(GraphRef, Vec<Touched>)>,
-    /// Statements run so far.
-    ran: u32,
     /// Its engine transaction, once a statement used a graph stored in the
     /// storage engine.
     engine: Option<EngineTx>,
 }
 
-/// The session's causal target and last bookmark.
+/// The session's last bookmark.
 #[derive(Debug, Default)]
 struct Causal {
-    /// GTID positions per cluster.
-    gtids: BTreeMap<String, GtidSet>,
     last: Option<String>,
 }
 
@@ -101,7 +62,6 @@ pub(crate) struct GwSession {
     /// The gateway session table's entry (`SHOW PROCESSLIST`, `KILL`).
     reg: Option<crate::session::Session>,
     graphs: Arc<GatewayGraphs>,
-    backend: Arc<GraphBackend>,
     dc: DcId,
     tx: Option<Tx>,
     causal: Arc<Mutex<Causal>>,
@@ -116,10 +76,6 @@ struct Prepared {
     g: GraphRef,
     cat: Arc<TenantCatalog>,
     budgets: sprig_graph::Budgets,
-    read_mode: bool,
-    /// The auto-commit statement's `tx_timeout` (an explicit
-    /// transaction's is in its `Tx`).
-    timeout: Option<Duration>,
     /// Per-label and per-type grants, when the graph-wide ones don't give
     /// `SELECT` or a write action.
     visible: Option<Access>,
@@ -375,10 +331,6 @@ fn status_pack(n: &sprig_graph::exec::Notification) -> PackValue {
     ])
 }
 
-fn read_mode(extra: &PackValue) -> bool {
-    extra.get("mode").and_then(PackValue::as_str) == Some("r")
-}
-
 fn lost_conn() -> SprigError {
     SprigError::new(
         SprigCode::BoltProtocol,
@@ -397,7 +349,6 @@ impl GwSession {
         Self {
             principal,
             reg: None,
-            backend: Arc::new(GraphBackend::new(Arc::clone(&graphs))),
             graphs,
             dc,
             tx: None,
@@ -445,7 +396,7 @@ impl GwSession {
         }
     }
 
-    /// Checks the bookmarks in `extra` and adds them to the target.
+    /// Checks the bookmarks in `extra`.
     ///
     /// # Errors
     /// 39917 for a bad or foreign bookmark.
@@ -462,288 +413,24 @@ impl GwSession {
         }
         let tenant = self.tenant();
         let key = self.graphs.bookmark_key(tenant).await?;
-        let mut got: Vec<Bookmark> = Vec::with_capacity(list.len());
         for b in list {
-            got.push(bookmark::decode(b, tenant.0, &key)?);
-        }
-        let mut c = self.causal();
-        for b in got {
-            for (cluster, g) in b.gtids {
-                let set = GtidSet::parse(&g).map_err(|_| {
-                    SprigError::new(SprigCode::BoltBookmarkInvalid, "invalid bookmark: bad GTID")
-                })?;
-                c.gtids.entry(cluster).or_default().union(&set);
-            }
+            bookmark::decode(b, tenant.0, &key)?;
         }
         Ok(())
     }
 
-    /// After a commit: the positions of the branches that wrote join the
-    /// target, and the bookmark of the whole target.
+    /// After a commit: the session's new bookmark.
     async fn after_commit(&self) -> Result<String> {
-        for (cluster, g) in self.backend.take_positions() {
-            if let Ok(set) = GtidSet::parse(&g) {
-                self.causal().gtids.entry(cluster).or_default().union(&set);
-            }
-        }
         let key = self.graphs.bookmark_key(self.tenant()).await?;
         let mut c = self.causal();
         let b = Bookmark {
             tenant: self.tenant().0,
             hlc: now_us(),
-            gtids: c
-                .gtids
-                .iter()
-                .map(|(k, v)| (k.clone(), v.to_string()))
-                .collect(),
+            gtids: BTreeMap::new(),
         };
         let text = bookmark::encode(&b, &key);
         c.last = Some(text.clone());
         Ok(text)
-    }
-
-    /// `bolt.isolation` as SQL.
-    fn isolation(&self, cat: &TenantCatalog) -> &'static str {
-        let iso = self.graphs.svc.settings.get(
-            &ISOLATION,
-            &cat.setting_ctx(&self.dc),
-            Some(&cat.settings),
-        );
-        if iso == "repeatable_read" {
-            "REPEATABLE READ"
-        } else {
-            "READ COMMITTED"
-        }
-    }
-
-    /// Read-only transactions on every cluster of `g` missing from `rc`:
-    /// replicas for `mode: "r"` (after the causal wait), else writers.
-    async fn open_reads(
-        &self,
-        rc: &mut ReadConns,
-        g: &GraphRef,
-        read_mode: bool,
-        cat: &TenantCatalog,
-    ) -> Result<()> {
-        // An auto-commit read at READ COMMITTED needs no transaction: each
-        // of its statements sees the latest commits inside one as well, so
-        // it saves the `SET TRANSACTION`, `START TRANSACTION` and `COMMIT`
-        // round trips.
-        if rc.conns.is_empty() && rc.implicit && self.isolation(cat) == "READ COMMITTED" {
-            rc.autocommit = true;
-        }
-        let tx = !rc.autocommit;
-        for c in rc.missing(&g.shards) {
-            let cluster = ClusterId::new(&c)
-                .map_err(|e| SprigError::internal(format!("cluster id {c}: {e}")))?;
-            let conn = if read_mode {
-                self.read_conn(&cluster, tx, cat).await?
-            } else {
-                self.writer_conn(&cluster, true, tx, cat).await?
-            };
-            // Spare connections for reads that run at the same time: from
-            // the writer's pool, when the read is on the writer.
-            if rc.autocommit
-                && (!read_mode || matches!(self.graphs.replica_pool(&cluster).await, Ok(None)))
-            {
-                rc.pools
-                    .insert(c.clone(), self.graphs.session_pool(&cluster).await?);
-            }
-            rc.conns.insert(c, conn);
-        }
-        Ok(())
-    }
-
-    /// The `txn.*` settings for the tenant (for example
-    /// `txn.non_xa_policy = sprig_2pc` holds graph writes' branches on
-    /// clusters without XA, as SQL sessions do).
-    fn txn_config(&self, cat: &TenantCatalog) -> sprig_txn::TxnConfig {
-        let ctx = cat.setting_ctx(&self.dc);
-        let s = &self.graphs.svc.settings;
-        sprig_txn::TxnConfig::resolve_with(
-            &ctx,
-            |k, cx| s.get(k, cx, Some(&cat.settings)),
-            |k, cx| s.get(k, cx, Some(&cat.settings)).into_owned(),
-            "",
-        )
-    }
-
-    /// The mirror gate of a read statement on `g`: `None` unless
-    /// the applier keeps `g`'s mirrors.
-    fn gate(&self, g: &GraphRef, cat: &TenantCatalog) -> Option<Arc<dyn MirrorGate>> {
-        if !g.shards.mirror_async {
-            return None;
-        }
-        let ctx = cat.setting_ctx(&self.dc).with_db(g.db_id);
-        let wait = self.graphs.svc.settings.get(
-            &sprig_graph::settings::MIRROR_MAX_WAIT_MS,
-            &ctx,
-            Some(&cat.settings),
-        );
-        let targets = self
-            .causal()
-            .gtids
-            .iter()
-            .map(|(c, s)| (c.clone(), s.to_string()))
-            .collect();
-        Some(Arc::new(CatalogGate {
-            graphs: Arc::clone(&self.graphs),
-            tenant: g.tenant,
-            graph: g.graph_id,
-            targets,
-            wait: Duration::from_millis(wait),
-        }))
-    }
-
-    /// Waits while the mover holds a range of `g`'s map (a cutover), then
-    /// answers `g` with the map after it.
-    async fn after_holds(&self, g: GraphRef) -> Result<GraphRef> {
-        let mut g = g;
-        let started = Instant::now();
-        while let Some(until) = g.held_until {
-            let now = u64::try_from(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0, |d| d.as_millis()),
-            )
-            .unwrap_or(u64::MAX);
-            if now > until.saturating_add(5_000) || started.elapsed() > Duration::from_secs(30) {
-                return Err(SprigError::new(
-                    SprigCode::ShardMapChanged,
-                    "the graph's shards are held by a split, merge or move; retry",
-                ));
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            g = self.graphs.refresh(&g).await?;
-        }
-        Ok(g)
-    }
-
-    /// Starts a transaction on `c` at `bolt.isolation`.
-    async fn start_tx(
-        &self,
-        c: &mut mysql_async::Conn,
-        read_only: bool,
-        cat: &TenantCatalog,
-    ) -> Result<()> {
-        let iso = self.graphs.svc.settings.get(
-            &ISOLATION,
-            &cat.setting_ctx(&self.dc),
-            Some(&cat.settings),
-        );
-        let level = if iso == "repeatable_read" {
-            "REPEATABLE READ"
-        } else {
-            "READ COMMITTED"
-        };
-        c.query_drop(format!("SET TRANSACTION ISOLATION LEVEL {level}"))
-            .await
-            .map_err(backend_error)?;
-        c.query_drop(if read_only {
-            "START TRANSACTION READ ONLY"
-        } else {
-            "START TRANSACTION"
-        })
-        .await
-        .map_err(backend_error)
-    }
-
-    /// A transaction on the writer of `cluster` (`tx`; else a connection
-    /// for auto-commit statements).
-    async fn writer_conn(
-        &self,
-        cluster: &ClusterId,
-        read_only: bool,
-        tx: bool,
-        cat: &TenantCatalog,
-    ) -> Result<mysql_async::Conn> {
-        let pool = self.graphs.session_pool(cluster).await?;
-        let mut c = pool.get_conn().await.map_err(backend_error)?;
-        if tx {
-            self.start_tx(&mut c, read_only, cat).await?;
-        }
-        Ok(c)
-    }
-
-    /// A read-only transaction for a `mode: "r"` read: on a replica that
-    /// has the session's causal target, else on the writer.
-    async fn read_conn(
-        &self,
-        cluster: &ClusterId,
-        tx: bool,
-        cat: &TenantCatalog,
-    ) -> Result<mysql_async::Conn> {
-        let ctx = cat.setting_ctx(&self.dc);
-        let s = &self.graphs.svc.settings;
-        let routing = s.get(&crate::reads::settings::ROUTING, &ctx, Some(&cat.settings));
-        if routing != "writer"
-            && let Ok(Some(pool)) = self.graphs.replica_pool(cluster).await
-        {
-            let target = self
-                .causal()
-                .gtids
-                .get(cluster.as_str())
-                .cloned()
-                .unwrap_or_default();
-            let wait = Duration::from_millis(s.get(
-                &crate::reads::settings::GTID_WAIT_TIMEOUT_MS,
-                &ctx,
-                Some(&cat.settings),
-            ));
-            let outcome = match pool.get_conn().await {
-                Err(e) => Err(("error", e.to_string())),
-                Ok(c) if target.is_empty() && !tx => Ok((c, "none")),
-                Ok(mut c) if target.is_empty() => match self.start_tx(&mut c, true, cat).await {
-                    Ok(()) => Ok((c, "none")),
-                    Err(e) => Err(("error", e.to_string())),
-                },
-                Ok(mut c) => {
-                    let r: std::result::Result<Option<Option<i64>>, _> = c
-                        .exec_first(
-                            "SELECT MASTER_GTID_WAIT(?, ?)",
-                            (target.to_string(), wait.as_secs_f64()),
-                        )
-                        .await;
-                    match r {
-                        Ok(Some(Some(0))) if !tx => Ok((c, "ok")),
-                        Ok(Some(Some(0))) => match self.start_tx(&mut c, true, cat).await {
-                            Ok(()) => Ok((c, "ok")),
-                            Err(e) => Err(("error", e.to_string())),
-                        },
-                        Ok(Some(Some(_))) => Err(("timeout", String::new())),
-                        Ok(_) => Err(("error", "no replication position".into())),
-                        Err(e) => Err(("error", e.to_string())),
-                    }
-                }
-            };
-            match outcome {
-                Ok((c, o)) => {
-                    metrics::counter!("sprig_bolt_bookmark_waits_total", "outcome" => o)
-                        .increment(1);
-                    return Ok(c);
-                }
-                Err((o, why)) => {
-                    metrics::counter!("sprig_bolt_bookmark_waits_total", "outcome" => o)
-                        .increment(1);
-                    tracing::debug!(%cluster, outcome = o, %why, "Bolt read stays on the writer");
-                }
-            }
-        }
-        self.writer_conn(cluster, true, tx, cat).await
-    }
-
-    /// The open transaction's connections, back from a streamed result if
-    /// one had them.
-    async fn tx_conns(&mut self) -> Result<&mut TxConns> {
-        let t = self
-            .tx
-            .as_mut()
-            .ok_or_else(|| SprigError::internal("no transaction"))?;
-        if t.conns.is_none() {
-            let back = t.back.take().ok_or_else(lost_conn)?;
-            t.conns = Some(back.await.map_err(|_| lost_conn())?);
-        }
-        t.conns.as_mut().ok_or_else(lost_conn)
     }
 
     #[allow(clippy::many_single_char_names, clippy::too_many_lines)] // q, p, g; parse, resolve, authorize, budgets
@@ -781,7 +468,7 @@ impl GwSession {
         };
         let (db, name) = self.split_db(db_req.as_deref(), &cat);
         let grants = self.graphs.grants(&cat, self.principal.user_id);
-        let mut graph = self.graphs.resolve(&cat, &db, &name).await?;
+        let mut graph = self.graphs.resolve(&cat, &db, &name)?;
         let mut cat = cat;
         if graph.is_none() {
             if !(is_default(db_req.as_deref()) && has_writes(&q)) {
@@ -828,18 +515,9 @@ impl GwSession {
                 .await?;
             graph = Some(g);
         }
-        let Some(mut g) = graph else {
+        let Some(g) = graph else {
             return Err(SprigError::internal("graph missing"));
         };
-        // The graph's storage follows `graph.storage` (in the background),
-        // and its mirror mode `graph.mirror`.
-        self.graphs.follow_storage(&g, &cat);
-        if self.graphs.follow_mirror_setting(&g, &cat).await {
-            cat = self.graphs.catalog(tenant, Freshness::Latest).await?;
-            if let Some(now) = self.graphs.resolve(&cat, &g.db, &g.name).await? {
-                g = now;
-            }
-        }
         let mut visible: Option<Access> = None;
         for a in actions(&q) {
             if !self
@@ -1000,8 +678,6 @@ impl GwSession {
             g,
             cat,
             budgets,
-            read_mode: read_mode(extra),
-            timeout,
             visible,
         })))
     }
@@ -1014,329 +690,36 @@ impl GwSession {
             g,
             cat,
             budgets,
-            read_mode,
-            timeout,
             visible,
         } = pr;
         let writes = has_writes(&q);
         if g.def.kind == "mapped" {
-            // Read-only SQL over the user's tables, on its own read-only
-            // transaction (also inside an explicit Bolt transaction).
+            // Read-only SQL over the user's tables, read in process (also
+            // inside an explicit Bolt transaction).
             let def = mapped_def(&g)?;
-            // Over an engine database's tables: read in process.
-            if crate::engine::graphsql::EngineSql::serves(&cat, g.db_id) {
-                let mut run = crate::engine::graphsql::EngineSql::new(
-                    g.tenant,
-                    &cat,
-                    self.graphs.lctn(&cat),
-                    false,
-                );
-                let mut store =
-                    sprig_graph::mapped::MappedStore::new(&mut run, g.graph_id, &g.schema, def);
-                let r = sprig_graph::exec::run(&mut store, &q, &p, &budgets).await;
-                return Ok(StartOrResult::Result(self.result(r?, &g.name, &cat)?));
-            }
-            let mut rc = ReadConns::default();
-            if let Err(e) = self.open_reads(&mut rc, &g, read_mode, &cat).await {
-                rc.end().await;
-                return Err(e);
-            }
-            let r = match rc.conns.get_mut(g.cluster.as_str()) {
-                Some(conn) => {
-                    let mut store =
-                        sprig_graph::mapped::MappedStore::new(conn, g.graph_id, &g.schema, def);
-                    sprig_graph::exec::run(&mut store, &q, &p, &budgets).await
-                }
-                None => Err(SprigError::internal("no connection for a mapped graph")),
-            };
-            rc.end().await;
+            let mut run = crate::engine::graphsql::EngineSql::new(
+                g.tenant,
+                &cat,
+                self.graphs.lctn(&cat),
+                false,
+            );
+            let mut store =
+                sprig_graph::mapped::MappedStore::new(&mut run, g.graph_id, &g.schema, def);
+            let r = sprig_graph::exec::run(&mut store, &q, &p, &budgets).await;
             return Ok(StartOrResult::Result(self.result(r?, &g.name, &cat)?));
         }
-        if crate::graphs::engine::on_engine(&g, &cat) {
-            let streams = sprig_graph::streamable(&q).is_some();
-            return self
-                .execute_engine(EngineRun {
-                    q,
-                    p,
-                    g,
-                    cat,
-                    budgets,
-                    visible,
-                    writes,
-                    streams,
-                })
-                .await;
-        }
-        let g = if writes {
-            self.after_holds(g).await?
-        } else {
-            g
-        };
-        let dict = self.graphs.dictionary(&g);
-        let (labels, types) = self.graphs.names_of(&g);
-        let ids = self.graphs.counters(&g).await?;
         let streams = sprig_graph::streamable(&q).is_some();
-        self.backend.set_isolation(self.isolation(&cat));
-        self.backend.set_config(self.txn_config(&cat));
-        if self.tx.is_none() {
-            if !writes {
-                let mut rc = ReadConns {
-                    implicit: true,
-                    ..ReadConns::default()
-                };
-                if let Err(e) = self.open_reads(&mut rc, &g, read_mode, &cat).await {
-                    rc.end().await;
-                    return Err(e);
-                }
-                let gate = self.gate(&g, &cat);
-                if streams {
-                    let (tx, rx) = mpsc::channel(CHANNEL_ROWS);
-                    let graphs = Arc::clone(&self.graphs);
-                    let gr = g.clone();
-                    let parts = StoreParts {
-                        labels,
-                        types,
-                        dict,
-                        ids,
-                        indexes: g.def.indexes.clone(),
-                        ops: None,
-                        gate,
-                        holds: None,
-                    };
-                    tokio::spawn(crate::offload::run_graph_stream(async move {
-                        let r = {
-                            let mut store = graphs.open_store(&gr, &mut rc, parts);
-                            let mut sink = ChanSink { tx: tx.clone() };
-                            stream_on(&mut *store, visible, &q, &p, &budgets, &mut sink).await
-                        };
-                        rc.end().await;
-                        let end = r.map(|o| summary(o.stats, None)).map_err(|e| failure(&e));
-                        let _ = tx.send(Msg::End(end)).await;
-                    }));
-                    return Ok(StartOrResult::Stream(rx, g.name));
-                }
-                // A route over a range a mover holds waits for the hold,
-                // then plans again.
-                let holds: Arc<dyn sprig_graph::maria::HoldWait> = Arc::new(RouteHolds {
-                    graphs: Arc::clone(&self.graphs),
-                    g: g.clone(),
-                });
-                let parts = StoreParts {
-                    labels,
-                    types,
-                    dict,
-                    ids,
-                    indexes: g.def.indexes.clone(),
-                    ops: Some(self.graphs.schema_ops(&g)),
-                    gate,
-                    holds: Some(holds),
-                };
-                let r = {
-                    let mut store = self.graphs.open_store(&g, &mut rc, parts);
-                    hard_time(
-                        budgets.max_time,
-                        run_on(&mut *store, visible.clone(), &q, &p, &budgets),
-                    )
-                    .await
-                };
-                rc.end().await;
-                let out = r?;
-                self.after_commit().await?;
-                return Ok(StartOrResult::Result(self.result(out, &g.name, &cat)?));
-            }
-            // A write: one coordinated transaction, whose lock waits end
-            // with its tx_timeout.
-            self.backend.set_lock_wait(timeout);
-            let mut coord = self.backend.coordinator(self.tenant());
-            let mut touched: Vec<Touched> = Vec::new();
-            let r = {
-                let mut cc = CoordConns {
-                    coord: &mut coord,
-                    backend: Arc::clone(&self.backend),
-                    db: DbId(g.shards.db),
-                    group: GroupId(g.shards.group),
-                    touched: &mut touched,
-                    batches: Some((Arc::clone(&self.graphs), g.clone())),
-                };
-                let parts = StoreParts {
-                    labels,
-                    types,
-                    dict,
-                    ids,
-                    indexes: g.def.indexes.clone(),
-                    ops: Some(self.graphs.schema_ops(&g)),
-                    gate: None,
-                    holds: None,
-                };
-                let r = {
-                    let mut store = self.graphs.open_store(&g, &mut cc, parts);
-                    run_on(&mut *store, visible.clone(), &q, &p, &budgets).await
-                };
-                match r {
-                    Ok(o) => self
-                        .graphs
-                        .check_deleted(&g, &mut cc, &o.deleted_nodes)
-                        .await
-                        .map(|()| o),
-                    Err(e) => Err(e),
-                }
-            };
-            let r = match r {
-                Ok(o) if g.shards.group != 0 && !touched.is_empty() => {
-                    match self.graphs.refresh(&g).await {
-                        Ok(now) => check_epochs(&touched, &now.shards).map(|()| o),
-                        Err(e) => Err(e),
-                    }
-                }
-                x => x,
-            };
-            let out = match r {
-                Ok(o) => {
-                    coord.commit().await?;
-                    o
-                }
-                Err(e) => {
-                    let _ = coord.rollback().await;
-                    return Err(e);
-                }
-            };
-            self.after_commit().await?;
-            return Ok(StartOrResult::Result(self.result(out, &g.name, &cat)?));
-        }
-        // In the explicit transaction.
-        if self.tx.as_ref().is_some_and(|t| t.engine.is_some()) {
-            return Err(engine::mixed_graphs());
-        }
-        self.tx_conns().await?;
-        let Some(t) = self.tx.as_mut() else {
-            return Err(SprigError::internal("no transaction"));
-        };
-        let schema = q
-            .parts
-            .iter()
-            .any(|x| x.clauses.iter().any(|c| matches!(c, Clause::Schema(_))));
-        if schema && t.ran > 0 {
-            return Err(SprigError::new(
-                SprigCode::GraphUnsupported,
-                "an index or constraint command must be the first statement of its transaction",
-            ));
-        }
-        t.ran += 1;
-        let mut conns = t.conns.take().ok_or_else(lost_conn)?;
-        if let TxConns::Read(rc) = &mut conns
-            && let Err(e) = self.open_reads(rc, &g, true, &cat).await
-        {
-            if let Some(t) = self.tx.as_mut() {
-                t.conns = Some(conns);
-            }
-            return Err(e);
-        }
-        let backend = Arc::clone(&self.backend);
-        // Read-only transactions may read asynchronous mirrors.
-        let gate = if matches!(conns, TxConns::Read(_)) {
-            self.gate(&g, &cat)
-        } else {
-            None
-        };
-        if streams {
-            let (back_tx, back_rx) = oneshot::channel();
-            if let Some(t) = self.tx.as_mut() {
-                t.back = Some(back_rx);
-            }
-            let (tx, rx) = mpsc::channel(CHANNEL_ROWS);
-            let layout = Arc::clone(&g.shards);
-            let graphs = Arc::clone(&self.graphs);
-            let gr = g.clone();
-            let parts = StoreParts {
-                labels,
-                types,
-                dict,
-                ids,
-                indexes: g.def.indexes.clone(),
-                ops: None,
-                gate,
-                holds: None,
-            };
-            tokio::spawn(crate::offload::run_graph_stream(async move {
-                let mut touched = Vec::new();
-                let r = {
-                    let mut sink = ChanSink { tx: tx.clone() };
-                    let mut cc;
-                    let sc: &mut dyn ShardConns = match &mut conns {
-                        TxConns::Read(rc) => rc,
-                        TxConns::Write(coord) => {
-                            cc = CoordConns {
-                                coord,
-                                backend,
-                                db: DbId(layout.db),
-                                group: GroupId(layout.group),
-                                touched: &mut touched,
-                                batches: None,
-                            };
-                            &mut cc
-                        }
-                    };
-                    let mut store = graphs.open_store(&gr, sc, parts);
-                    stream_on(&mut *store, visible, &q, &p, &budgets, &mut sink).await
-                };
-                let _ = back_tx.send(conns);
-                let end = r.map(|o| summary(o.stats, None)).map_err(|e| failure(&e));
-                let _ = tx.send(Msg::End(end)).await;
-            }));
-            return Ok(StartOrResult::Stream(rx, g.name));
-        }
-        let ops = self.graphs.schema_ops(&g);
-        let mut touched = Vec::new();
-        let r = {
-            let mut cc;
-            let sc: &mut dyn ShardConns = match &mut conns {
-                TxConns::Read(rc) => rc,
-                TxConns::Write(coord) => {
-                    cc = CoordConns {
-                        coord,
-                        backend,
-                        db: DbId(g.shards.db),
-                        group: GroupId(g.shards.group),
-                        touched: &mut touched,
-                        batches: None,
-                    };
-                    &mut cc
-                }
-            };
-            let parts = StoreParts {
-                labels,
-                types,
-                dict,
-                ids,
-                indexes: g.def.indexes.clone(),
-                ops: Some(ops),
-                gate,
-                holds: None,
-            };
-            let mut store = self.graphs.open_store(&g, sc, parts);
-            run_on(&mut *store, visible.clone(), &q, &p, &budgets).await
-        };
-        let Some(t) = self.tx.as_mut() else {
-            return Err(SprigError::internal("no transaction"));
-        };
-        t.conns = Some(conns);
-        let out = r?;
-        if !touched.is_empty() {
-            match t.touched.iter_mut().find(|(x, _)| x.graph_id == g.graph_id) {
-                Some((_, v)) => {
-                    for x in touched {
-                        if !v.contains(&x) {
-                            v.push(x);
-                        }
-                    }
-                }
-                None => t.touched.push((g.clone(), touched)),
-            }
-        }
-        if !out.deleted_nodes.is_empty() {
-            t.deleted.push((g.clone(), out.deleted_nodes.clone()));
-        }
-        Ok(StartOrResult::Result(self.result(out, &g.name, &cat)?))
+        self.execute_engine(EngineRun {
+            q,
+            p,
+            g,
+            cat,
+            budgets,
+            visible,
+            writes,
+            streams,
+        })
+        .await
     }
 
     fn result(
@@ -1404,44 +787,14 @@ impl GwSession {
         })
     }
 
-    /// Ends the open transaction, whether its connections are here or
-    /// still with a streamed result: everything rolls back.
+    /// Ends the open transaction, whether it is here or still with a
+    /// streamed result: everything rolls back.
     fn abandon(&mut self) {
         let Some(t) = self.tx.take() else { return };
-        let fut = async move {
-            if let Some(et) = t.engine {
-                et.abandon().await;
-            }
-            let conns = match (t.conns, t.back) {
-                (Some(c), _) => Some(c),
-                (None, Some(b)) => b.await.ok(),
-                (None, None) => None,
-            };
-            match conns {
-                Some(TxConns::Read(rc)) => rc.end().await,
-                Some(TxConns::Write(mut coord)) => {
-                    let _ = coord.rollback().await;
-                }
-                None => {}
-            }
-        };
-        tokio::spawn(fut);
+        if let Some(et) = t.engine {
+            tokio::spawn(et.abandon());
+        }
     }
-}
-
-/// Whether `e` says the statement used a shard map that changed under it.
-fn stale(e: &SprigError) -> bool {
-    match e.kind {
-        sprig_common::ErrorKind::Backend { errno, .. } => matches!(errno, 1146 | 1049),
-        _ => e.code() == Some(SprigCode::ShardMapChanged),
-    }
-}
-
-/// [`stale`] for a failure a streamed statement reported.
-fn stale_failure(f: &BoltFailure) -> bool {
-    f.message.contains("(1146)")
-        || f.message.contains("(1049)")
-        || f.code == "Neo.TransientError.General.DatabaseUnavailable"
 }
 
 /// A mapped graph's definition.
@@ -1457,8 +810,7 @@ enum StartOrResult {
 }
 
 impl GwSession {
-    /// A `RUN`: prepare and execute, again with a fresh map when the
-    /// statement met a shard that moved.
+    /// A `RUN`: prepare and execute.
     async fn run_inner(
         &mut self,
         query: &str,
@@ -1466,40 +818,19 @@ impl GwSession {
         extra: &PackValue,
     ) -> std::result::Result<QueryResult, BoltFailure> {
         let started = Instant::now();
-        let mut attempt = 0;
         let timeout = self
             .tx
             .as_ref()
             .map_or_else(|| timeout_of(extra), |t| t.timeout);
-        let (start, graph) = loop {
-            let pr = match self.prepare(query, params, extra).await {
-                Ok(Prep::Done(r)) => return Ok(r),
-                Ok(Prep::Run(p)) => *p,
-                Err(e) => return Err(failure(&e)),
-            };
-            match self.execute(pr).await {
-                Ok(StartOrResult::Result(r)) => return Ok(r),
-                Ok(StartOrResult::Stream(rx, g)) => match super::stream::start(rx).await {
-                    Ok(s) => break (s, g),
-                    // A streamed read that failed before its first row
-                    // (nothing reached the client): as below.
-                    Err(f) if self.tx.is_none() && attempt < 5 && stale_failure(&f) => {
-                        attempt += 1;
-                        metrics::counter!("sprig_graph_stale_map_retries_total").increment(1);
-                        tokio::time::sleep(Duration::from_millis(100 << attempt.min(4))).await;
-                    }
-                    Err(f) => return Err(f),
-                },
-                // An auto-commit statement that met a shard the mover just
-                // split, merged or moved (its schema or table is gone, or
-                // the map changed under it) runs again with the new map.
-                Err(e) if self.tx.is_none() && attempt < 5 && stale(&e) => {
-                    attempt += 1;
-                    metrics::counter!("sprig_graph_stale_map_retries_total").increment(1);
-                    tokio::time::sleep(Duration::from_millis(100 << attempt.min(4))).await;
-                }
-                Err(e) => return Err(timed_out_failure(&e, timeout)),
-            }
+        let pr = match self.prepare(query, params, extra).await {
+            Ok(Prep::Done(r)) => return Ok(r),
+            Ok(Prep::Run(p)) => *p,
+            Err(e) => return Err(failure(&e)),
+        };
+        let (start, graph) = match self.execute(pr).await {
+            Ok(StartOrResult::Result(r)) => return Ok(r),
+            Ok(StartOrResult::Stream(rx, g)) => (super::stream::start(rx).await?, g),
+            Err(e) => return Err(timed_out_failure(&e, timeout)),
         };
         let t_first = i64::try_from(started.elapsed().as_millis()).unwrap_or(0);
         Ok(match start {
@@ -1582,32 +913,15 @@ impl BoltSession for GwSession {
                 "impersonation (imp_user) is not supported",
             ));
         }
-        let tenant = self.tenant();
         let r: Result<Tx> = async {
             self.take_bookmarks(extra).await?;
-            let cat = self.graphs.catalog(tenant, Freshness::Latest).await?;
-            self.backend.set_isolation(self.isolation(&cat));
-            self.backend.set_config(self.txn_config(&cat));
-            self.backend.set_lock_wait(timeout_of(extra));
-            let conns = if read_mode(extra) {
-                TxConns::Read(ReadConns::default())
-            } else {
-                let mut coord = self.backend.coordinator(tenant);
-                coord.begin(BeginOptions::default())?;
-                TxConns::Write(Box::new(coord))
-            };
             Ok(Tx {
-                conns: Some(conns),
-                back: None,
                 db: extra
                     .get("db")
                     .and_then(PackValue::as_str)
                     .map(str::to_owned),
                 timeout: timeout_of(extra),
                 metadata: metadata_of(extra),
-                deleted: Vec::new(),
-                touched: Vec::new(),
-                ran: 0,
                 engine: None,
             })
         }
@@ -1620,58 +934,13 @@ impl BoltSession for GwSession {
         if self.tx.is_none() {
             return Err(BoltFailure::invalid("no open transaction"));
         }
-        // The engine part first: its deleted-node check may still refuse.
-        if let Some(et) = self.tx.as_mut().and_then(|t| t.engine.take())
-            && let Err(e) = et.commit().await
-        {
-            self.abandon();
-            return Err(failure(&e));
-        }
-        if let Err(e) = self.tx_conns().await {
-            self.abandon();
-            return Err(failure(&e));
-        }
+        // Its deleted-node check may still refuse.
         let Some(mut t) = self.tx.take() else {
             return Err(BoltFailure::invalid("no open transaction"));
         };
-        let Some(conns) = t.conns.take() else {
-            return Err(failure(&lost_conn()));
-        };
-        let mut coord = match conns {
-            TxConns::Read(rc) => {
-                rc.end().await;
-                let b = self.after_commit().await.map_err(|e| failure(&e))?;
-                return Ok(Some(b));
-            }
-            TxConns::Write(c) => c,
-        };
-        let checked: Result<()> = async {
-            for (g, ids) in &t.deleted {
-                let mut touched = Vec::new();
-                let mut cc = CoordConns {
-                    coord: &mut coord,
-                    backend: Arc::clone(&self.backend),
-                    db: DbId(g.shards.db),
-                    group: GroupId(g.shards.group),
-                    touched: &mut touched,
-                    batches: None,
-                };
-                self.graphs.check_deleted(g, &mut cc, ids).await?;
-            }
-            for (g, touched) in &t.touched {
-                if g.shards.group != 0 {
-                    let now = self.graphs.refresh(g).await?;
-                    check_epochs(touched, &now.shards)?;
-                }
-            }
-            Ok(())
+        if let Some(et) = t.engine.take() {
+            et.commit().await.map_err(|e| failure(&e))?;
         }
-        .await;
-        if let Err(e) = checked {
-            let _ = coord.rollback().await;
-            return Err(failure(&e));
-        }
-        coord.commit().await.map_err(|e| failure(&e))?;
         let b = self.after_commit().await.map_err(|e| failure(&e))?;
         Ok(Some(b))
     }

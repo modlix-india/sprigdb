@@ -54,6 +54,7 @@ pub mod mover;
 pub mod placement_admin;
 // An operator's errant_extract and node_rebuild.
 pub mod graph_admin;
+pub mod logic_admin;
 pub mod recovery;
 // sprigctl search.
 mod search_admin;
@@ -111,6 +112,8 @@ pub struct AdminService {
     moves: Option<Arc<crate::migrate::DcMoves>>,
     failover: Option<Arc<crate::failover::role::FailoverRole>>,
     graphs: Option<Arc<crate::graph_views::GraphViews>>,
+    /// Tenants' logic catalogs (`sprigctl logic`).
+    logic: Option<Arc<dyn sprig_catalog::RecordStore>>,
     residency: Option<Arc<crate::residency::Residency>>,
     /// The in-doubt transaction calls, built on first use.
     txn: std::sync::OnceLock<Arc<txn_admin::TxnAdmin>>,
@@ -151,6 +154,7 @@ impl AdminService {
             failover: None,
             residency: None,
             graphs: None,
+            logic: None,
             txn: std::sync::OnceLock::new(),
             search_catalog: None,
             contracts: None,

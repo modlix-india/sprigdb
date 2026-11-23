@@ -256,7 +256,13 @@ impl Txn {
         let p = shared.xa_claim(xid).ok_or_else(xaer_nota)?;
         let key = record_key(p.home, xid);
         let done = shared.commit_writes(&**path, p.id, p.writes, p.durability, Some(&key));
-        shared.xa_finished(xid, done.is_ok());
+        // A commit across units whose coordinator stopped part way has an
+        // outcome only its resolver learns: the XID stays claimed (neither
+        // commit nor rollback can run on it) until a restart reads the truth
+        // back from the store.
+        if done.is_ok() || !shared.cross_holds_locks(p.id) {
+            shared.xa_finished(xid, done.is_ok());
+        }
         let (cts, ticket) = done?;
         Ok(CommitTicket::new(Some(cts), cts, ticket.max(p.ticket)))
     }
@@ -307,6 +313,20 @@ impl TxnShared {
     /// Reads the prepare records back from the store after a restart: each
     /// becomes a prepared transaction again, holding its exclusive locks.
     pub(crate) fn load_prepared(&self, path: &dyn CommitPath) {
+        self.load_prepared_of(path, None);
+    }
+
+    /// [`TxnShared::load_prepared`] for one unit's records only (`None`:
+    /// every unit's), after that unit's snapshot was ingested.
+    pub(crate) fn load_prepared_of(&self, path: &dyn CommitPath, only: Option<u64>) {
+        self.load_xa_of(path, only);
+        // Commits across units a crash left unfinished.
+        self.load_cross(path, only);
+    }
+
+    /// The prepared XA transactions recorded in `only`'s bookkeeping (or
+    /// every unit's), listed with their locks.
+    pub(crate) fn load_xa_of(&self, path: &dyn CommitPath, only: Option<u64>) {
         // Every unit's bookkeeping: `<prefix> | unit u64 | field`.
         let all = keys::unit_meta_key(0, b"");
         let prefix = &all[..all.len() - 8];
@@ -322,7 +342,11 @@ impl TxnShared {
                     && let Some(xid) = rest[8..].strip_prefix(FIELD)
                 {
                     let home = u64::from_be_bytes(rest[..8].try_into().unwrap_or([0; 8]));
-                    found.push((home, xid.to_vec(), decode(it.value())));
+                    // A replicated unit's prepared transactions belong to
+                    // its leader: a node lists them when it takes the unit.
+                    if only.is_none_or(|u| u == home) && path.leader_epoch_of(home) != 0 {
+                        found.push((home, xid.to_vec(), decode(it.value())));
+                    }
                 }
                 it.next();
             }

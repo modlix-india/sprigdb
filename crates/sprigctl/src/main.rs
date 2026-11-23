@@ -621,7 +621,7 @@ fn main() -> ExitCode {
             "gateway" => gateway::run(&client, sub, output(&matches))
                 .await
                 .map(|()| ExitCode::SUCCESS),
-            "logic" => logic::run(sub, output(&matches))
+            "logic" => logic::run(&client, sub, output(&matches))
                 .await
                 .map(|()| ExitCode::SUCCESS),
             "inherit" => inherit::run(sub, output(&matches))

@@ -1097,7 +1097,7 @@ impl PassSession {
         // its map holds now (a split's, merge's or move's new shards from
         // their cutover, with the chunk tables the move carried); a
         // database's default group's as the index records them.
-        let maps = crate::exec::router::map_cache(&svc, tenant).ok();
+        let maps = crate::graphs::map_cache(&svc, tenant).ok();
         let mut shards = Vec::new();
         let mut groups: HashSet<u32> = HashSet::new();
         for schema in ix.shards() {

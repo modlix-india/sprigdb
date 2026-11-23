@@ -17,13 +17,10 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use mysql_async::Pool;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sprig_api::proto::logic_peer::RunTriggerRequest;
 use sprig_api::proto::logic_peer::logic_peer_client::LogicPeerClient;
-use sprig_catalog::CatalogLocator;
-use sprig_catalog::pool_wait::Bounded as _;
 use sprig_common::ids::TenantId;
 use sprig_common::{Result, SprigCode, SprigError};
 use sprig_controller::catalogs::{ClusterPools, ShardMapLocator};
@@ -41,6 +38,10 @@ const MQ_QUEUES: sprig_catalog::RowTable = sprig_catalog::RowTable::new("mq", "q
 
 use crate::runtime::{JobCtx, JobHandler};
 use crate::settings::LogicScope;
+
+/// The flag of an engine table's change-topic stream id: a trigger whose
+/// source carries it is an after-commit trigger on that table.
+const CHANGE_FLAG: u64 = 1 << 61;
 
 /// How long one run may take before the peer call gives up (the run's
 /// own budget is `logic.trigger_budget_ms`; this is the transport's).
@@ -376,27 +377,30 @@ fn note_due(last: &mut Option<Instant>, now: Instant, every: Duration) -> bool {
 /// Where a trigger's run log goes: `logic_log` in its tenant's catalog.
 #[derive(Clone)]
 struct RunLog {
-    catalog: Pool,
-    schema: String,
+    tenant: TenantId,
     module_id: u64,
     version: Arc<AtomicU64>,
 }
 
 impl RunLog {
     async fn write(&self, level: &str, message: &str) {
-        let Ok(mut c) = self.catalog.get_conn_bounded().await else {
+        let Ok(mut c) = crate::sinks::catalog_records().begin(self.tenant).await else {
             return;
         };
-        let _ = LogicStore::new(&self.schema)
+        if LogicStore::default()
             .log(
-                &mut c,
+                &mut *c,
                 self.module_id,
                 Some(self.version.load(Ordering::Relaxed)),
                 level,
                 "trigger",
                 message,
             )
-            .await;
+            .await
+            .is_ok()
+        {
+            let _ = c.commit().await;
+        }
     }
 }
 
@@ -480,8 +484,7 @@ enum Unloaded {
 struct Loaded {
     source: SourceRow,
     version: u64,
-    catalog: Pool,
-    schema: String,
+    tenant: TenantId,
 }
 
 fn spec_u64(spec: &Value, k: &str) -> std::result::Result<u64, String> {
@@ -527,22 +530,19 @@ impl MsgEnv {
         tenant: TenantId,
         binding: u64,
     ) -> Result<std::result::Result<Loaded, Unloaded>> {
-        let ep = self.locator.writer(tenant).await?;
-        let schema = ep.store.schema().to_owned();
-        let mut c = ep.pool.get_conn_bounded().await.map_err(|e| {
-            SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
-        })?;
-        let Some(source) = messages::source(&mut c, &schema, binding).await? else {
+        let mut c = crate::sinks::catalog_records().begin(tenant).await?;
+        let Some(source) = messages::source(&mut *c, binding).await? else {
             return Ok(Err(Unloaded::Gone));
         };
-        let store = LogicStore::new(&schema);
-        let b = store.binding_by_id(&mut c, binding).await?;
+        let store = LogicStore::default();
+        let b = store.binding_by_id(&mut *c, binding).await?;
         if b.as_ref().is_none_or(|b| b.state != "active") {
             return Ok(Err(Unloaded::Gone));
         }
-        let Some(m) = store.module_by_id(&mut c, source.module_id).await? else {
+        let Some(m) = store.module_by_id(&mut *c, source.module_id).await? else {
             return Ok(Err(Unloaded::Gone));
         };
+        let _ = c.rollback().await;
         if m.state == "disabled" {
             return Ok(Err(Unloaded::Disabled));
         }
@@ -564,11 +564,22 @@ impl MsgEnv {
         }
         // The source itself (a fan-in trigger's: its definition).
         let alive = match source.kind {
-            // Triggers on streams ran only on streams kept in MariaDB.
+            // An after-commit trigger on an engine table reads the table's
+            // changes (its stream id carries the change-topic flag); triggers
+            // on streams ran only on streams kept in MariaDB.
+            SourceKind::Stream if source.object_id & CHANGE_FLAG != 0 => {
+                let object = sprig_common::ids::ObjectId(source.object_id & !CHANGE_FLAG);
+                let mut rec = crate::sinks::catalog_records().begin(tenant).await?;
+                let o = sprig_catalog::store::rec::CoreRecords::object(&mut *rec, object).await;
+                let _ = rec.rollback().await;
+                o?.is_some_and(|o| {
+                    o.state == sprig_catalog::store::ObjectState::Active
+                        && o.db_id.0 == source.db_id
+                })
+            }
             SourceKind::Stream => false,
             SourceKind::Queue => {
                 // Durable queues are catalog records on the engine node.
-                drop(c);
                 let mut rec = crate::sinks::catalog_records().begin(tenant).await?;
                 let q: Result<Option<Value>> = MQ_QUEUES
                     .get(&mut *rec, &sprig_catalog::Pk::new().u64(source.object_id))
@@ -585,8 +596,7 @@ impl MsgEnv {
         Ok(Ok(Loaded {
             source,
             version,
-            catalog: ep.pool.clone(),
-            schema,
+            tenant,
         }))
     }
 
@@ -700,12 +710,15 @@ impl MsgEnv {
 async fn replay_due(l: &Loaded, t: &Template, gw: &dyn Gateway) -> Result<u64> {
     // A catalog connection per step: none is held across a run, which
     // takes the gateway's time and the trigger's budget.
-    let store = LogicStore::new(&l.schema);
+    let store = LogicStore::default();
+    let records = crate::sinks::catalog_records();
     let rows = {
-        let mut c = l.catalog.get_conn_bounded().await.map_err(db_err)?;
-        store
-            .dead_letters(&mut c, Some(l.source.binding_id), Some("replaying"), 100)
-            .await?
+        let mut c = records.begin(l.tenant).await?;
+        let rows = store
+            .dead_letters(&mut *c, Some(l.source.binding_id), Some("replaying"), 100)
+            .await?;
+        let _ = c.rollback().await;
+        rows
     };
     if rows.is_empty() {
         return Ok(0);
@@ -720,12 +733,13 @@ async fn replay_due(l: &Loaded, t: &Template, gw: &dyn Gateway) -> Result<u64> {
             event: r.event.clone(),
         });
         let reply = gw.run(&req).await?;
-        let mut c = l.catalog.get_conn_bounded().await.map_err(db_err)?;
+        let mut tx = records.begin(l.tenant).await?;
+        let c = &mut *tx;
         match reply.outcome {
             messages::RunOutcome::Ok | messages::RunOutcome::Moved => {
                 store
                     .set_dead_letters(
-                        &mut c,
+                        c,
                         Some(l.source.binding_id),
                         &[r.dl_id],
                         "replaying",
@@ -734,7 +748,7 @@ async fn replay_due(l: &Loaded, t: &Template, gw: &dyn Gateway) -> Result<u64> {
                     .await?;
                 let _ = store
                     .log(
-                        &mut c,
+                        c,
                         l.source.module_id,
                         Some(req.version),
                         "info",
@@ -742,12 +756,13 @@ async fn replay_due(l: &Loaded, t: &Template, gw: &dyn Gateway) -> Result<u64> {
                         &format!("dead letter {} ({}) replayed", r.dl_id, r.event_key),
                     )
                     .await;
+                tx.commit().await?;
                 n += 1;
             }
             _ => {
                 store
                     .put_dead_letter(
-                        &mut c,
+                        c,
                         l.source.binding_id,
                         req.version,
                         &r.event_key,
@@ -761,8 +776,9 @@ async fn replay_due(l: &Loaded, t: &Template, gw: &dyn Gateway) -> Result<u64> {
                 // In order: nothing after it runs; the later ones go back
                 // to `dead` with it, for the next replay.
                 store
-                    .set_dead_letters(&mut c, Some(l.source.binding_id), &[], "replaying", "dead")
+                    .set_dead_letters(c, Some(l.source.binding_id), &[], "replaying", "dead")
                     .await?;
+                tx.commit().await?;
                 tracing::warn!(
                     binding = l.source.binding_id,
                     dead_letter = r.dl_id,
@@ -783,10 +799,6 @@ async fn replay_due(l: &Loaded, t: &Template, gw: &dyn Gateway) -> Result<u64> {
     Ok(n)
 }
 
-fn db_err(e: mysql_async::Error) -> SprigError {
-    SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
-}
-
 /// The `logic_queue_trigger` job.
 pub struct QueueTrigger(pub MsgEnv);
 
@@ -801,69 +813,99 @@ impl JobHandler for QueueTrigger {
     }
 
     async fn run(&self, cx: &JobCtx) -> std::result::Result<Value, String> {
-        let env = &self.0;
-        let tenant = TenantId(spec_u64(&cx.spec, "tenant")?);
-        let binding = spec_u64(&cx.spec, "binding")?;
-        let l = match env.load_or_end(tenant, binding).await? {
-            Ok(l) => l,
-            Err(end) => return Ok(end),
-        };
-        env.settings.refresh_tenant(tenant).await;
-        let t = env.template(tenant, &l);
-        let log = RunLog {
-            catalog: l.catalog.clone(),
-            schema: l.schema.clone(),
-            module_id: l.source.module_id,
-            version: Arc::clone(&t.version),
-        };
-        log.write(
-            "info",
-            &format!(
-                "trigger on queue {} of vhost {} started (job {}, {} lanes)",
-                l.source.name,
-                l.source.db_name,
-                cx.job_id,
-                env.opts_for(tenant, &l).lanes
-            ),
-        )
-        .await;
-        let gw: Arc<dyn Gateway> = Arc::new(GwClient {
-            gws: Arc::clone(&env.gateways),
-            seed: binding,
-            log,
-            unreachable_noted: Mutex::new(None),
-        });
-        let stats = Arc::new(MsgStats::default());
-        let stop = cx.cancel.child_token();
-        tracing::info!(%tenant, binding, queue = %l.source.name, lanes = env.opts_for(tenant, &l).lanes, "trigger on a queue started");
-        let runner = msgrun::run_queue(
-            Arc::clone(&gw),
-            t.clone(),
-            env.opts_for(tenant, &l),
-            Arc::clone(&stats),
-            stop.clone(),
-        );
-        tokio::pin!(runner);
-        let sup = env.supervise(cx, tenant, binding, &t, &stats, &stop, &gw);
-        tokio::pin!(sup);
-        let gone = tokio::select! {
-            () = &mut runner => {
-                stop.cancel();
-                false
-            }
-            gone = &mut sup => {
-                stop.cancel();
-                runner.await;
-                gone
-            }
-        };
-        let mut out = stats.json();
-        out["binding"] = json!(binding);
-        if gone {
-            out["end"] = json!("gone");
-        }
-        Ok(out)
+        run_job(&self.0, cx, false).await
     }
+}
+
+/// The `logic_stream_trigger` job, for after-commit triggers on engine
+/// tables: one run at a time (the gateway picks the next change after the
+/// trigger's position, so changes run in commit order).
+pub struct ChangeTrigger(pub MsgEnv);
+
+#[async_trait]
+impl JobHandler for ChangeTrigger {
+    fn kind(&self) -> &'static str {
+        messages::STREAM_JOB_KIND
+    }
+
+    fn class(&self) -> JobClass {
+        JobClass::Consumer
+    }
+
+    async fn run(&self, cx: &JobCtx) -> std::result::Result<Value, String> {
+        run_job(&self.0, cx, true).await
+    }
+}
+
+/// A queue trigger's job, or (`changes`) an after-commit trigger's on an
+/// engine table.
+async fn run_job(env: &MsgEnv, cx: &JobCtx, changes: bool) -> std::result::Result<Value, String> {
+    let tenant = TenantId(spec_u64(&cx.spec, "tenant")?);
+    let binding = spec_u64(&cx.spec, "binding")?;
+    let l = match env.load_or_end(tenant, binding).await? {
+        Ok(l) => l,
+        Err(end) => return Ok(end),
+    };
+    env.settings.refresh_tenant(tenant).await;
+    let t = env.template(tenant, &l);
+    let log = RunLog {
+        tenant,
+        module_id: l.source.module_id,
+        version: Arc::clone(&t.version),
+    };
+    let mut opts = env.opts_for(tenant, &l);
+    let started = if changes {
+        // One run at a time, in commit order.
+        opts.lanes = 1;
+        format!(
+            "after-commit trigger on {}.{} started (job {})",
+            l.source.db_name,
+            l.source.name.trim_end_matches(".changes"),
+            cx.job_id
+        )
+    } else {
+        format!(
+            "trigger on queue {} of vhost {} started (job {}, {} lanes)",
+            l.source.name, l.source.db_name, cx.job_id, opts.lanes
+        )
+    };
+    log.write("info", &started).await;
+    let gw: Arc<dyn Gateway> = Arc::new(GwClient {
+        gws: Arc::clone(&env.gateways),
+        seed: binding,
+        log,
+        unreachable_noted: Mutex::new(None),
+    });
+    let stats = Arc::new(MsgStats::default());
+    let stop = cx.cancel.child_token();
+    tracing::info!(%tenant, binding, source = %l.source.name, lanes = opts.lanes, "trigger job started");
+    let runner = msgrun::run_queue(
+        Arc::clone(&gw),
+        t.clone(),
+        opts,
+        Arc::clone(&stats),
+        stop.clone(),
+    );
+    tokio::pin!(runner);
+    let sup = env.supervise(cx, tenant, binding, &t, &stats, &stop, &gw);
+    tokio::pin!(sup);
+    let gone = tokio::select! {
+        () = &mut runner => {
+            stop.cancel();
+            false
+        }
+        gone = &mut sup => {
+            stop.cancel();
+            runner.await;
+            gone
+        }
+    };
+    let mut out = stats.json();
+    out["binding"] = json!(binding);
+    if gone {
+        out["end"] = json!("gone");
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

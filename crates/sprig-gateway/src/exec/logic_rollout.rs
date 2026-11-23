@@ -18,8 +18,6 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use sprig_catalog::CatalogLocator;
-use sprig_catalog::pool_wait::Bounded as _;
 use sprig_logic::rollout::{self, Acc, Rollout};
 
 use super::PassSession;
@@ -60,7 +58,7 @@ pub(super) fn invalidate(tenant: u64) {
 }
 
 /// The routine a `CALL` names: `(database, name)`, unquoted.
-fn call_target(text: &[u8]) -> Option<(Option<String>, String)> {
+pub(super) fn call_target(text: &[u8]) -> Option<(Option<String>, String)> {
     let s = std::str::from_utf8(text.get(..text.len().min(512))?).ok()?;
     let mut t = s.trim_start();
     while let Some(r) = t.strip_prefix("/*") {
@@ -182,30 +180,25 @@ fn call_arg(text: &[u8], i: usize) -> Option<String> {
 /// Ends a trigger's rollout (a trigger on a stream or queue): in the
 /// catalog only, both versions' routines stay.
 async fn abort_trigger_rollout(
-    pool: &mysql_async::Pool,
-    schema: &str,
+    records: &Arc<dyn sprig_catalog::RecordStore>,
+    tenant: sprig_common::ids::TenantId,
     module: u64,
     name: &str,
     catalog_version: u64,
 ) -> sprig_common::Result<Vec<String>> {
-    let mut conn = pool.get_conn_bounded().await.map_err(|e| {
-        sprig_common::SprigError::new(
-            sprig_common::SprigCode::CatalogUnavailable,
-            "catalog unreachable",
-        )
-        .with_source(e)
-    })?;
-    sprig_logic::messages::rollout_change(
-        &mut conn,
-        schema,
+    let mut conn = records.begin(tenant).await?;
+    let n = sprig_logic::messages::rollout_change(
+        &mut *conn,
+        "",
         module,
         name,
         rollout::RolloutOp::Abort,
         catalog_version,
         "SprigDB",
     )
-    .await
-    .map(|n| vec![n])
+    .await?;
+    conn.commit().await?;
+    Ok(vec![n])
 }
 
 impl PassSession {
@@ -223,9 +216,8 @@ impl PassSession {
         }
         let svc = Arc::clone(ts.services());
         let loaded = async {
-            let ep = svc.locator.writer(tenant).await.ok()?;
-            let mut conn = ep.pool.get_conn_bounded().await.ok()?;
-            rollout::all(&mut conn, ep.store.schema()).await.ok()
+            let mut conn = svc.records.begin(tenant).await.ok()?;
+            rollout::all(&mut *conn).await.ok()
         }
         .await;
         let list = Arc::new(
@@ -342,30 +334,23 @@ impl PassSession {
         let svc = Arc::clone(ts.services());
         let tenant = ts.tenant;
         let catalog = ts.catalog().cloned();
-        let ep = svc.locator.writer(tenant).await?;
-        let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
-            sprig_common::SprigError::new(
-                sprig_common::SprigCode::CatalogUnavailable,
-                "catalog unreachable",
-            )
-            .with_source(e)
-        })?;
-        let schema = ep.store.schema().to_owned();
+        let mut tx = svc.records.begin(tenant).await?;
+        let conn = &mut *tx;
         let rows: Vec<((u64, u64), Acc)> = accs.into_iter().collect();
-        rollout::flush(&mut conn, &schema, &rows).await?;
+        rollout::flush(conn, &rows).await?;
         let mut modules: Vec<u64> = rows.iter().map(|((m, _), _)| *m).collect();
         modules.sort_unstable();
         modules.dedup();
-        let store = sprig_logic::LogicStore::new(&schema);
+        let store = sprig_logic::LogicStore::default();
         // The candidates to roll back, read first: the abort is a deploy,
         // which takes catalog connections from the same pool (4 per
         // cluster), so this one isn't held across it.
         let mut aborts = Vec::new();
         for m in modules {
-            let Some(r) = rollout::get(&mut conn, &schema, m).await? else {
+            let Some(r) = rollout::get(conn, m).await? else {
                 continue;
             };
-            let stats = rollout::stats(&mut conn, &schema, m).await?;
+            let stats = rollout::stats(conn, m).await?;
             let Some(cand) = stats.iter().find(|s| s.version == r.candidate_version) else {
                 continue;
             };
@@ -373,12 +358,12 @@ impl PassSession {
             let Some(why) = rollout::verdict(active, cand) else {
                 continue;
             };
-            let Some(module) = store.module_by_id(&mut conn, m).await? else {
+            let Some(module) = store.module_by_id(conn, m).await? else {
                 continue;
             };
             aborts.push((m, r, why, module));
         }
-        drop(conn);
+        tx.commit().await?;
         for (m, r, why, module) in aborts {
             let Some(db) = catalog
                 .as_ref()
@@ -397,7 +382,7 @@ impl PassSession {
             let owner = sprig_common::ids::UserId(module.created_by);
             let done = if module.kind == "trigger" {
                 let version = catalog.as_ref().map_or(0, |c| c.version);
-                abort_trigger_rollout(&ep.pool, &schema, m, &module.name, version).await
+                abort_trigger_rollout(&svc.records, tenant, m, &module.name, version).await
             } else {
                 Box::pin(self.logic_deploy_with(cx, &Bytes::from(text.into_bytes()), Some(owner)))
                     .await
@@ -421,10 +406,10 @@ impl PassSession {
                     ),
                 ),
             };
-            if let Ok(mut conn) = ep.pool.get_conn_bounded().await {
+            if let Ok(mut conn) = svc.records.begin(tenant).await {
                 let _ = store
                     .log(
-                        &mut conn,
+                        &mut *conn,
                         m,
                         Some(r.candidate_version),
                         level,
@@ -432,6 +417,7 @@ impl PassSession {
                         &msg,
                     )
                     .await;
+                let _ = conn.commit().await;
             }
         }
         Ok(())

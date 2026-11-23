@@ -58,6 +58,35 @@ const MAX_LOOP_ITERATIONS: u64 = 100_000;
 /// `logic.compile_max_cost`'s default.
 const COMPILE_MAX_COST: u64 = 100_000;
 
+/// A deploy's `sprig_ctl` session, or none for an engine database (whose
+/// routines get nothing on MariaDB: an empty column list, and 39960 for a
+/// statement).
+#[derive(Clone)]
+enum Ctl {
+    Shared(super::logic_bound::SharedCtl),
+    None,
+}
+
+#[async_trait]
+impl Session for Ctl {
+    async fn exec(&mut self, sql: &str) -> Result<()> {
+        match self {
+            Ctl::Shared(c) => c.exec(sql).await,
+            Ctl::None => Err(SprigError::new(
+                SprigCode::NotOnEngine,
+                "an engine database's routines have nothing on MariaDB",
+            )),
+        }
+    }
+
+    async fn rows(&mut self, sql: &str) -> Result<Vec<Vec<Option<String>>>> {
+        match self {
+            Ctl::Shared(c) => c.rows(sql).await,
+            Ctl::None => Ok(Vec::new()),
+        }
+    }
+}
+
 /// The session's backend connection as a [`Session`].
 struct Bs<'a>(&'a mut BackendSession);
 
@@ -215,6 +244,23 @@ impl PassSession {
             .ok_or_else(|| {
                 SprigError::standard(1049, *b"42000", format!("Unknown database '{db}'"))
             })?;
+        // An engine database's code runs on the engine tier: its tables
+        // aren't in MariaDB, where a compiled version would run (SE79).
+        let mut decl = decl;
+        let engine_db =
+            crate::engine::catalog::of(&catalog).is_some_and(|e| e.dbs.contains(&row.db_id));
+        if engine_db {
+            if decl.tier == sprig_logic::declare::TierPref::Mariadb {
+                return Err(SprigError::new(
+                    SprigCode::LogicTierUnavailable,
+                    format!(
+                        "SPRIG_TIER = 'mariadb': database {db} is stored on the engine, where \
+                         code runs on the engine tier"
+                    ),
+                ));
+            }
+            decl.tier = sprig_logic::declare::TierPref::Engine;
+        }
         // Every shard of the database:
         // a sharded database gets the routines on each, all or nothing.
         let shard_list = shard_list(ts, &self.target.cluster, &db, &row)?;
@@ -259,9 +305,8 @@ impl PassSession {
         let svc = Arc::clone(ts.services());
         let tenant = ts.tenant;
         let ep = svc.locator.writer(tenant).await?;
-        let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
-            SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
-        })?;
+        // The logic catalog's records: one transaction for the deploy.
+        let mut rtx = svc.records.begin(tenant).await?;
         // The routines are created as `sprig_ctl` with the user as
         // `DEFINER`, as the DDL path creates stored programs: the session's
         // own connection can't hold `sql_mode=ORACLE` between statements on
@@ -279,30 +324,42 @@ impl PassSession {
             conns: std::collections::HashMap::new(),
             locator: Arc::clone(&svc.locator),
         });
+        // An engine database has no MariaDB schema: its routines need no
+        // `sprig_ctl` connection, and its columns aren't MariaDB's.
         let shared = match shards.as_mut() {
+            _ if engine_db => Ctl::None,
             // The first shard's: the columns are read there.
-            Some(sh) => sh.shared(&shard_list[0].1).await?,
-            None => super::logic_bound::SharedCtl::new(
+            Some(sh) => Ctl::Shared(sh.shared(&shard_list[0].1).await?),
+            None => Ctl::Shared(super::logic_bound::SharedCtl::new(
                 svc.locator
                     .ctl_pool(&self.target.cluster)
                     .await?
                     .get_conn_bounded()
                     .await
                     .map_err(sprig_logic::deploy::conn_err)?,
-            ),
+            )),
         };
         let mut ctl = shared.clone();
         // The columns are read as the deploying user sees them; an
         // automatic rollback reads them as `sprig_ctl`.
-        let mut ctl_cols = auto.map(|_| shared.clone());
-        let _ = self.bs(cx);
-        let Some(bs) = self.bs.as_mut() else {
-            return Err(SprigError::internal("no backend session"));
+        let mut ctl_cols = if engine_db {
+            Some(Ctl::None)
+        } else {
+            auto.map(|_| shared.clone())
         };
-        let mut user_session = Bs(bs);
-        let session: &mut dyn Session = match ctl_cols.as_mut() {
-            Some(c) => c,
-            None => &mut user_session,
+        let mut user_session = if ctl_cols.is_some() {
+            None
+        } else {
+            let _ = self.bs(cx);
+            let Some(bs) = self.bs.as_mut() else {
+                return Err(SprigError::internal("no backend session"));
+            };
+            Some(Bs(bs))
+        };
+        let session: &mut dyn Session = match (ctl_cols.as_mut(), user_session.as_mut()) {
+            (Some(c), _) => c,
+            (None, Some(u)) => u,
+            (None, None) => return Err(SprigError::internal("no backend session")),
         };
         // The wall budget a compiled version's wrapper sets for each call:
         // `logic.function_budget_ms` for the database, as the engine tier
@@ -318,7 +375,7 @@ impl PassSession {
             Some(r) => {
                 let store = sprig_logic::LogicStore::new(ep.store.schema());
                 let (d, v) =
-                    sprig_logic::rollback::resolve(&store, &mut conn, row.db_id.0, r).await?;
+                    sprig_logic::rollback::resolve(&store, &mut *rtx, row.db_id.0, r).await?;
                 (d, Some(v))
             }
             None => (decl, None),
@@ -326,7 +383,7 @@ impl PassSession {
         let outcome = service::deploy_at(
             &decl,
             Target {
-                catalog: &mut conn,
+                catalog: &mut *rtx,
                 catalog_schema: ep.store.schema(),
                 catalog_version: catalog.version,
                 db_id: row.db_id.0,
@@ -350,9 +407,11 @@ impl PassSession {
                 tenant: tenant.0,
                 db_name: &row.name,
                 streams,
+                no_mariadb: engine_db,
             },
         )
         .await?;
+        rtx.commit().await?;
         let mut notes = outcome.notes();
         if let Some(v) = fixed {
             let what = match rollback.as_ref().and_then(|r| r.rollout) {
@@ -392,6 +451,9 @@ impl PassSession {
                 "SELECT {}(...) keeps the active version until the candidate is promoted",
                 decl.name
             ));
+        } else if engine_db && decl.kind == sprig_logic::declare::Kind::Function {
+            // Answered by the gateway from the records (`select_rewrite`).
+            notes.push(format!("SELECT {}(...) is available", decl.name));
         } else if let Some(sql) = outcome.select_fn {
             let plan = sprig_logic::deploy::plan_select(&schema, &decl.name, sql, &definer);
             let r = match shards.as_mut() {
@@ -430,38 +492,17 @@ impl PassSession {
     }
 }
 
-/// Every shard schema of database `db`: the session's own schema (the default group's shard, where
-/// a statement naming no table goes) first, then the groups'; one for an
-/// unsharded database.
+/// The schema of database `db` this session's statements go to.
 pub(super) fn shard_list(
     ts: &crate::tenant::session::TenantSession,
     cluster: &sprig_common::ids::ClusterId,
     db: &str,
     row: &sprig_catalog::DatabaseRow,
 ) -> Result<Vec<(String, sprig_common::ids::ClusterId)>> {
-    let template = ts.schema_of(Some(db));
-    let layout = super::router::ddl_layout(ts);
-    let first = template.clone().or_else(|| {
-        sprig_catalog::ddl::shard_schemas(ts.tenant, row)
-            .first()
-            .map(ToString::to_string)
-    });
-    let from_layout = match (&layout, &first) {
-        (Some(l), Some(t)) => l(t, None),
-        _ => None,
-    };
-    let from_layout = from_layout.map(|mut v| {
-        if let Some(t) = &template
-            && !v.iter().any(|(s, _)| s == t)
-        {
-            v.insert(0, (t.clone(), cluster.clone()));
-        }
-        v
-    });
-    match (from_layout.filter(|v| v.len() > 1), &template) {
-        (Some(v), _) => Ok(v),
-        (None, Some(t)) => Ok(vec![(t.clone(), cluster.clone())]),
-        (None, None) => Err(SprigError::new(
+    let _ = row;
+    match ts.schema_of(Some(db)) {
+        Some(t) => Ok(vec![(t, cluster.clone())]),
+        None => Err(SprigError::new(
             SprigCode::LogicUnsupported,
             format!("database {db} has no shard this gateway can find"),
         )),
@@ -861,14 +902,30 @@ impl PassSession {
         // counted per version (`exec::logic_rollout`).
         let pick = self.rollout_pick(original).await;
         let called = std::time::Instant::now();
-        let marker = {
+        // An engine database has no MariaDB schema, so no wrapper routine
+        // to forward to: the gateway runs its engine-tier routine directly.
+        let direct = match self.engine_db_marker(original, pick).await {
+            Ok(m) => m,
+            Err(e) => return self.fail(out, &e).await,
+        };
+        let marker = if let Some(m) = direct {
+            Some(m)
+        } else {
             let mut tap = Tap {
                 inner: &mut *out,
                 state: TapState::Idle,
             };
-            let step =
-                Box::pin(self.routed(cx, sql, original, more, format, mapper, map, &mut tap))
-                    .await?;
+            let step = Box::pin(self.forward(
+                cx,
+                Bytes::from(sql),
+                Some(original),
+                more,
+                format,
+                mapper,
+                map,
+                &mut tap,
+            ))
+            .await?;
             if !tap.captured() {
                 if let Some((m, v)) = pick {
                     self.rollout_count(cx, m, v, called.elapsed(), step.errored)
@@ -943,6 +1000,72 @@ impl PassSession {
         }
     }
 
+    /// A `CALL` of an engine-tier function or procedure of an engine
+    /// database: the marker the gateway runs itself, with the version a
+    /// staged rollout picked (`pick`). `None` when the call names anything
+    /// else (it is forwarded as before).
+    ///
+    /// # Errors
+    /// 39960 for arguments other than constants; 1305 for a routine the
+    /// engine database doesn't have.
+    async fn engine_db_marker(
+        &mut self,
+        original: &[u8],
+        pick: Option<(u64, u64)>,
+    ) -> Result<Option<Marker>> {
+        let Some((db, name)) = super::logic_rollout::call_target(original) else {
+            return Ok(None);
+        };
+        let Some(db) = db.or_else(|| self.current_logical()) else {
+            return Ok(None);
+        };
+        if !self.engine_database_named(&db) {
+            return Ok(None);
+        }
+        let Some(ts) = self.tenant.as_deref_mut() else {
+            return Ok(None);
+        };
+        let cat = match ts.catalog() {
+            Some(c) => Arc::clone(c),
+            None => ts.refresh().await?,
+        };
+        let Some(row) = cat
+            .database(&db)
+            .or_else(|| cat.database(&db.to_ascii_lowercase()))
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        let svc = Arc::clone(ts.services());
+        let callable = {
+            let mut conn = svc.records.begin(ts.tenant).await?;
+            sprig_logic::LogicStore::default()
+                .callable(&mut *conn, row.db_id.0, &name)
+                .await?
+        };
+        // An engine database holds no MariaDB routines: a name the logic
+        // records don't know doesn't exist, as MariaDB would say.
+        let Some(f) = callable else {
+            return Err(SprigError::standard(
+                1305,
+                *b"42000",
+                format!("PROCEDURE {}.{name} does not exist", row.name),
+            ));
+        };
+        let (Some(active), Some("engine")) = (f.version, f.tier.as_deref()) else {
+            return Ok(None);
+        };
+        let version = match pick {
+            Some((m, v)) if m == f.module_id => v,
+            _ => active,
+        };
+        Ok(Some(Marker {
+            module_id: f.module_id,
+            version,
+            args: call_args(original)?,
+        }))
+    }
+
     /// Runs the version a marker names: loads it (cached), resolves the
     /// budgets for the session's tenant and database, and runs it with
     /// this session as its `db`.
@@ -983,18 +1106,10 @@ impl PassSession {
         let v = if let Some(v) = invoke::cached(tenant_key, marker.module_id, marker.version) {
             v
         } else {
-            let ep = svc.locator.writer(tenant).await?;
-            let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
-                SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
-            })?;
-            invoke::load(
-                &mut conn,
-                ep.store.schema(),
-                tenant_key,
-                marker.module_id,
-                marker.version,
-            )
-            .await?
+            let mut rtx = svc.records.begin(tenant).await?;
+            let v = invoke::load(&mut *rtx, tenant_key, marker.module_id, marker.version).await?;
+            rtx.rollback().await?;
+            v
         };
         let program = v.runnable()?;
         let args = program.coerce(&v.name, marker.args.clone())?;
@@ -1117,6 +1232,37 @@ impl PassSession {
             },
         })
     }
+}
+
+/// The arguments of `CALL [db.]name(constants)` as values (none for
+/// `CALL name` or `CALL name()`).
+///
+/// # Errors
+/// 39960 when an argument isn't a constant (a variable, an expression).
+fn call_args(original: &[u8]) -> Result<Vec<serde_json::Value>> {
+    let text = String::from_utf8_lossy(original);
+    let mut t = text.trim_start();
+    while let Some(r) = t.strip_prefix("/*") {
+        t = r.split_once("*/").map_or("", |x| x.1).trim_start();
+    }
+    let rest = t
+        .get(4..)
+        .unwrap_or("")
+        .trim()
+        .trim_end_matches(';')
+        .trim_end();
+    if !rest.contains('(') {
+        return Ok(Vec::new());
+    }
+    invoke::select_calls(&format!("SELECT {rest}"))
+        .and_then(|c| c.into_iter().next())
+        .map(|c| c.args)
+        .ok_or_else(|| {
+            SprigError::new(
+                SprigCode::NotOnEngine,
+                "a CALL of an engine database's routine takes constant arguments",
+            )
+        })
 }
 
 // ---- SELECT f(constants) of engine-tier functions --------------------------
@@ -1247,15 +1393,34 @@ impl PassSession {
         map: &dyn NameMap,
         out: &mut dyn ResultSink,
     ) -> Result<Step> {
+        // An engine database's functions have no MariaDB wrapper: their
+        // constant calls are answered here first.
+        match self.select_rewrite(cx, original, None).await {
+            Ok(Some(text)) => {
+                let text = Bytes::from(text.into_bytes());
+                let attrs = QueryAttrs::default();
+                return Box::pin(self.tenant_text(cx, &text, &attrs, more, format, out)).await;
+            }
+            Ok(None) => {}
+            Err(e) => return self.fail(out, &e).await,
+        }
         let caught = {
             let mut tap = SelectTap {
                 inner: &mut *out,
                 held: None,
                 caught: None,
             };
-            let step =
-                Box::pin(self.routed(cx, sql, original, more, format, mapper, map, &mut tap))
-                    .await?;
+            let step = Box::pin(self.forward(
+                cx,
+                Bytes::from(sql),
+                Some(original),
+                more,
+                format,
+                mapper,
+                map,
+                &mut tap,
+            ))
+            .await?;
             match tap.caught.take() {
                 None => {
                     tap.release().await?;
@@ -1264,7 +1429,10 @@ impl PassSession {
                 Some(e) => e,
             }
         };
-        match self.select_rewrite(cx, original, &caught).await {
+        let Some(mark) = sprig_logic::deploy::select_mark(&caught.message) else {
+            return self.fail(out, &caught).await;
+        };
+        match self.select_rewrite(cx, original, Some(mark)).await {
             Ok(Some(text)) => {
                 let text = Bytes::from(text.into_bytes());
                 let attrs = QueryAttrs::default();
@@ -1276,16 +1444,15 @@ impl PassSession {
     }
 
     /// The statement with the marked function's constant calls replaced
-    /// by their values; `None` when there is nothing to replace.
+    /// by their values; `None` when there is nothing to replace. With no
+    /// `mark` (module, version), the calls of engine-tier functions of
+    /// engine databases, at their active versions.
     async fn select_rewrite(
         &mut self,
         cx: &mut ExecCtx<'_>,
         original: &[u8],
-        caught: &SprigError,
+        mark: Option<(u64, u64)>,
     ) -> Result<Option<String>> {
-        let Some((module_id, version)) = sprig_logic::deploy::select_mark(&caught.message) else {
-            return Ok(None);
-        };
         let text = String::from_utf8_lossy(original).into_owned();
         let Some(calls) = invoke::select_calls(&text) else {
             return Ok(None);
@@ -1302,11 +1469,9 @@ impl PassSession {
             None => ts.refresh().await?,
         };
         let svc = Arc::clone(ts.services());
-        let ep = svc.locator.writer(ts.tenant).await?;
-        let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
-            SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
-        })?;
-        let store = sprig_logic::LogicStore::new(ep.store.schema());
+        let mut conn = svc.records.begin(ts.tenant).await?;
+        let store = sprig_logic::LogicStore::default();
+        let engine_dbs = crate::engine::catalog::of(&cat).map(|e| e.dbs.clone());
         let mut mine = Vec::new();
         for c in calls {
             let Some(db) = c.db.clone().or_else(|| current.clone()) else {
@@ -1318,16 +1483,24 @@ impl PassSession {
             else {
                 continue;
             };
-            if let Some(f) = store.callable(&mut conn, row.db_id.0, &c.name).await?
-                && f.module_id == module_id
-                && f.kind == "function"
-            {
-                mine.push(c);
+            if mark.is_none() && !engine_dbs.as_ref().is_some_and(|e| e.contains(&row.db_id)) {
+                continue;
+            }
+            let Some(f) = store.callable(&mut *conn, row.db_id.0, &c.name).await? else {
+                continue;
+            };
+            if f.kind != "function" {
+                continue;
+            }
+            match (mark, f.version, f.tier.as_deref()) {
+                (Some((m, v)), _, _) if f.module_id == m => mine.push((c, m, v)),
+                (None, Some(v), Some("engine")) => mine.push((c, f.module_id, v)),
+                _ => {}
             }
         }
         drop(conn);
         let mut edits = Vec::new();
-        for c in mine {
+        for (c, module_id, version) in mine {
             let marker = Marker {
                 module_id,
                 version,
@@ -1476,13 +1649,10 @@ impl PassSession {
                 SprigError::standard(1049, *b"42000", format!("Unknown database '{db}'"))
             })?;
         let svc = Arc::clone(ts.services());
-        let ep = svc.locator.writer(ts.tenant).await?;
         let callable = {
-            let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
-                SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
-            })?;
-            sprig_logic::LogicStore::new(ep.store.schema())
-                .callable(&mut conn, row.db_id.0, &name)
+            let mut conn = svc.records.begin(ts.tenant).await?;
+            sprig_logic::LogicStore::default()
+                .callable(&mut *conn, row.db_id.0, &name)
                 .await?
         };
         let Some(f) = callable else {
@@ -1615,5 +1785,33 @@ impl PassSession {
         )
         .await
         .map(|_| ())
+    }
+}
+
+#[cfg(test)]
+mod call_args_tests {
+    use super::call_args;
+    use serde_json::json;
+
+    #[test]
+    fn constants_by_position() {
+        assert_eq!(
+            call_args(b"CALL shop.quote(7, 'a', NULL)").unwrap(),
+            vec![json!(7), json!("a"), json!(null)]
+        );
+        assert_eq!(
+            call_args(b"/* x */ call `shop`.`quote`(1.5);").unwrap(),
+            vec![json!(1.5)]
+        );
+        assert!(call_args(b"CALL quote()").unwrap().is_empty());
+        assert!(call_args(b"CALL quote").unwrap().is_empty());
+    }
+
+    #[test]
+    fn variables_are_refused() {
+        assert_eq!(
+            call_args(b"CALL quote(@a)").unwrap_err().code(),
+            Some(sprig_common::SprigCode::NotOnEngine)
+        );
     }
 }

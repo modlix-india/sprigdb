@@ -1536,23 +1536,8 @@ pub async fn tree_binding(ts: &TenantSession, cat: &TenantCatalog) -> Result<Tre
         return Ok(TreeBinding { tree, table: false });
     }
     // A large subtree goes to `__sprig_sys.__sprig_subtree` on the
-    // tenant's clusters, and the statement reads it there.
-    let mut clusters = crate::exec::router::placement_digest(svc, cat)
-        .map(|p| p.1)
-        .unwrap_or_default();
-    if !clusters.contains(&ts.principal.backend.cluster) {
-        clusters.push(ts.principal.backend.cluster.clone());
-    }
-    if clusters.is_empty() {
-        return Err(sprig_sql::rls::unsupported(&format!(
-            "a subtree of {} tenants (rls.inline_subtree_max is {max}) before the tenant's \
-             clusters are known",
-            tree.len()
-        )));
-    }
-    for c in &clusters {
-        subtree_sync(svc, ts.tenant.0, &tree, c).await?;
-    }
+    // tenant's cluster, and the statement reads it there.
+    subtree_sync(svc, ts.tenant.0, &tree, &ts.principal.backend.cluster).await?;
     Ok(TreeBinding { tree, table: true })
 }
 

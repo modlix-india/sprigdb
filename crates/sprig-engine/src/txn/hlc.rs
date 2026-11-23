@@ -64,10 +64,37 @@ impl Clock for ManualClock {
     }
 }
 
+/// Milliseconds from a [`sprig_common::time::Clock`] (the simulator's
+/// clocks): its wall time.
+pub struct CommonClock(pub Arc<dyn sprig_common::time::Clock>);
+
+impl fmt::Debug for CommonClock {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("CommonClock")
+    }
+}
+
+impl Clock for CommonClock {
+    fn now_ms(&self) -> u64 {
+        self.0
+            .wall()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+    }
+}
+
 /// A hybrid logical clock.
 pub struct Hlc {
     clock: Arc<dyn Clock>,
     last: AtomicU64,
+}
+
+impl Hlc {
+    /// The physical clock's reading, in milliseconds.
+    #[must_use]
+    pub fn physical_ms(&self) -> u64 {
+        self.clock.now_ms()
+    }
 }
 
 impl fmt::Debug for Hlc {

@@ -145,6 +145,37 @@ pub trait LogStore: Send + Sync {
 
     /// Housekeeping between turns (deleting trimmed files).
     fn maintain(&self) {}
+
+    /// The lowest entry index of `group` the log holds. The default
+    /// recovers the whole log (the simulated disk).
+    fn first_index(&self, group: GroupId) -> Option<u64> {
+        self.recover()
+            .ok()?
+            .into_iter()
+            .find(|g| g.group == group)
+            .and_then(|g| g.entries.first().map(|e| e.index))
+    }
+
+    /// The entries `from..to` of `group` the log holds, in order (fewer
+    /// when trimmed or not yet written). Reads what was written; the
+    /// caller asks only for committed indexes. The default recovers the
+    /// whole log (the simulated disk).
+    ///
+    /// # Errors
+    /// The log could not be read.
+    fn entries(&self, group: GroupId, from: u64, to: u64) -> Result<Vec<Entry>, RaftError> {
+        Ok(self
+            .recover()?
+            .into_iter()
+            .find(|g| g.group == group)
+            .map(|g| {
+                g.entries
+                    .into_iter()
+                    .filter(|e| e.index >= from && e.index < to)
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
 }
 
 #[derive(Default)]
@@ -406,6 +437,27 @@ impl LogStore for EngineLogStore {
             .write(&mut lb, sync)
             .map(drop)
             .map_err(|e| engine_err("write", &e))
+    }
+
+    fn first_index(&self, group: GroupId) -> Option<u64> {
+        self.engine.first_index(group)
+    }
+
+    fn entries(&self, group: GroupId, from: u64, to: u64) -> Result<Vec<Entry>, RaftError> {
+        on_fresh_thread(|| {
+            let Some(first) = self.engine.first_index(group) else {
+                return Ok(Vec::new());
+            };
+            let last = self.engine.last_index(group).unwrap_or(0);
+            let (lo, hi) = (from.max(first), to.min(last + 1));
+            let mut out = Vec::new();
+            if lo < hi {
+                self.engine
+                    .fetch_entries_to::<EntryExt>(group, lo, hi, None, &mut out)
+                    .map_err(|e| engine_err("read", &e))?;
+            }
+            Ok(out)
+        })
     }
 
     fn recover(&self) -> Result<Vec<RecoveredGroup>, RaftError> {

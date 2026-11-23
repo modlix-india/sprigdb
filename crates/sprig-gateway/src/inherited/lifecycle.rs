@@ -22,21 +22,15 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sprig_catalog::CatalogLocator;
-use sprig_catalog::pool_wait::Bounded as _;
 use sprig_catalog::version::VersionKind;
 use sprig_common::ids::TenantId;
-use sprig_common::{Result, SprigCode, SprigError};
+use sprig_common::Result;
 use sprig_inherit::msg::store::MsgStore;
 use sprig_inherit::msg::{DefKey, DefKind, Definition, InstanceState};
 use sprig_meta::{ListOpts, Record, Versioned};
 
 use super::catalog;
 use crate::tenant::TenantServices;
-
-fn cat_err(e: mysql_async::Error) -> SprigError {
-    SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
-}
 
 /// Removes member `t`'s instance of `def` (its physical part, row and index
 /// entry), whatever its state but `detached`.
@@ -260,8 +254,6 @@ pub async fn database_dropped(
     // The chain may load an ancestor's catalog from the same pool: before
     // this function's catalog connection is taken.
     let chain = super::chain(svc, &cat).await?;
-    let ep = svc.locator.writer(t).await?;
-    let conn = ep.pool.get_conn_bounded().await.map_err(cat_err)?;
     let st = MsgStore::new(Arc::clone(&svc.records), t);
     for i in &gone {
         let triggers = match chain.def(i.def) {
@@ -286,8 +278,6 @@ pub async fn database_dropped(
         super::delete_index(svc, t, i.def).await?;
     }
     super::mq::forget_applied(t, Some(db));
-    // The change takes its own catalog connection.
-    drop(conn);
     // Every gateway reads the rows at the member's next version.
     let c = svc.catalog.change(t, VersionKind::Catalog).await?;
     c.commit().await?;
@@ -309,7 +299,6 @@ pub async fn detach(svc: &Arc<TenantServices>, t: TenantId, def: &Definition) ->
             "only a stream, exchange or queue instance can be detached",
         ));
     }
-    let ep = svc.locator.writer(t).await?;
     let st = MsgStore::new(Arc::clone(&svc.records), t);
     {
         let Some(i) = st.instance(def.key()).await? else {
@@ -339,7 +328,6 @@ pub async fn detach(svc: &Arc<TenantServices>, t: TenantId, def: &Definition) ->
         DefKind::Queue => super::triggers::on_queue(&chain, def),
         _ => Vec::new(),
     };
-    let conn = ep.pool.get_conn_bounded().await.map_err(cat_err)?;
     let mut stopped = 0;
     for g in triggers {
         if let Some(gi) = st.instance(g.key()).await? {
@@ -355,7 +343,6 @@ pub async fn detach(svc: &Arc<TenantServices>, t: TenantId, def: &Definition) ->
             stopped += 1;
         }
     }
-    drop(conn);
     // Every gateway reads the row at the member's next version.
     let c = svc.catalog.change(t, VersionKind::Catalog).await?;
     c.commit().await?;

@@ -47,6 +47,27 @@ pub struct EngineConfig {
     /// last checkpoint, whatever the interval: what bounds the log's size
     /// on disk under a steady write load. Zero turns this trigger off.
     pub checkpoint_log_bytes: u64,
+    /// The clock commit timestamps come from (`None`: the system clock).
+    /// The simulator passes its node clock.
+    pub clock: Option<EngineClock>,
+    /// Tenant units commit through a replicated log the node attaches
+    /// after opening ([`crate::Engine::attach_replication`]); only the
+    /// node's own unit stays on the local log. Off: one node, every unit
+    /// local.
+    pub replicated: bool,
+    /// The transaction layer's settings (version retention, lock memory
+    /// and write-set bytes per transaction).
+    pub txn: crate::txn::UnitConfig,
+}
+
+/// The clock an engine takes its commit timestamps from.
+#[derive(Clone)]
+pub struct EngineClock(pub std::sync::Arc<dyn crate::txn::hlc::Clock>);
+
+impl std::fmt::Debug for EngineClock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("EngineClock")
+    }
 }
 
 impl EngineConfig {
@@ -63,6 +84,9 @@ impl EngineConfig {
             checkpoint_interval: Duration::from_secs(30),
             checkpoint_entries: 500_000,
             checkpoint_log_bytes: 64 << 20,
+            clock: None,
+            replicated: false,
+            txn: crate::txn::UnitConfig::default(),
         }
     }
 }

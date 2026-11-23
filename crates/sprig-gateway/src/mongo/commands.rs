@@ -1203,6 +1203,100 @@ async fn open_cursor(
     Ok(cursor_reply(id, &ns, batch, true))
 }
 
+/// `aggregate` with `$changeStream` on engine collections: read from the
+/// node's change log.
+#[allow(clippy::too_many_arguments)]
+async fn open_engine_change_stream(
+    c: &mut Conn,
+    sql: &mut SqlSession,
+    body: &Document,
+    db: &str,
+    coll: &str,
+    stage: &Document,
+    rest: &[Document],
+    lsid: Option<&[u8]>,
+    parsed: (
+        super::changes::Images,
+        super::changes::Images,
+        Option<Bson>,
+        bool,
+    ),
+) -> Result<Document, MongoError> {
+    use super::changes::{StreamSpec, token_doc};
+    let (full, before, resume, all) = parsed;
+    let who = owner(c);
+    // Bring the session's catalog (and its row policies) up to date, as
+    // every getMore does before comparing them with these.
+    let _ = sql.query("SELECT 1").await;
+    if db == "admin" && (!all || !coll.is_empty()) {
+        return Err(MongoError::new(
+            code::INVALID_OPTIONS,
+            "$changeStream on admin must be {aggregate: 1} with allChangesForCluster: true",
+        ));
+    }
+    if db != "admin" && all {
+        return Err(MongoError::new(
+            code::INVALID_OPTIONS,
+            "allChangesForCluster is only for the admin database",
+        ));
+    }
+    let visibility = sql.row_policy_docs();
+    if let Some(v) = &visibility
+        && !coll.is_empty()
+        && v.unwatched
+            .contains(&(db.to_lowercase(), coll.to_lowercase()))
+    {
+        return Err(MongoError::new(
+            code::UNAUTHORIZED,
+            format!(
+                "not authorized on {db} to execute command {{ aggregate: \"{coll}\", pipeline: [ {{ $changeStream: {{}} }} ] }}: \
+                 WATCH (changeStream) is required"
+            ),
+        ));
+    }
+    let spec = StreamSpec {
+        tenant: sprig_common::ids::TenantId(who.tenant),
+        db: (db != "admin").then(|| db.to_owned()),
+        coll: (!coll.is_empty()).then(|| (coll.to_owned(), coll.to_owned())),
+        tables: None,
+        full,
+        before,
+        pipeline: rest.to_vec(),
+        expanded: super::changes::expanded_of(stage),
+        visibility,
+    };
+    let start_after = stage.contains_key("startAfter");
+    let stream = super::engine_changes::open(spec, resume.as_ref(), start_after)
+        .await
+        .inspect_err(|e| super::status::stream_error(who.tenant, e))?;
+    let token = stream.token.clone();
+    let ns = if coll.is_empty() {
+        format!("{db}.$cmd.aggregate")
+    } else {
+        format!("{db}.{coll}")
+    };
+    let bs = body
+        .get_document("cursor")
+        .ok()
+        .and_then(|cd| cd.get("batchSize").and_then(as_i64))
+        .and_then(|n| usize::try_from(n).ok())
+        .filter(|n| *n > 0);
+    let id = c.shared.cursors.open_stream(
+        stream,
+        ns.clone(),
+        who,
+        lsid.map(<[u8]>::to_vec),
+        bs,
+        c.shared.settings().max_cursors,
+    )?;
+    let tenant = owner(c).tenant;
+    super::status::stream_options(tenant, stage, body);
+    super::status::stream_returned(tenant, &[]);
+    Ok(
+        doc! {"cursor": {"firstBatch": [], "postBatchResumeToken": token_doc(&token), "id": id, "ns": ns}, "ok": 1.0},
+    )
+}
+
 /// `aggregate` with `$changeStream`.
 async fn open_change_stream(
     c: &mut Conn,
@@ -1217,6 +1311,28 @@ async fn open_change_stream(
     use super::changes::{StreamSpec, check_pipeline, parse_stage, token_doc};
     let (full, before, resume, all) = parse_stage(stage)?;
     check_pipeline(rest)?;
+    // Engine collections: the database is the engine's, or (a deployment
+    // stream) the whole tenant is.
+    let on_engine = if db == "admin" {
+        let t = owner(c).tenant;
+        t != 0 && super::engine::tenants().has(t)
+    } else {
+        super::engine::on_engine(c, db)?
+    };
+    if on_engine {
+        return open_engine_change_stream(
+            c,
+            sql,
+            body,
+            db,
+            coll,
+            stage,
+            rest,
+            lsid,
+            (full, before, resume, all),
+        )
+        .await;
+    }
     let Some(feed) = c.shared.feed.as_ref() else {
         return Err(MongoError::new(
             code::COMMAND_NOT_SUPPORTED,

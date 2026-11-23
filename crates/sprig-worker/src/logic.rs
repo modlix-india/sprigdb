@@ -252,7 +252,6 @@ fn spec_u64(spec: &Value, k: &str) -> std::result::Result<u64, String> {
 /// (the job widens an INSERT- or DELETE-only binding to updates for this).
 struct DefinerGuard {
     rls: crate::sinks::RlsCatalogs,
-    locator: Arc<dyn CatalogLocator>,
     tenant: TenantId,
     module_id: u64,
     object: u64,
@@ -310,24 +309,11 @@ impl DefinerGuard {
         {
             return Ok(u);
         }
-        let ep = self.locator.writer(self.tenant).await?;
-        let mut c = ep.pool.get_conn_bounded().await.map_err(|e| {
-            SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
-        })?;
-        let schema = sprig_common::names::quote(ep.store.schema());
-        let u: Option<u32> = c
-            .exec_first(
-                format!(
-                    "SELECT v.created_by FROM {schema}.logic_modules m JOIN {schema}.logic_versions v \
-                     ON v.module_id = m.module_id AND v.version = m.active_version \
-                     WHERE m.module_id = ?"
-                ),
-                (self.module_id,),
-            )
-            .await
-            .map_err(|e| {
-                SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
-            })?;
+        let mut tx = crate::sinks::catalog_records().begin(self.tenant).await?;
+        let u = LogicStore::default()
+            .active_definer(&mut *tx, self.module_id)
+            .await?;
+        tx.commit().await?;
         let u = u.ok_or_else(|| {
             SprigError::new(
                 SprigCode::LogicNotFound,
@@ -388,28 +374,22 @@ impl LogicTrigger {
         let env = &self.0;
         let tenant = TenantId(spec_u64(&cx.spec, "tenant")?);
         let binding_id = spec_u64(&cx.spec, "binding")?;
-        let ep = env
-            .locator
-            .writer(tenant)
-            .await
-            .map_err(|e| e.to_string())?;
-        let store = LogicStore::new(ep.store.schema());
+        let records = crate::sinks::catalog_records();
+        let store = LogicStore::default();
         let (b, module) = {
-            let mut c = ep
-                .pool
-                .get_conn_bounded()
-                .await
-                .map_err(|e| e.to_string())?;
+            let mut tx = records.begin(tenant).await.map_err(|e| e.to_string())?;
+            let c = &mut *tx;
             let b = store
-                .binding_by_id(&mut c, binding_id)
+                .binding_by_id(c, binding_id)
                 .await
                 .map_err(|e| e.to_string())?
                 .ok_or_else(|| format!("binding {binding_id} is gone"))?;
             let m = store
-                .module_by_id(&mut c, b.module_id)
+                .module_by_id(c, b.module_id)
                 .await
                 .map_err(|e| e.to_string())?
                 .ok_or_else(|| format!("module {} is gone", b.module_id))?;
+            tx.commit().await.map_err(|e| e.to_string())?;
             (b, m)
         };
         if b.state != "active" || module.state != "active" {
@@ -462,9 +442,8 @@ impl LogicTrigger {
         )
         .await
         .map_err(|e| e.to_string())?;
-        let locator: Arc<dyn CatalogLocator> = Arc::clone(&env.locator) as Arc<dyn CatalogLocator>;
         let versions = Arc::new(CatalogVersions::new(
-            Arc::clone(&locator),
+            Arc::clone(&records),
             tenant,
             module.module_id,
         ));
@@ -494,7 +473,6 @@ impl LogicTrigger {
             ) {
                 (Some(object), Some(rls)) => Some(Arc::new(DefinerGuard {
                     rls,
-                    locator: Arc::clone(&locator),
                     tenant,
                     module_id: module.module_id,
                     object,
@@ -510,7 +488,7 @@ impl LogicTrigger {
             },
         });
         let out = Arc::new(CatalogOutcomes {
-            locator: Arc::clone(&locator),
+            records: Arc::clone(&records),
             tenant,
             binding_id,
             module_id: module.module_id,
@@ -573,7 +551,7 @@ impl LogicTrigger {
                     }
                     if last_replay.elapsed() > Duration::from_secs(3) {
                         last_replay = Instant::now();
-                        match sprig_logic::triggers::maria::replay(locator.as_ref(), tenant, binding_id, module.module_id, apply.as_ref()).await {
+                        match sprig_logic::triggers::maria::replay(records.as_ref(), tenant, binding_id, module.module_id, apply.as_ref()).await {
                             Ok(0) => {}
                             Ok(n) => tracing::info!(binding = binding_id, replayed = n, "dead letters replayed"),
                             Err(e) => tracing::warn!(error = %e, "dead letter replay failed"),
@@ -585,7 +563,7 @@ impl LogicTrigger {
                     }
                     if last_check.elapsed() > Duration::from_secs(5) {
                         last_check = Instant::now();
-                        if let Some(why) = gone(&ep.pool, &store, binding_id, module.module_id).await {
+                        if let Some(why) = gone(records.as_ref(), tenant, &store, binding_id, module.module_id).await {
                             ended = Some(why);
                             break Ok(());
                         }
@@ -604,10 +582,17 @@ impl LogicTrigger {
 /// Why an after-commit trigger's job should end: its binding or module
 /// is gone or no longer active. `None` while both are active, or when the
 /// catalog can't be read (the next check tries again).
-async fn gone(pool: &Pool, store: &LogicStore, binding_id: u64, module_id: u64) -> Option<String> {
-    let mut c = pool.get_conn_bounded().await.ok()?;
-    let b = store.binding_by_id(&mut c, binding_id).await.ok()?;
-    let m = store.module_by_id(&mut c, module_id).await.ok()?;
+async fn gone(
+    records: &dyn sprig_catalog::RecordStore,
+    tenant: TenantId,
+    store: &LogicStore,
+    binding_id: u64,
+    module_id: u64,
+) -> Option<String> {
+    let mut tx = records.begin(tenant).await.ok()?;
+    let b = store.binding_by_id(&mut *tx, binding_id).await.ok()?;
+    let m = store.module_by_id(&mut *tx, module_id).await.ok()?;
+    let _ = tx.commit().await;
     match (b, m) {
         (None, _) => Some(format!("binding {binding_id} is gone")),
         (_, None) => Some(format!("module {module_id} is gone")),
@@ -622,8 +607,12 @@ async fn purge(env: &LogicEnv, tenant: TenantId, binding_id: u64, store: &LogicS
     let Ok(ep) = env.locator.writer(tenant).await else {
         return;
     };
+    if let Ok(mut tx) = crate::sinks::catalog_records().begin(tenant).await
+        && store.purge(&mut *tx, 14, 14, 10_000).await.is_ok()
+    {
+        let _ = tx.commit().await;
+    }
     if let Ok(mut c) = ep.pool.get_conn_bounded().await {
-        let _ = store.purge(&mut c, 14, 14, 10_000).await;
         let schemas: Vec<String> = c
             .exec(
                 "SELECT TABLE_SCHEMA FROM information_schema.TABLES WHERE TABLE_NAME = '__sprig_ldone' \
@@ -686,11 +675,6 @@ impl JobHandler for LogicSchedule {
             .ok_or("spec.run is missing")?
             .parse()
             .map_err(|e| format!("spec.run: {e}"))?;
-        let ep = env
-            .locator
-            .writer(tenant)
-            .await
-            .map_err(|e| e.to_string())?;
         let cluster = env
             .locator
             .cluster_of(tenant)
@@ -707,7 +691,7 @@ impl JobHandler for LogicSchedule {
         let pool = crate::relay_pools::shard_pool(&env.dc, tenant, &cluster, direct)
             .await
             .map_err(|e| e.to_string())?;
-        let store = LogicStore::new(ep.store.schema());
+        let store = LogicStore::default();
         // Row-level security: the run applies its definer's policies in
         // MariaDB (policy views and write triggers), not an internal
         // session's (every row).
@@ -716,7 +700,6 @@ impl JobHandler for LogicSchedule {
             .ok_or("the worker can't load row-level security catalogs")?;
         let guard = DefinerGuard {
             rls,
-            locator: Arc::clone(&env.locator) as Arc<dyn CatalogLocator>,
             tenant,
             module_id,
             object: 0,
@@ -729,9 +712,8 @@ impl JobHandler for LogicSchedule {
         // their own, from the same pool) before the run's connections are
         // taken.
         let ctx = guard.context().await.map_err(|e| e.to_string())?;
-        let mut catalog = ep
-            .pool
-            .get_conn_bounded()
+        let mut catalog = crate::sinks::catalog_records()
+            .begin(tenant)
             .await
             .map_err(|e| e.to_string())?;
         let mut shard = pool.get_conn_bounded().await.map_err(|e| e.to_string())?;
@@ -744,14 +726,14 @@ impl JobHandler for LogicSchedule {
         // The module's database's `logic.job_budget_ms` too, over the
         // tenant's, as committed now.
         env.settings.refresh_tenant(tenant).await;
-        let budget = match store.module_by_id(&mut catalog, module_id).await {
+        let budget = match store.module_by_id(&mut *catalog, module_id).await {
             Ok(Some(m)) => env
                 .settings
                 .job_budget_for(crate::settings::LogicScope::db(tenant, m.db_id)),
             _ => env.settings.job_budget_for(tenant),
         };
         let end = sprig_logic::schedule::run(
-            &mut catalog,
+            &mut *catalog,
             &store,
             &mut shard,
             &schema,
@@ -765,6 +747,7 @@ impl JobHandler for LogicSchedule {
             let _ = shard.disconnect().await;
         }
         let end = end.map_err(|e| e.to_string())?;
+        catalog.commit().await.map_err(|e| e.to_string())?;
         tracing::info!(%tenant, module = module_id, job = %cx.job_id, %run, outcome = %end.outcome, "schedule run ended");
         if end.queued {
             // A queued run: make the index due now.

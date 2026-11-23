@@ -3,74 +3,28 @@
 //! [`EngineGraph`] per graph every statement on it shares (its dictionary,
 //! id blocks and index definitions in memory).
 //!
-//! A native graph lives on the engine when its database is one of the
-//! tenant's engine databases (every database once the engine owns the
-//! catalog). `SPRIGDB_ENGINE_GRAPHS` overrides that for the whole node:
-//! `all` puts every native graph there, `off` keeps every graph on MariaDB
-//! (the "before" arm of a benchmark). Mapped graphs (`CREATE PROPERTY
-//! GRAPH`) read SQL tables and never move.
-//!
-//! A graph on the engine keeps its catalog row (name, id, grants) where it
-//! is; its nodes, relationships, names, ids and indexes are engine keys
-//! only, never written to MariaDB. If the engine can't open, statements on
-//! those graphs fail with the engine's error: nothing falls back to
-//! MariaDB.
+//! Every native graph lives on the engine; mapped graphs (`CREATE
+//! PROPERTY GRAPH`) read SQL tables. A graph keeps its catalog record
+//! (name, id, grants); its nodes, relationships, names, ids and indexes
+//! are engine keys. If the engine can't open, statements on graphs fail
+//! with the engine's error.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
-use sprig_catalog::TenantCatalog;
 use sprig_common::Result;
-use sprig_common::ids::DbId;
 use sprig_graph::engine::{EngineGraph, drop_graph};
 
 use super::GraphRef;
-
-/// The variable that overrides where native graphs live.
-pub(crate) const GRAPHS_VAR: &str = "SPRIGDB_ENGINE_GRAPHS";
 
 /// Data shards of a graph on the engine (one unit: placement inside it
 /// buys nothing yet).
 const SHARDS: usize = 1;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Mode {
-    /// By database.
-    Database,
-    All,
-    Off,
-}
-
-fn mode() -> Mode {
-    static MODE: OnceLock<Mode> = OnceLock::new();
-    *MODE.get_or_init(|| {
-        match std::env::var(GRAPHS_VAR)
-            .ok()
-            .map(|v| v.trim().to_ascii_lowercase())
-            .as_deref()
-        {
-            Some("all") => Mode::All,
-            Some("off") => Mode::Off,
-            _ => Mode::Database,
-        }
-    })
-}
-
-/// Whether `g`'s elements live on the storage engine.
+/// Whether `g`'s elements live on the storage engine (a native graph).
 #[must_use]
-pub(crate) fn on_engine(g: &GraphRef, cat: &TenantCatalog) -> bool {
-    g.def.kind != "mapped" && serves(cat, g.db_id)
-}
-
-/// Whether a native graph in database `db` keeps its elements on the
-/// storage engine (so `CREATE GRAPH` makes no MariaDB tables for it).
-#[must_use]
-pub(crate) fn serves(cat: &TenantCatalog, db: DbId) -> bool {
-    match mode() {
-        Mode::All => true,
-        Mode::Off => false,
-        Mode::Database => crate::engine::catalog::of(cat).is_some_and(|e| e.dbs.contains(&db)),
-    }
+pub(crate) fn on_engine(g: &GraphRef) -> bool {
+    g.def.kind != "mapped"
 }
 
 type Graphs = Mutex<HashMap<(u64, u64), Arc<EngineGraph>>>;

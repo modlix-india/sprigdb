@@ -26,6 +26,7 @@
     clippy::redundant_closure_for_method_calls
 )]
 
+pub mod change_source;
 pub mod dropdb;
 pub mod filter;
 pub mod grammar;

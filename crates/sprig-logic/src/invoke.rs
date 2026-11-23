@@ -24,8 +24,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
 
-use mysql_async::Conn;
-use mysql_async::prelude::Queryable;
 use serde_json::Value;
 use sprig_common::{Result, SprigCode, SprigError};
 use sprig_logic_js::{ParamTy, Program, ScriptSig};
@@ -760,13 +758,12 @@ pub fn cached(tenant: u64, module_id: u64, version: u64) -> Option<Arc<EngineVer
 /// 39860 when there is no such engine-tier version; 39861 for a source
 /// that no longer parses; 39070 or a backend error.
 pub async fn load(
-    c: &mut Conn,
-    catalog_schema: &str,
+    c: &mut dyn sprig_catalog::records::RecordTx,
     tenant: u64,
     module_id: u64,
     version: u64,
 ) -> Result<Arc<EngineVersion>> {
-    load_version(c, catalog_schema, tenant, module_id, version, false).await
+    load_version(c, tenant, module_id, version, false).await
 }
 
 /// [`load`] of a version of any tier: a compiled trigger's version, whose
@@ -776,18 +773,16 @@ pub async fn load(
 /// # Errors
 /// As [`load`].
 pub async fn load_any(
-    c: &mut Conn,
-    catalog_schema: &str,
+    c: &mut dyn sprig_catalog::records::RecordTx,
     tenant: u64,
     module_id: u64,
     version: u64,
 ) -> Result<Arc<EngineVersion>> {
-    load_version(c, catalog_schema, tenant, module_id, version, true).await
+    load_version(c, tenant, module_id, version, true).await
 }
 
 async fn load_version(
-    c: &mut Conn,
-    catalog_schema: &str,
+    c: &mut dyn sprig_catalog::records::RecordTx,
     tenant: u64,
     module_id: u64,
     version: u64,
@@ -799,37 +794,29 @@ async fn load_version(
     {
         return Ok(v);
     }
-    let q = sprig_common::names::quote(catalog_schema);
-    let row: Option<(String, u32, String, String, String, String, String)> = c
-        .exec_first(
-            format!(
-                "SELECT m.name, m.db_id, m.runtime, m.security, v.tier, v.source, CAST(v.signature AS CHAR) \
-                 FROM {q}.logic_versions v JOIN {q}.logic_modules m ON m.module_id = v.module_id \
-                 WHERE v.module_id = ? AND v.version = ?"
-            ),
-            (module_id, version),
-        )
-        .await
-        .map_err(|e| {
-            SprigError::new(
-                SprigCode::CatalogUnavailable,
-                "the logic catalog is unreachable",
-            )
-            .with_source(e)
-        })?;
-    let Some((name, db_id, runtime, security, tier, source, signature)) = row else {
-        return Err(SprigError::new(
+    let missing = || {
+        SprigError::new(
             SprigCode::LogicNotFound,
             format!("logic module {module_id} has no version {version}"),
-        ));
+        )
     };
+    let store = crate::LogicStore::default();
+    let m = store
+        .module_by_id(c, module_id)
+        .await?
+        .ok_or_else(missing)?;
+    let (sig, tier) = store
+        .version_signature(c, module_id, version)
+        .await
+        .map_err(|_| missing())?;
+    let source = store.source(c, module_id, version).await?;
+    let (name, db_id, runtime, security) = (m.name, m.db_id, m.runtime, m.security);
     if tier != "engine" && !any_tier {
         return Err(SprigError::new(
             SprigCode::LogicNotFound,
             format!("{name} version {version} isn't an engine-tier version"),
         ));
     }
-    let sig: Value = serde_json::from_str(&signature).unwrap_or_default();
     let program = match runtime.as_str() {
         "kirun" | "javascript" | "lua" => {
             Some(Program::new(&runtime, &name, &source, script_sig(&sig))?)

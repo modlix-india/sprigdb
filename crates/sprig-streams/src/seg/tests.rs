@@ -13,7 +13,23 @@ fn engine(dir: &Path) -> Engine {
     c.checkpoint_interval = Duration::ZERO;
     c.log.sync = SyncMode::Off;
     c.budget.engine_mb = 64;
-    Engine::open(c).unwrap()
+    // A test that reopens its directory can find the engine it dropped
+    // still closing: the stream log's apply observer may hold the last
+    // handle on the log writer's thread, and the store's lock is free only
+    // when that thread lets it go.
+    let until = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match Engine::open(c.clone()) {
+            Ok(e) => return e,
+            Err(e)
+                if e.message.contains("lock hold by current process")
+                    && std::time::Instant::now() < until =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => panic!("{e}"),
+        }
+    }
 }
 
 fn cfg() -> SegConfig {
@@ -37,6 +53,9 @@ fn key(p: u32) -> PartKey {
 }
 
 const W: Duration = Duration::from_secs(10);
+
+/// The unit `key(_)`'s appends ride on: tenant 5's.
+const U5: sprig_engine::UnitId = sprig_engine::UnitId(5);
 
 async fn put(l: &SegLog, k: PartKey, b: &[u8]) -> Outcome {
     l.append(k, b, W).await.unwrap()
@@ -426,18 +445,102 @@ async fn appends_inside_a_transaction_commit_with_it_or_not_at_all() {
     let s1 = l.append_in(&mut t, key(1), &batch_bytes(3, 1, 1)).unwrap();
     let c = t.commit().unwrap();
     c.wait_async().await.unwrap();
-    let index = c.log_ticket().unwrap().index();
+    let unit = sprig_engine::Engine::unit_of_tenant(key(0).tenant).0;
+    let index = c.log_ticket_of(unit).unwrap().index();
     let dl = tokio::time::Instant::now() + W;
     assert_eq!(
-        base(&l.outcome(Pending { index, slot: s0 }, dl).await.unwrap()),
+        base(
+            &l.outcome(
+                Pending {
+                    unit,
+                    index,
+                    slot: s0
+                },
+                dl
+            )
+            .await
+            .unwrap()
+        ),
         0
     );
     assert_eq!(
-        base(&l.outcome(Pending { index, slot: s1 }, dl).await.unwrap()),
+        base(
+            &l.outcome(
+                Pending {
+                    unit,
+                    index,
+                    slot: s1
+                },
+                dl
+            )
+            .await
+            .unwrap()
+        ),
         0
     );
     assert_eq!(l.bounds(key(0)).high_watermark, 2);
     assert_eq!(l.bounds(key(1)).high_watermark, 3);
+}
+
+/// A transaction of one tenant publishing into another tenant's stream
+/// commits across the two units: the records appear exactly when it
+/// commits (with its rows), never when it rolls back, and survive a
+/// restart; with and without waits between the protocol's steps.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_publish_into_another_tenants_stream_commits_with_the_transaction() {
+    use sprig_engine::txn::TxnOptions;
+    for wait in [false, true] {
+        let d = TempDir::new("xtenant");
+        let l = open(d.path());
+        let e = l.engine().clone();
+        e.txn_shared().set_cross_unit_wait(wait);
+        let other = PartKey {
+            tenant: 9,
+            stream: 1,
+            partition: 0,
+        };
+        let row = |i: u8| {
+            let mut k = 3u64.to_be_bytes().to_vec();
+            k.extend_from_slice(b"row");
+            k.push(i);
+            k
+        };
+        // Rolled back: no record.
+        let mut t = e.begin(TxnOptions::mysql()).unwrap();
+        t.put(row(0), b"v".to_vec()).unwrap();
+        l.append_in(&mut t, other, &batch_bytes(2, 1, 1)).unwrap();
+        t.rollback();
+        assert_eq!(l.bounds(other).high_watermark, 0);
+        // Committed: the records and the rows, together.
+        let mut t = e.begin(TxnOptions::mysql()).unwrap();
+        t.put(row(1), b"v".to_vec()).unwrap();
+        t.put(row(2), b"v".to_vec()).unwrap();
+        let slot = l.append_in(&mut t, other, &batch_bytes(3, 1, 1)).unwrap();
+        assert_eq!(
+            l.bounds(other).high_watermark,
+            0,
+            "nothing before the commit"
+        );
+        let c = t.commit().unwrap();
+        c.wait_async().await.unwrap();
+        let unit = sprig_engine::Engine::unit_of_tenant(other.tenant).0;
+        let index = c.log_ticket_of(unit).unwrap().index();
+        let out = l
+            .outcome(
+                Pending { unit, index, slot },
+                tokio::time::Instant::now() + W,
+            )
+            .await
+            .unwrap();
+        assert_eq!(base(&out), 0, "wait={wait}");
+        assert_eq!(l.bounds(other).high_watermark, 3);
+        let mut r = e.begin(TxnOptions::mysql()).unwrap();
+        assert!(r.get_snapshot(&row(2)).unwrap().is_some());
+        drop(r);
+        drop((l, e));
+        let l = open(d.path());
+        assert_eq!(l.bounds(other).high_watermark, 3, "after a restart");
+    }
 }
 
 /// Exactly-once consume-transform-produce on engine transactions: the
@@ -475,9 +578,13 @@ async fn an_offset_commit_and_appends_share_one_transaction() {
     let slot = l.append_in(&mut t, key(0), &batch_bytes(3, 1, 1)).unwrap();
     let c = t.commit().unwrap();
     c.wait_async().await.unwrap();
-    let index = c.log_ticket().unwrap().index();
+    let unit = sprig_engine::Engine::unit_of_tenant(key(0).tenant).0;
+    let index = c.log_ticket_of(unit).unwrap().index();
     let out = l
-        .outcome(Pending { index, slot }, tokio::time::Instant::now() + W)
+        .outcome(
+            Pending { unit, index, slot },
+            tokio::time::Instant::now() + W,
+        )
         .await
         .unwrap();
     assert_eq!(base(&out), 0);
@@ -503,7 +610,7 @@ async fn a_failed_flush_keeps_the_floor_and_redoes_the_work() {
     let l = open(d.path());
     put(&l, key(0), &batch_bytes(3, 1, 10)).await;
     l.flush().unwrap();
-    let floor = l.engine().log_floor(FLOOR).unwrap();
+    let floor = l.engine().log_floor_of(U5, FLOOR).unwrap();
     put(&l, key(0), &batch_bytes(2, 1, 10)).await;
     put(&l, key(1), &batch_bytes(4, 1, 10)).await;
     // The manifest can't be written (its temporary file can't be made).
@@ -512,11 +619,11 @@ async fn a_failed_flush_keeps_the_floor_and_redoes_the_work() {
     let failed = l.flush();
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
     assert!(failed.is_err());
-    assert_eq!(l.engine().log_floor(FLOOR), Some(floor));
+    assert_eq!(l.engine().log_floor_of(U5, FLOOR), Some(floor));
     // Nothing looks clean that isn't: a second, plain pass doesn't move the
     // floor without a manifest either; it writes one.
     l.flush().unwrap();
-    assert!(l.engine().log_floor(FLOOR).unwrap() > floor);
+    assert!(l.engine().log_floor_of(U5, FLOOR).unwrap() > floor);
     let m = read_manifest(&dir).unwrap().unwrap();
     let p1 = m.parts.iter().find(|p| p.key == key(1)).unwrap();
     assert_eq!(p1.next_offset, 4);
@@ -539,12 +646,12 @@ async fn opens_after_a_binary_without_floors_trimmed_the_log() {
     // past the floor.
     {
         let e = engine(d.path());
-        let floor = e.log_floor(FLOOR).unwrap();
+        let floor = e.log_floor_of(U5, FLOOR).unwrap();
         e.clear_log_floor(FLOOR).unwrap();
         for _ in 0..20 {
             e.consensus()
                 .propose(
-                    e.notes_unit(),
+                    U5,
                     sprig_engine::log::Payload::new().into_bytes(),
                     sprig_engine::Durability::Local,
                 )
@@ -553,14 +660,14 @@ async fn opens_after_a_binary_without_floors_trimmed_the_log() {
                 .unwrap();
         }
         e.checkpoint().unwrap();
-        assert!(e.last_applied() > floor + 1);
-        assert!(e.log_first_index().is_none_or(|f| f > floor + 1));
+        assert!(e.last_applied_of(U5) > floor + 1);
+        assert!(e.log_first_index_of(U5).is_none_or(|f| f > floor + 1));
         // The engine itself refuses to hand the observer what it lost.
         let err = e
-            .observe(
+            .observe_units(
                 std::sync::Arc::new(NoObserver)
                     as std::sync::Arc<dyn sprig_engine::observe::ApplyObserver>,
-                floor,
+                &[(U5, floor)],
             )
             .unwrap_err();
         assert!(err.message.contains("no longer holds"), "{}", err.message);
@@ -620,14 +727,15 @@ async fn the_floor_never_passes_what_the_commit_log_holds_durably() {
     // Applied, not yet durable: the flush doesn't write a manifest or
     // raise the floor past the durable index.
     assert!(l.flush().is_err());
-    let durable = e.consensus().durable_index(e.notes_unit());
-    assert!(e.log_floor(FLOOR).unwrap_or(0) <= durable);
+    let durable = e.consensus().durable_index(U5);
+    assert!(e.log_floor_of(U5, FLOOR).unwrap_or(0) <= durable);
     assert!(
         read_manifest(&d.path().join("streams"))
             .unwrap()
             .unwrap()
-            .floor
-            <= durable
+            .floors
+            .iter()
+            .all(|(u, f)| *u != U5.0 || *f <= durable)
     );
 }
 
@@ -700,4 +808,167 @@ async fn a_replay_mark_moves_once() {
     let got = r.offsets(5, "replay", None).unwrap();
     assert_eq!(got.len(), 1);
     assert_eq!((got[0].stream_id, got[0].offset), (41, 1));
+}
+
+/// A stream append is an entry of its tenant's unit, not of the node
+/// unit, and the stream log keeps that unit's log above its floor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn appends_ride_on_the_tenants_unit() {
+    let d = TempDir::new("tenant-unit");
+    let l = open(d.path());
+    let e = l.engine().clone();
+    let c = e.consensus();
+    let (node0, t0) = (c.applied_index(e.notes_unit()), c.applied_index(U5));
+    put(&l, key(0), &batch_bytes(3, 1, 10)).await;
+    let other = PartKey {
+        tenant: 6,
+        stream: 1,
+        partition: 0,
+    };
+    let pending = l
+        .propose_many(&[
+            (key(1), batch_bytes(2, 1, 10)),
+            (other, batch_bytes(4, 1, 10)),
+        ])
+        .unwrap();
+    assert_eq!(
+        pending.iter().map(|p| p.unit).collect::<Vec<_>>(),
+        vec![5, 6]
+    );
+    for p in pending {
+        l.outcome(p, tokio::time::Instant::now() + W).await.unwrap();
+    }
+    assert_eq!(c.applied_index(e.notes_unit()), node0);
+    // The stream log resolves an append from its apply observer, which runs
+    // before the engine publishes the unit's new applied index: wait for it.
+    let until = std::time::Instant::now() + W;
+    while c.applied_index(U5) < t0 + 2 && std::time::Instant::now() < until {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(c.applied_index(U5) >= t0 + 2);
+    l.flush().unwrap();
+    assert!(e.log_floor_of(U5, FLOOR).unwrap() >= t0 + 2);
+    assert!(e.log_floor_of(sprig_engine::UnitId(6), FLOOR).is_some());
+    drop(e);
+    drop(l);
+    let l = open(d.path());
+    assert_eq!(l.bounds(key(0)).high_watermark, 3);
+    assert_eq!(l.bounds(key(1)).high_watermark, 2);
+    assert_eq!(l.bounds(other).high_watermark, 4);
+}
+
+/// A node that takes a tenant's leadership gives its partitions a new
+/// leader epoch, above every epoch before, also after a restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn taking_a_tenants_leadership_starts_a_new_epoch() {
+    let d = TempDir::new("unit-epoch");
+    let l = open(d.path());
+    let e = l.engine().clone();
+    put(&l, key(0), &batch_bytes(3, 1, 10)).await;
+    let first = l.epoch_of(5);
+    assert_eq!(l.epoch_of(6), first);
+    e.lead(U5);
+    let second = l.epoch_of(5);
+    assert!(second > first);
+    assert_eq!(l.epoch_of(6), first);
+    put(&l, key(0), &batch_bytes(2, 1, 10)).await;
+    assert_eq!(l.bounds(key(0)).epoch, second);
+    // The first epoch's records end where the second's begin.
+    assert_eq!(l.epoch_end(key(0), first), (first, 3));
+    l.flush().unwrap();
+    drop(l);
+    drop(e);
+    let l = open(d.path());
+    assert!(l.epoch_of(5) > second);
+    assert_eq!(l.bounds(key(0)).high_watermark, 5);
+}
+
+/// A data directory moved from one unit to units: the node unit carries
+/// the old unit's applied index but its log holds none of those entries.
+/// The stream log, whose manifest floor is on the node unit, still opens
+/// (the node unit counts what it applied as durable) and serves appends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn opens_on_a_directory_moved_to_units() {
+    use sprig_engine::store::{StoreBatch, WalMode};
+    let d = TempDir::new("moved");
+    {
+        let l = open(d.path());
+        put(&l, key(0), &batch_bytes(3, 1, 10)).await;
+        l.flush().unwrap();
+    }
+    // What the move leaves: the node unit applied through 50 in the store,
+    // with no entries of it in the commit log.
+    {
+        let e = engine(d.path());
+        let mut b = StoreBatch::new();
+        b.put(
+            sprig_engine::Cf::Data,
+            sprig_engine::keys::unit_meta_key(sprig_engine::NODE_UNIT.0, b"applied"),
+            50u64.to_be_bytes(),
+        );
+        e.store().write(&b, WalMode::Sync).unwrap();
+    }
+    let e = engine(d.path());
+    assert_eq!(e.consensus().applied_index(sprig_engine::NODE_UNIT), 50);
+    assert_eq!(e.consensus().durable_index(sprig_engine::NODE_UNIT), 50);
+    let l = SegLog::open(&e, d.path().join("streams"), cfg()).unwrap();
+    assert_eq!(l.bounds(key(0)).high_watermark, 3);
+    let o = put(&l, key(0), &batch_bytes(2, 1, 10)).await;
+    assert_eq!(base(&o), 3);
+    l.flush().unwrap();
+    assert!(e.log_floor(FLOOR).unwrap() >= 50);
+}
+
+/// A unit snapshot carries its tenant's partitions: the target node gets
+/// the same records at the same offsets, appends continue after them, and
+/// they survive a restart there. Both forms: the stream and the files.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_unit_snapshot_carries_the_tenants_streams() {
+    for files in [false, true] {
+        let (da, db) = (TempDir::new("snap-src"), TempDir::new("snap-dst"));
+        let a = open(da.path());
+        for i in 0..20 {
+            put(&a, key(i % 2), &batch_bytes(3, i64::from(i), 10)).await;
+        }
+        let other = PartKey {
+            tenant: 6,
+            stream: 1,
+            partition: 0,
+        };
+        put(&a, other, &batch_bytes(2, 1, 10)).await;
+        let want: Vec<_> = (0..2).map(|p| all(&a, key(p))).collect();
+        let b = open(db.path());
+        let eb = b.engine().clone();
+        if files {
+            let x = a
+                .engine()
+                .export_unit(U5, &da.path().join("export"), 1 << 20)
+                .unwrap();
+            assert!(x.files.iter().any(|f| f.ends_with("parts.snap")));
+            eb.ingest_unit(U5, &x.files).unwrap();
+        } else {
+            let mut bytes = Vec::new();
+            a.engine().export_unit_to(U5, &mut bytes).unwrap();
+            eb.ingest_unit_from(U5, &mut bytes.as_slice()).unwrap();
+        }
+        for p in 0..2 {
+            let (x, y) = (b.bounds(key(p)), a.bounds(key(p)));
+            assert_eq!(
+                (x.log_start, x.high_watermark),
+                (y.log_start, y.high_watermark),
+                "files {files}"
+            );
+            assert_eq!(all(&b, key(p)), want[p as usize]);
+        }
+        // Only tenant 5's unit came over.
+        assert_eq!(b.bounds(other).high_watermark, 0);
+        let o = put(&b, key(0), &batch_bytes(2, 1, 99)).await;
+        assert_eq!(base(&o), 30);
+        b.flush().unwrap();
+        drop(eb);
+        drop(b);
+        let b = open(db.path());
+        assert_eq!(b.bounds(key(0)).high_watermark, 32);
+        assert_eq!(b.bounds(key(1)).high_watermark, 30);
+    }
 }

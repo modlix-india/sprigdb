@@ -427,10 +427,8 @@ pub async fn serve(
 /// # Errors
 /// The store's and the members' catalogs'.
 pub async fn drop_trigger_here(svc: &Arc<TenantServices>, g: DefKey) -> Result<usize> {
-    use mysql_async::prelude::Queryable;
     use serde_json::Value;
-    use sprig_catalog::CatalogLocator;
-    use sprig_catalog::pool_wait::Bounded as _;
+
     // Trigger instances live with the members' stream instances.
     let prefix = svc.locator.dc_store().tier().key("inherit-instances/")?;
     let page = svc
@@ -459,10 +457,6 @@ pub async fn drop_trigger_here(svc: &Arc<TenantServices>, g: DefKey) -> Result<u
         if super::dir_entry(svc, t).await?.is_none() {
             continue;
         }
-        let ep = svc.locator.writer(t).await?;
-        let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
-            SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
-        })?;
         let store = sprig_inherit::msg::MsgStore::new(Arc::clone(&svc.records), t);
         if let Some(i) = store.instance(g).await? {
             if let Some(b) = i
@@ -473,19 +467,20 @@ pub async fn drop_trigger_here(svc: &Arc<TenantServices>, g: DefKey) -> Result<u
             {
                 sprig_logic::messages::delete_index(svc.locator.dc_store().as_ref(), t, b).await?;
                 // The job ends at its next check; its module stays, marked.
-                let _ = conn
-                    .exec_drop(
-                        format!(
-                            "UPDATE {}.logic_modules SET state = 'dropped' WHERE module_id = ?",
-                            sprig_common::names::quote(ep.store.schema())
-                        ),
-                        (i.physical
-                            .as_ref()
-                            .and_then(|p| p.get("module"))
-                            .and_then(Value::as_u64)
-                            .unwrap_or(0),),
-                    )
-                    .await;
+                let module = i
+                    .physical
+                    .as_ref()
+                    .and_then(|p| p.get("module"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let mut tx = svc.records.begin(t).await?;
+                if sprig_logic::LogicStore::default()
+                    .mark_dropped(&mut *tx, module, 0)
+                    .await
+                    .is_ok()
+                {
+                    let _ = tx.commit().await;
+                }
             }
             store.delete_instance(g).await?;
             n += 1;

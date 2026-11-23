@@ -428,6 +428,28 @@ impl Compiler<'_> {
             Expr::Identifier(i) => CExpr::Col(self.column(std::slice::from_ref(i))?),
             Expr::CompoundIdentifier(p) => CExpr::Col(self.column(p)?),
             Expr::Nested(x) => self.compile(x)?,
+            // A character set introducer on a literal (`_utf8mb4 X'61'`,
+            // as engine-tier code binds its strings): UTF-8 text, or
+            // bytes for `_binary`.
+            Expr::Prefixed { prefix, value } => {
+                let lit = match &**value {
+                    Expr::Value(v) if !matches!(v.value, SqlValue::Placeholder(_)) => {
+                        literal(&v.value, self.backslash)?
+                    }
+                    _ => return Err(not_on_engine("a character set introducer")),
+                };
+                match (prefix.value.to_ascii_lowercase().as_str(), lit) {
+                    ("_binary", Datum::Str(b)) => CExpr::Lit(Datum::Bytes(b)),
+                    ("_binary", d @ Datum::Bytes(_))
+                    | ("_utf8mb4" | "_utf8" | "_utf8mb3", d @ Datum::Str(_)) => CExpr::Lit(d),
+                    ("_utf8mb4" | "_utf8" | "_utf8mb3", Datum::Bytes(b))
+                        if std::str::from_utf8(&b).is_ok() =>
+                    {
+                        CExpr::Lit(Datum::Str(b))
+                    }
+                    _ => return Err(not_on_engine("a character set introducer")),
+                }
+            }
             Expr::Value(v) => match &v.value {
                 SqlValue::Placeholder(p) if p == "?" => {
                     self.params += 1;

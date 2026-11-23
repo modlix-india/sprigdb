@@ -189,6 +189,78 @@ where
     let _ = wr.shutdown().await;
 }
 
+/// The client property a relaying gateway adds to the start-ok it replays,
+/// so the receiving gateway serves the connection itself (never relays it
+/// on, even if the two disagree for a moment about which leads).
+const RELAYED: &str = "x-sprig-relayed";
+
+fn relayed(props: &FieldTable) -> bool {
+    props.0.iter().any(|(k, _)| k == RELAYED)
+}
+
+/// Relays a logged-in connection to the gateway at `to`: opens a 0-9-1
+/// connection there, replays the client's start-ok (marked as relayed),
+/// then copies bytes both ways until either side ends. The client goes on
+/// with that gateway's tune, open and everything after as if it had
+/// connected there.
+#[allow(clippy::too_many_arguments)]
+async fn relay<R, W>(
+    mut rd: R,
+    mut wr: W,
+    inb: BytesMut,
+    mut start_ok: super::method::ConnectionStartOk,
+    to: &str,
+    hs_max: u32,
+    deadline: Instant,
+    info: &ConnInfo,
+) -> Result<(), MqError>
+where
+    R: AsyncRead + Unpin + Send,
+    W: AsyncWrite + Unpin + Send,
+{
+    let unreachable = |e: &dyn std::fmt::Display| {
+        MqError::new(
+            MqCode::FrameError,
+            format!("the gateway serving this tenant ({to}) can't be reached: {e}; retry"),
+        )
+        .with_reply(reply::CONNECTION_FORCED)
+    };
+    let up = match tokio::time::timeout_at(deadline, tokio::net::TcpStream::connect(to)).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => return Err(unreachable(&e)),
+        Err(_) => return Err(unreachable(&"connect timed out")),
+    };
+    let _ = up.set_nodelay(true);
+    let (mut urd, mut uwr) = up.into_split();
+    let mut uinb = BytesMut::with_capacity(4096);
+    let mut buf = BytesMut::new();
+    buf.extend_from_slice(b"AMQP\x00\x00\x09\x01");
+    flush(&mut uwr, &mut buf).await?;
+    let Method::ConnectionStart(_) = expect(&mut urd, &mut uinb, hs_max, deadline).await? else {
+        return Err(unreachable(&"no connection.start"));
+    };
+    start_ok
+        .client_properties
+        .0
+        .push((RELAYED.to_owned(), FieldValue::Bool(true)));
+    put_method(&mut buf, 0, &Method::ConnectionStartOk(start_ok));
+    // Whatever the client sent after its start-ok goes on too.
+    buf.extend_from_slice(&inb);
+    flush(&mut uwr, &mut buf).await?;
+    if !uinb.is_empty() {
+        wr.write_all(&uinb).await.map_err(|e| io_err(&e))?;
+        wr.flush().await.map_err(|e| io_err(&e))?;
+    }
+    tracing::debug!(peer = %info.peer, to, "AMQP 0-9-1 connection relayed");
+    metrics::counter!("sprig_amqp_relayed_connections_total").increment(1);
+    let down = tokio::io::copy(&mut rd, &mut uwr);
+    let back = tokio::io::copy(&mut urd, &mut wr);
+    tokio::select! {
+        r = down => { let _ = uwr.shutdown().await; r.map(|_| ()).map_err(|e| io_err(&e)) }
+        r = back => { let _ = wr.shutdown().await; r.map(|_| ()).map_err(|e| io_err(&e)) }
+    }
+}
+
 /// Runs a 0-9-1 connection whose protocol header was read.
 pub(crate) async fn run<S>(
     io: S,
@@ -261,6 +333,18 @@ where
             return Err(e);
         }
     };
+    // Served by another gateway (the one leading the tenant's data): the
+    // connection is relayed there from here on. Only password logins: the
+    // relay replays the client's own start-ok.
+    if !relayed(&start_ok.client_properties)
+        && matches!(
+            auth::credentials(&start_ok.mechanism, &start_ok.response, &offered, &info),
+            Some(Credentials::Password { .. })
+        )
+        && let Some(to) = svc.backend.serve_elsewhere(&principal).await
+    {
+        return relay(rd, wr, inb, start_ok, &to, hs_max, deadline, &info).await;
+    }
     put_method(
         &mut out,
         0,

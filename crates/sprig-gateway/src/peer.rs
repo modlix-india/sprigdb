@@ -1002,6 +1002,7 @@ mod tests {
             load: registry::Load::default(),
             kafka_host: None,
             degraded: std::collections::BTreeMap::new(),
+            raft_node: None,
         });
         r.set_degraded("peer", Some(text.clone()));
         assert_eq!(r.record().degraded.get("peer"), Some(&text));
@@ -1204,6 +1205,7 @@ mod tests {
             load: registry::Load::default(),
             kafka_host: None,
             degraded: std::collections::BTreeMap::new(),
+            raft_node: None,
         };
         let put = |r: &GatewayRecord| {
             let fra1 = Arc::clone(&fra1);
@@ -1305,6 +1307,7 @@ mod tests {
             load: registry::Load::default(),
             kafka_host: None,
             degraded: std::collections::BTreeMap::new(),
+            raft_node: None,
         };
         let peers = Peers::new(Arc::clone(&mem), None);
         let req = |db: &str| WatchChangesRequest {

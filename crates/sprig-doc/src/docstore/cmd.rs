@@ -1084,15 +1084,12 @@ impl DocStore {
                             | "pipeline"
                     ) {
                         opts.insert(k.clone(), v.clone());
+                    } else if k == "changeStreamPreAndPostImages" {
+                        super::check_pre_post(v)?;
+                        opts.insert(k.clone(), v.clone());
                     } else if matches!(
                         k.as_str(),
-                        "capped"
-                            | "size"
-                            | "max"
-                            | "timeseries"
-                            | "clusteredIndex"
-                            | "changeStreamPreAndPostImages"
-                            | "collation"
+                        "capped" | "size" | "max" | "timeseries" | "clusteredIndex" | "collation"
                     ) {
                         return Err(MongoError::new(
                             code::SPRIG_DOC_FEATURE_UNSUPPORTED,
@@ -1139,9 +1136,16 @@ impl DocStore {
             }
             "dropDatabase" => {
                 let _g = self.ddl_guard(tenant).await;
-                for c in self.list(tenant, Some(db))? {
+                let colls = self.list(tenant, Some(db))?;
+                for c in &colls {
                     self.drop_locked(tenant, &Name::new(db, &c.meta.name))
                         .await?;
+                }
+                if !colls.is_empty() {
+                    // The change log's `dropDatabase` event.
+                    let mut t = self.begin(false);
+                    t.delete(super::layout::db_drop_marker(tenant, db))?;
+                    t.commit().await?;
                 }
                 Ok(Reply::Doc(doc! {"dropped": db, "ok": 1.0}))
             }

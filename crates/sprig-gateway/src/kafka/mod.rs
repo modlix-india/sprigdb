@@ -11,6 +11,8 @@
 //!   plane (Produce, Fetch, ListOffsets, OffsetForLeaderEpoch);
 //! - [`data`]: the tenant catalog and privileges the engine router asks
 //!   about, and the produce and fetch limits;
+//! - [`changes`]: engine tables' change topics (`<db>.<table>.changes`),
+//!   read-only, from the node's change log, in front of the others;
 //! - [`catalog`]: what the engine router falls back to (consumer groups'
 //!   rows; topics of databases that don't exist).
 
@@ -18,6 +20,7 @@
 #![allow(clippy::doc_markdown)]
 
 pub mod catalog;
+pub mod changes;
 pub mod cluster;
 pub mod data;
 pub mod engine;
@@ -149,6 +152,7 @@ impl KafkaFrontend {
     #[must_use]
     pub fn start(mut d: KafkaDeps, stop: CancellationToken) -> Self {
         engine::wrap(&mut d);
+        changes::wrap(&mut d);
         let groups = Arc::new(Coordinator::new(
             Arc::clone(&d.groups),
             Arc::clone(&d.cluster) as Arc<dyn sprig_proto_kafka::group::Leases>,

@@ -57,6 +57,10 @@ struct StoreMachine {
     /// bookkeeping (`max_ts`) so a restarted clock starts above it even when
     /// the wall clock stepped back.
     max_ts: AtomicU64,
+    /// Per unit, the highest version timestamp applied since the engine
+    /// opened (what a read view on a replica that doesn't lead the unit
+    /// takes: see [`Engine::follower_read`]).
+    unit_ts: RwLock<std::collections::HashMap<UnitId, u64>>,
 }
 
 /// The field of a unit's bookkeeping that holds the highest version
@@ -139,6 +143,12 @@ impl StateMachine for StoreMachine {
                 last.index.to_be_bytes(),
             );
             if let Some(m) = part_max {
+                self.unit_ts
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .entry(*unit)
+                    .and_modify(|t| *t = (*t).max(m.0))
+                    .or_insert(m.0);
                 let top = self.max_ts.fetch_max(m.0, Ordering::AcqRel).max(m.0);
                 batch.put(
                     Cf::Data,
@@ -238,17 +248,29 @@ struct Stop {
 struct Inner {
     cfg: EngineConfig,
     sm: Arc<StoreMachine>,
-    /// Observers' log floors, by name ([`crate::observe`]).
-    floors: Mutex<std::collections::BTreeMap<String, u64>>,
+    /// Observers' log floors, by unit and name ([`crate::observe`]).
+    floors: Mutex<std::collections::BTreeMap<(UnitId, String), u64>>,
     store: Arc<dyn SortedStore>,
     rocks: Option<Arc<RocksStore>>,
     log: Arc<LocalLog>,
+    /// The commit path: the local log, or the replicated one for tenant
+    /// units of a replicated engine.
+    router: crate::repl::Router,
     budgets: Budgets,
     unit: UnitId,
     /// The version GC rule compactions of `data` run, and its watermark.
     gc: Arc<GcSlot>,
     txn: Arc<txn::TxnShared>,
     checkpoints: AtomicU64,
+    /// Which units this node leads, under which epochs.
+    leaders: Arc<crate::leader::Leaders>,
+    /// What unit snapshots carry beside the unit's keys.
+    snapshot_parts: RwLock<Vec<Arc<dyn crate::snapshot::UnitSnapshotPart>>>,
+    /// Parts of an ingested snapshot whose part wasn't registered yet (a
+    /// replica re-restoring a snapshot while it opens, before the stream
+    /// log starts): name, unit, index and bytes, handed over on
+    /// registration.
+    pending_parts: Mutex<Vec<crate::snapshot::PendingPart>>,
     stop: Arc<Stop>,
     checkpointer: Mutex<Option<JoinHandle<()>>>,
 }
@@ -273,7 +295,8 @@ impl Drop for Inner {
                 let _ = h.join();
             }
         }
-        // Drain and sync the log before the store closes behind it.
+        // Drain and sync the logs before the store closes behind it.
+        self.router.close_replicated();
         self.log.close();
     }
 }
@@ -310,9 +333,30 @@ impl Drop for Users {
                 .unwrap_or_else(PoisonError::into_inner)
                 .take()
         });
-        if let Some(h) = h {
+        if let Some(h) = h
+            && h.thread().id() != std::thread::current().id()
+        {
             let _ = h.join();
         }
+    }
+}
+
+/// A handle that doesn't keep the engine open ([`Engine::downgrade`]):
+/// what a replicated log the engine holds keeps of it.
+#[derive(Clone)]
+pub struct WeakEngine(std::sync::Weak<Inner>);
+
+impl std::fmt::Debug for WeakEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("WeakEngine")
+    }
+}
+
+impl WeakEngine {
+    /// The engine, while it is open.
+    #[must_use]
+    pub fn upgrade(&self) -> Option<Engine> {
+        self.0.upgrade().map(|inner| Engine { user: None, inner })
     }
 }
 
@@ -382,7 +426,9 @@ impl Engine {
             observers: RwLock::new(Vec::new()),
             last_applied: RwLock::new(std::collections::HashMap::new()),
             max_ts: AtomicU64::new(max_ts),
+            unit_ts: RwLock::new(std::collections::HashMap::new()),
         });
+        let leaders = Arc::new(crate::leader::Leaders::new(1, cfg.replicated));
         let log = Arc::new(LocalLog::open(
             cfg.data_dir.join("raft"),
             cfg.log.clone(),
@@ -392,13 +438,16 @@ impl Engine {
         if cfg.store != StoreKind::Mem {
             migrate_legacy(store.as_ref())?;
         }
-        let floors = load_floors(store.as_ref(), NODE_UNIT)?;
+        let floors = load_all_floors(store.as_ref())?;
         let stop = Arc::new(Stop {
             stopped: Mutex::new(false),
             cv: Condvar::new(),
         });
         // After replay: the clock starts above every version in the store.
-        let txn_shared = Arc::new(txn::TxnShared::new());
+        let txn_shared = Arc::new(match &cfg.clock {
+            Some(c) => txn::TxnShared::with_config(cfg.txn, Arc::clone(&c.0)),
+            None => txn::TxnShared::with_config(cfg.txn, Arc::new(txn::hlc::SystemClock)),
+        });
         txn_shared.observe(keys::Ts(sm.max_ts.load(Ordering::Acquire)));
         // Compactions drop versions by the transaction layer's rule, at the
         // watermark it computes when each compaction starts.
@@ -411,11 +460,19 @@ impl Engine {
                 txn: txn_shared,
                 store,
                 rocks,
+                router: crate::repl::Router::new(
+                    Arc::clone(&log),
+                    cfg.replicated,
+                    Arc::clone(&leaders),
+                ),
                 log,
                 budgets,
                 unit: NODE_UNIT,
                 gc,
                 checkpoints: AtomicU64::new(0),
+                leaders,
+                snapshot_parts: RwLock::new(Vec::new()),
+                pending_parts: Mutex::new(Vec::new()),
                 stop,
                 checkpointer: Mutex::new(None),
                 cfg,
@@ -426,6 +483,9 @@ impl Engine {
             inner: Arc::downgrade(&engine.inner),
         }));
         engine.set_version_gc(txn_gc);
+        // Prepared transactions come back, and commits across units a crash
+        // left unfinished are resolved, before anything reads.
+        engine.inner.txn.recover_once(&engine);
         if !engine.inner.cfg.checkpoint_interval.is_zero()
             && engine.inner.cfg.store != StoreKind::Mem
         {
@@ -448,6 +508,14 @@ impl Engine {
         Txn::begin(self.clone(), opts)
     }
 
+    /// Moves unfinished commits across units on (participants whose
+    /// commit point is durable are resolved, stale pending ones aborted,
+    /// finished records deleted). Commits do this as they go; a stepped log
+    /// (the simulator) or an idle node calls it. Never blocks on the log.
+    pub fn resolve_cross_unit(&self) {
+        self.inner.txn.drive_cross(self);
+    }
+
     /// The sorted store.
     #[must_use]
     pub fn store(&self) -> &Arc<dyn SortedStore> {
@@ -463,7 +531,95 @@ impl Engine {
     /// The commit path.
     #[must_use]
     pub fn consensus(&self) -> &dyn Consensus {
-        self.inner.log.as_ref()
+        &self.inner.router
+    }
+
+    /// A handle that doesn't keep the engine open.
+    #[must_use]
+    pub fn downgrade(&self) -> WeakEngine {
+        WeakEngine(Arc::downgrade(&self.inner))
+    }
+
+    /// Whether tenant units commit through a replicated log
+    /// ([`EngineConfig::replicated`]).
+    #[must_use]
+    pub fn is_replicated(&self) -> bool {
+        self.inner.router.is_replicated()
+    }
+
+    /// Whether `unit` commits through the replicated log.
+    #[must_use]
+    pub fn is_replicated_unit(&self, unit: UnitId) -> bool {
+        self.inner.router.is_replicated_unit(unit)
+    }
+
+    /// Before a read of `unit`: on a replica that doesn't lead the
+    /// (replicated) unit, waits until this replica has applied everything
+    /// the unit's leader had committed when asked (a read barrier), and
+    /// returns the timestamp a read view must take to see it all: the
+    /// highest version applied to the unit (within a unit, commit
+    /// timestamps follow log order, so every commit at or below it is
+    /// applied). `None` where the unit is led here or not replicated:
+    /// reads use the node's own view.
+    ///
+    /// # Errors
+    /// No leader confirmed in time, or replication hasn't started
+    /// (retryable).
+    pub fn follower_read(&self, unit: UnitId) -> Result<Option<keys::Ts>> {
+        if !self.is_replicated_unit(unit) || self.leader_epoch(unit) > 0 {
+            return Ok(None);
+        }
+        let Some(r) = self.replicated_log() else {
+            return Err(SprigError::new(
+                sprig_common::SprigCode::ShardMoved,
+                "this node's replication hasn't started yet; retry",
+            ));
+        };
+        r.read_barrier(unit)?;
+        let ts = self
+            .inner
+            .sm
+            .unit_ts
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&unit)
+            .copied()
+            // Nothing applied since the engine opened: the node's highest
+            // (at or above the unit's own).
+            .unwrap_or_else(|| self.inner.sm.max_ts.load(Ordering::Acquire));
+        let ts = keys::Ts(ts);
+        // The node's clock and views move past what it now holds.
+        self.txn_shared().observe(ts);
+        Ok(Some(ts))
+    }
+
+    /// Attaches the replicated log tenant units commit through. Once only,
+    /// on an engine opened with [`EngineConfig::replicated`].
+    ///
+    /// # Errors
+    /// The engine isn't replicated, or a log is already attached.
+    pub fn attach_replication(&self, r: Arc<dyn crate::repl::ReplicatedLog>) -> Result<()> {
+        self.inner.router.attach(r)
+    }
+
+    /// The replicated log, once attached.
+    #[must_use]
+    pub fn replicated_log(&self) -> Option<&Arc<dyn crate::repl::ReplicatedLog>> {
+        self.inner.router.replicated_log()
+    }
+
+    /// What applies committed entries to this engine's store: a replicated
+    /// log applies every unit's entries through it, on every replica.
+    #[must_use]
+    pub fn state_machine(&self) -> Arc<dyn StateMachine> {
+        Arc::clone(&self.inner.sm) as Arc<dyn StateMachine>
+    }
+
+    /// The highest version timestamp the store has applied (what a new
+    /// leader's clock must start above).
+    #[must_use]
+    pub fn applied_max_ts(&self) -> keys::Ts {
+        keys::Ts(self.inner.sm.max_ts.load(Ordering::Acquire))
     }
 
     /// The commit log itself.
@@ -511,9 +667,24 @@ impl Engine {
     /// index.
     #[must_use]
     pub fn units(&self) -> Vec<(UnitId, u64)> {
-        let mut u = self.inner.log.applied();
+        let mut u = self.inner.router.applied();
         u.sort_unstable();
         u
+    }
+
+    pub(crate) fn leaders(&self) -> &crate::leader::Leaders {
+        &self.inner.leaders
+    }
+
+    /// The parts unit snapshots carry.
+    pub(crate) fn snapshot_parts(
+        &self,
+    ) -> &RwLock<Vec<Arc<dyn crate::snapshot::UnitSnapshotPart>>> {
+        &self.inner.snapshot_parts
+    }
+
+    pub(crate) fn pending_parts(&self) -> &Mutex<Vec<crate::snapshot::PendingPart>> {
+        &self.inner.pending_parts
     }
 
     /// The memory budgets.
@@ -567,61 +738,100 @@ impl Engine {
         if self.inner.cfg.store == StoreKind::Mem {
             return Ok(0);
         }
-        let store = Arc::clone(&self.inner.store);
-        let floor = self
+        let store = &self.inner.store;
+        // Per unit, the lowest floor any observer holds on it.
+        let mut caps: std::collections::HashMap<UnitId, u64> = std::collections::HashMap::new();
+        for ((u, _), f) in self
             .inner
             .floors
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .values()
-            .min()
-            .copied();
-        let unit = self.inner.unit;
-        let n = self
+            .iter()
+        {
+            let c = caps.entry(*u).or_insert(*f);
+            *c = (*c).min(*f);
+        }
+        let flush = || store.flush_all();
+        let mut n = self
             .inner
             .log
-            .checkpoint_capped(&move || store.flush_all(), &|u| {
-                if u == unit { floor } else { None }
-            })?;
+            .checkpoint_capped(&flush, &|u| caps.get(&u).copied())?;
+        if let Some(r) = self.inner.router.replicated_log() {
+            n += r.checkpoint(&flush, &|u| caps.get(&u).copied())?;
+        }
         self.inner.checkpoints.fetch_add(1, Ordering::Relaxed);
         Ok(n)
     }
 
-    /// An observer's log floor ([`crate::observe`]), if it ever set one.
+    /// An observer's log floor on the node unit ([`crate::observe`]), if
+    /// it ever set one.
     #[must_use]
     pub fn log_floor(&self, name: &str) -> Option<u64> {
+        self.log_floor_of(NODE_UNIT, name)
+    }
+
+    /// An observer's log floor on `unit`, if it ever set one.
+    #[must_use]
+    pub fn log_floor_of(&self, unit: UnitId, name: &str) -> Option<u64> {
         self.inner
             .floors
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .get(name)
+            .get(&(unit, name.to_owned()))
             .copied()
     }
 
-    /// Records that observer `name` holds every entry up to `index`
-    /// durably in its own files: the checkpoint keeps the log above it.
-    /// Synced before it returns.
+    /// Every unit observer `name` holds a floor on, with the floor.
+    #[must_use]
+    pub fn log_floors(&self, name: &str) -> Vec<(UnitId, u64)> {
+        self.inner
+            .floors
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter(|((_, n), _)| n == name)
+            .map(|((u, _), f)| (*u, *f))
+            .collect()
+    }
+
+    /// Records that observer `name` holds every entry of the node unit up
+    /// to `index` durably in its own files: the checkpoint keeps the log
+    /// above it. Synced before it returns.
     ///
     /// # Errors
     /// The store failed.
     pub fn set_log_floor(&self, name: &str, index: u64) -> Result<()> {
+        self.set_log_floors(name, &[(NODE_UNIT, index)])
+    }
+
+    /// [`Engine::set_log_floor`] on several units in one synced write: the
+    /// checkpoint keeps each unit's log above its floor. A unit's floor is
+    /// set before the observer depends on any of its entries.
+    ///
+    /// # Errors
+    /// The store failed.
+    pub fn set_log_floors(&self, name: &str, floors_at: &[(UnitId, u64)]) -> Result<()> {
+        if floors_at.is_empty() {
+            return Ok(());
+        }
         let mut floors = self
             .inner
             .floors
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let mut b = StoreBatch::new();
-        b.put(
-            Cf::Local,
-            floor_key(self.inner.unit, name),
-            index.to_be_bytes(),
-        );
+        for (unit, index) in floors_at {
+            b.put(Cf::Local, floor_key(*unit, name), index.to_be_bytes());
+        }
         self.inner.store.write(&b, WalMode::Sync)?;
-        floors.insert(name.to_owned(), index);
+        for (unit, index) in floors_at {
+            floors.insert((*unit, name.to_owned()), *index);
+        }
         Ok(())
     }
 
-    /// Forgets observer `name`'s floor: the log may be trimmed past it.
+    /// Forgets observer `name`'s floors on every unit: the log may be
+    /// trimmed past them.
     ///
     /// # Errors
     /// The store failed.
@@ -632,9 +842,15 @@ impl Engine {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let mut b = StoreBatch::new();
-        b.delete(Cf::Local, floor_key(self.inner.unit, name));
+        let gone: Vec<(UnitId, String)> =
+            floors.keys().filter(|(_, n)| n == name).cloned().collect();
+        for (u, n) in &gone {
+            b.delete(Cf::Local, floor_key(*u, n));
+        }
         self.inner.store.write(&b, WalMode::Sync)?;
-        floors.remove(name);
+        for k in gone {
+            floors.remove(&k);
+        }
         Ok(())
     }
 
@@ -643,7 +859,19 @@ impl Engine {
     /// from the log: a binary that didn't keep observer floors trimmed it.
     #[must_use]
     pub fn log_first_index(&self) -> Option<u64> {
-        self.inner.log.first_index(self.inner.unit)
+        self.inner.router.first_index(self.inner.unit)
+    }
+
+    /// [`Engine::log_first_index`] of `unit`.
+    #[must_use]
+    pub fn log_first_index_of(&self, unit: UnitId) -> Option<u64> {
+        self.inner.router.first_index(unit)
+    }
+
+    /// The highest index of `unit` the store has applied.
+    #[must_use]
+    pub fn last_applied_of(&self, unit: UnitId) -> u64 {
+        self.inner.sm.last_applied(unit)
     }
 
     /// The highest index of the notes unit the store has applied (what
@@ -666,38 +894,95 @@ impl Engine {
         let unit = self.notes_unit();
         let mut obs = sm.observers.write().unwrap_or_else(PoisonError::into_inner);
         let top = sm.last_applied(unit);
-        let mut next = from + 1;
-        if next <= top && self.inner.log.first_index(unit).is_none_or(|f| f > next) {
+        let next = from + 1;
+        if next <= top && self.inner.router.first_index(unit).is_none_or(|f| f > next) {
             return Err(SprigError::internal(format!(
                 "engine: the log no longer holds entry {next}, which an observer needs"
             )));
         }
+        self.catch_up(o.as_ref(), unit, from, top)?;
+        obs.push(o);
+        Ok(top)
+    }
+
+    /// Hands `o` the entries of `unit` above `from` up to `top` (applied
+    /// already) from the log. A replicated unit's log has indexes without a
+    /// payload (a new leader's first entry, membership changes), so its
+    /// entries may skip indexes.
+    fn catch_up(
+        &self,
+        o: &dyn crate::observe::ApplyObserver,
+        unit: UnitId,
+        from: u64,
+        top: u64,
+    ) -> Result<()> {
+        let gone = |next: u64| {
+            SprigError::internal(format!(
+                "engine: the log of unit {} no longer holds entry {next}, which an observer \
+                 needs",
+                unit.0
+            ))
+        };
+        let replicated = self.is_replicated_unit(unit);
+        let mut next = from + 1;
+        if replicated && next <= top && self.inner.router.first_index(unit).is_none_or(|f| f > next)
+        {
+            return Err(gone(next));
+        }
         while next <= top {
             let end = (next + 512).min(top + 1);
-            let got = self.inner.log.entries(unit, next, end)?;
+            let got = self.inner.router.entries(unit, next, end)?;
+            if replicated {
+                if !got.is_empty() {
+                    o.applied(unit, &got);
+                }
+                next = end;
+                continue;
+            }
             if got.first().map(|e| e.index) != Some(next) {
-                return Err(SprigError::internal(format!(
-                    "engine: the log no longer holds entry {next}, which an observer needs"
-                )));
+                return Err(gone(next));
             }
             next += got.len() as u64;
             o.applied(unit, &got);
         }
+        Ok(())
+    }
+
+    /// [`Engine::observe`] over several units: for each `(unit, from)`,
+    /// the unit's entries above `from` the store has already applied are
+    /// handed to the observer first, then it sees every new entry of every
+    /// unit. Returns the last index given for each listed unit.
+    ///
+    /// # Errors
+    /// The log no longer holds an entry it needs, or reading it failed.
+    pub fn observe_units(
+        &self,
+        o: Arc<dyn crate::observe::ApplyObserver>,
+        from: &[(UnitId, u64)],
+    ) -> Result<Vec<(UnitId, u64)>> {
+        let sm = &self.inner.sm;
+        let mut obs = sm.observers.write().unwrap_or_else(PoisonError::into_inner);
+        let mut tops = Vec::with_capacity(from.len());
+        for &(unit, from) in from {
+            let top = sm.last_applied(unit);
+            self.catch_up(o.as_ref(), unit, from, top)?;
+            tops.push((unit, top.max(from)));
+        }
         obs.push(o);
-        Ok(top)
+        Ok(tops)
     }
 
     /// Counters.
     #[must_use]
     pub fn stats(&self) -> EngineStats {
         let i = &self.inner;
-        let units = i.log.applied();
+        let units = i.router.applied();
         EngineStats {
             store: i.store.stats(),
             log: i.log.stats(),
             log_disk_bytes: i.log.disk_bytes(),
             applied_index: units.iter().map(|(_, a)| a).sum(),
-            durable_index: units.iter().map(|(u, _)| i.log.durable_index(*u)).sum(),
+            durable_index: units.iter().map(|(u, _)| i.router.durable_index(*u)).sum(),
             units: units.len() as u64,
             checkpoints: i.checkpoints.load(Ordering::Relaxed),
             txn_bytes: i.budgets.txn.used(),
@@ -705,11 +990,62 @@ impl Engine {
         }
     }
 
+    /// After a unit snapshot was ingested: the unit's applied index and the
+    /// node's highest timestamp take its values, and its prepared XA
+    /// transactions come back with their locks.
+    pub(crate) fn note_ingested(&self, unit: UnitId, index: u64, max_ts: u64) {
+        self.inner
+            .sm
+            .last_applied
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(unit, index);
+        self.inner.sm.max_ts.fetch_max(max_ts, Ordering::AcqRel);
+        self.inner
+            .sm
+            .unit_ts
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(unit)
+            .and_modify(|t| *t = (*t).max(max_ts))
+            .or_insert(max_ts);
+        self.inner.txn.load_prepared_of(self, Some(unit.0));
+    }
+
     /// The data directory.
     #[must_use]
     pub fn data_dir(&self) -> &Path {
         &self.inner.cfg.data_dir
     }
+}
+
+/// Every observer floor stored, by unit and name.
+fn load_all_floors(
+    store: &dyn SortedStore,
+) -> Result<std::collections::BTreeMap<(UnitId, String), u64>> {
+    let prefix = keys::unit_meta_key(0, b"");
+    let prefix = &prefix[..prefix.len() - 8];
+    let mut out = std::collections::BTreeMap::new();
+    let mut it = store.iter(
+        Cf::Local,
+        crate::store::IterOpts::range(&keys::KeyRange::prefix(prefix)),
+    );
+    it.seek(prefix);
+    while it.valid() {
+        let rest = &it.key()[prefix.len()..];
+        if rest.len() > 8 && rest[8..].starts_with(b"floor/") {
+            let unit = UnitId(u64::from_be_bytes(rest[..8].try_into().unwrap_or([0; 8])));
+            let name = String::from_utf8_lossy(&rest[8 + 6..]).into_owned();
+            let v: [u8; 8] = it
+                .value()
+                .try_into()
+                .map_err(|_| SprigError::internal("storage: an observer floor is corrupt"))?;
+            out.insert((unit, name), u64::from_be_bytes(v));
+        }
+        it.next();
+    }
+    it.status()?.expect_ready()?;
+    Ok(out)
 }
 
 /// Every observer floor stored for `unit`.
@@ -829,8 +1165,11 @@ fn migrate_legacy(store: &dyn SortedStore) -> Result<()> {
     }
     let mut b = StoreBatch::new();
     b.put(Cf::Data, layout_key, LAYOUT_QUEUES.to_be_bytes());
+    // Synced through the store's own log: durable without a flush.
     store.write(&b, WalMode::Sync)?;
-    store.flush_all()?;
+    if moved > 0 {
+        store.flush_all()?;
+    }
     Ok(())
 }
 
@@ -910,7 +1249,12 @@ fn migrate_units(store: &dyn SortedStore) -> Result<()> {
     }
     b.put(Cf::Data, layout_key, LAYOUT_UNITS.to_be_bytes());
     store.write(&b, WalMode::Sync)?;
-    store.flush_all()?;
+    // Only a moved directory needs the flush (its old unit's entries must
+    // never replay); a new one would just get a one-key table file that
+    // every read then probes until a compaction.
+    if legacy_applied > 0 {
+        store.flush_all()?;
+    }
     Ok(())
 }
 
@@ -943,7 +1287,13 @@ fn spawn_checkpointer(engine: &Engine) -> Result<JoinHandle<()>> {
                 let engine = Engine { user: None, inner };
                 // Entries written on every unit, not one unit's index.
                 let stats = engine.inner.log.stats();
-                let applied = stats.entries;
+                // Replicated units' entries count by their applied indexes.
+                let applied = stats.entries
+                    + engine
+                        .inner
+                        .router
+                        .replicated_log()
+                        .map_or(0, |r| r.applied().iter().map(|(_, a)| *a).sum::<u64>());
                 let bytes = stats.bytes;
                 let due = applied.saturating_sub(last_applied) >= every
                     || (every_bytes > 0 && bytes.saturating_sub(last_bytes) >= every_bytes)

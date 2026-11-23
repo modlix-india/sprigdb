@@ -426,7 +426,18 @@ impl Node {
             let mut sm = node.inner.machines.create(rg.group);
             let meta = rg.snapshot.get_metadata().clone();
             let skip_until = if sm.durable() {
-                sm.applied_index()
+                let applied = sm.applied_index();
+                // A snapshot installed just before a crash: its record is
+                // durable, but the state machine may not have made the
+                // restore durable. The record still holds the data (a
+                // checkpoint's record has none, and comes only after the
+                // state machine made everything up to it durable).
+                if applied < meta.index && !rg.snapshot.data.is_empty() {
+                    sm.restore(meta.index, &rg.snapshot.data)?;
+                    meta.index
+                } else {
+                    applied
+                }
             } else {
                 if meta.index > 0 {
                     sm.restore(meta.index, &rg.snapshot.data)?;
@@ -760,6 +771,54 @@ impl Node {
         Ok(slot)
     }
 
+    /// A read barrier on any replica: the slot is set once this replica
+    /// has applied everything the group's leader had committed when the
+    /// barrier was asked (a `ReadIndex` the leader confirms with a quorum,
+    /// or the leader's own lease). After it, a read of this replica's state
+    /// sees every write acknowledged before the barrier started.
+    ///
+    /// # Errors
+    /// [`RaftError::NotLeader`] with no leader known here (retry),
+    /// [`RaftError::NoGroup`], [`RaftError::Closed`].
+    pub fn read_barrier(
+        &self,
+        group: GroupId,
+    ) -> Result<Slot<Result<Vec<u8>, RaftError>>, RaftError> {
+        let cell = self.cell(group).ok_or(RaftError::NoGroup(group))?;
+        if self.inner.closed.load(Ordering::Acquire) {
+            return Err(RaftError::Closed);
+        }
+        let mut g = lock(&cell.g);
+        if g.raw.raft.state == StateRole::Leader {
+            drop(g);
+            return self.read(group, Vec::new());
+        }
+        if g.raw.raft.leader_id == raft::INVALID_ID {
+            // raft-rs drops a follower's ReadIndex with no leader to send
+            // it to: say so, so the caller retries. A quiesced group ticks
+            // again meanwhile, so it learns (or elects) a leader.
+            self.wake_group(&mut g);
+            drop(g);
+            self.mark_dirty(group);
+            return Err(RaftError::NotLeader { leader: None });
+        }
+        bump(&self.inner.counters.index_reads, 1);
+        let slot = Slot::new();
+        let ctx = self.inner.next_ctx.fetch_add(1, Ordering::Relaxed);
+        g.raw.read_index(ctx.to_le_bytes().to_vec());
+        g.reads.insert(
+            ctx,
+            ReadReq {
+                slot: slot.clone(),
+                query: Vec::new(),
+            },
+        );
+        self.wake_group(&mut g);
+        drop(g);
+        self.mark_dirty(group);
+        Ok(slot)
+    }
+
     /// Answers `query` from this replica's state without any check (stale
     /// reads, diagnostics), with the applied index it reflects.
     #[must_use]
@@ -828,6 +887,35 @@ impl Node {
         Ok(())
     }
 
+    /// Asks `group`'s leader to hand its leadership to this replica (a
+    /// transfer, sent through the leader, which waits until this replica's
+    /// log has caught up). Returns at once; nothing to do if this replica
+    /// already leads.
+    ///
+    /// # Errors
+    /// [`RaftError::NotLeader`] with no leader known here,
+    /// [`RaftError::NoGroup`], [`RaftError::Closed`].
+    pub fn request_leadership(&self, group: GroupId) -> Result<(), RaftError> {
+        let cell = self.cell(group).ok_or(RaftError::NoGroup(group))?;
+        if self.inner.closed.load(Ordering::Acquire) {
+            return Err(RaftError::Closed);
+        }
+        let mut g = lock(&cell.g);
+        if g.raw.raft.state == StateRole::Leader {
+            return Ok(());
+        }
+        if g.raw.raft.leader_id == raft::INVALID_ID {
+            return Err(RaftError::NotLeader { leader: None });
+        }
+        // A follower's transfer request goes to the leader, which starts
+        // the transfer to this replica (see `on_frame`: its lease ends).
+        g.raw.transfer_leader(self.inner.id);
+        self.wake_group(&mut g);
+        drop(g);
+        self.mark_dirty(group);
+        Ok(())
+    }
+
     /// Starts an election for `group` on this replica now.
     ///
     /// # Errors
@@ -861,6 +949,35 @@ impl Node {
             voters_outgoing: g.applied_conf.voters_outgoing.clone(),
             learners: g.applied_conf.learners.clone(),
         })
+    }
+
+    /// The entries `from..to` of `group` in this node's log store (the
+    /// caller asks for committed indexes only). Doesn't take the group's
+    /// lock: callers may hold locks the apply path waits for.
+    ///
+    /// # Errors
+    /// The log store could not be read.
+    pub fn log_entries(&self, group: GroupId, from: u64, to: u64) -> Result<Vec<Entry>, RaftError> {
+        self.inner.store.entries(group, from, to)
+    }
+
+    /// The lowest index of `group` in this node's log store. Doesn't take
+    /// the group's lock.
+    #[must_use]
+    pub fn log_first_index(&self, group: GroupId) -> Option<u64> {
+        self.inner.store.first_index(group)
+    }
+
+    /// On the group's leader: the highest index `peer`'s log is known to
+    /// match (`None`: not the leader, or not a member).
+    #[must_use]
+    pub fn matched(&self, group: GroupId, peer: NodeId) -> Option<u64> {
+        let cell = self.cell(group)?;
+        let g = lock(&cell.g);
+        if g.raw.raft.state != StateRole::Leader {
+            return None;
+        }
+        g.raw.raft.prs().get(peer).map(|p| p.matched)
     }
 
     /// The groups hosted here.
@@ -1079,10 +1196,19 @@ impl Node {
             )
         };
         let mut out: BTreeMap<NodeId, Vec<Item>> = BTreeMap::new();
+        let mut early: BTreeMap<NodeId, Vec<Item>> = BTreeMap::new();
         let mut ctrl: BTreeMap<NodeId, Vec<Item>> = BTreeMap::new();
         bump(&self.inner.counters.frames_received, frames.len() as u64);
         for f in &frames {
             self.on_frame(f, now, &mut dirty, &mut out);
+        }
+        {
+            // Groups the frames created: their first state goes in this
+            // turn's batch, ahead of anything the frames made them write.
+            let mut ib = lock(&self.inner.inbox);
+            writes.append(&mut ib.writes);
+            created.append(&mut ib.created);
+            dirty.extend(std::mem::take(&mut ib.dirty));
         }
         if live {
             self.check_liveness(now, &mut dirty);
@@ -1101,11 +1227,14 @@ impl Node {
             let mut done = Vec::new();
             for gid in std::mem::take(&mut dirty) {
                 if let Some(cell) = self.cell(gid)
-                    && let Some(c) = self.collect(cell, &mut batch, &mut out, &mut need_sync, now)
+                    && let Some(c) =
+                        self.collect(cell, &mut batch, &mut early, &mut out, &mut need_sync)
                 {
                     done.push(c);
                 }
             }
+            // The leader's appends go out while its own sync runs.
+            self.flush(&mut early, &mut BTreeMap::new(), now);
             if !batch.is_empty() {
                 if need_sync {
                     // A slow disk (simulation): a crash meanwhile loses
@@ -1199,6 +1328,17 @@ impl Node {
                         && m.term == g.raw.raft.term
                         && g.raw.raft.state == StateRole::Leader;
                     let mut m = m;
+                    if t == MessageType::MsgTransferLeader
+                        && g.raw.raft.state == StateRole::Leader
+                        && m.from != self.inner.id
+                    {
+                        // A follower asks for the leadership: as in
+                        // `transfer_leader`, the lease ends first, so no
+                        // lease read here overlaps the next leader's writes.
+                        g.lease.disable();
+                        let term = g.raw.raft.term;
+                        self.inner.observer.on_lease_end(gid, term, now);
+                    }
                     self.repair_stale(&mut g, gid, &mut m, out);
                     let _ = g.raw.step(m);
                     self.check_role(&mut g);
@@ -1224,8 +1364,17 @@ impl Node {
                             && r.term == term
                             && r.leader_id == frame.from
                             && r.raft_log.last_index() == index
-                            && r.raft_log.committed == index
                         {
+                            // The leader quiesces only with every entry through
+                            // `index` committed and matched on every follower, so
+                            // a follower whose log ends there in the leader's term
+                            // holds the leader's entries: it may commit them now.
+                            // Otherwise it would learn of the last commits only at
+                            // the group's next activity, and apply them late.
+                            if g.raw.raft.raft_log.committed < index {
+                                g.raw.raft.raft_log.commit_to(index);
+                                dirty.insert(group);
+                            }
                             g.quiesced = true;
                             g.idle = 0;
                             lock(&self.inner.active).remove(&group);
@@ -1295,6 +1444,18 @@ impl Node {
     fn cell_or_create(&self, gid: GroupId, m: &Message, sender_applied: u64) -> Option<Arc<Cell>> {
         if let Some(c) = self.cell(gid) {
             return Some(c);
+        }
+        let statics = &self.inner.cfg.static_voters;
+        if statics.contains(&self.inner.id) && !lock(&self.inner.tombstones).contains_key(&gid) {
+            // A fixed membership: every member starts the group the same
+            // way, whoever hears of it first.
+            return match self.create_group(gid, statics) {
+                Ok(_) => self.cell(gid),
+                Err(e) => {
+                    tracing::warn!(group = gid, error = %e, "raft: could not create a group");
+                    None
+                }
+            };
         }
         if !self.inner.cfg.auto_create || !leader_msg(m.get_msg_type()) {
             return None;
@@ -1521,9 +1682,9 @@ impl Node {
         &self,
         cell: Arc<Cell>,
         batch: &mut WriteBatch,
+        early: &mut BTreeMap<NodeId, Vec<Item>>,
         out: &mut BTreeMap<NodeId, Vec<Item>>,
         need_sync: &mut bool,
-        _now: Instant,
     ) -> Option<Collected> {
         let mut g = lock(&cell.g);
         let gid = g.id;
@@ -1581,11 +1742,16 @@ impl Node {
             g.raw.mut_store().set_hard_state(hs.clone());
             batch.group(gid).hard_state = Some(hs);
         }
-        for m in rd
-            .take_messages()
-            .into_iter()
-            .chain(rd.take_persisted_messages())
-        {
+        // A leader's appends and heartbeats may go before its own write is
+        // durable (its entries count towards a quorum only once persisted
+        // here); everything else (votes, responses) waits for the sync.
+        for m in rd.take_messages() {
+            early
+                .entry(m.to)
+                .or_default()
+                .push(Item::Raft(gid, g.applied, m));
+        }
+        for m in rd.take_persisted_messages() {
             out.entry(m.to)
                 .or_default()
                 .push(Item::Raft(gid, g.applied, m));
@@ -1732,12 +1898,14 @@ impl Node {
         if !data.is_empty() {
             g.sm.apply(&data)?;
         }
+        let mut applied = Vec::with_capacity(run.len());
         for e in run.drain(..) {
             g.applied = e.index;
             g.applied_term = e.term;
             self.inner.observer.on_apply(g.id, e.index, e.term);
-            resolve(g, e.index, e.term, false);
+            applied.push((e.index, e.term));
         }
+        resolve_run(g, &applied);
         Ok(())
     }
 
@@ -1834,6 +2002,35 @@ fn resolve(g: &mut Group, index: u64, term: u64, conf: bool) {
                 .failed(p.index, RaftError::Busy("a membership change is pending"));
         } else {
             p.waiter.applied(index);
+        }
+    }
+}
+
+/// Resolves the proposals of a run of applied (non-membership) entries,
+/// given as (index, term) in log order, as [`resolve`] would entry by entry,
+/// but newest first: proposals that share one progress (a replicated
+/// unit's, per term) then learn the run's last index first, and the others'
+/// reports change nothing (and wake no one).
+fn resolve_run(g: &mut Group, run: &[(u64, u64)]) {
+    let Some(&(last, _)) = run.last() else {
+        return;
+    };
+    let mut done = Vec::new();
+    while g.pending.front().is_some_and(|p| p.index <= last) {
+        let Some(p) = g.pending.pop_front() else {
+            break;
+        };
+        done.push(p);
+    }
+    for mut p in done.into_iter().rev() {
+        match run.binary_search_by_key(&p.index, |e| e.0) {
+            Ok(i) if run[i].1 == p.term && !p.conf => p.waiter.applied(p.index),
+            // raft-rs turns a membership change it can't take (another is
+            // pending) into an empty entry.
+            Ok(i) if run[i].1 == p.term => p
+                .waiter
+                .failed(p.index, RaftError::Busy("a membership change is pending")),
+            _ => p.waiter.failed(p.index, RaftError::Dropped),
         }
     }
 }

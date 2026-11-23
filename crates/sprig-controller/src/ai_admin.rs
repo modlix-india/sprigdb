@@ -477,6 +477,14 @@ impl Reconciler for AiPurgeLoop {
         if !self.ours(entry.body()) {
             return Ok(Outcome::Done);
         }
+        // A tenant whose catalog schema was never made (EC-124) has no
+        // assistant messages: nothing to ask MariaDB.
+        if sprig_catalog::migrate::lazy_schema(*key)
+            .await?
+            .is_some_and(|l| !l.mariadb)
+        {
+            return Ok(Outcome::RequeueAfter(PURGE_INTERVAL));
+        }
         let ep = self.locator.writer(*key).await?;
         let schema = ep.store.schema().to_owned();
         // Only tenants that used the assistants: the check never creates

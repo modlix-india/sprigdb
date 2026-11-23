@@ -227,15 +227,8 @@ impl PassSession {
                 }
                 let bound = !g.unrestricted() && g.row_filter(on, Action::Select).is_some();
                 let slot = if bound {
-                    let template = ts.schema_of(Some(&db.name));
-                    let layout = super::router::ddl_layout(ts);
-                    match (&layout, &template) {
-                        (Some(l), Some(tm)) => l(tm, Some(&obj.name))
-                            .filter(|v| !v.is_empty())
-                            .and_then(|v| v.into_iter().next()),
-                        _ => None,
-                    }
-                    .or_else(|| template.map(|tm| (tm, self.target.cluster.clone())))
+                    ts.schema_of(Some(&db.name))
+                        .map(|tm| (tm, self.target.cluster.clone()))
                 } else {
                     None
                 };

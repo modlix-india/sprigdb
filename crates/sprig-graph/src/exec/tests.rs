@@ -304,6 +304,9 @@ async fn optional_match_with_unwind_and_aggregation() {
     assert_eq!(show(&o), ["Person", "Product"]);
     let o = q(&mut s, "CALL db.relationshipTypes").await;
     assert_eq!(o.columns, ["relationshipType"]);
+    let o = q(&mut s, "CALL db.ping()").await;
+    assert_eq!(o.columns, ["success"]);
+    assert_eq!(show(&o), ["true"]);
     let o = q(&mut s, "MATCH (a:Person) WHERE exists((a)-[:BOUGHT]->(:Product {name: 'Pen'})) RETURN a.name ORDER BY a.name").await;
     assert_eq!(show(&o), ["Carol", "Dave"]);
     let o = q(

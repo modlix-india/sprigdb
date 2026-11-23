@@ -740,6 +740,41 @@ async fn the_auto_increment_option_is_where_an_empty_table_starts() {
     );
 }
 
+/// A node that takes the tenant's leadership loads the counter again from
+/// the stored rows; a node that doesn't lead the tenant hands out nothing.
+#[tokio::test]
+async fn the_auto_increment_counter_is_loaded_again_by_a_new_leader() {
+    let (e, _d) = mem();
+    let sql = "CREATE TABLE `ai2` (\n  `id` bigint(20) unsigned NOT NULL AUTO_INCREMENT,\n  `v` int(11) DEFAULT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci";
+    let f = names(&[("ai2", 25, sql)]);
+    let o = q(&e, &f, "INSERT INTO ai2 (v) VALUES (1), (2), (3)")
+        .await
+        .unwrap();
+    assert_eq!(o.last_insert_id, 1);
+    // Rows another leader wrote, which this node's memory doesn't know:
+    // written here behind the counter's back.
+    let unit = sprig_engine::Engine::unit_of_tenant(TENANT.0);
+    e.autoinc
+        .lock()
+        .unwrap()
+        .get_mut(&(TENANT.0, 25))
+        .unwrap()
+        .next = 2;
+    let epoch = e.eng.leader_epoch(unit);
+    assert_ne!(e.eng.lead(unit), epoch);
+    let o = q(&e, &f, "INSERT INTO ai2 (v) VALUES (4)").await.unwrap();
+    assert_eq!(o.last_insert_id, 4);
+    // Not led here: no value is handed out (retryable).
+    e.eng.step_down(unit);
+    let err = q(&e, &f, "INSERT INTO ai2 (v) VALUES (5)")
+        .await
+        .unwrap_err();
+    assert!(err.retryable, "{err:?}");
+    e.eng.lead(unit);
+    let o = q(&e, &f, "INSERT INTO ai2 (v) VALUES (5)").await.unwrap();
+    assert_eq!(o.last_insert_id, 5);
+}
+
 #[test]
 fn session_rules_come_from_sql_mode_and_time_zone() {
     let m = Env::from_vars(

@@ -995,43 +995,26 @@ impl Loaded {
 /// # Errors
 /// 39860 for no such module or version; the catalog's.
 pub async fn load(
-    c: &mut mysql_async::Conn,
+    c: &mut dyn sprig_catalog::records::RecordTx,
     store: &crate::LogicStore,
     db_id: u32,
     kind: &str,
     name: &str,
     version: Option<u64>,
 ) -> Result<Loaded> {
-    use mysql_async::prelude::Queryable;
     let not_found = |m: String| SprigError::new(SprigCode::LogicNotFound, m);
-    let m = match store.module(c, db_id, kind, name).await {
-        Ok(m) => m,
-        Err(e) if format!("{e:?}").contains("1146") => None,
-        Err(e) => return Err(e),
-    }
-    .ok_or_else(|| not_found(format!("no {kind} {name}")))?;
+    let m = store
+        .module(c, db_id, kind, name)
+        .await?
+        .ok_or_else(|| not_found(format!("no {kind} {name}")))?;
     let v = version
         .or(m.active_version)
         .ok_or_else(|| not_found(format!("{kind} {name} has no active version")))?;
-    let q = sprig_common::names::quote(store.schema());
-    let row: Option<(String, String, String)> = c
-        .exec_first(
-            format!(
-                "SELECT CAST(tier AS CHAR), source, CAST(signature AS CHAR) FROM {q}.logic_versions \
-                 WHERE module_id = ? AND version = ?"
-            ),
-            (m.module_id, v),
-        )
+    let (signature, tier) = store
+        .version_signature(c, m.module_id, v)
         .await
-        .map_err(|e| {
-            SprigError::new(
-                SprigCode::CatalogUnavailable,
-                "the logic catalog is unreachable",
-            )
-            .with_source(e)
-        })?;
-    let (tier, source, signature) =
-        row.ok_or_else(|| not_found(format!("{kind} {name} has no version {v}")))?;
+        .map_err(|_| not_found(format!("{kind} {name} has no version {v}")))?;
+    let source = store.source(c, m.module_id, v).await?;
     Ok(Loaded {
         module_id: m.module_id,
         version: v,
@@ -1040,7 +1023,7 @@ pub async fn load(
         runtime: m.runtime,
         tier,
         source,
-        signature: serde_json::from_str(&signature).unwrap_or(Value::Null),
+        signature,
     })
 }
 

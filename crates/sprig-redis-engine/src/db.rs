@@ -56,6 +56,10 @@ const UID_BLOCK: u64 = 1_000;
 /// Uids taken from the counter (durably) and not yet handed out.
 #[derive(Debug, Default)]
 struct UidPool {
+    /// The leader epoch the pool's uids were taken under: a pool of
+    /// another epoch is dropped (a block taken by a leader whose log tail
+    /// was later lost may have been handed out again by the next one).
+    epoch: u64,
     /// Handed out but returned unused.
     free: Vec<u64>,
     /// The rest of the current block: `next..limit`.
@@ -126,10 +130,28 @@ impl<U: Unit> Uids<U> {
         self.pool.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Gives back uids a batch didn't use.
-    fn give_back(&self, uids: Vec<u64>) {
+    /// The pool, emptied first if it was filled under another leader
+    /// epoch than the unit's current one.
+    fn current_pool(&self) -> MutexGuard<'_, UidPool> {
+        let epoch = self.unit.leader_epoch(&self.counter);
+        let mut p = self.pool();
+        if p.epoch != epoch {
+            *p = UidPool {
+                epoch,
+                ..UidPool::default()
+            };
+        }
+        p
+    }
+
+    /// Gives back uids a batch didn't use (kept only under the epoch they
+    /// were taken in).
+    fn give_back(&self, uids: Vec<u64>, epoch: u64) {
         if !uids.is_empty() {
-            self.pool().free.extend(uids);
+            let mut p = self.pool();
+            if p.epoch == epoch {
+                p.free.extend(uids);
+            }
         }
     }
 
@@ -137,21 +159,26 @@ impl<U: Unit> Uids<U> {
     /// next block is taken from the counter in a transaction of its own,
     /// durable before any uid of it is handed out, so a uid is never
     /// handed out twice, even across a crash.
-    async fn reserve(&self, n: usize) -> Result<Vec<u64>, StoreError> {
+    /// Also returns the leader epoch they were taken under.
+    async fn reserve(&self, n: usize) -> Result<(Vec<u64>, u64), StoreError> {
         if n == 0 {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), 0));
         }
         loop {
             {
-                let mut p = self.pool();
+                let mut p = self.current_pool();
                 if p.available() >= n {
-                    return Ok(p.take(n));
+                    return Ok((p.take(n), p.epoch));
                 }
             }
             let _one = self.refill.lock().await;
-            if self.pool().available() >= n {
-                continue;
-            }
+            let epoch = {
+                let p = self.current_pool();
+                if p.available() >= n {
+                    continue;
+                }
+                p.epoch
+            };
             let key = self.counter.clone();
             let mut b = self.unit.begin(vec![key.clone()]).await?;
             let from = match b.get(&key)? {
@@ -167,7 +194,10 @@ impl<U: Unit> Uids<U> {
                 .ok_or_else(|| StoreError::fatal("collection uids exhausted"))?;
             b.put(key, Bytes::copy_from_slice(&to.to_be_bytes()))?;
             b.commit()?.durable().await?;
-            self.pool().add_block(from, to);
+            let mut p = self.pool();
+            if p.epoch == epoch {
+                p.add_block(from, to);
+            }
         }
     }
 }
@@ -442,7 +472,7 @@ impl<U: Unit> EngineDb<U> {
         names: &[String],
         resp3: &[bool],
     ) -> Outcome<TicketOf<U>> {
-        let mut uids = self
+        let (mut uids, epoch) = self
             .uids
             .reserve(names.iter().map(|n| exec::uids_needed(n)).sum())
             .await?;
@@ -451,7 +481,7 @@ impl<U: Unit> EngineDb<U> {
             .await;
         // Uids the batch didn't use go back (one it wrote but rolled back
         // was never committed, but it isn't returned either).
-        self.uids.give_back(uids);
+        self.uids.give_back(uids, epoch);
         // No watched keys: the batch always runs.
         out.and_then(|o| {
             o.ok_or_else(|| StoreError::fatal("a batch without watched keys was skipped"))
@@ -549,7 +579,7 @@ impl<U: Unit> EngineDb<U> {
         keys.dedup();
         let protos = vec![resp3; cmds.len()];
         let all_failed = |e: &StoreError| Some(cmds.iter().map(|_| failed(e)).collect());
-        let mut uids = match self
+        let (mut uids, epoch) = match self
             .uids
             .reserve(names.iter().map(|n| exec::uids_needed(n)).sum())
             .await
@@ -560,7 +590,7 @@ impl<U: Unit> EngineDb<U> {
         let out = self
             .execute_with(keys, cmds, &names, &protos, &mut uids, watched)
             .await;
-        self.uids.give_back(uids);
+        self.uids.give_back(uids, epoch);
         match out {
             Ok(None) => None,
             Ok(Some((replies, ticket))) => match ticket.durable().await {
@@ -840,5 +870,40 @@ impl<U: Unit> EngineDatabase for EngineDb<U> {
         resp3: bool,
     ) -> Option<Vec<Frame>> {
         self.exec_watched(cmds, watched, resp3).await
+    }
+}
+
+#[cfg(test)]
+mod uid_tests {
+    use sprig_engine::config::{EngineConfig, StoreKind};
+    use sprig_engine::{Engine, UnitId};
+
+    use super::*;
+    use crate::engine_unit::EngineUnit;
+
+    /// A node that takes the tenant's leadership again drops the uids it
+    /// held: the next ones come from a new block of the counter.
+    #[tokio::test]
+    async fn uids_held_under_an_older_leader_epoch_are_dropped() {
+        let d = std::env::temp_dir().join(format!("redis-uids-epoch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let mut c = EngineConfig::new(&d);
+        c.store = StoreKind::Mem;
+        let engine = Engine::open(c).unwrap();
+        let uids = Uids::new(Arc::new(EngineUnit::on_engine(engine.clone())), 7);
+        let (a, e1) = uids.reserve(2).await.unwrap();
+        assert_eq!(a, vec![1, 2]);
+        uids.give_back(vec![2], e1);
+        assert_eq!(uids.reserve(1).await.unwrap().0, vec![2]);
+        let e2 = engine.lead(UnitId(7));
+        assert_ne!(e1, e2);
+        let (b, e) = uids.reserve(1).await.unwrap();
+        assert_eq!(e, e2);
+        assert!(b[0] > UID_BLOCK, "{b:?}");
+        // A uid given back under the old epoch is not kept.
+        uids.give_back(vec![3], e1);
+        assert_ne!(uids.reserve(1).await.unwrap().0, vec![3]);
+        drop(engine);
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

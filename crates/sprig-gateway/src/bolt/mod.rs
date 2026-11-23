@@ -10,16 +10,14 @@
 //!   (`neo4j`), created natively on its first write. Reading a default
 //!   graph that doesn't exist yet answers no rows.
 //! - **Transactions** ([`session`]). Each auto-commit `RUN` is one
-//!   MariaDB transaction; `BEGIN` holds one `sprig_ctl` connection of the
-//!   tenant's cluster until `COMMIT`/`ROLLBACK`, at `READ COMMITTED`
-//!   (`bolt.isolation`). The commit check refuses nodes deleted with their
-//!   relationships left (39906).
+//!   engine transaction; `BEGIN` opens one on the first statement's graph
+//!   until `COMMIT`/`ROLLBACK`. The commit check refuses nodes deleted with
+//!   their relationships left (39906).
 //! - **Routing.** `ROUTE` answers one address for `ROUTE`, `READ` and
 //!   `WRITE`: `bolt.advertise_address`, else the address the driver used.
-//! - **Bookmarks and replica reads** ([`session`]): signed `SB1:`
-//!   bookmarks carry the commit's GTID positions; reads in `mode: "r"` go
-//!   to a replica that has waited for them (read-your-writes),
-//!   else to the writer.
+//! - **Bookmarks** ([`session`]): signed `SB1:` bookmarks; a commit is
+//!   durable before it is answered, so every later read on the node sees
+//!   it.
 //! - **Streaming** ([`stream`]): reads whose rows don't depend on each
 //!   other stream to `PULL` with back-pressure; others are buffered.
 
@@ -106,12 +104,6 @@ key!(
     /// `bolt.default_graph`: the graph when `db` is absent.
     DEFAULT_GRAPH: Text = "bolt.default_graph", Cow::Borrowed("neo4j"), DB_TENANT_GLOBAL,
     HardBounds::NONE, "Graph of Bolt requests without db"
-);
-key!(
-    /// `bolt.isolation`.
-    ISOLATION: Text = "bolt.isolation", Cow::Borrowed("read_committed"), TENANT_GLOBAL,
-    HardBounds::one_of(&["read_committed", "repeatable_read"]),
-    "Isolation level of Bolt transactions"
 );
 key!(
     /// `bolt.max_buffered_result_mb`.

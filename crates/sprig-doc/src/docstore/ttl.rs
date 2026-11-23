@@ -47,6 +47,12 @@ impl DocStore {
         let now = self.now_ms();
         let mut deleted = 0usize;
         for tenant in tenants {
+            // Only the tenant unit's leader deletes; replicas apply its
+            // deletes.
+            let unit = sprig_engine::Engine::unit_of_tenant(tenant).0;
+            if self.path.leader_epoch_of(unit) == 0 {
+                continue;
+            }
             for c in self.list(tenant, None)? {
                 for idx in &c.meta.indexes {
                     let Some(secs) = idx.expire_after else {

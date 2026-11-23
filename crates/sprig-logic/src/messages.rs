@@ -55,58 +55,16 @@
 //! definition's parameters bind by name to those fields, or to `record`,
 //! `message` and `ctx` for the whole object.
 
-use mysql_async::Conn;
-use mysql_async::prelude::Queryable;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sprig_catalog::migrate::MigrateOpts;
-use sprig_catalog::{Migrator, Store};
+use sprig_catalog::records::{Pk, RecordTx, RowTable};
 use sprig_common::ids::TenantId;
 use sprig_common::names::quote;
 use sprig_common::{Result, SprigCode, SprigError};
 use sprig_meta::{Consistency, Key, ListOpts, MetaStore, Record, Versioned};
 
-use crate::catalog::{BindingRow, LOGIC_MODULE, LogicStore, ModuleRow, NewVersion};
+use crate::catalog::{BindingRow, LogicStore, ModuleRow, NewVersion};
 use crate::declare::{Declaration, Kind, SourceKind};
-
-/// Migration 3: `logic_bindings.timing` gains `on_message`.
-pub const DDL_TIMING_ON_MESSAGE: &str = "ALTER TABLE logic_bindings MODIFY timing \
-     ENUM('before_write','after_commit','on_read','on_write','on_message') NOT NULL";
-
-/// Migration 3: what each `on_message` binding reads.
-pub const DDL_MESSAGE_SOURCES: &str = "CREATE TABLE IF NOT EXISTS logic_message_sources (
-  binding_id        BIGINT UNSIGNED NOT NULL,
-  module_id         BIGINT UNSIGNED NOT NULL,
-  kind              ENUM('stream','queue') NOT NULL,
-  db_id             INT UNSIGNED    NOT NULL,
-  db_name           VARCHAR(64)     NOT NULL,
-  name              VARCHAR(255)    NOT NULL,
-  object_id         BIGINT UNSIGNED NOT NULL,
-  definer_user_id   INT UNSIGNED    NOT NULL,
-  tenant_name       VARCHAR(255)    NOT NULL,
-  PRIMARY KEY (binding_id),
-  KEY by_module (module_id)
-) ENGINE=InnoDB";
-
-/// Migration 4: a fan-in trigger's definition is named by
-/// `fanin_declarer` and `object_id` = [`FANIN_SOURCE_FLAG`] | the
-/// definition's object id, so any 64-bit declarer id works. Earlier rows
-/// packed the declarer into `object_id` (declarers below 2^38); the two
-/// updates rewrite them, the binding's `object_id` first (it is read
-/// through the source row's old value), each once (`fanin_declarer = 0`).
-pub const DDL_SOURCES_FANIN_DECLARER: &str = "ALTER TABLE logic_message_sources \
-     ADD COLUMN IF NOT EXISTS fanin_declarer BIGINT UNSIGNED NOT NULL DEFAULT 0";
-/// Migration 4: the bindings of packed fan-in sources.
-pub const DML_BINDINGS_FANIN_UNPACK: &str = "UPDATE logic_bindings b \
-     JOIN logic_message_sources s ON s.binding_id = b.binding_id \
-     SET b.object_id = (1 << 62) | (s.object_id & 16777215) \
-     WHERE s.fanin_declarer = 0 AND (s.object_id & (1 << 62)) <> 0 AND (s.object_id >> 63) = 0";
-/// Migration 4: packed fan-in sources (MariaDB assigns left to right, so
-/// `fanin_declarer` reads the old `object_id`).
-pub const DML_SOURCES_FANIN_UNPACK: &str = "UPDATE logic_message_sources \
-     SET fanin_declarer = (object_id & ~(1 << 62)) >> 24, \
-         object_id = (1 << 62) | (object_id & 16777215) \
-     WHERE fanin_declarer = 0 AND (object_id & (1 << 62)) <> 0 AND (object_id >> 63) = 0";
 
 /// The job kind of a trigger on a stream.
 pub const STREAM_JOB_KIND: &str = "logic_stream_trigger";
@@ -167,100 +125,23 @@ impl<'de> Deserialize<'de> for SourceKind {
     }
 }
 
-fn map_err(e: mysql_async::Error) -> SprigError {
-    SprigError::new(
-        SprigCode::CatalogUnavailable,
-        "the logic catalog is unreachable",
-    )
-    .with_source(e)
-}
+/// Message triggers' sources by binding.
+const SOURCES: RowTable = RowTable::new(crate::catalog::MODULE, "sources");
 
 /// Writes (or replaces) a binding's source.
 ///
 /// # Errors
-/// 39070 or a backend error.
-pub async fn put_source(c: &mut Conn, schema: &str, s: &SourceRow) -> Result<()> {
-    c.exec_drop(
-        format!(
-            "REPLACE INTO {}.logic_message_sources (binding_id, module_id, kind, db_id, db_name, \
-             name, object_id, definer_user_id, tenant_name, fanin_declarer) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            quote(schema)
-        ),
-        mysql_async::Params::Positional(vec![
-            s.binding_id.into(),
-            s.module_id.into(),
-            s.kind.as_str().into(),
-            s.db_id.into(),
-            s.db_name.as_str().into(),
-            s.name.as_str().into(),
-            s.object_id.into(),
-            s.definer_user_id.into(),
-            s.tenant_name.as_str().into(),
-            s.fanin_declarer.into(),
-        ]),
-    )
-    .await
-    .map_err(map_err)
+/// The record store's.
+pub async fn put_source(c: &mut dyn RecordTx, s: &SourceRow) -> Result<()> {
+    SOURCES.put(c, &Pk::new().u64(s.binding_id), s).await
 }
 
-/// A binding's source; `None` for a binding that has none (or a catalog
-/// without the table).
+/// A binding's source; `None` for a binding that has none.
 ///
 /// # Errors
-/// 39070 or a backend error other than a missing table.
-pub async fn source(c: &mut Conn, schema: &str, binding_id: u64) -> Result<Option<SourceRow>> {
-    type T = (u64, u64, String, u32, String, String, u64, u32, String, u64);
-    let q = |declarer: &str| {
-        format!(
-            "SELECT binding_id, module_id, kind, db_id, db_name, name, object_id, \
-             definer_user_id, tenant_name, {declarer} FROM {}.logic_message_sources \
-             WHERE binding_id = ?",
-            quote(schema)
-        )
-    };
-    let mut r: std::result::Result<Option<T>, _> =
-        c.exec_first(q("fanin_declarer"), (binding_id,)).await;
-    if matches!(&r, Err(mysql_async::Error::Server(s)) if s.code == 1054) {
-        // A catalog before migration 4 (its rows decode the old way).
-        r = c.exec_first(q("0"), (binding_id,)).await;
-    }
-    let row = match r {
-        Ok(r) => r,
-        Err(mysql_async::Error::Server(s)) if s.code == 1146 => return Ok(None),
-        Err(e) => return Err(map_err(e)),
-    };
-    Ok(row.map(
-        |(
-            binding_id,
-            module_id,
-            kind,
-            db_id,
-            db_name,
-            name,
-            object_id,
-            definer,
-            tenant_name,
-            fanin_declarer,
-        )| {
-            SourceRow {
-                binding_id,
-                module_id,
-                kind: if kind == "queue" {
-                    SourceKind::Queue
-                } else {
-                    SourceKind::Stream
-                },
-                db_id,
-                db_name,
-                name,
-                object_id,
-                definer_user_id: definer,
-                tenant_name,
-                fanin_declarer,
-            }
-        },
-    ))
+/// The record store's.
+pub async fn source(c: &mut dyn RecordTx, binding_id: u64) -> Result<Option<SourceRow>> {
+    SOURCES.get(c, &Pk::new().u64(binding_id)).await
 }
 
 // ---- the index the controller reads ----------------------------------------
@@ -576,7 +457,7 @@ pub async fn list_index(store: &dyn MetaStore) -> Result<Vec<MsgIndex>> {
 /// Where a trigger on a stream or queue deploys, and what it reads.
 pub struct MsgTarget<'a> {
     /// The tenant's catalog writer.
-    pub catalog: &'a mut Conn,
+    pub catalog: &'a mut dyn RecordTx,
     /// `t<tenant>_sprig`.
     pub catalog_schema: &'a str,
     /// The catalog version the session saw.
@@ -805,6 +686,21 @@ pub fn script_signature() -> Value {
 /// 39861 for code that doesn't parse; 39862 for unknown functions; 39874
 /// for a KIRun parameter the record or message lacks.
 pub async fn check(d: &Declaration, kind: SourceKind) -> Result<Value> {
+    let (fields, what) = match kind {
+        SourceKind::Stream => (STREAM_FIELDS, "record"),
+        SourceKind::Queue => (QUEUE_FIELDS, "message"),
+    };
+    check_fields(d, fields, what).await
+}
+
+/// [`check`] for a trigger whose KIRun parameters may be `fields` (the
+/// source is called `what` in the error): an after-commit trigger on an
+/// engine table names its columns, `old_<column>`, `op`, `trigger` and
+/// `ctx`.
+///
+/// # Errors
+/// As [`check`].
+pub async fn check_fields(d: &Declaration, fields: &[&str], what: &str) -> Result<Value> {
     use sprig_logic_compile::Runtime;
     match d.runtime {
         Runtime::Kirun => {
@@ -820,22 +716,13 @@ pub async fn check(d: &Declaration, kind: SourceKind) -> Result<Value> {
                     ),
                 ));
             }
-            let fields = match kind {
-                SourceKind::Stream => STREAM_FIELDS,
-                SourceKind::Queue => QUEUE_FIELDS,
-            };
             for n in p.params() {
                 if !fields.contains(&n.as_str()) {
                     return Err(SprigError::new(
                         SprigCode::LogicSignatureMismatch,
                         format!(
-                            "{}: parameter {n} isn't a field of the {} (one of {})",
+                            "{}: parameter {n} isn't a field of the {what} (one of {})",
                             d.name,
-                            if kind == SourceKind::Stream {
-                                "record"
-                            } else {
-                                "message"
-                            },
                             fields.join(", ")
                         ),
                     ));
@@ -861,6 +748,50 @@ pub async fn check(d: &Declaration, kind: SourceKind) -> Result<Value> {
                 d.name
             ),
         )),
+    }
+}
+
+/// Checks an after-commit trigger on an engine table with `columns`, which
+/// runs from the change log as a trigger on the table's changes: KIRun
+/// parameters name a column, `old_<column>`, `op`, `trigger` or `ctx`;
+/// JavaScript's default export takes parameters by name (`row`, `old`,
+/// `op`, `ctx`, a column; see [`crate::testrun::js_row_sig`]); Lua gets
+/// `ctx`. The signature to record.
+///
+/// # Errors
+/// As [`check`].
+pub async fn check_table(d: &Declaration, columns: &[String]) -> Result<Value> {
+    use sprig_logic_compile::Runtime;
+    const WHAT: &str = "table's row change";
+    match d.runtime {
+        Runtime::Javascript => {
+            let sig = crate::testrun::js_row_sig(&d.body);
+            let params: Vec<Value> = sig
+                .params
+                .iter()
+                .map(|(n, _)| json!({"name": n, "type": "json"}))
+                .collect();
+            sprig_logic_js::Program::new(d.runtime.as_str(), &d.name, &d.body, sig)?;
+            Ok(json!({"params": params, "events": [], "scalar": false}))
+        }
+        Runtime::Kirun => {
+            let mut allowed: Vec<String> = Vec::new();
+            for c in columns {
+                for n in [c.clone(), c.to_ascii_lowercase()] {
+                    let old = format!("old_{n}");
+                    if !allowed.contains(&n) {
+                        allowed.push(n);
+                    }
+                    if !allowed.contains(&old) {
+                        allowed.push(old);
+                    }
+                }
+            }
+            allowed.extend(["op", "trigger", "ctx"].map(str::to_owned));
+            let allowed: Vec<&str> = allowed.iter().map(String::as_str).collect();
+            check_fields(d, &allowed, WHAT).await
+        }
+        _ => check_fields(d, &[], WHAT).await,
     }
 }
 
@@ -894,13 +825,28 @@ pub async fn deploy(d: &Declaration, t: MsgTarget<'_>) -> Result<Deployed> {
         .source
         .as_ref()
         .ok_or_else(|| SprigError::internal("a message trigger without its source"))?;
+    let signature = check(d, src.kind).await?;
+    deploy_checked(d, signature, t).await
+}
+
+/// [`deploy`] with the code already checked (`signature`, from [`check`]
+/// or [`check_fields`]).
+///
+/// # Errors
+/// As [`deploy`].
+#[allow(clippy::too_many_lines)]
+pub async fn deploy_checked(
+    d: &Declaration,
+    signature: Value,
+    t: MsgTarget<'_>,
+) -> Result<Deployed> {
+    let src = d
+        .source
+        .as_ref()
+        .ok_or_else(|| SprigError::internal("a message trigger without its source"))?;
     if d.kind != Kind::Trigger {
         return Err(SprigError::internal("a message source on a non-trigger"));
     }
-    let signature = check(d, src.kind).await?;
-    Migrator::new(&[LOGIC_MODULE])?
-        .run(t.catalog, t.catalog_schema, &MigrateOpts::default())
-        .await?;
     let store = LogicStore::new(t.catalog_schema);
     let kind = d.kind.as_str();
     let existing = store.module(t.catalog, t.db_id, kind, &d.name).await?;
@@ -920,10 +866,12 @@ pub async fn deploy(d: &Declaration, t: MsgTarget<'_>) -> Result<Deployed> {
         }
         None => (
             ModuleRow {
-                module_id: Store::new(t.catalog_schema)
-                    .next_object_id(t.catalog)
-                    .await?
-                    .0,
+                module_id: sprig_catalog::store::rec::CoreRecords::next_ids(
+                    t.catalog,
+                    sprig_catalog::store::Counter::Object,
+                    1,
+                )
+                .await?,
                 db_id: t.db_id,
                 name: d.name.clone(),
                 kind: kind.to_owned(),
@@ -989,7 +937,7 @@ pub async fn deploy(d: &Declaration, t: MsgTarget<'_>) -> Result<Deployed> {
     let old_source = if created {
         None
     } else {
-        source(t.catalog, t.catalog_schema, binding.binding_id).await?
+        source(t.catalog, binding.binding_id).await?
     };
     // A replaced trigger that reads another stream or queue starts afresh:
     // a new binding, so a new consumer group.
@@ -1044,7 +992,6 @@ pub async fn deploy(d: &Declaration, t: MsgTarget<'_>) -> Result<Deployed> {
     if let Some((active, spec)) = staged {
         crate::rollout::put(
             t.catalog,
-            t.catalog_schema,
             module.module_id,
             active,
             version,
@@ -1055,7 +1002,7 @@ pub async fn deploy(d: &Declaration, t: MsgTarget<'_>) -> Result<Deployed> {
         )
         .await?;
     } else {
-        crate::rollout::clear(t.catalog, t.catalog_schema, module.module_id).await?;
+        crate::rollout::clear(t.catalog, module.module_id).await?;
         store
             .activate(t.catalog, module.module_id, version, t.catalog_version)
             .await?;
@@ -1072,7 +1019,7 @@ pub async fn deploy(d: &Declaration, t: MsgTarget<'_>) -> Result<Deployed> {
         tenant_name: t.tenant_name.to_owned(),
         fanin_declarer: t.fanin_declarer,
     };
-    put_source(t.catalog, t.catalog_schema, &row).await?;
+    put_source(t.catalog, &row).await?;
     if moved && let Some(o) = &old_source {
         // The old binding stops: no source row, no job.
         let mut old = binding.clone();
@@ -1152,8 +1099,8 @@ async fn place(
     kind: SourceKind,
     module_id: u64,
     version: u64,
-    catalog: &mut Conn,
-    catalog_schema: &str,
+    catalog: &mut dyn RecordTx,
+    _catalog_schema: &str,
     db_id: u32,
     c: Option<&mut MsgCompile<'_>>,
 ) -> Result<Placed> {
@@ -1182,7 +1129,8 @@ async fn place(
         }
     }
     let Some(c) = c else {
-        let why = "an inherited trigger's instance runs in the engine tier";
+        let why = "a trigger with no MariaDB schema (an inherited trigger's instance, or one on \
+                   an engine database) runs in the engine tier";
         refuse_mariadb(why)?;
         return Ok(Placed::engine("trigger.instance", why));
     };
@@ -1199,7 +1147,7 @@ async fn place(
         crate::service::columns(s, &first).await?
     };
     let env = crate::calls::Env::new(cols, c.db_name)
-        .with_callees(crate::calls::callees(catalog, catalog_schema, db_id).await?)
+        .with_callees(crate::calls::callees(catalog, db_id).await?)
         .with_streams(&c.streams);
     let opts = sprig_logic_compile::Options {
         module_id,
@@ -1267,7 +1215,7 @@ async fn place(
 /// # Errors
 /// 39860 without a rollout; 39861 for `BY USER | TENANT`; catalog errors.
 pub async fn rollout_change(
-    c: &mut Conn,
+    c: &mut dyn RecordTx,
     schema: &str,
     module_id: u64,
     name: &str,
@@ -1276,7 +1224,7 @@ pub async fn rollout_change(
     who: &str,
 ) -> Result<String> {
     use crate::rollout::{RolloutBy, RolloutOp, RolloutSpec};
-    let Some(r) = crate::rollout::get(c, schema, module_id).await? else {
+    let Some(r) = crate::rollout::get(c, module_id).await? else {
         return Err(SprigError::new(
             SprigCode::LogicNotFound,
             format!("{name} has no rollout: deploy a candidate WITH (SPRIG_ROLLOUT = n)"),
@@ -1293,7 +1241,6 @@ pub async fn rollout_change(
             }
             crate::rollout::put(
                 c,
-                schema,
                 module_id,
                 r.active_version,
                 r.candidate_version,
@@ -1315,7 +1262,7 @@ pub async fn rollout_change(
             store
                 .activate(c, module_id, r.candidate_version, catalog_version)
                 .await?;
-            crate::rollout::clear(c, schema, module_id).await?;
+            crate::rollout::clear(c, module_id).await?;
             (
                 format!(
                     "{name}: version {} is active for every record or row (workers take it within 5 s)",
@@ -1325,7 +1272,7 @@ pub async fn rollout_change(
             )
         }
         RolloutOp::Abort => {
-            crate::rollout::clear(c, schema, module_id).await?;
+            crate::rollout::clear(c, module_id).await?;
             (
                 format!(
                     "{name}: rollout of version {} ended; version {} runs every record or row",

@@ -5,6 +5,8 @@
 //!
 //! What exists:
 //!
+//! - [`changes`]: the change log: each unit's committed changes, written
+//!   on the apply step as segment files, read by change consumers;
 //! - [`seg`]: streams stored on the node's engine: segment files fed by
 //!   the engine's commit log, and offsets, groups and the topic catalog as
 //!   engine records;
@@ -26,6 +28,7 @@
     clippy::type_complexity
 )]
 
+pub mod changes;
 pub mod envelope;
 pub mod grammar;
 pub mod maria;

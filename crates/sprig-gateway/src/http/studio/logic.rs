@@ -26,7 +26,6 @@
 //! `SPRIG_TENANT_ADMIN` (1044 otherwise): Studio shows the generated PL/SQL
 //! only to users with alter routine.
 
-use sprig_catalog::pool_wait::Bounded as _;
 use std::sync::Arc;
 
 use hyper::body::Incoming;
@@ -138,7 +137,7 @@ async fn store(
     core: &Arc<Core>,
     caller: &Caller,
     db: &str,
-) -> Result<(mysql_async::Conn, LogicStore, u32), SprigError> {
+) -> Result<(Box<dyn sprig_catalog::RecordTx>, LogicStore, u32), SprigError> {
     let (Some(svc), Some(tid)) = (&core.studio.tenants, caller.principal.tenant) else {
         return Err(invalid("the logic views need a tenant login"));
     };
@@ -151,15 +150,8 @@ async fn store(
         .or_else(|| cat.database(&db.to_ascii_lowercase()))
         .ok_or_else(|| SprigError::standard(1049, *b"42000", format!("Unknown database '{db}'")))?;
     let db_id = row.db_id.0;
-    let ep = sprig_catalog::CatalogLocator::writer(&*svc.locator, tid).await?;
-    let conn = ep.pool.get_conn_bounded().await.map_err(|e| {
-        SprigError::new(
-            SprigCode::CatalogUnavailable,
-            "the tenant's catalog is unreachable",
-        )
-        .with_source(e)
-    })?;
-    Ok((conn, LogicStore::new(ep.store.schema()), db_id))
+    let conn = svc.records.begin(tid).await?;
+    Ok((conn, LogicStore::default(), db_id))
 }
 
 /// A tenant without logic has no logic tables yet: an empty list, not 1146.
@@ -284,7 +276,7 @@ async fn list(core: &Arc<Core>, caller: &Caller, db: &str) -> Result<Response<Bo
         return Err(denied(caller, db));
     }
     let (mut conn, st, db_id) = store(core, caller, db).await?;
-    let modules = match st.modules(&mut conn, Some(db_id)).await {
+    let modules = match st.modules(&mut *conn, Some(db_id)).await {
         Ok(m) => m,
         Err(e) if missing_tables(&e) => Vec::new(),
         Err(e) => return Err(e),
@@ -297,7 +289,7 @@ async fn list(core: &Arc<Core>, caller: &Caller, db: &str) -> Result<Response<Bo
 
 async fn module_of(
     st: &LogicStore,
-    conn: &mut mysql_async::Conn,
+    conn: &mut dyn sprig_catalog::RecordTx,
     db_id: u32,
     kind: &str,
     name: &str,
@@ -323,26 +315,26 @@ async fn show(
         return Err(denied(caller, db));
     }
     let (mut conn, st, db_id) = store(core, caller, db).await?;
-    let m = module_of(&st, &mut conn, db_id, kind, name).await?;
-    let versions = st.versions(&mut conn, m.module_id).await?;
-    let binding = st.binding(&mut conn, m.module_id).await.ok().flatten();
-    let schedule = st.schedule(&mut conn, m.module_id).await.ok().flatten();
+    let m = module_of(&st, &mut *conn, db_id, kind, name).await?;
+    let versions = st.versions(&mut *conn, m.module_id).await?;
+    let binding = st.binding(&mut *conn, m.module_id).await.ok().flatten();
+    let schedule = st.schedule(&mut *conn, m.module_id).await.ok().flatten();
     let mut out = json!({
         "module": m,
         "versions": versions,
         "binding": binding,
         "schedule": schedule,
         "routines": a.routines,
-        "rollout": sprig_logic::rollout::get(&mut conn, st.schema(), m.module_id).await.ok().flatten(),
-        "stats": sprig_logic::rollout::stats(&mut conn, st.schema(), m.module_id).await.unwrap_or_default(),
+        "rollout": sprig_logic::rollout::get(&mut *conn, m.module_id).await.ok().flatten(),
+        "stats": sprig_logic::rollout::stats(&mut *conn, m.module_id).await.unwrap_or_default(),
     });
     if a.routines
         && let Some(v) = m
             .active_version
             .or_else(|| versions.first().map(|x| x.version))
     {
-        out["source"] = json!(st.source(&mut conn, m.module_id, v).await.ok());
-        out["plsql"] = json!(st.plsql(&mut conn, m.module_id, v).await.ok().flatten());
+        out["source"] = json!(st.source(&mut *conn, m.module_id, v).await.ok());
+        out["plsql"] = json!(st.plsql(&mut *conn, m.module_id, v).await.ok().flatten());
         out["source_version"] = json!(v);
     }
     Ok(json_response(200, &out))
@@ -364,9 +356,9 @@ async fn rollout(
         return Err(denied(caller, db));
     }
     let (mut conn, st, db_id) = store(core, caller, db).await?;
-    let m = module_of(&st, &mut conn, db_id, kind, name).await?;
-    let r = sprig_logic::rollout::get(&mut conn, st.schema(), m.module_id).await?;
-    let stats = sprig_logic::rollout::stats(&mut conn, st.schema(), m.module_id).await?;
+    let m = module_of(&st, &mut *conn, db_id, kind, name).await?;
+    let r = sprig_logic::rollout::get(&mut *conn, m.module_id).await?;
+    let stats = sprig_logic::rollout::stats(&mut *conn, m.module_id).await?;
     let verdict = r.as_ref().and_then(|r| {
         let cand = stats.iter().find(|s| s.version == r.candidate_version)?;
         sprig_logic::rollout::verdict(stats.iter().find(|s| s.version == r.active_version), cand)
@@ -398,9 +390,9 @@ async fn version(
         return Err(denied(caller, db));
     }
     let (mut conn, st, db_id) = store(core, caller, db).await?;
-    let m = module_of(&st, &mut conn, db_id, kind, name).await?;
-    let source = st.source(&mut conn, m.module_id, v).await?;
-    let plsql = st.plsql(&mut conn, m.module_id, v).await?;
+    let m = module_of(&st, &mut *conn, db_id, kind, name).await?;
+    let source = st.source(&mut *conn, m.module_id, v).await?;
+    let plsql = st.plsql(&mut *conn, m.module_id, v).await?;
     Ok(json_response(
         200,
         &json!({"version": v, "source": source, "plsql": plsql}),
@@ -420,12 +412,12 @@ async fn logs(
         return Err(denied(caller, db));
     }
     let (mut conn, st, db_id) = store(core, caller, db).await?;
-    let m = module_of(&st, &mut conn, db_id, kind, name).await?;
+    let m = module_of(&st, &mut *conn, db_id, kind, name).await?;
     let after = query_u64(query, "after", 0);
     let limit = u32::try_from(query_u64(query, "limit", 100))
         .unwrap_or(100)
         .clamp(1, MAX_ROWS);
-    let rows = match st.logs(&mut conn, Some(m.module_id), after, limit).await {
+    let rows = match st.logs(&mut *conn, Some(m.module_id), after, limit).await {
         Ok(r) => r,
         Err(e) if missing_tables(&e) => Vec::new(),
         Err(e) => return Err(e),
@@ -446,8 +438,8 @@ async fn dead_letters(
         return Err(denied(caller, db));
     }
     let (mut conn, st, db_id) = store(core, caller, db).await?;
-    let m = module_of(&st, &mut conn, db_id, kind, name).await?;
-    let Some(b) = st.binding(&mut conn, m.module_id).await? else {
+    let m = module_of(&st, &mut *conn, db_id, kind, name).await?;
+    let Some(b) = st.binding(&mut *conn, m.module_id).await? else {
         return Ok(json_response(
             200,
             &json!({"dead_letters": [], "binding": null}),
@@ -460,12 +452,12 @@ async fn dead_letters(
         return Err(invalid(format!("'{s}' isn't a dead letter's state")));
     }
     let mut rows = st
-        .dead_letters(&mut conn, Some(b.binding_id), state, MAX_ROWS)
+        .dead_letters(&mut *conn, Some(b.binding_id), state, MAX_ROWS)
         .await?;
     // A trigger's dead letters hold table rows (an after-commit trigger's
     // images, a change topic's records): hidden from a caller the table's
     // policies bind.
-    let hidden = match table_source(core, caller, &mut conn, &b).await? {
+    let hidden = match table_source(core, caller, &mut *conn, &b).await? {
         Some(object) => !unbound(core, caller, object).await,
         None => false,
     };
@@ -485,17 +477,17 @@ async fn dead_letters(
 async fn table_source(
     core: &Arc<Core>,
     caller: &Caller,
-    conn: &mut mysql_async::Conn,
+    conn: &mut dyn sprig_catalog::RecordTx,
     b: &sprig_logic::catalog::BindingRow,
 ) -> Result<Option<u64>, SprigError> {
     let (Some(svc), Some(tid)) = (&core.studio.tenants, caller.principal.tenant) else {
         // Can't tell: treat it as table rows.
         return Ok(Some(b.object_id.unwrap_or(0)));
     };
-    let ep = sprig_catalog::CatalogLocator::writer(&*svc.locator, tid).await?;
+    let _ = (svc, tid);
     // A stream or queue trigger's binding names its stream or queue; an
     // after-commit trigger's names its table.
-    let src = match sprig_logic::messages::source(conn, ep.store.schema(), b.binding_id).await {
+    let src = match sprig_logic::messages::source(conn, b.binding_id).await {
         Ok(s) => s,
         Err(e) if missing_tables(&e) => None,
         Err(e) => return Err(e),
@@ -566,22 +558,24 @@ async fn settle(
         ));
     }
     let (mut conn, st, db_id) = store(core, caller, db).await?;
-    let m = module_of(&st, &mut conn, db_id, kind, name).await?;
-    let Some(b) = st.binding(&mut conn, m.module_id).await? else {
+    let m = module_of(&st, &mut *conn, db_id, kind, name).await?;
+    let Some(b) = st.binding(&mut *conn, m.module_id).await? else {
         return Err(not_found(&format!("binding of {kind} {name}")));
     };
     if verb.ends_with(":replay") {
         let (marked, skipped) = st
-            .replay_dead_letters(&mut conn, Some(b.binding_id), &ids)
+            .replay_dead_letters(&mut *conn, Some(b.binding_id), &ids)
             .await?;
+        conn.commit().await?;
         Ok(json_response(
             200,
             &json!({"replaying": marked, "skipped": skipped}),
         ))
     } else {
         let n = st
-            .set_dead_letters(&mut conn, Some(b.binding_id), &ids, "dead", "discarded")
+            .set_dead_letters(&mut *conn, Some(b.binding_id), &ids, "dead", "discarded")
             .await?;
+        conn.commit().await?;
         Ok(json_response(200, &json!({"discarded": n})))
     }
 }

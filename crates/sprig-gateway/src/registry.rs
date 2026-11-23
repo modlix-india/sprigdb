@@ -118,6 +118,11 @@ pub struct GatewayRecord {
     /// sinks need). Empty: nothing is.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub degraded: BTreeMap<String, String>,
+    /// Its engine's Raft id when its engine is one replica of several
+    /// (`SPRIGDB_ENGINE_RAFT_ID`), so other gateways can name the gateway
+    /// that leads a tenant's unit. Unset: a one-node engine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raft_node: Option<u64>,
 }
 
 impl Versioned for GatewayRecord {
@@ -392,25 +397,6 @@ impl Registrar {
                 otherwise: vec![],
             })
             .await?;
-        // The write sketches, when a minute completed, in a transaction of
-        // their own: the report can never hold up the record or the token.
-        match crate::write_load::report_op(store.as_ref(), &id, session.lease()) {
-            Ok(Some((op, mark))) => {
-                let put = store
-                    .txn(Txn {
-                        when: vec![],
-                        then: vec![op],
-                        otherwise: vec![],
-                    })
-                    .await;
-                match put {
-                    Ok(_) => crate::write_load::written(&id, mark),
-                    Err(e) => tracing::warn!(error = %e, "can't write the gateway's load report"),
-                }
-            }
-            Ok(None) => {}
-            Err(e) => tracing::warn!(error = %e, "can't encode the gateway's load report"),
-        }
         Ok(())
     }
 }
@@ -504,7 +490,6 @@ pub fn catalog_modules() -> Vec<sprig_catalog::Module> {
     vec![
         sprig_types::store::TYPES_MODULE,
         sprig_graph::catalog::GRAPH_MODULE,
-        sprig_graph::catalog::GRAPH_SQL_MODULE,
         crate::search::catalog::SEARCH_MODULE,
         crate::mongo::catalog::DOC_MODULE,
         Module {

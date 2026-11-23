@@ -30,6 +30,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
+use crate::store::{CmpOp, LABEL_KEY};
 use async_trait::async_trait;
 use bytes::Bytes;
 use serde_json::Value as Json;
@@ -38,7 +39,6 @@ use sprig_engine::keys::KeyRange;
 use sprig_engine::txn::{
     CommitPath, CommitTicket, Dir as ScanDir, Isolation, LockRequest, ReadMode, Txn, TxnOptions,
 };
-use sprig_router::graph_route::{CmpOp, LABEL_KEY};
 
 use crate::ast::{Dir, Entity, IndexKind, Schema};
 use crate::engine_keys::{
@@ -170,6 +170,10 @@ fn set_name(labels: &[u32]) -> Vec<u8> {
 struct IdBlock {
     next: u64,
     end: u64,
+    /// The leader epoch the block was taken under: a block of another
+    /// epoch is dropped (its counter raise was not waited for, so a leader
+    /// whose log tail was lost may see its ids handed out again).
+    epoch: u64,
 }
 
 /// One native graph on the engine: where it lives, and what every
@@ -441,10 +445,20 @@ impl EngineGraph {
         let slot = usize::from(which == IdKind::Edge);
         let n64 = u64::try_from(n).unwrap_or(u64::MAX);
         let mut out = Vec::with_capacity(n);
+        let which_c = if slot == 0 { C_NODE } else { C_EDGE };
+        let epoch = self
+            .path
+            .leader_epoch_of(self.path.unit_of(&self.space.id_counter(which_c)));
         loop {
             {
                 let mut b = self.ids.lock().unwrap_or_else(poisoned);
                 let blk = &mut b[slot];
+                if blk.epoch != epoch {
+                    *blk = IdBlock {
+                        epoch,
+                        ..IdBlock::default()
+                    };
+                }
                 while blk.next < blk.end && out.len() < n {
                     out.push(blk.next);
                     blk.next += 1;
@@ -454,13 +468,15 @@ impl EngineGraph {
                 return Ok(out);
             }
             let want = (n64 - u64::try_from(out.len()).unwrap_or(0)).max(ID_BLOCK);
-            let (start, end) = self
-                .take_block(if slot == 0 { C_NODE } else { C_EDGE }, want)
-                .await?;
+            let (start, end) = self.take_block(which_c, want).await?;
             let mut b = self.ids.lock().unwrap_or_else(poisoned);
             let blk = &mut b[slot];
-            if blk.next >= blk.end {
-                *blk = IdBlock { next: start, end };
+            if blk.epoch != epoch || blk.next >= blk.end {
+                *blk = IdBlock {
+                    next: start,
+                    end,
+                    epoch,
+                };
             } else {
                 // Another statement refilled first: use this block now.
                 while out.len() < n && blk.next < blk.end {

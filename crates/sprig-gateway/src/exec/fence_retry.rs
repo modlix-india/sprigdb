@@ -350,8 +350,7 @@ impl PassSession {
                 }
                 None => false,
             };
-            let in_trx =
-                self.router.in_txn() || self.bs.as_ref().is_some_and(|b| b.pins().in_transaction());
+            let in_trx = self.bs.as_ref().is_some_and(|b| b.pins().in_transaction());
             let mut fs = FenceSink::new(out, watch);
             let r = match gate {
                 Some(f) => {

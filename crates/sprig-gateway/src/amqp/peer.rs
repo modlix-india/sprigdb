@@ -725,8 +725,13 @@ pub type HomeOf = Arc<dyn Fn(u64) -> DcId + Send + Sync>;
 pub struct GatewayPlacement {
     store: Arc<dyn MetaStore>,
     home: HomeOf,
-    cache: Mutex<HashMap<DcId, (Instant, Vec<String>)>>,
+    /// Candidates by DC, with each one's engine Raft id when its engine
+    /// replicates.
+    cache: Mutex<HashMap<DcId, (Instant, Candidates)>>,
 }
+
+/// Placement candidates: gateway ids with their engines' Raft ids.
+type Candidates = Vec<(String, Option<u64>)>;
 
 impl std::fmt::Debug for GatewayPlacement {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -735,6 +740,35 @@ impl std::fmt::Debug for GatewayPlacement {
 }
 
 impl GatewayPlacement {
+    /// The ready gateways of `tenant`'s home DC that serve the peer
+    /// service, with their engines' Raft ids; read at most once a second.
+    async fn all_candidates(&self, tenant: u64) -> Candidates {
+        let dc = (self.home)(tenant);
+        if let Some((at, v)) = lock(&self.cache).get(&dc)
+            && at.elapsed() < Duration::from_secs(1)
+        {
+            return v.clone();
+        }
+        let tier = TierView::over(&self.store, Tier::Dc(dc.clone()));
+        let mut v: Candidates = match registry::list(&*tier).await {
+            Ok(list) => list
+                .into_iter()
+                .filter(|r| r.state == GatewayState::Ready && r.listeners.contains_key("peer"))
+                .map(|r| (r.gateway_id, r.raft_node))
+                .collect(),
+            Err(e) => {
+                tracing::debug!(error = %e, "queue placement: registry unreadable");
+                return lock(&self.cache)
+                    .get(&dc)
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_default();
+            }
+        };
+        v.sort();
+        lock(&self.cache).insert(dc, (Instant::now(), v.clone()));
+        v
+    }
+
     /// Placement over `store` (any tier: single-etcd mode reads every
     /// DC's tier through it); `home` names a tenant's home DC.
     #[must_use]
@@ -761,30 +795,20 @@ impl GatewayPlacement {
 #[async_trait]
 impl Placement for GatewayPlacement {
     async fn candidates(&self, tenant: u64) -> Vec<String> {
-        let dc = (self.home)(tenant);
-        if let Some((at, v)) = lock(&self.cache).get(&dc)
-            && at.elapsed() < Duration::from_secs(1)
-        {
-            return v.clone();
-        }
-        let tier = TierView::over(&self.store, Tier::Dc(dc.clone()));
-        let mut v: Vec<String> = match registry::list(&*tier).await {
-            Ok(list) => list
-                .into_iter()
-                .filter(|r| r.state == GatewayState::Ready && r.listeners.contains_key("peer"))
-                .map(|r| r.gateway_id)
-                .collect(),
-            Err(e) => {
-                tracing::debug!(error = %e, "queue placement: registry unreadable");
-                return lock(&self.cache)
-                    .get(&dc)
-                    .map(|(_, v)| v.clone())
-                    .unwrap_or_default();
-            }
+        let all = self.all_candidates(tenant).await;
+        // On replicated engines a tenant's queue messages commit only where
+        // its unit is led: that gateway is the only candidate.
+        let leader = match crate::node_engine::tenant_leader(tenant) {
+            crate::node_engine::UnitLeader::Here => crate::node_engine::raft_id_from_env(),
+            crate::node_engine::UnitLeader::Node(n) => Some(n),
+            crate::node_engine::UnitLeader::Any | crate::node_engine::UnitLeader::Unknown => None,
         };
-        v.sort();
-        lock(&self.cache).insert(dc, (Instant::now(), v.clone()));
-        v
+        if let Some(n) = leader
+            && let Some((g, _)) = all.iter().find(|(_, r)| *r == Some(n))
+        {
+            return vec![g.clone()];
+        }
+        all.into_iter().map(|(g, _)| g).collect()
     }
 
     async fn preferred(&self, tenant: u64, object: u64) -> Option<(String, i64)> {
@@ -1333,6 +1357,7 @@ mod tests {
                 load: registry::Load::default(),
                 kafka_host: None,
                 degraded: std::collections::BTreeMap::new(),
+                raft_node: None,
             };
             let slot = registry::SlotRecord {
                 gateway_id: id.clone(),

@@ -94,12 +94,11 @@ pub fn check(name: &str, runtime: &str, source: &str) -> Result<()> {
 /// # Errors
 /// The catalog's.
 pub async fn source_of(
-    c: &mut mysql_async::Conn,
-    catalog_schema: &str,
+    c: &mut dyn sprig_catalog::records::RecordTx,
     db_id: u32,
     name: &str,
 ) -> Result<Option<(String, u64, String, Value)>> {
-    source_at(c, catalog_schema, db_id, name, None).await
+    source_at(c, db_id, name, None).await
 }
 
 /// [`source_of`] for version `version` of the function (`None`: the
@@ -108,44 +107,26 @@ pub async fn source_of(
 /// # Errors
 /// The catalog's.
 pub async fn source_at(
-    c: &mut mysql_async::Conn,
-    catalog_schema: &str,
+    c: &mut dyn sprig_catalog::records::RecordTx,
     db_id: u32,
     name: &str,
     version: Option<u64>,
 ) -> Result<Option<(String, u64, String, Value)>> {
-    use mysql_async::prelude::Queryable;
-    let q = sprig_common::names::quote(catalog_schema);
-    let which = match version {
-        Some(v) => format!("v.version = {v}"),
-        None => "v.version = m.active_version".to_owned(),
+    let store = sprig_logic::LogicStore::default();
+    let Some(m) = store.module(c, db_id, "function", name).await? else {
+        return Ok(None);
     };
-    let r: std::result::Result<Option<(String, u64, String, String)>, mysql_async::Error> = c
-        .exec_first(
-            format!(
-                "SELECT m.runtime, v.version, v.source, CAST(v.signature AS CHAR) \
-                 FROM {q}.logic_modules m JOIN {q}.logic_versions v \
-                 ON v.module_id = m.module_id AND {which} \
-                 WHERE m.db_id = ? AND m.name = ? AND m.kind = 'function' AND m.state = 'active'"
-            ),
-            (db_id, name),
-        )
-        .await;
-    match r {
-        // No logic tables yet: no function.
-        Err(mysql_async::Error::Server(e)) if e.code == 1146 => Ok(None),
-        Err(e) => Err(
-            SprigError::new(SprigCode::CatalogUnavailable, "catalog unavailable").with_source(e),
-        ),
-        Ok(r) => Ok(r.map(|(runtime, v, src, sig)| {
-            (
-                runtime,
-                v,
-                src,
-                serde_json::from_str(&sig).unwrap_or(Value::Null),
-            )
-        })),
+    if m.state != "active" {
+        return Ok(None);
     }
+    let Some(v) = version.or(m.active_version) else {
+        return Ok(None);
+    };
+    let Ok((sig, _)) = store.version_signature(c, m.module_id, v).await else {
+        return Ok(None);
+    };
+    let src = store.source(c, m.module_id, v).await?;
+    Ok(Some((m.runtime, v, src, sig)))
 }
 
 /// Whether a version's recorded signature says `DETERMINISTIC`
@@ -178,13 +159,12 @@ impl Transform {
     /// 39219 for a function that is gone or can't be a transform; 39861
     /// for text that doesn't compile.
     pub async fn load(
-        c: &mut mysql_async::Conn,
-        catalog_schema: &str,
+        c: &mut dyn sprig_catalog::records::RecordTx,
         db_id: u32,
         name: &str,
         budget: Duration,
     ) -> Result<Arc<Self>> {
-        Self::load_at(c, catalog_schema, db_id, name, None, false, budget).await
+        Self::load_at(c, db_id, name, None, false, budget).await
     }
 
     /// Compiles version `version` of `name` (`None`: the active one),
@@ -194,16 +174,14 @@ impl Transform {
     /// As [`Transform::load`]; 39219 for a missing version or one that
     /// isn't deterministic under `EXACTLY ONCE`.
     pub async fn load_at(
-        c: &mut mysql_async::Conn,
-        catalog_schema: &str,
+        c: &mut dyn sprig_catalog::records::RecordTx,
         db_id: u32,
         name: &str,
         version: Option<u64>,
         exactly_once: bool,
         budget: Duration,
     ) -> Result<Arc<Self>> {
-        let Some((runtime, version, source, sig)) =
-            source_at(c, catalog_schema, db_id, name, version).await?
+        let Some((runtime, version, source, sig)) = source_at(c, db_id, name, version).await?
         else {
             return Err(invalid(match version {
                 Some(v) => format!("TRANSFORM {name}: no version {v} of the function"),

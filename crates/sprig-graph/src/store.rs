@@ -10,7 +10,6 @@
 use async_trait::async_trait;
 use serde_json::Value as Json;
 use sprig_common::Result;
-use sprig_router::graph_route::CmpOp;
 use sprig_shard::{KeyClass, KeySpec, KeyValue, hash_key};
 
 use crate::ast::{Dir, Entity, IndexKind, Schema};
@@ -650,3 +649,42 @@ pub trait GraphStore: Send {
         ))
     }
 }
+
+/// A numeric comparison of a pushed-down filter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CmpOp {
+    /// `<`.
+    Lt,
+    /// `<=`.
+    Le,
+    /// `>`.
+    Gt,
+    /// `>=`.
+    Ge,
+    /// `=`.
+    Eq,
+    /// Keeps the row unless the value is a JSON number below the given
+    /// one (any other value, or none, passes): a sort bound, which must
+    /// not drop the strings and `null`s Cypher orders elsewhere.
+    NotNumBelow,
+    /// The same for a JSON number above the given one.
+    NotNumAbove,
+}
+
+impl CmpOp {
+    /// The SQL operator.
+    #[must_use]
+    pub fn sql(self) -> &'static str {
+        match self {
+            Self::Lt | Self::NotNumBelow => "<",
+            Self::Le => "<=",
+            Self::Gt | Self::NotNumAbove => ">",
+            Self::Ge => ">=",
+            Self::Eq => "=",
+        }
+    }
+}
+
+/// A filter key naming a required label instead of a property:
+/// `LABEL_KEY` then the label id (the value is ignored).
+pub const LABEL_KEY: &str = "\u{1}label:";

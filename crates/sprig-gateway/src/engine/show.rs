@@ -97,6 +97,33 @@ pub(crate) fn create_table(name: &str, text: &str) -> Answer {
     }
 }
 
+/// `SHOW CREATE DATABASE` of database `name` (the schema name the
+/// statement used): `text` is its `Create Database`, as MariaDB 11.8
+/// writes it.
+pub(crate) fn create_database(name: &str, text: &str) -> Answer {
+    Answer {
+        defs: vec![
+            coldef("", "", "Database", "", 224, 256, VARSTR, 0x0001, 0x27),
+            coldef(
+                "",
+                "",
+                "Create Database",
+                "",
+                224,
+                4096,
+                VARSTR,
+                0x0001,
+                0x27,
+            ),
+        ],
+        rows: vec![encode_text_row([
+            Some(name.as_bytes()),
+            Some(text.as_bytes()),
+        ])],
+        no_index: false,
+    }
+}
+
 /// The definition's text with `AUTO_INCREMENT=next` as the server shows it
 /// (the next value the table gives, when it is above 1).
 pub(crate) fn with_counter(def: &Def, next: Option<u64>) -> String {

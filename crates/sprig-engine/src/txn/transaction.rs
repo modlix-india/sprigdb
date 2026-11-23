@@ -234,11 +234,19 @@ pub struct CommitTicket {
     cts: Option<Ts>,
     token: Ts,
     ticket: DurableTicket,
+    /// Entries queued after the ones the reply waits for (a commit across
+    /// units resolving its participants on a log that needs waits).
+    later: DurableTicket,
 }
 
 impl CommitTicket {
     pub(super) fn new(cts: Option<Ts>, token: Ts, ticket: DurableTicket) -> Self {
-        Self { cts, token, ticket }
+        Self {
+            cts,
+            token,
+            ticket,
+            later: DurableTicket::Ready,
+        }
     }
 
     /// The commit timestamp, or, for a transaction that wrote nothing, the
@@ -260,6 +268,12 @@ impl CommitTicket {
     #[must_use]
     pub fn log_ticket(&self) -> Option<&Ticket> {
         self.ticket.first_log()
+    }
+
+    /// The commit's log ticket on `unit`, if it wrote there.
+    #[must_use]
+    pub fn log_ticket_of(&self, unit: u64) -> Option<&Ticket> {
+        self.ticket.log_of(unit).or_else(|| self.later.log_of(unit))
     }
 
     /// What the reply waits for.
@@ -406,13 +420,20 @@ pub struct Txn {
     notes: Vec<Extra>,
     /// `notes.len()` when the current statement started.
     stmt_notes: usize,
+    /// Whether reads may land on a replica that doesn't lead their unit
+    /// (a replicated engine).
+    follows: bool,
+    /// Units this read view has already caught up on (see
+    /// [`Txn::follow`]).
+    followed: Vec<u64>,
 }
 
 /// What a commit's log entry carries beside the versioned writes.
 #[derive(Debug, Clone)]
 pub(crate) enum Extra {
-    /// An opaque note (the apply step skips it; observers read it).
-    Note(Vec<u8>),
+    /// An opaque note (the apply step skips it; observers read it), in
+    /// the entry of the notes unit, or of the unit holding a tenant's keys.
+    Note(Option<u64>, Vec<u8>),
     /// A plain put.
     Put(Cf, Vec<u8>, Vec<u8>),
     /// A plain delete.
@@ -443,6 +464,7 @@ impl Txn {
     pub fn begin_on(path: Arc<dyn CommitPath>, opts: TxnOptions) -> Txn {
         path.shared().recover_once(&*path);
         let id = path.shared().next_txn_id();
+        let follows = path.follows();
         let mut t = Self {
             path,
             id,
@@ -460,6 +482,8 @@ impl Txn {
             phase: Phase::Active,
             notes: Vec::new(),
             stmt_notes: 0,
+            follows,
+            followed: Vec::new(),
         };
         // A consistent snapshot opens the view at once. (SERIALIZABLE with
         // snapshot isolation opens it when the first statement starts: see
@@ -634,9 +658,43 @@ impl Txn {
     }
 
     fn close_view(&mut self) {
+        self.followed.clear();
         if let Some(ts) = self.view.take() {
             self.path.shared().close_view(self.id, ts);
         }
+    }
+
+    /// Before the first read of `key`'s unit under this read view, on a
+    /// replica that doesn't lead the unit: catches up with the leader (a
+    /// read barrier) and, if this is the view's first such unit and the
+    /// transaction hasn't written, opens (or moves up) the view to the
+    /// unit's applied timestamp, so the read sees every commit acknowledged
+    /// before it started. Later units are caught up and read at the same
+    /// view (reads across units see each unit's state at that timestamp,
+    /// as on the leader).
+    fn follow(&mut self, key: &[u8]) -> Result<()> {
+        if !self.follows {
+            return Ok(());
+        }
+        let unit = self.path.unit_of(key);
+        if self.followed.contains(&unit) {
+            return Ok(());
+        }
+        let ts = self.path.follower_read(unit)?;
+        let first = self.followed.is_empty();
+        self.followed.push(unit);
+        let Some(ts) = ts else {
+            return Ok(());
+        };
+        match self.view {
+            None => self.view = Some(self.shared().open_view_at(self.id, ts)),
+            Some(v) if v < ts && first && self.writes.is_empty() => {
+                self.shared().close_view(self.id, v);
+                self.view = Some(self.shared().open_view_at(self.id, ts));
+            }
+            Some(_) => {}
+        }
+        Ok(())
     }
 
     fn note_pending(&mut self, ticket: &DurableTicket) {
@@ -678,6 +736,7 @@ impl Txn {
         if let Some(v) = self.writes.get(key) {
             return Ok(v.clone());
         }
+        self.follow(key)?;
         let rts = self.read_ts();
         if !self.shared().overlay.is_empty() {
             self.shared().prune(&*self.path);
@@ -691,6 +750,7 @@ impl Txn {
 
     /// The newest version of `key`, pending or applied, with its timestamp.
     fn latest(&mut self, key: &[u8]) -> Result<Option<(Ts, Option<Bytes>)>> {
+        self.follow(key)?;
         if let Some(p) = self.shared().overlay.read_at(key, Ts::MAX) {
             self.note_pending(&p.ticket);
             return Ok(Some((p.ts, p.value)));
@@ -726,6 +786,7 @@ impl Txn {
     ) -> Result<Vec<(Vec<u8>, Bytes)>> {
         let rows = match LockRequest::for_mode(mode) {
             None => {
+                self.follow(&range.start)?;
                 let rts = self.read_ts();
                 self.scan_at(range, dir, limit, rts)?
             }
@@ -783,6 +844,7 @@ impl Txn {
         if range.end.as_ref().is_some_and(|e| *e <= range.start) {
             return Ok((Vec::new(), true));
         }
+        self.follow(&range.start)?;
         let mut pending = self.shared().overlay.range_at(range, at);
         let mut own: Vec<(Bytes, Option<Bytes>)> = self
             .writes
@@ -991,7 +1053,17 @@ impl Txn {
         }
     }
 
+    /// 1213 if the leadership of a unit whose locks the transaction holds
+    /// or waited for left this node: the transaction is rolled back.
+    fn check_doomed(&mut self) -> Result<()> {
+        if self.shared().locks.is_doomed(self.id) {
+            return Err(self.abort(AbortReason::LeaderChange, errors::leader_lost()));
+        }
+        Ok(())
+    }
+
     fn check_interrupt(&mut self) -> Result<()> {
+        self.check_doomed()?;
         match self.interrupted() {
             None => Ok(()),
             Some(why) => Err(self.interrupted_error(why)),
@@ -1001,6 +1073,12 @@ impl Txn {
     /// Turns the lock table's answer into a grant, waiting if it must.
     /// `None`: `SKIP LOCKED` skipped the row.
     async fn settle(&mut self, got: Acquire, wait: Wait, how: How) -> Result<Option<Grant>> {
+        if let Err(e) = self.check_doomed() {
+            if let Acquire::Wait(w) = got {
+                drop(w);
+            }
+            return Err(e);
+        }
         match got {
             Acquire::Granted { fresh, upgrade } => Ok(Some(Grant {
                 new: fresh && !upgrade,
@@ -1025,7 +1103,10 @@ impl Txn {
                     WaitOutcome::Deadlock => {
                         Err(self.abort(AbortReason::Deadlock, errors::deadlock()))
                     }
-                    WaitOutcome::Interrupted(why) => Err(self.interrupted_error(why)),
+                    WaitOutcome::Interrupted(why) => {
+                        self.check_doomed()?;
+                        Err(self.interrupted_error(why))
+                    }
                 }
             }
             Acquire::WouldWait if wait == Wait::SkipLocked => Ok(None),
@@ -1815,8 +1896,37 @@ impl Txn {
     /// The transaction is not active.
     pub fn add_note(&mut self, note: Vec<u8>) -> Result<()> {
         self.ensure_active()?;
-        self.notes.push(Extra::Note(note));
+        self.notes.push(Extra::Note(None, note));
         Ok(())
+    }
+
+    /// Adds a note to the log entry of the unit holding `tenant`'s keys
+    /// (a stream append of that tenant), as [`Txn::add_note`] adds one to
+    /// the notes unit's entry.
+    ///
+    /// # Errors
+    /// The transaction is not active.
+    pub fn add_note_for_tenant(&mut self, tenant: u64, note: Vec<u8>) -> Result<()> {
+        self.ensure_active()?;
+        self.notes.push(Extra::Note(Some(tenant), note));
+        Ok(())
+    }
+
+    /// The unit whose entry carries note `e`.
+    fn note_unit(&self, e: &Extra) -> Option<u64> {
+        match e {
+            Extra::Note(None, _) => Some(self.path.notes_unit()),
+            Extra::Note(Some(t), _) => Some(self.path.unit_of(&t.to_be_bytes())),
+            _ => None,
+        }
+    }
+
+    /// The notes added so far for `tenant`'s unit: the next such note's
+    /// slot among that unit's entry's notes.
+    #[must_use]
+    pub fn notes_for_tenant(&self, tenant: u64) -> usize {
+        let u = Some(self.path.unit_of(&tenant.to_be_bytes()));
+        self.notes.iter().filter(|e| self.note_unit(e) == u).count()
     }
 
     /// Adds a plain (unversioned) put of `key` in `cf` to the commit's log
@@ -1849,17 +1959,15 @@ impl Txn {
     /// across `XA PREPARE`).
     #[must_use]
     pub fn has_plain_writes(&self) -> bool {
-        self.notes.iter().any(|e| !matches!(e, Extra::Note(_)))
+        self.notes.iter().any(|e| !matches!(e, Extra::Note(..)))
     }
 
     /// The notes added so far (plain writes not counted: a note's slot
     /// among the entry's notes is what observers see).
     #[must_use]
     pub fn notes(&self) -> usize {
-        self.notes
-            .iter()
-            .filter(|e| matches!(e, Extra::Note(_)))
-            .count()
+        let u = Some(self.path.notes_unit());
+        self.notes.iter().filter(|e| self.note_unit(e) == u).count()
     }
 
     /// A ticket for replying to the current statement: ready once every
@@ -1877,35 +1985,45 @@ impl Txn {
     /// transaction is then rolled back).
     pub fn commit(mut self) -> Result<CommitTicket> {
         self.ensure_active()?;
+        self.check_doomed()?;
         let token = self.view.unwrap_or_else(|| self.shared().visible_ts());
         self.close_view();
         if self.writes.is_empty() && self.notes.is_empty() {
             self.shared().locks.release_all(self.id);
             self.finish(Phase::Done);
-            return Ok(CommitTicket {
-                cts: None,
+            return Ok(CommitTicket::new(
+                None,
                 token,
-                ticket: std::mem::take(&mut self.dep),
-            });
+                std::mem::take(&mut self.dep),
+            ));
         }
         let writes = std::mem::take(&mut self.writes).into_writes();
         let notes = std::mem::take(&mut self.notes);
         let path = self.path.clone();
-        match path.shared().commit_writes_noted(
+        match path.shared().commit_full(
             &*path,
             self.id,
             writes,
             self.opts.durability,
             None,
             &notes,
+            &self.dep,
         ) {
-            Ok((cts, ticket)) => {
+            Ok(done) => {
                 self.finish(Phase::Done);
                 Ok(CommitTicket {
-                    cts: Some(cts),
-                    token: cts,
-                    ticket: ticket.max(std::mem::take(&mut self.dep)),
+                    cts: Some(done.cts),
+                    token: done.cts,
+                    ticket: done.ticket.max(std::mem::take(&mut self.dep)),
+                    later: done.later,
                 })
+            }
+            // A commit across units whose coordinator stopped part way: its
+            // locks stay until a resolver or recovery finishes it.
+            Err(e) if path.shared().cross_holds_locks(self.id) => {
+                self.detach();
+                self.finish(Phase::Aborted(AbortReason::LeaderChange));
+                Err(e)
             }
             Err(e) => Err(self.abort(AbortReason::LeaderChange, e)),
         }

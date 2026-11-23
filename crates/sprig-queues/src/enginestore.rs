@@ -93,7 +93,7 @@ impl EngineQueues {
                 engine: self.engine.clone(),
                 durability: self.durability,
                 scope: (tenant, db),
-                lanes: Mutex::new(HashMap::new()),
+                lanes: Mutex::new((0, HashMap::new())),
             })
         }))
     }
@@ -108,7 +108,27 @@ pub struct EngineMsgStore {
     /// claim starts from (a write proposed but not yet applied is already
     /// in it). Held while a write checks the fence and proposes, and while
     /// a claim reads and proposes, so the two are ordered.
-    lanes: Mutex<HashMap<(u64, u16), (u64, LaneState)>>,
+    ///
+    /// Kept with the unit's leader epoch it was built under: when this node
+    /// takes the tenant's unit again (the epoch changed), it is rebuilt
+    /// from the stored lane states, not trusted.
+    lanes: Mutex<(u64, HashMap<(u64, u16), (u64, LaneState)>)>,
+}
+
+/// The lane cache, after a check of the leader epoch.
+struct Lanes<'a>(MutexGuard<'a, (u64, HashMap<(u64, u16), (u64, LaneState)>)>);
+
+impl std::ops::Deref for Lanes<'_> {
+    type Target = HashMap<(u64, u16), (u64, LaneState)>;
+    fn deref(&self) -> &Self::Target {
+        &self.0.1
+    }
+}
+
+impl std::ops::DerefMut for Lanes<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0.1
+    }
 }
 
 impl std::fmt::Debug for EngineMsgStore {
@@ -426,6 +446,18 @@ impl EngineMsgStore {
         Engine::unit_of_tenant(self.scope.0)
     }
 
+    /// The lane cache, emptied first if the unit's leader epoch changed
+    /// since it was filled.
+    fn lanes(&self) -> Lanes<'_> {
+        let mut g = lock(&self.lanes);
+        let epoch = self.engine.leader_epoch(self.unit());
+        if g.0 != epoch {
+            g.0 = epoch;
+            g.1.clear();
+        }
+        Lanes(g)
+    }
+
     fn queue_p(&self, f: (u8, u16), queue: u64) -> Vec<u8> {
         let mut v = self.p(f);
         v.extend_from_slice(&queue.to_be_bytes());
@@ -542,7 +574,7 @@ impl EngineMsgStore {
         p: Payload,
     ) -> Result<(), StoreError> {
         let t = {
-            let mut g = lock(&self.lanes);
+            let mut g = self.lanes();
             let current = if let Some(x) = g.get(&(queue, lane)) {
                 *x
             } else {
@@ -569,11 +601,11 @@ impl EngineMsgStore {
     }
 
     fn fence(&self, queue: u64, lane: u16, epoch: u64) -> Result<(), StoreError> {
-        let known = lock(&self.lanes).get(&(queue, lane)).map(|x| x.0);
+        let known = self.lanes().get(&(queue, lane)).map(|x| x.0);
         let current = match known {
             Some(e) => e,
             None => match self.lane_state(queue, lane)? {
-                Some(x) => lock(&self.lanes).entry((queue, lane)).or_insert(x).0,
+                Some(x) => self.lanes().entry((queue, lane)).or_insert(x).0,
                 None => return Err(StoreError::Fenced),
             },
         };
@@ -617,7 +649,7 @@ fn delete_runs(p: &mut Payload, s: &EngineMsgStore, queue: u64, lane: u16, refs:
 impl MsgStore for EngineMsgStore {
     async fn claim(&self, queue: u64, lane: u16) -> Result<Claim, StoreError> {
         let (t, epoch, state) = {
-            let mut g = lock(&self.lanes);
+            let mut g = self.lanes();
             let newest = match g.get(&(queue, lane)) {
                 Some(x) => Some(*x),
                 None => self.lane_state(queue, lane)?,
@@ -859,7 +891,7 @@ impl MsgStore for EngineMsgStore {
             let qp = self.queue_p(f, queue);
             p.delete_range(Cf::Data, &qp, &prefix_end(&qp).unwrap_or_default());
         }
-        lock(&self.lanes).retain(|(q, _), _| *q != queue);
+        self.lanes().retain(|(q, _), _| *q != queue);
         self.commit(p).await
     }
 

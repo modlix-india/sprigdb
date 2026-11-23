@@ -24,18 +24,11 @@
 
 use std::collections::BTreeMap;
 
-use mysql_async::Conn;
-use mysql_async::prelude::Queryable;
 use serde_json::Value;
 use sprig_common::{Result, SprigCode, SprigError};
 use sprig_logic_compile::ir::{Function, Ty};
 use sprig_logic_compile::link::{CallDep, Callee, StreamTarget};
 use sprig_logic_compile::{Columns, StaticColumns};
-
-#[allow(clippy::needless_pass_by_value)]
-fn map_err(e: mysql_async::Error) -> SprigError {
-    SprigError::new(SprigCode::CatalogUnavailable, format!("logic catalog: {e}"))
-}
 
 /// The fields a call of `f` returns, as its wrapper's columns: every
 /// event's fields once, in event order, without `event`; booleans as
@@ -169,29 +162,28 @@ struct Ver {
 /// # Errors
 /// The catalog's.
 pub async fn callees(
-    c: &mut Conn,
-    schema: &str,
+    c: &mut dyn sprig_catalog::records::RecordTx,
     db_id: u32,
 ) -> Result<Vec<(String, std::result::Result<Callee, String>)>> {
-    type Row = (u64, String, String, u64, String, String, String);
-    let s = sprig_common::names::quote(schema);
-    let rows: Vec<Row> = c
-        .exec(
-            format!(
-                "SELECT m.module_id, m.name, CAST(m.kind AS CHAR), v.version, CAST(v.tier AS CHAR), \
-                 CAST(v.signature AS CHAR), CAST(v.placement AS CHAR) \
-                 FROM {s}.logic_modules m JOIN {s}.logic_versions v ON v.module_id = m.module_id \
-                 AND (v.version = m.active_version OR v.version = m.candidate_version) \
-                 WHERE m.db_id = ? AND m.state = 'active' AND m.kind IN ('function', 'procedure') \
-                 ORDER BY m.module_id, v.version"
-            ),
-            (db_id,),
-        )
-        .await
-        .map_err(map_err)?;
+    let rows: Vec<(u64, String, String, u64, String, Value, Value)> = crate::LogicStore::new("")
+        .live_versions(c, db_id)
+        .await?
+        .into_iter()
+        .filter(|v| matches!(v.kind.as_str(), "function" | "procedure"))
+        .map(|v| {
+            (
+                v.module_id,
+                v.name,
+                v.kind,
+                v.version,
+                v.tier,
+                v.signature,
+                v.placement,
+            )
+        })
+        .collect();
     let mut by: BTreeMap<u64, (String, String, Vec<Ver>)> = BTreeMap::new();
     for (m, name, kind, version, tier, sig, placement) in rows {
-        let sig: Value = serde_json::from_str(&sig).unwrap_or(Value::Null);
         let e = by
             .entry(m)
             .or_insert_with(|| (name.clone(), kind, Vec::new()));
@@ -199,7 +191,7 @@ pub async fn callees(
             version,
             tier,
             func: crate::rollout::function_of(&name, &sig),
-            placement: serde_json::from_str(&placement).unwrap_or(Value::Null),
+            placement,
         });
     }
     let mut names: BTreeMap<String, usize> = BTreeMap::new();
@@ -320,8 +312,7 @@ pub struct NewVersion<'a> {
 /// # Errors
 /// 39875; the catalog's.
 pub async fn check_callers(
-    c: &mut Conn,
-    schema: &str,
+    c: &mut dyn sprig_catalog::records::RecordTx,
     db_id: u32,
     v: NewVersion<'_>,
 ) -> Result<()> {
@@ -333,20 +324,15 @@ pub async fn check_callers(
         compiled,
         writes,
     } = v;
-    let s = sprig_common::names::quote(schema);
-    let rows: Vec<Row> = c
-        .exec(
-            format!(
-                "SELECT m.name, CAST(m.kind AS CHAR), v.version, CAST(v.placement AS CHAR) \
-                 FROM {s}.logic_modules m JOIN {s}.logic_versions v ON v.module_id = m.module_id \
-                 AND (v.version = m.active_version OR v.version = m.candidate_version) \
-                 WHERE m.db_id = ? AND m.state = 'active' AND m.module_id <> ? \
-                 AND v.tier = 'mariadb' AND JSON_EXISTS(v.placement, '$.calls')"
-            ),
-            (db_id, module_id),
-        )
-        .await
-        .map_err(map_err)?;
+    let rows: Vec<Row> = crate::LogicStore::new("")
+        .live_versions(c, db_id)
+        .await?
+        .into_iter()
+        .filter(|x| {
+            x.module_id != module_id && x.tier == "mariadb" && x.placement.get("calls").is_some()
+        })
+        .map(|x| (x.name, x.kind, x.version, x.placement.to_string()))
+        .collect();
     let params: Vec<String> = f.params.iter().map(|p| p.ty.name().to_owned()).collect();
     let fields: Vec<(String, String)> = call_fields(f)
         .into_iter()

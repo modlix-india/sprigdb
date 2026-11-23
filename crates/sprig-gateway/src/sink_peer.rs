@@ -25,6 +25,9 @@
 //!                       up to the first that fails; to an
 //!                       exchange inherited from a declarer, into the
 //!                       tenant's own instance, stamped
+//! Changes {objects, token, ...}
+//!                       a CHANGES OF sink's engine tables' changes from the
+//!                       change log (crate::table_changes)
 //! ```
 
 use std::net::SocketAddr;
@@ -239,6 +242,44 @@ async fn serve_inner(
                 .clone()
                 .ok_or_else(|| SprigError::internal("this gateway serves no tenant catalogs"))?;
             crate::inherited::fanin_sink::settle(&svc, &caller, &tokens, ack).await
+        }
+        // A `CHANGES OF` sink's read of its engine tables' changes
+        // (crate::table_changes); the owner's SELECT on each table is
+        // checked when its reader opens.
+        SqlOp::Changes {
+            objects,
+            token,
+            from_ms,
+            max_bytes,
+            wait_ms,
+            consumer,
+        } => {
+            let svc = engine
+                .tenants
+                .clone()
+                .ok_or_else(|| SprigError::internal("this gateway serves no tenant catalogs"))?;
+            let consumer = format!("{}/{consumer}", req.tenant);
+            let check = |sql: String| {
+                let caller = caller.clone();
+                async move { run(engine, &caller, "", sql, None, caps).await.map(|_| ()) }
+            };
+            let (result, next) = crate::table_changes::serve(
+                &svc,
+                req.tenant,
+                &objects,
+                token.as_deref(),
+                from_ms,
+                max_bytes,
+                wait_ms,
+                &consumer,
+                check,
+            )
+            .await?;
+            Ok(SqlReply {
+                results: vec![result],
+                next: Some(next),
+                ..SqlReply::default()
+            })
         }
     }
 }

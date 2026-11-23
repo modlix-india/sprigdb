@@ -28,9 +28,9 @@ use sprig_common::Result;
 use super::Exec;
 use crate::ast::{BinOp, Expr, MapItem};
 use crate::eval::Row;
+use crate::store::CmpOp;
 use crate::store::{EdgeRow, NodeRow};
 use crate::value::{Node, Rel, Value};
-use sprig_router::graph_route::CmpOp;
 
 /// A need's pseudo-key: the node's labels (`labels(v)`, `v:L`, a label
 /// in a later pattern on bound `v`).
@@ -703,11 +703,7 @@ impl Exec<'_> {
         };
         let mut filter = self.filters_for(var);
         if let Some(l) = label {
-            filter.push((
-                format!("{}{l}", sprig_router::graph_route::LABEL_KEY),
-                CmpOp::Eq,
-                0.0,
-            ));
+            filter.push((format!("{}{l}", crate::store::LABEL_KEY), CmpOp::Eq, 0.0));
         }
         let batch = self.id_batch();
         for chunk in want.chunks(batch) {

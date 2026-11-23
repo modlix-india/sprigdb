@@ -1003,7 +1003,7 @@ impl Engine {
                     },
                 };
                 if c.auto_inc {
-                    self.seen_autoinc(sp, def, &stored);
+                    self.seen_autoinc(sp, def, &stored)?;
                 }
                 row.push(stored);
             }

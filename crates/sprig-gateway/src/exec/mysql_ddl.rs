@@ -286,13 +286,17 @@ impl PassSession {
 
     /// The physical schema of database `db` (the session's when `None`)
     /// and table `table`, for statements on the session's backend
-    /// connection.
+    /// connection. `None` for an engine database: MariaDB holds none of
+    /// its tables, and the engine answers these checks itself.
     fn physical_table(&self, db: Option<&str>, table: &str) -> Option<(String, String)> {
         let ts = self.tenant.as_deref()?;
         let db = match db {
             Some(d) => d.to_owned(),
             None => self.current_logical()?,
         };
+        if self.engine_database_named(&db) {
+            return None;
+        }
         Some((ts.schema_of(Some(&db))?, table.to_owned()))
     }
 

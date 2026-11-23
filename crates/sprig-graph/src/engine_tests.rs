@@ -267,3 +267,24 @@ async fn overlapping_new_names_and_an_index_built_under_writers() {
     let o = run(&g, "MATCH (p:P) RETURN count(*)").await.unwrap();
     assert_eq!(show(&o), ["240"]);
 }
+
+/// A node that takes the graph's tenant leadership again drops its id
+/// blocks: the next ids come from a new block of the counter.
+#[tokio::test]
+async fn id_blocks_of_an_older_leader_epoch_are_dropped() {
+    use sprig_engine::config::{EngineConfig, StoreKind};
+    let d = std::env::temp_dir().join(format!("graph-ids-epoch-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    let mut c = EngineConfig::new(&d);
+    c.store = StoreKind::Mem;
+    let engine = sprig_engine::Engine::open(c).unwrap();
+    let g = EngineGraph::open(Arc::new(engine.clone()), 7, 3, 1).unwrap();
+    assert_eq!(g.alloc(IdKind::Node, 2).await.unwrap(), vec![1, 2]);
+    assert_eq!(g.alloc(IdKind::Node, 1).await.unwrap(), vec![3]);
+    engine.lead(sprig_engine::Engine::unit_of_tenant(7));
+    let next = g.alloc(IdKind::Node, 1).await.unwrap();
+    assert!(next[0] > ID_BLOCK, "{next:?}");
+    drop(g);
+    drop(engine);
+    let _ = std::fs::remove_dir_all(&d);
+}

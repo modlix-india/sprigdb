@@ -229,6 +229,25 @@ impl DocTxn {
         self.txn.delete(key).map_err(|e| self.err(&e))
     }
 
+    /// Notes what the write of document key `key` (a logical key) was, for
+    /// the change log (a change stream's operation type).
+    ///
+    /// # Errors
+    /// The transaction is not active.
+    pub fn hint(
+        &mut self,
+        key: &[u8],
+        op: sprig_engine::observe::hint::HintOp,
+    ) -> Result<(), MongoError> {
+        let tenant = key
+            .get(..8)
+            .and_then(|b| b.try_into().ok())
+            .map_or(0, u64::from_be_bytes);
+        self.txn
+            .add_note_for_tenant(tenant, sprig_engine::observe::hint::encode(key, op, &[]))
+            .map_err(|e| self.err(&e))
+    }
+
     /// Starts a statement: its writes can be undone alone.
     pub fn begin_statement(&mut self) {
         self.txn.begin_statement();
@@ -269,6 +288,40 @@ impl DocTxn {
     pub fn rollback(self) {
         self.txn.rollback();
     }
+}
+
+/// Checks a `changeStreamPreAndPostImages` option: `{enabled: <bool>}`.
+///
+/// # Errors
+/// 40414 without `enabled`; 14 for another type; 40415 for another field.
+pub fn check_pre_post(v: &bson::Bson) -> Result<(), MongoError> {
+    let d = v.as_document().ok_or_else(|| {
+        MongoError::new(
+            code::TYPE_MISMATCH,
+            "BSON field 'changeStreamPreAndPostImages' is the wrong type, expected type 'object'",
+        )
+    })?;
+    for (k, x) in d {
+        if k != "enabled" {
+            return Err(MongoError::new(
+                40415,
+                format!("BSON field 'changeStreamPreAndPostImages.{k}' is an unknown field."),
+            ));
+        }
+        if !matches!(x, bson::Bson::Boolean(_)) {
+            return Err(MongoError::new(
+                code::TYPE_MISMATCH,
+                "BSON field 'changeStreamPreAndPostImages.enabled' is the wrong type, expected type 'bool'",
+            ));
+        }
+    }
+    if !d.contains_key("enabled") {
+        return Err(MongoError::new(
+            40414,
+            "BSON field 'changeStreamPreAndPostImages.enabled' is missing but a required field",
+        ));
+    }
+    Ok(())
 }
 
 /// `db.coll`.
@@ -958,6 +1011,10 @@ impl DocStore {
                 | "apiVersion"
                 | "apiStrict"
                 | "apiDeprecationErrors" => {}
+                "changeStreamPreAndPostImages" => {
+                    check_pre_post(v)?;
+                    meta.options.insert(k.clone(), v.clone());
+                }
                 "validator" | "validationLevel" | "validationAction" => {
                     meta.options.insert(k.clone(), v.clone());
                     if k == "validator" {

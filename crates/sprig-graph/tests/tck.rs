@@ -1,7 +1,6 @@
 //! The openCypher TCK through a
 //! small Gherkin runner of our own, on the in-memory store with 1 and 4
-//! shards (the MariaDB store answers as memory does: the differential and
-//! store tests show it).
+//! shards, or the storage engine's store (`SPRIG_TCK_ENGINE`).
 //!
 //! The feature files (Apache-2.0) are test data, not part of the
 //! repository: `SPRIG_TCK_DIR` names the `tck/features` folder of an
@@ -38,246 +37,10 @@ use sprig_graph::store::GraphStore;
 use sprig_graph::value::Value;
 use sprig_graph::{Budgets, Output, execute};
 
-/// The graph catalog's records for these tests (in memory: the graph
-/// module's rows live in the engine's catalog records).
-fn catalog_records() -> &'static sprig_catalog::records::mem::MemRecords {
-    static M: std::sync::OnceLock<sprig_catalog::records::mem::MemRecords> =
-        std::sync::OnceLock::new();
-    M.get_or_init(sprig_catalog::records::mem::MemRecords::new)
-}
-
-/// Adds a native label or type to graph `g` in a transaction of its own.
-async fn add_source(g: u64, label: bool, name: &str) -> sprig_common::Result<u32> {
-    use sprig_catalog::records::RecordStore as _;
-    let mut tx = catalog_records()
-        .begin(sprig_common::ids::TenantId(1))
-        .await?;
-    let id = sprig_graph::catalog::GraphCatalog::add_source(&mut *tx, g, label, name).await?;
-    tx.commit().await?;
-    Ok(id)
-}
-
-/// The TCK over typed tables in MariaDB (`SPRIG_TCK_TYPED` set, with
-/// `SPRIG_TEST_MARIADB_SINGLE`): each scenario a graph of its own over
-/// four shard schemas with mirrors, each statement its own transaction.
-mod typed_env {
-    use std::collections::BTreeMap;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::{Arc, Mutex};
-    use std::time::Duration;
-
-    use async_trait::async_trait;
-    use mysql_async::prelude::Queryable;
-    use sprig_common::Result;
-    use sprig_graph::catalog::{GraphCatalog, Tables, backend_error};
-    use sprig_graph::eval::Params;
-    use sprig_graph::maria::{CounterIds, Dictionary, GraphShards, OneConn, ShardLoc};
-    use sprig_graph::typed::catalog::{DdlConns, SqlDdl, TypedDdl, load};
-    use sprig_graph::typed::store::{TypedStore, check_deleted};
-    use sprig_graph::{Budgets, Output, execute};
-
-    pub(crate) const CAT: &str = "gs_tck_cat";
-    pub(crate) const SHARDS: u32 = 4;
-    static NEXT: AtomicU64 = AtomicU64::new(1000);
-
-    struct Dict {
-        g: u64,
-        labels: Mutex<BTreeMap<u32, String>>,
-        types: Mutex<BTreeMap<u32, String>>,
-    }
-
-    #[async_trait]
-    impl Dictionary for Dict {
-        async fn create(&self, label: bool, name: &str) -> Result<u32> {
-            let id = super::add_source(self.g, label, name).await?;
-            let m = if label { &self.labels } else { &self.types };
-            m.lock().expect("lock").insert(id, name.to_owned());
-            Ok(id)
-        }
-    }
-
-    struct Conns(mysql_async::Pool);
-
-    #[async_trait]
-    impl DdlConns for Conns {
-        async fn catalog(&self) -> Result<mysql_async::Conn> {
-            self.0.get_conn().await.map_err(backend_error)
-        }
-        async fn cluster(&self, _cluster: &str) -> Result<mysql_async::Conn> {
-            self.0.get_conn().await.map_err(backend_error)
-        }
-    }
-
-    pub(crate) struct Env {
-        pool: mysql_async::Pool,
-        g: u64,
-        dict: Arc<Dict>,
-        ids: Arc<CounterIds>,
-        layout: Arc<GraphShards>,
-        ddl: Arc<SqlDdl>,
-    }
-
-    fn data(i: u32) -> String {
-        format!("gs_tck_s{i}")
-    }
-
-    /// The pool, the schemas made once.
-    pub(crate) async fn pool() -> Option<mysql_async::Pool> {
-        let url = std::env::var("SPRIG_TEST_MARIADB_SINGLE").ok()?;
-        let opts = mysql_async::Opts::from_url(&url).ok()?;
-        let pool = mysql_async::Pool::new(
-            mysql_async::OptsBuilder::from_opts(opts).pool_opts(
-                mysql_async::PoolOpts::new()
-                    .with_constraints(mysql_async::PoolConstraints::new(0, 8).expect("pool"))
-                    .with_inactive_connection_ttl(Duration::from_secs(30)),
-            ),
-        );
-        let mut c = pool.get_conn().await.ok()?;
-        for s in std::iter::once(CAT.to_owned()).chain((1..=SHARDS).map(data)) {
-            c.query_drop(format!("DROP DATABASE IF EXISTS {s}"))
-                .await
-                .ok()?;
-            c.query_drop(format!("CREATE DATABASE {s}")).await.ok()?;
-        }
-        GraphCatalog::migrate(&mut c, CAT).await.ok()?;
-        drop(c);
-        Some(pool)
-    }
-
-    impl Env {
-        pub(crate) async fn new(pool: &mysql_async::Pool) -> Result<Self> {
-            let g = NEXT.fetch_add(1, Ordering::Relaxed);
-            let mut c = pool.get_conn().await.map_err(backend_error)?;
-            let mut layout = GraphShards::single(g, 1, &data(1), "c1");
-            layout.group = 7;
-            layout.mirrors = true;
-            layout.shards = (0..SHARDS)
-                .map(|i| ShardLoc {
-                    shard: i + 1,
-                    lo: u64::try_from((u128::from(i) << 64) / u128::from(SHARDS)).expect("lo"),
-                    epoch: 1,
-                    cluster: "c1".into(),
-                    schema: data(i + 1),
-                    tables: Tables::of(&data(i + 1), g),
-                })
-                .collect();
-            for sh in &layout.shards {
-                for s in sprig_graph::typed::base_ddl(&sh.schema, g) {
-                    c.query_drop(s).await.map_err(backend_error)?;
-                }
-            }
-            for s in Tables::of(&data(1), g).seq_ddl() {
-                c.query_drop(s).await.map_err(backend_error)?;
-            }
-            let ddl = Arc::new(SqlDdl {
-                cat: CAT.into(),
-                graph: g,
-                shards: layout
-                    .shards
-                    .iter()
-                    .map(|s| (s.cluster.clone(), s.schema.clone()))
-                    .collect(),
-                conns: Arc::new(Conns(pool.clone())),
-            });
-            Ok(Self {
-                pool: pool.clone(),
-                g,
-                dict: Arc::new(Dict {
-                    g,
-                    labels: Mutex::new(BTreeMap::new()),
-                    types: Mutex::new(BTreeMap::new()),
-                }),
-                ids: Arc::new(CounterIds::new(pool.clone(), &Tables::of(&data(1), g), 64)),
-                layout: Arc::new(layout),
-                ddl,
-            })
-        }
-
-        pub(crate) fn labels(&self) -> Vec<String> {
-            self.dict
-                .labels
-                .lock()
-                .expect("lock")
-                .values()
-                .cloned()
-                .collect()
-        }
-
-        pub(crate) async fn execute(&self, q: &str, params: &Params) -> Result<Output> {
-            let mut conn = self.pool.get_conn().await.map_err(backend_error)?;
-            conn.query_drop("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
-                .await
-                .map_err(backend_error)?;
-            conn.query_drop("START TRANSACTION")
-                .await
-                .map_err(backend_error)?;
-            let schema = {
-                let mut c = self.pool.get_conn().await.map_err(backend_error)?;
-                load(&mut c, CAT, self.g).await?
-            };
-            let labels = self.dict.labels.lock().expect("lock").clone();
-            let types = self.dict.types.lock().expect("lock").clone();
-            let r = {
-                let mut one = OneConn(&mut conn);
-                let ddl: Arc<dyn TypedDdl> = self.ddl.clone();
-                let r = {
-                    let mut store = TypedStore::new(
-                        &mut one,
-                        Arc::clone(&self.layout),
-                        schema,
-                        ddl,
-                        labels,
-                        types,
-                        self.dict.clone(),
-                        self.ids.clone(),
-                    );
-                    execute(&mut store, q, params, &Budgets::default()).await
-                };
-                match r {
-                    Ok(o) => {
-                        let s = {
-                            let mut c = self.pool.get_conn().await.map_err(backend_error)?;
-                            load(&mut c, CAT, self.g).await?
-                        };
-                        check_deleted(&mut one, &self.layout, &s, &o.deleted_nodes)
-                            .await
-                            .map(|()| o)
-                    }
-                    Err(e) => Err(e),
-                }
-            };
-            let end = if r.is_ok() { "COMMIT" } else { "ROLLBACK" };
-            conn.query_drop(end).await.map_err(backend_error)?;
-            r
-        }
-
-        /// Drops the scenario's tables.
-        pub(crate) async fn drop(self) {
-            let Ok(mut c) = self.pool.get_conn().await else {
-                return;
-            };
-            let Ok(s) = load(&mut c, CAT, self.g).await else {
-                return;
-            };
-            for sh in &self.layout.shards {
-                for d in sprig_graph::typed::drop_ddl(&sh.schema, self.g, &s) {
-                    let _ = c.query_drop(d).await;
-                }
-            }
-            let _ = c
-                .query_drop(format!(
-                    "DROP TABLE IF EXISTS {}",
-                    Tables::of(&data(1), self.g).seq
-                ))
-                .await;
-        }
-    }
-}
-
 /// Where a scenario runs.
+#[allow(clippy::large_enum_variant)] // one per scenario
 enum Store {
     Mem(MemStore),
-    Typed(typed_env::Env),
     /// The storage engine's store (`SPRIG_TCK_ENGINE` set), on an
     /// in-memory engine path, one transaction per scenario.
     Engine(Box<sprig_graph::engine::EngineStore<'static>>),
@@ -297,7 +60,6 @@ impl Store {
     async fn execute(&mut self, q: &str, p: &Params) -> Result<Output, sprig_common::SprigError> {
         match self {
             Self::Mem(m) => execute(m, q, p, &Budgets::default()).await,
-            Self::Typed(t) => t.execute(q, p).await,
             Self::Engine(e) => execute(&mut **e, q, p, &Budgets::default()).await,
         }
     }
@@ -305,7 +67,6 @@ impl Store {
     fn all_labels(&self) -> Vec<String> {
         match self {
             Self::Mem(m) => m.all_labels(),
-            Self::Typed(t) => t.labels(),
             Self::Engine(e) => e.all_labels(),
         }
     }
@@ -943,22 +704,16 @@ fn counts(stats: &BTreeMap<String, i64>) -> BTreeMap<&'static str, i64> {
     m
 }
 
-async fn run(s: &Scenario, shards: usize, typed: Option<&mysql_async::Pool>) -> Outcome {
-    // The sharded run reads properties late, as reads over MariaDB do.
-    let mut store = match typed {
-        Some(pool) => match typed_env::Env::new(pool).await {
-            Ok(e) => Store::Typed(e),
-            Err(e) => return Outcome::Fail(format!("typed setup: {e}")),
-        },
-        None if engine_mode() => engine_store(shards),
-        None if shards > 1 => Store::Mem(MemStore::new(shards).with_late_reads()),
-        None => Store::Mem(MemStore::new(shards)),
+async fn run(s: &Scenario, shards: usize) -> Outcome {
+    // The sharded run reads properties late.
+    let mut store = if engine_mode() {
+        engine_store(shards)
+    } else if shards > 1 {
+        Store::Mem(MemStore::new(shards).with_late_reads())
+    } else {
+        Store::Mem(MemStore::new(shards))
     };
-    let o = run_on(s, &mut store).await;
-    if let Store::Typed(e) = store {
-        e.drop().await;
-    }
-    o
+    run_on(s, &mut store).await
 }
 
 async fn run_on(s: &Scenario, store: &mut Store) -> Outcome {
@@ -1119,16 +874,7 @@ async fn opencypher_tck() {
     let mut files = Vec::new();
     features(Path::new(&dir), &mut files);
     let mut report = String::new();
-    let typed = if std::env::var("SPRIG_TCK_TYPED").is_ok_and(|v| !v.is_empty()) {
-        typed_env::pool().await
-    } else {
-        None
-    };
-    let modes: &[usize] = if typed.is_some() {
-        &[typed_env::SHARDS as usize]
-    } else {
-        &[1, 4]
-    };
+    let modes: &[usize] = &[1, 4];
     for &shards in modes {
         let (mut pass, mut fail, mut skip) = (0usize, 0usize, 0usize);
         let mut by_area: BTreeMap<String, (usize, usize)> = BTreeMap::new();
@@ -1144,12 +890,9 @@ async fn opencypher_tck() {
                 })
                 .unwrap_or_default();
             for s in parse_feature(f) {
-                let o = tokio::time::timeout(
-                    std::time::Duration::from_secs(20),
-                    run(&s, shards, typed.as_ref()),
-                )
-                .await
-                .unwrap_or_else(|_| Outcome::Fail("timed out".into()));
+                let o = tokio::time::timeout(std::time::Duration::from_secs(20), run(&s, shards))
+                    .await
+                    .unwrap_or_else(|_| Outcome::Fail("timed out".into()));
                 let e = by_area.entry(area.clone()).or_default();
                 match o {
                     Outcome::Pass => {
@@ -1175,9 +918,7 @@ async fn opencypher_tck() {
         let run = pass + fail;
         eprintln!(
             "openCypher TCK on {shards} shard(s){}: {pass} of {run} run scenarios pass ({:.1}%), {skip} skipped, {} total",
-            if typed.is_some() {
-                ", typed tables in MariaDB"
-            } else if engine_mode() {
+            if engine_mode() {
                 ", the storage engine's store"
             } else {
                 ""

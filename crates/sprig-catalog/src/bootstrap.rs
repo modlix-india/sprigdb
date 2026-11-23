@@ -295,6 +295,51 @@ pub async fn write_progress(
         .await
 }
 
+/// [`write_progress`] for a catalog kept in engine records (EC-124):
+/// `sprig.bootstrap` in the tenant's records.
+///
+/// # Errors
+/// The records' errors.
+#[allow(clippy::too_many_arguments)] // the record's fields
+pub async fn write_progress_records(
+    records: &dyn crate::records::RecordStore,
+    tenant: sprig_common::ids::TenantId,
+    step: BootstrapStep,
+    cluster: &ClusterId,
+    placement: &str,
+    considered: &[(ClusterId, u64)],
+    at: SystemTime,
+) -> Result<()> {
+    let p = BootstrapProgress {
+        step,
+        cluster: cluster.clone(),
+        placement: placement.to_owned(),
+        considered: considered.to_vec(),
+        at: rfc3339(at),
+    };
+    let value = serde_json::to_value(&p)
+        .map_err(|e| SprigError::internal(format!("encoding {BOOTSTRAP_KEY}: {e}")))?;
+    let mut tx = records.begin(tenant).await?;
+    crate::store::rec::CoreRecords::put_internal(&mut *tx, BOOTSTRAP_KEY, &value, 0, at).await?;
+    tx.commit().await
+}
+
+/// `sprig.bootstrap` from the tenant's records ([`write_progress_records`]).
+///
+/// # Errors
+/// The records' errors; `Internal` for a bad record.
+pub async fn read_progress_records(
+    records: &dyn crate::records::RecordStore,
+    tenant: sprig_common::ids::TenantId,
+) -> Result<Option<BootstrapProgress>> {
+    let mut tx = records.begin(tenant).await?;
+    let v = crate::store::rec::CoreRecords::internal(&mut *tx, BOOTSTRAP_KEY).await;
+    let _ = tx.rollback().await;
+    v?.map(serde_json::from_value)
+        .transpose()
+        .map_err(|e| SprigError::internal(format!("bad {BOOTSTRAP_KEY}: {e}")))
+}
+
 /// Drops the catalog schema of a tenant being deleted.
 ///
 /// The caller first makes sure the catalog lists no live database: the

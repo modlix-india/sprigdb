@@ -489,30 +489,18 @@ impl PassSession {
             .get::<sprig_inherit::InheritState>(sprig_inherit::MODULE)
             .is_some_and(|st| st.object(object).is_some());
         let template = ts.schema_of(Some(&db.name));
-        let layout = super::router::ddl_layout(ts);
-        let list: Vec<(String, ClusterId)> = match (&layout, &template) {
-            (Some(l), Some(t)) => l(t, Some(&obj.name)).filter(|v| !v.is_empty()),
-            _ => None,
-        }
-        .or_else(|| template.clone().map(|t| vec![(t, own_cluster.clone())]))
-        .ok_or_else(|| SprigError::internal("the table has no shard this gateway can find"))?;
-        // Where a policy subquery's table lives: its group's shard here if
-        // co-located with this shard, else its first shard, else its
-        // database's schema.
+        let list: Vec<(String, ClusterId)> = template
+            .clone()
+            .map(|t| vec![(t, own_cluster.clone())])
+            .ok_or_else(|| SprigError::internal("the table has no shard this gateway can find"))?;
+        // Where a policy subquery's table lives: its database's schema.
         let table_schema = |d: &str, t: &str, here: &str| -> Option<String> {
             // The subtree view is the cluster's own.
             if d.eq_ignore_ascii_case(sprig_sql::rls::subtree::SYS_SCHEMA) {
                 return Some(sprig_sql::rls::subtree::SYS_SCHEMA.to_owned());
             }
-            let tmpl = ts.schema_of(Some(d))?;
-            let shards = layout
-                .as_ref()
-                .and_then(|l| l(&tmpl, Some(t)))
-                .unwrap_or_default();
-            if shards.iter().any(|(s, _)| s == here) {
-                return Some(here.to_owned());
-            }
-            shards.first().map(|(s, _)| s.clone()).or(Some(tmpl))
+            let _ = (t, here);
+            ts.schema_of(Some(d))
         };
         // Triggers and the policy view run as a user who reads and writes
         // the table itself: the changing user when it can.
@@ -778,13 +766,10 @@ impl PassSession {
             return Ok(());
         };
         let template = ts.schema_of(Some(&db.name));
-        let layout = super::router::ddl_layout(ts);
-        let list: Vec<(String, ClusterId)> = match (&layout, &template) {
-            (Some(l), Some(t)) => l(t, Some(&obj.name)).filter(|v| !v.is_empty()),
-            _ => None,
-        }
-        .or_else(|| template.clone().map(|t| vec![(t, own_cluster.clone())]))
-        .unwrap_or_default();
+        let list: Vec<(String, ClusterId)> = template
+            .clone()
+            .map(|t| vec![(t, own_cluster.clone())])
+            .unwrap_or_default();
         // The shard list is in the key: a split or move needn't change the
         // catalog version, and the mover copies triggers but not views.
         // So is `rls.backend_enforcement`: a global value changes
@@ -1159,38 +1144,6 @@ impl PassSession {
         let tainted = tainted.names;
         names.extend(tainted.iter().cloned());
         Ok((names, tainted, fixable))
-    }
-
-    /// Whether `text`, the text of a SQL-level prepared statement, names a
-    /// table the session's row-level security binds (or code over one), so
-    /// that `PREPARE ... FROM` it would be refused (39366). An `EXECUTE` of a
-    /// statement MariaDB holds is checked with it: the statement may have
-    /// been prepared before the policy, or from a variable.
-    pub(super) async fn rls_names_protected(
-        &mut self,
-        cx: &ExecCtx<'_>,
-        text: &[u8],
-    ) -> Result<bool> {
-        let (lex_opts, _) = self.lex_opts();
-        let Some(ts) = self.tenant.as_deref() else {
-            return Ok(false);
-        };
-        let Some(cat) = ts.catalog().cloned() else {
-            return Ok(false);
-        };
-        if !RlsState::of(&cat).is_some_and(RlsState::any_enabled)
-            || crate::tenant::rls::is_exempt(cx.session.id)
-        {
-            return Ok(false);
-        }
-        let Some(rls) = crate::tenant::authz::privileges(ts, &cat).row_policies() else {
-            return Ok(false);
-        };
-        if rls.is_empty() {
-            return Ok(false);
-        }
-        let (names, _, _) = self.rls_refused_names(&cat, &rls).await?;
-        Ok(names_any(&words(text, &lex_opts), &names))
     }
 
     /// The rewrite before planning (see the module docs): the text to plan
@@ -1837,7 +1790,6 @@ impl PassSession {
             x.hash(&mut h);
             h.finish()
         };
-        let layout = super::router::ddl_layout(ts);
         let db_of = |schema: &str| -> Option<u32> {
             let rest = schema.strip_prefix(&format!("t{tenant}_d"))?;
             let end = rest.find('_')?;
@@ -1857,12 +1809,10 @@ impl PassSession {
                 continue;
             };
             let template = ts.schema_of(Some(&db.name));
-            let list: Vec<(String, ClusterId)> = match (&layout, &template) {
-                (Some(l), Some(t)) => l(t, None).filter(|v| !v.is_empty()),
-                _ => None,
-            }
-            .or_else(|| template.clone().map(|t| vec![(t, own_cluster.clone())]))
-            .unwrap_or_default();
+            let list: Vec<(String, ClusterId)> = template
+                .clone()
+                .map(|t| vec![(t, own_cluster.clone())])
+                .unwrap_or_default();
             let mut shards = super::logic_bound::CtlShards {
                 list: list.clone(),
                 conns: HashMap::new(),

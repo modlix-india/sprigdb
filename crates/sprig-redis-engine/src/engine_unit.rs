@@ -109,6 +109,10 @@ impl Unit for EngineUnit {
         Ok(EngineBatch { txn, held: keys })
     }
 
+    fn leader_epoch(&self, key: &[u8]) -> u64 {
+        self.path.leader_epoch_of(self.path.unit_of(key))
+    }
+
     fn now_ms(&self) -> i64 {
         match self.clock.load(Ordering::Relaxed) {
             i64::MIN => std::time::SystemTime::now()

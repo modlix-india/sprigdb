@@ -33,7 +33,6 @@ sprig-common.workspace = true
 sprig-settings.workspace = true
 # Graph hops are router routes: the router plans each
 # shard statement from its own map cache's group.
-sprig-router.workspace = true
 sprig-shard.workspace = true
 tokio.workspace = true
 tracing.workspace = true

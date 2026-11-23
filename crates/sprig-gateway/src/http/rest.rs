@@ -126,6 +126,11 @@ pub async fn handle(core: &Arc<Core>, info: &ConnInfo, req: Request<Incoming>) -
     if method == Method::GET && path == "/admin/v1/openapi.json" {
         return json_response(200, &routes::openapi(true));
     }
+    if method == Method::POST && path == crate::node_engine::REPLACE_PATH {
+        return replace_replica(core, req)
+            .await
+            .unwrap_or_else(|e| error_response(&e));
+    }
     let Some(m) = routes::find(method.as_str(), &path) else {
         let (status_code, msg) = if routes::path_known(&path) {
             (405, format!("{method} is not allowed on {path}"))
@@ -152,6 +157,46 @@ pub async fn handle(core: &Arc<Core>, info: &ConnInfo, req: Request<Incoming>) -
         data(core, info, &rpc, m, req).await
     };
     r.unwrap_or_else(|e| error_response(&e))
+}
+
+/// `POST /admin/v1/engine/replicas:replace` (this gateway's own engine,
+/// not a controller route): `{"dead": 1, "new": 4, "new_addr":
+/// "host:port"}` replaces a lost replica in every unit this node holds.
+async fn replace_replica(
+    core: &Arc<Core>,
+    req: Request<Incoming>,
+) -> Result<Response<Body>, SprigError> {
+    let auth = header(&req, "authorization");
+    core.admin.authorized(auth.as_deref()).await?;
+    let body = parse_json(&read_body(req, 64 << 10).await?)?;
+    let bad = |m: String| SprigError::new(SprigCode::AdminRequestInvalid, m);
+    let id = |k: &str| {
+        body.get(k)
+            .and_then(Value::as_u64)
+            .ok_or_else(|| bad(format!("'{k}' (a node id) is required")))
+    };
+    let (dead, new) = (id("dead")?, id("new")?);
+    let addr = match body.get("new_addr").and_then(Value::as_str) {
+        None | Some("") => None,
+        Some(a) => Some(
+            a.parse()
+                .map_err(|_| bad(format!("'new_addr' must be host:port, not '{a}'")))?,
+        ),
+    };
+    let timeout = std::time::Duration::from_secs(
+        body.get("timeout_seconds")
+            .and_then(Value::as_u64)
+            .unwrap_or(120),
+    );
+    let report = tokio::task::spawn_blocking(move || {
+        crate::node_engine::replace_replica(dead, new, addr, timeout)
+    })
+    .await
+    .map_err(|e| SprigError::internal(format!("replacing a replica: {e}")))??;
+    Ok(json_response(
+        200,
+        &serde_json::to_value(report).unwrap_or_default(),
+    ))
 }
 
 async fn admin(

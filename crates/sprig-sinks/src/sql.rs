@@ -151,6 +151,12 @@ pub trait Host: Send {
         None
     }
 
+    /// The engine table `name` of database `db`: its object id. `None`
+    /// when there is none, or this host can't tell.
+    fn table(&self, _db: u32, _name: &str) -> Option<u64> {
+        None
+    }
+
     /// What `TEST CONNECTION` and `TEST SINK` open connections and read
     /// sources through, as a sink task would. `None`: this
     /// host can't run them.
@@ -1191,14 +1197,48 @@ async fn sink_def(h: &mut dyn Host, c: grammar::CreateSink) -> Result<SinkDef> {
     let (db, dbname) = db_of(h, c.name.db.as_deref())?;
     // The source, readable by the owner.
     let source = match &c.source {
-        grammar::SourceAst::Stream(_)
-        | grammar::SourceAst::FanIn { .. }
-        | grammar::SourceAst::Changes(_) => {
+        grammar::SourceAst::Stream(_) | grammar::SourceAst::FanIn { .. } => {
             return Err(err(
                 SprigCode::SinkOptionInvalid,
-                "sinks read queues only: streams are stored on the SprigDB engine, which has \
-                 no sink source yet, and tables' changes wait for the engine's change log",
+                "sinks read queues and tables' changes only: streams are stored on the \
+                 SprigDB engine, which has no stream sink source yet",
             ));
+        }
+        grammar::SourceAst::Changes(ts) => {
+            // Engine tables' changes, read from the change log as the
+            // owner, who needs SELECT on each table.
+            let mut objects = Vec::new();
+            for t in ts {
+                let (tdb, tdbname) = db_of(h, t.db.as_deref().or(Some(&dbname)))?;
+                let id = h.table(tdb, &t.name).ok_or_else(|| {
+                    sprig_common::SprigError::standard(
+                        1146,
+                        *b"42S02",
+                        format!("Table '{tdbname}.{}' doesn't exist", t.name),
+                    )
+                })?;
+                if !h.can_select(&tdbname, &t.name) {
+                    return Err(err(
+                        SprigCode::SinkPrivilege,
+                        format!("you need SELECT on table {}", t.name),
+                    ));
+                }
+                if !objects.iter().any(|(o, _)| *o == id) {
+                    objects.push((id, t.name.clone()));
+                }
+            }
+            if c.start_at == StartAt::Snapshot {
+                return Err(bad_option(
+                    "START AT SNAPSHOT isn't built for engine tables' changes yet: use LATEST, \
+                     EARLIEST or a TIMESTAMP",
+                ));
+            }
+            if c.guarantee == Guarantee::ExactlyOnce && objects.len() > 1 {
+                return Err(bad_option(
+                    "EXACTLY ONCE with CHANGES OF more than one table isn't built yet",
+                ));
+            }
+            SourceSpec::Changes { objects }
         }
         grammar::SourceAst::Queue(q) => {
             // A durable queue of the database's vhost, which the sink

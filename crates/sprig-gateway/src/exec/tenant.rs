@@ -405,7 +405,11 @@ impl PassSession {
         let Some(bs) = &self.bs else {
             return ts.current.clone();
         };
-        let schema = bs.vars().schema.as_deref()?;
+        // No schema on MariaDB: the current database, if any, is an
+        // engine database (`use_engine_database`).
+        let Some(schema) = bs.vars().schema.as_deref() else {
+            return ts.current.clone().filter(|c| self.engine_database_named(c));
+        };
         if let Some(db) = ts.map().logical(schema) {
             return Some(db.name.clone());
         }
@@ -881,54 +885,6 @@ impl PassSession {
             };
         }
 
-        // Global lookup indexes (before the pins, whose parser claims every
-        // `SPRIG SHOW`): `SPRIG SHOW|REBUILD|DROP LOOKUP INDEX`.
-        if let Some(stmt) = crate::tenant::lookups_sql::parse_bytes(text) {
-            if sandbox {
-                return self.fail(out, &must_reset()).await;
-            }
-            let current = self.current_logical();
-            let Some(ts) = self.tenant.as_deref_mut() else {
-                return Err(SprigError::internal("no tenant"));
-            };
-            let cat = match ts.refresh().await {
-                Ok(c) => c,
-                Err(e) => return self.fail(out, &e).await,
-            };
-            let r = Box::pin(crate::tenant::lookups_sql::execute(
-                ts,
-                &cat,
-                current.as_deref(),
-                &stmt,
-                charset,
-            ))
-            .await;
-            if let Some(ts) = self.tenant.as_deref_mut() {
-                // Its own publishes: the session reads them next.
-                let _ = ts.refresh().await;
-            }
-            let s = status(self.status());
-            return match r {
-                Ok(crate::tenant::lookups_sql::LookupAnswer::Ok { affected }) => {
-                    let mut ok = OkPacket::new(s);
-                    ok.affected_rows = affected;
-                    out.ok(ok).await?;
-                    Ok(Step {
-                        errored: false,
-                        status: Some(s),
-                    })
-                }
-                Ok(crate::tenant::lookups_sql::LookupAnswer::Rows(ans)) => {
-                    send_local(out, &ans, format, s).await?;
-                    Ok(Step {
-                        errored: false,
-                        status: Some(s),
-                    })
-                }
-                Err(e) => self.fail(out, &e).await,
-            };
-        }
-
         // The advisor's pins and advice (`SPRIG PIN`, `UNPIN`, `SHOW`).
         if let Some(parsed) = sprig_sql::pin_stmt::parse(text, &lex) {
             if sandbox {
@@ -1122,25 +1078,6 @@ impl PassSession {
                 &owned
             }
             Some(Err(e)) => return self.fail(out, &e).await,
-        };
-        // ...and `information_schema.SPRIG_LOOKUP_INDEXES`.
-        let lookups_owned;
-        let text: &Bytes = if text
-            .windows(20)
-            .any(|w| w.eq_ignore_ascii_case(b"SPRIG_LOOKUP_INDEXES"))
-        {
-            let view =
-                crate::tenant::lookups_sql::view_sql(ts, &cat, lex.no_backslash_escapes).await;
-            match settings_sql::inline_named(text, &lex, "SPRIG_LOOKUP_INDEXES", || view) {
-                None => text,
-                Some(Ok(t)) => {
-                    lookups_owned = Bytes::from(t);
-                    &lookups_owned
-                }
-                Some(Err(e)) => return self.fail(out, &e).await,
-            }
-        } else {
-            text
         };
         // 3306: MySQL-only executable comments whose body MariaDB
         // understands, and `CAST(? AS JSON)`.
@@ -1500,12 +1437,6 @@ impl PassSession {
         };
         let attr_owned = attr_pairs(attrs);
         let mut retried = false;
-        // Metadata of the tables the advisor grouped.
-        let grouped = self.grouped_tables().await;
-        // `information_schema` rows of groups on other clusters,
-        // read there between two planning passes.
-        let mut remote = sprig_sql::names::RemoteBranches::default();
-        let mut remote_read = false;
         let planned = loop {
             let current = self.current_logical();
             let Some(ts) = self.tenant.as_deref() else {
@@ -1523,25 +1454,7 @@ impl PassSession {
                     tenant: ts.tenant,
                     user: &ts.principal.user,
                 };
-                let with = grouped.as_deref().map(|g| sprig_sql::names::WithGroups {
-                    base: &*map,
-                    groups: g,
-                });
-                let names: &dyn NameMap = match &with {
-                    Some(w) => w,
-                    None => &*map,
-                };
-                let far = grouped.as_deref().filter(|g| g.has_remote()).map(|g| {
-                    sprig_sql::names::WithRemote {
-                        inner: names,
-                        groups: g,
-                        branches: &remote,
-                    }
-                });
-                let names: &dyn NameMap = match &far {
-                    Some(w) => w,
-                    None => names,
-                };
+                let names: &dyn NameMap = &*map;
                 let mut rw = RewriteCtx::new(names, self.persona)
                     .lex(lex)
                     .current_db(current.as_deref())
@@ -1570,19 +1483,7 @@ impl PassSession {
                 plan(text, &pctx)
             };
             match r {
-                Ok(p) => {
-                    let wanted = remote.take_wanted();
-                    if wanted.is_empty() || remote_read {
-                        break Ok((p, map));
-                    }
-                    remote_read = true;
-                    for (cluster, sql) in wanted {
-                        match self.remote_branch_rows(cx, &cluster, &sql).await {
-                            Ok(rows) => remote.insert(sql, rows),
-                            Err(e) => return self.fail(out, &e).await,
-                        }
-                    }
-                }
+                Ok(p) => break Ok((p, map)),
                 Err(NameError::UnknownDatabase(n)) if !retried => {
                     retried = true;
                     let Some(ts) = self.tenant.as_deref_mut() else {
@@ -1733,13 +1634,22 @@ impl PassSession {
                 Box::pin(self.tenant_select(cx, sql, &original, more, format, mapper, &*map, out))
                     .await
             }
-            // Through the router when the tenant has shards.
             Route::Forward(sql, mapper) => {
                 // Every step left a plain statement's text alone: its
                 // shape may skip them next time (exec/engine_seam/fast.rs).
                 let unchanged = text.as_ptr() == entry.as_ptr() && text.len() == entry.len();
                 self.fast_forwarding(&sql, &entry, unchanged);
-                Box::pin(self.routed(cx, sql, &original, more, format, mapper, &*map, out)).await
+                Box::pin(self.forward(
+                    cx,
+                    Bytes::from(sql),
+                    Some(&original),
+                    more,
+                    format,
+                    mapper,
+                    &*map,
+                    out,
+                ))
+                .await
             }
         }
     }
@@ -1784,6 +1694,24 @@ impl PassSession {
             {
                 return Ok(Route::Done(self.fail(out, &e).await?));
             }
+        }
+        // `USE` of an engine database: answered here, MariaDB told nothing.
+        if sp.info.kind == StmtKind::Use
+            && let Some(sprig_sql::names::rewrite::UseTarget::Database { logical, .. }) =
+                &sp.info.use_target
+            && self.engine_database_named(logical)
+        {
+            let name = logical.clone();
+            if let Err(e) = self.use_engine_database(&name) {
+                return Ok(Route::Done(self.fail(out, &e).await?));
+            }
+            let mut ok = OkPacket::new(s);
+            ok.set_session_changes(&[SessionChange::Schema(Bytes::from(name))]);
+            out.ok(ok).await?;
+            return Ok(Route::Done(Step {
+                errored: false,
+                status: Some(s),
+            }));
         }
         if let Some(target) = &sp.info.ddl {
             // DDL an engine database's rows can't follow.
@@ -1878,18 +1806,11 @@ impl PassSession {
             }
             Err(e) => return Ok(Route::Done(self.fail(out, &e.into()).await?)),
         };
-        // DDL inside a transaction the router's coordinator holds commits
-        // it first, as MySQL does; a failed commit is the
-        // statement's error.
-        let status = if self.router.in_txn() {
-            if let Err(e) = self.implicit_commit(cx).await {
-                return Ok(Route::Done(self.fail(out, &e).await?));
-            }
-            (status & StatusFlags::MORE_RESULTS_EXISTS) | self.status()
-        } else if self.bs.as_ref().is_some_and(|b| b.pins().in_transaction()) {
-            // The same for a transaction on the session's own connection:
-            // the DDL runs on another one, so without the commit it would
-            // stay open (and its metadata locks could block the DDL).
+        // DDL inside a transaction on the session's own connection commits
+        // it first, as MySQL does: the DDL runs on another connection, so
+        // without the commit it would stay open (and its metadata locks
+        // could block the DDL); a failed commit is the statement's error.
+        let status = if self.bs.as_ref().is_some_and(|b| b.pins().in_transaction()) {
             if let Err(e) = self.backend_rows(cx, "COMMIT").await {
                 return Ok(Route::Done(self.fail(out, &e).await?));
             }
@@ -1938,52 +1859,7 @@ impl PassSession {
             Ok(p) => p,
             Err(e) => return Ok(Route::Done(self.fail(out, &e).await?)),
         };
-        // A foreign key the gateway keeps leaves the
-        // shards' statement and becomes a `foreign_keys` row.
-        let mut fk_change = None;
-        let wire = out.wire();
-        let physical = match self
-            .fk_ddl_plan(cx, &physical, &ResultMapper::relay(), &*map, wire)
-            .await
-        {
-            super::router::FkDdl::Keep => physical,
-            super::router::FkDdl::Run(sql, change) => {
-                fk_change = Some(change);
-                sql
-            }
-            super::router::FkDdl::Skip(change) => {
-                if let Err(e) = self.fk_ddl_commit(&change).await {
-                    return Ok(Route::Done(self.fail(out, &e).await?));
-                }
-                out.ok(OkPacket::new(status)).await?;
-                return Ok(Route::Done(Step {
-                    errored: false,
-                    status: Some(status),
-                }));
-            }
-            super::router::FkDdl::Fail(e) => return Ok(Route::Done(self.fail(out, &e).await?)),
-        };
-        // A unique key on a sharded table without the distribution key
-        // gets a global lookup index after the shards' DDL; a dropped key
-        // loses its lookup first.
-        let lookup_adds = match self.lookup_ddl_plan(&physical, &logical).await {
-            super::router::LookupDdl::Keep => None,
-            super::router::LookupDdl::Fail(e) => {
-                return Ok(Route::Done(self.fail(out, &e).await?));
-            }
-            super::router::LookupDdl::Drop(d) => {
-                if let Err(e) = self.lookup_ddl_drop(&d).await {
-                    return Ok(Route::Done(self.fail(out, &e).await?));
-                }
-                None
-            }
-            super::router::LookupDdl::Build(a) => Some(a),
-        };
-        // Auto-indexing's 64-index rule: room for the user's indexes.
         let (lex, _) = self.lex_opts();
-        if let Some(ts) = self.tenant.as_deref() {
-            autoindex::make_room(ts, &ctl, target, original, &lex).await;
-        }
         // The committed rows of a dropped
         // database's cross-tenant outbox are forwarded first (39245 when
         // they can't be within inherit.outbox_drain_seconds).
@@ -1997,22 +1873,14 @@ impl PassSession {
         }
         // The database's sinks, connections and logic modules
         // go with it once the drop has published.
-        let mut db_drop = match &stmt {
+        let db_drop = match &stmt {
             DdlStatement::DropDatabase { name, .. } => self
                 .tenant
                 .as_deref()
                 .and_then(|ts| super::dropdb::DbDrop::before(ts, name, lctn)),
             _ => None,
         };
-        // Its table groups' shards, which may be on other clusters: read
-        // now, refused while a mover job holds one.
-        if let Some(d) = db_drop.as_mut()
-            && let Err(e) = Box::pin(d.prepare(&svc)).await
-        {
-            return Ok(Route::Done(self.fail(out, &e).await?));
-        }
         let ctl_pool = ctl.clone();
-        let undo_pool = ctl.clone();
         let ctl = MariaExecutor::new(ctl);
         let req = DdlRequest {
             tenant,
@@ -2032,54 +1900,18 @@ impl PassSession {
             .as_deref()
             .map(|ts| crate::tenant::authz::dropped_objects(ts, &stmt, current.as_deref()))
             .unwrap_or_default();
-        // The global lookup indexes of the tables a DROP removes go with
-        // them once it succeeded.
-        let lookup_owners = self
-            .tenant
-            .as_deref()
-            .map(|ts| crate::tenant::lookups_sql::owners_dropped(ts, &dropped))
-            .unwrap_or_default();
         // A rename leaves table grants with the old names, as
         // MySQL does; the engine records that before the statement runs.
         if let Some(ts) = self.tenant.as_deref() {
             let renamed = crate::tenant::authz::renamed_objects(ts, &stmt, current.as_deref());
             crate::tenant::authz::objects_renamed(ts, &renamed).await;
         }
-        // A statement on a sharded table group runs on every shard (the
-        // layout comes from the router's topology).
-        let layout = self.tenant.as_deref().and_then(super::router::ddl_layout);
-        // ...and waits for a split, merge or shard move of those shards.
-        let movers = self.tenant.as_deref().and_then(|ts| {
-            let cat = ts.catalog()?;
-            let mins = svc.settings.get(
-                &sprig_catalog::ddl::MOVER_WAIT_MINUTES,
-                &cat.setting_ctx(&svc.dc),
-                Some(&cat.settings),
-            );
-            let home = svc.locator.home_of(tenant);
-            let dc = svc.locator.dc_store();
-            let store = if home == svc.dc {
-                dc
-            } else {
-                sprig_meta::TierView::over(&dc, sprig_meta::Tier::Dc(home))
-            };
-            Some(crate::tenant::ddl::MoverLocks::new(
-                store,
-                std::time::Duration::from_secs(mins.saturating_mul(60)),
-            ))
-        });
         // A change of an engine database's tables: the engine takes part in
         // the statement (its rows follow the new definition, or the
         // statement fails and nothing changes).
         let engine_hook = self
             .engine_ddl_hook(cx, target)
             .map(|h| h.with_services(Arc::clone(&svc)));
-        if engine_hook.is_some() && layout.is_some() {
-            let e = crate::engine::not_on_engine(
-                "a definition change on an engine database of a tenant with sharded table groups",
-            );
-            return Ok(Route::Done(self.fail(out, &e).await?));
-        }
         self.tenant_bs(cx);
         // Gaps row 53: `VERSION()` in a body gives this persona's version.
         let version = self.settings.persona_version(self.persona);
@@ -2094,68 +1926,10 @@ impl PassSession {
                 .reporting_version(version)
                 .counting(Arc::clone(&backend_rows))
                 .defined_by(definer_account);
-            match layout {
-                Some(layout) => {
-                    let mut sharded = crate::tenant::ddl::ShardedDdl::new(
-                        exec,
-                        layout,
-                        Arc::clone(&svc.locator),
-                        tenant,
-                        named_definer.or(user),
-                    );
-                    if let Some(m) = movers {
-                        sharded = sharded.with_mover_locks(m);
-                    }
-                    svc.ddl.execute(&req, &sharded).await
-                }
-                None => match &engine_hook {
-                    Some(h) => svc.ddl.execute(&req, &h.over(&exec)).await,
-                    None => svc.ddl.execute(&req, &exec).await,
-                },
+            match &engine_hook {
+                Some(h) => svc.ddl.execute(&req, &h.over(&exec)).await,
+                None => svc.ddl.execute(&req, &exec).await,
             }
-        };
-        // The lookups of the keys the statement added; a failed build
-        // drops the shards' new keys again, so the statement changes nothing.
-        let result = match (result, lookup_adds) {
-            (Ok(outcome), Some(adds)) => match self.lookup_ddl_build(&adds).await {
-                Ok(()) => Ok(outcome),
-                Err(u) => {
-                    for (sql, logical_sql) in &u.undo {
-                        let Some(bs) = self.bs.as_mut() else { break };
-                        let undo_req = DdlRequest {
-                            tenant,
-                            statement: stmt.clone(),
-                            sql,
-                            logical_sql,
-                            current_db: current.as_deref(),
-                            user,
-                            lower_case_table_names: lctn,
-                            wait: ddl_wait,
-                        };
-                        let exec = GatewayDdl::new(bs, MariaExecutor::new(undo_pool.clone()))
-                            .checked_by(undo_pool.clone());
-                        let layout = self.tenant.as_deref().and_then(super::router::ddl_layout);
-                        let r = match layout {
-                            Some(layout) => {
-                                let sharded = crate::tenant::ddl::ShardedDdl::new(
-                                    exec,
-                                    layout,
-                                    Arc::clone(&svc.locator),
-                                    tenant,
-                                    user,
-                                );
-                                svc.ddl.execute(&undo_req, &sharded).await
-                            }
-                            None => svc.ddl.execute(&undo_req, &exec).await,
-                        };
-                        if let Err(e) = r {
-                            tracing::warn!(error = %e, sql, "undoing a unique key after its lookup failed");
-                        }
-                    }
-                    Err(u.error)
-                }
-            },
-            (r, _) => r,
         };
         // The engine applies a published change of its tables, and gives
         // up one that wasn't published.
@@ -2174,16 +1948,6 @@ impl PassSession {
             code: c.code,
             message: c.message.clone(),
         }));
-        if result.as_ref().is_ok_and(|o| o.version.is_some()) && !lookup_owners.is_empty() {
-            match crate::tenant::lookups_sql::drop_owned(&svc, tenant, &lookup_owners).await {
-                Ok(names) => {
-                    tracing::info!(tenant = %tenant, lookups = ?names, "lookup indexes of dropped tables dropped");
-                }
-                Err(e) => {
-                    tracing::warn!(tenant = %tenant, error = %e, "lookup indexes of dropped tables not dropped yet; the controller finishes them");
-                }
-            }
-        }
         if result.as_ref().is_ok_and(|o| o.version.is_some())
             && !dropped.is_empty()
             && let Some(ts) = self.tenant.as_deref()
@@ -2198,12 +1962,6 @@ impl PassSession {
             && let Some(ts) = self.tenant.as_deref()
         {
             crate::tenant::authz::after_rename(ts, v).await;
-        }
-        if result.is_ok()
-            && let Some(change) = &fk_change
-            && let Err(e) = self.fk_ddl_commit(change).await
-        {
-            return Ok(Route::Done(self.fail(out, &e).await?));
         }
         // A routine without SQL SECURITY over
         // policy-protected tables applies its definer's policies; say so.
@@ -2548,6 +2306,7 @@ impl PassSession {
         let conn_status = self.conn_status_for(&piece, cx.proto);
         let backend_caps = self.backend_caps(cx);
         let mysql = self.persona == Persona::MySql84;
+        self.backend_account_needed().await;
         self.tenant_bs(cx);
         let pending = logical.and_then(|l| self.wl_start(l));
         self.wl_probe(pending.as_ref());
@@ -2555,14 +2314,6 @@ impl PassSession {
             return Err(SprigError::internal("no backend session"));
         };
         bs.query(&info, &piece).await?;
-        // The router reads a stale-map ERR (or, on a
-        // coordinator branch, any ERR) before it reaches the client.
-        if self.router.probe_first(bs).await? {
-            return Ok(Step {
-                errored: true,
-                status: None,
-            });
-        }
         let r = Relay {
             more,
             format,
@@ -2759,10 +2510,64 @@ impl PassSession {
                 }
             }
         };
+        if SystemSchema::parse(name).is_none() && self.engine_database_named(name) {
+            self.use_engine_database(name)?;
+            return Ok(());
+        }
         self.init_physical(cx, &schema).await?;
         if let Some(ts) = self.tenant.as_deref_mut() {
             ts.current = Some(name.to_owned());
         }
+        Ok(())
+    }
+
+    /// The session is about to send MariaDB a statement: its tenant's
+    /// backend accounts are made first if no session here needed them yet
+    /// (`AuthzServices::ensure_needed`); a failure is logged, and the
+    /// statement then fails on MariaDB as it would have.
+    async fn backend_account_needed(&self) {
+        let Some(ts) = self.tenant.as_deref() else {
+            return;
+        };
+        let Some(cat) = ts.catalog().cloned() else {
+            return;
+        };
+        let svc = Arc::clone(ts.services());
+        let cluster = ts.principal.backend.cluster.clone();
+        if let Err(e) = svc.authz.ensure_needed(&svc, &cat, &cluster).await {
+            tracing::warn!(tenant = %ts.tenant, error = %e, "backend account not made before a statement for MariaDB");
+        }
+    }
+
+    /// The session's current database becomes engine database `name`
+    /// (`USE`, `COM_INIT_DB`, a login's database), with no word to
+    /// MariaDB: 1044 unless the session has some privilege in it, as the
+    /// servers check. MariaDB has no schema for it: a backend session
+    /// already open keeps no default database.
+    pub(super) fn use_engine_database(&mut self, name: &str) -> Result<()> {
+        let Some(ts) = self.tenant.as_deref() else {
+            return Err(SprigError::internal("no tenant"));
+        };
+        let Some(cat) = Self::session_catalog(ts) else {
+            return Err(SprigError::internal("no catalog"));
+        };
+        let key = sprig_catalog::ddl::database_key(name, ts.lower_case_table_names());
+        let p = crate::tenant::authz::privileges(ts, &cat);
+        if !p.unrestricted() && !p.sees_database(&key, cat.database(&key).map(|d| d.db_id)) {
+            return Err(sprig_auth::authz::account_sql::db_denied(
+                &ts.principal.user,
+                &ts.principal.host,
+                name,
+            ));
+        }
+        if let Some(bs) = self.bs.as_mut() {
+            bs.vars_mut().schema = None;
+        }
+        if let Some(ts) = self.tenant.as_deref_mut() {
+            ts.current = Some(name.to_owned());
+        }
+        // The engine path reads the current database again.
+        self.eng.stale();
         Ok(())
     }
 
@@ -2842,19 +2647,6 @@ impl PassSession {
                 _ => Vec::new(),
             };
             keep = deferred(cols)?;
-        } else if let Some(stmt) = crate::tenant::lookups_sql::parse_bytes(&sql) {
-            // `SPRIG SHOW|REBUILD|DROP LOOKUP INDEX` (before the pins, whose
-            // parser claims every `SPRIG SHOW`): run at execute time, as text.
-            if sandbox {
-                return Err(must_reset());
-            }
-            let cols = match stmt {
-                crate::tenant::lookups_sql::LookupStmt::Show { .. } => {
-                    crate::tenant::lookups_sql::columns(charset)
-                }
-                _ => Vec::new(),
-            };
-            keep = deferred(cols)?;
         } else if let Some(parsed) = sprig_sql::pin_stmt::parse(&sql, &lex) {
             // Run at execute time, as text.
             if sandbox {
@@ -2904,8 +2696,8 @@ impl PassSession {
             };
             keep = deferred(cols)?;
         } else if std::str::from_utf8(&sql).is_ok_and(|t| {
-            sprig_router::graph::mentions(t)
-                && sprig_router::graph::find(t).is_ok_and(|v| !v.is_empty())
+            sprig_graph::graph_table::mentions(t)
+                && sprig_graph::graph_table::find(t).is_ok_and(|v| !v.is_empty())
         }) {
             // `GRAPH_TABLE` runs as text at execute time (its plan depends
             // on the graph's rows); its columns come with the result. With
@@ -3018,21 +2810,13 @@ impl PassSession {
             Some(t) => t,
             None => sql,
         };
-        let grouped = self.grouped_tables().await;
         let current = self.current_logical();
         let Some(ts) = self.tenant.as_deref() else {
             return Err(SprigError::internal("no tenant"));
         };
         let map = ts.map();
         let client_host = ts.principal.client_ip.to_string();
-        let with = grouped.as_deref().map(|g| sprig_sql::names::WithGroups {
-            base: &*map,
-            groups: g,
-        });
-        let names: &dyn NameMap = match &with {
-            Some(w) => w,
-            None => &*map,
-        };
+        let names: &dyn NameMap = &*map;
         let mut rw = RewriteCtx::new(names, self.persona)
             .lex(lex)
             .current_db(current.as_deref())
@@ -3128,6 +2912,7 @@ impl PassSession {
             return Ok(summary);
         }
         self.tenant_bs(cx);
+        self.backend_account_needed().await;
         let mut summary = self.prepare(cx, rewritten).await?;
         let accounts = Accounts(self.tenant.as_deref().and_then(|t| t.auth()));
         let octx = OutputCtx::new(&*map).accounts(&accounts);

@@ -80,8 +80,11 @@ impl SimDisk {
     }
 
     /// Simulates a power loss after the log was dropped: each file keeps its
-    /// synced bytes plus a seed-chosen prefix of its unsynced tail. Returns
-    /// how many unsynced bytes were lost in total.
+    /// synced bytes plus a seed-chosen prefix of its unsynced tail. What
+    /// survives counts as synced afterwards, so the log can be reopened on
+    /// the same simulation and crashed again. Files a simulation never saw
+    /// count as unsynced: reopen a crashed log on the simulation that
+    /// crashed it. Returns how many unsynced bytes were lost in total.
     ///
     /// # Errors
     /// A file could not be truncated.
@@ -93,6 +96,9 @@ impl SimDisk {
             .clone();
         let mut lost = 0;
         let mut rng = seed | 1;
+        // What survives the power loss is on the disk: a later crash (the
+        // same log reopened on this simulation) keeps it.
+        let mut survived = HashMap::new();
         for entry in std::fs::read_dir(dir)? {
             let path = entry?.path();
             if !path.is_file() {
@@ -102,6 +108,7 @@ impl SimDisk {
             let keep_synced = synced.get(&path).copied().unwrap_or(0).min(len);
             let tail = len - keep_synced;
             if tail == 0 {
+                survived.insert(path, len);
                 continue;
             }
             // xorshift: deterministic per seed.
@@ -115,11 +122,9 @@ impl SimDisk {
                 .write(true)
                 .open(&path)?
                 .set_len(new_len)?;
+            survived.insert(path, new_len);
         }
-        self.synced
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clear();
+        *self.synced.lock().unwrap_or_else(PoisonError::into_inner) = survived;
         self.cut.store(false, Ordering::Release);
         Ok(lost)
     }

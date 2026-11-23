@@ -111,7 +111,7 @@ impl std::fmt::Debug for TrueClock {
 }
 
 impl TrueClock {
-    fn new(clock: Arc<SimClock>, origin: tokio::time::Instant) -> Self {
+    pub(crate) fn new(clock: Arc<SimClock>, origin: tokio::time::Instant) -> Self {
         Self {
             clock,
             origin,

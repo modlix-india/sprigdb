@@ -131,3 +131,116 @@ async fn a_vhost_limit_replaces_the_listener_one() {
         c.close().await.unwrap();
     }
 }
+
+/// An engine whose connections are served by another gateway once its
+/// address is set (`serve_elsewhere`).
+struct Elsewhere(EngineArc<MemBackend>, std::sync::Mutex<Option<String>>);
+
+#[async_trait]
+impl QueueBackend for Elsewhere {
+    async fn open_vhost(
+        &self,
+        principal: &Principal,
+        vhost: &str,
+        conn: sprig_proto_amqp::backend::ConnKey,
+        events: sprig_proto_amqp::backend::EventSender,
+    ) -> Result<EngineArc<dyn sprig_proto_amqp::backend::Vhost>, sprig_proto_amqp::error::MqError>
+    {
+        self.0.open_vhost(principal, vhost, conn, events).await
+    }
+
+    async fn serve_elsewhere(&self, _principal: &Principal) -> Option<String> {
+        self.1.lock().unwrap().clone()
+    }
+}
+
+async fn spawn_server(backend: EngineArc<dyn QueueBackend>) -> std::net::SocketAddr {
+    let svc = Services {
+        identity: Arc::new(TestIdentity),
+        backend,
+        replies: DirectReplyTo::new(1),
+    };
+    let cfg = Config {
+        handshake_timeout: Duration::from_secs(3),
+        ..Config::default()
+    };
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (s, peer) = l.accept().await.unwrap();
+            let (svc, cfg) = (svc.clone(), cfg.clone());
+            tokio::spawn(async move {
+                let info = ConnInfo {
+                    peer,
+                    tls: false,
+                    sni: None,
+                    cert_login: None,
+                    client_dn: None,
+                };
+                let _ = serve(s, info, &svc, cfg, CancellationToken::new()).await;
+            });
+        }
+    });
+    addr
+}
+
+#[tokio::test]
+async fn a_login_is_relayed_to_the_gateway_that_serves_it() {
+    let mem = || {
+        EngineArc::new(MemBackend::new(
+            Arc::new(|_, v| Ok(v.to_owned())),
+            Arc::new(|_, _, _| true),
+        ))
+    };
+    let a = EngineArc::new(Elsewhere(mem(), std::sync::Mutex::new(None)));
+    let b = EngineArc::new(Elsewhere(mem(), std::sync::Mutex::new(None)));
+    let a_addr = spawn_server(EngineArc::clone(&a) as EngineArc<dyn QueueBackend>).await;
+    let b_addr = spawn_server(EngineArc::clone(&b) as EngineArc<dyn QueueBackend>).await;
+    // A sends its logins to B; B would send them back to A, but a relayed
+    // connection is never relayed again.
+    *a.1.lock().unwrap() = Some(b_addr.to_string());
+    *b.1.lock().unwrap() = Some(a_addr.to_string());
+    let connect = |addr| async move {
+        let mut c = Client::connect(
+            TcpStream::connect(addr).await.unwrap(),
+            "PLAIN",
+            plain("acme.app", "secret"),
+            "/",
+            default_capabilities(),
+            None,
+        )
+        .await
+        .unwrap();
+        open(&mut c, 1).await;
+        c
+    };
+    let q = uniq("relay");
+    let mut via_a = connect(a_addr).await;
+    declare_queue(&mut via_a, 1, &q, FieldTable::new()).await;
+    via_a
+        .publish(1, "", &q, false, &text("bin"), b"through a")
+        .await
+        .unwrap();
+    // The queue and its message are B's.
+    *b.1.lock().unwrap() = None;
+    let mut on_b = connect(b_addr).await;
+    let started = std::time::Instant::now();
+    while declare_queue(&mut on_b, 1, &q, FieldTable::new())
+        .await
+        .message_count
+        == 0
+    {
+        assert!(started.elapsed() < Duration::from_secs(5), "not on B");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    *a.1.lock().unwrap() = None;
+    let mut on_a = connect(a_addr).await;
+    // A, serving itself now, never held it.
+    assert_eq!(
+        declare_queue(&mut on_a, 1, &q, FieldTable::new())
+            .await
+            .message_count,
+        0
+    );
+}

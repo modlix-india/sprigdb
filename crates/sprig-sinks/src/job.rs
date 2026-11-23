@@ -312,7 +312,7 @@ pub async fn resolve_opts<Q: Queryable + Send>(
     catalog: &str,
     def: &SinkDef,
 ) -> Result<Opts> {
-    let rows: Vec<(String, String, Option<String>)> = q
+    let rows: Vec<(String, String, Option<String>)> = match q
         .exec(
             format!(
                 "SELECT scope_kind, setting_key, CAST(value AS CHAR) FROM {}.settings \
@@ -323,9 +323,18 @@ pub async fn resolve_opts<Q: Queryable + Send>(
             (def.id.0, def.db_id),
         )
         .await
-        .map_err(|e| {
-            SprigError::new(SprigCode::CatalogUnavailable, "catalog unavailable").with_source(e)
-        })?;
+    {
+        Ok(r) => r,
+        // A tenant created on the engine has no MariaDB catalog schema:
+        // no settings rows there.
+        Err(mysql_async::Error::Server(e)) if matches!(e.code, 1049 | 1146) => Vec::new(),
+        Err(e) => {
+            return Err(
+                SprigError::new(SprigCode::CatalogUnavailable, "catalog unavailable")
+                    .with_source(e),
+            );
+        }
+    };
     let rank = |k: &str| match k {
         "object" => 0,
         "database" => 1,
@@ -389,7 +398,6 @@ impl DeadLetters for CatalogDead {
 
 /// The catalog side of a task: directives, state reports, the epoch.
 struct CatalogControl {
-    pool: Pool,
     store: SinksStore,
     sink: SinkId,
     task: TaskNo,
@@ -482,14 +490,6 @@ impl Regroup {
     }
 }
 
-impl CatalogControl {
-    async fn conn(&self) -> Result<mysql_async::Conn> {
-        self.pool.get_conn().await.map_err(|e| {
-            SprigError::new(SprigCode::CatalogUnavailable, "catalog unavailable").with_source(e)
-        })
-    }
-}
-
 /// The directive that stops a task, from its sink's catalog state: gone,
 /// redefined, failed, dropping, or paused by row-level security (a
 /// running task stops at once, its buffered records undelivered).
@@ -514,7 +514,7 @@ impl CatalogControl {
     /// Whether policies now bind the sink's owner on its tables; if
     /// so the sink is paused (state `paused`, reason 39366), as the
     /// gateway's policy statements do.
-    async fn rls_bound(&self, _c: &mut mysql_async::Conn) -> Result<bool> {
+    async fn rls_bound(&self) -> Result<bool> {
         let Some((env, tenant, owner, objects)) = &self.rls else {
             return Ok(false);
         };
@@ -544,7 +544,6 @@ impl CatalogControl {
     /// running sink whose owner lost access is paused (`Some(Stop)`).
     async fn owner_directive(
         &self,
-        _c: &mut mysql_async::Conn,
         state: Option<&(SinkState, Option<String>, u64)>,
     ) -> Result<Option<Directive>> {
         let Some(check) = &self.owner else {
@@ -599,10 +598,9 @@ impl CatalogControl {
 #[async_trait]
 impl Control for CatalogControl {
     async fn poll(&self) -> Result<Directive> {
-        let mut c = self.conn().await?;
         let state = self.store.state_of(self.sink).await?;
         // The owner's access (39229), before anything runs.
-        if let Some(d) = self.owner_directive(&mut c, state.as_ref()).await? {
+        if let Some(d) = self.owner_directive(state.as_ref()).await? {
             return Ok(d);
         }
         if let Some(d) = stop_directive(state.as_ref(), self.definition_ver) {
@@ -610,7 +608,7 @@ impl Control for CatalogControl {
         }
         // Row-level security now binds the owner (checked each poll,
         // so before each batch is cut).
-        if self.rls_bound(&mut c).await? {
+        if self.rls_bound().await? {
             return Ok(Directive::Stop);
         }
         if let Some(g) = &self.regroup
@@ -857,25 +855,22 @@ pub async fn open_conn(
 /// # Errors
 /// 39219 for a function that is gone or can't be a transform.
 pub(crate) async fn load_transform(
-    pool: &Pool,
-    schema: &str,
+    records: &dyn sprig_catalog::records::RecordStore,
+    tenant: TenantId,
     def: &SinkDef,
     opts: &Opts,
 ) -> Result<Option<Arc<crate::transform::Transform>>> {
     let Some(f) = &def.transform else {
         return Ok(None);
     };
-    let mut c = pool.get_conn().await.map_err(|e| {
-        SprigError::new(SprigCode::CatalogUnavailable, "catalog unavailable").with_source(e)
-    })?;
+    let mut c = records.begin(tenant).await?;
     let budget = Duration::from_millis(opts.u64("transform_budget_ms", 50)?);
     // `transform_version = n` pins a version (0 or absent: the active
     // one, followed at each task start); `EXACTLY ONCE` needs it
     // `DETERMINISTIC`.
     let version = opts.u64("transform_version", 0)?;
     crate::transform::Transform::load_at(
-        &mut c,
-        schema,
+        &mut *c,
         def.db_id,
         f,
         (version > 0).then_some(version),
@@ -941,11 +936,14 @@ pub async fn run_sink_task_of(
     of: u32,
     cancel: Cancel,
 ) -> Result<TaskEnd> {
-    let (cat_pool, cat_schema) = env.catalog(tenant).await?;
+    // The tenant's MariaDB catalog schema, when it has one: its
+    // `sink.*` settings rows. A tenant created on the engine has none;
+    // its sinks run on their own options and the global settings.
+    let schema = match env.catalog(tenant).await {
+        Ok((pool, schema)) => pool.get_conn().await.ok().map(|c| (c, schema)),
+        Err(_) => None,
+    };
     let store = SinksStore::new(env.records(), tenant);
-    let mut c = cat_pool.get_conn().await.map_err(|e| {
-        SprigError::new(SprigCode::CatalogUnavailable, "catalog unavailable").with_source(e)
-    })?;
     let Some(def) = store.sink(sink).await? else {
         return Ok(TaskEnd::Stopped);
     };
@@ -955,7 +953,10 @@ pub async fn run_sink_task_of(
     let def = Arc::new(def);
     // `sink.tenant_bytes_per_sec` is one budget across workers.
     crate::runtime::ensure_quota_sharing(env.dc(), env.worker_id());
-    let opts = resolve_opts(&mut c, &cat_schema, &def).await?;
+    let (opts, c) = match schema {
+        Some((mut c, schema)) => (resolve_opts(&mut c, &schema, &def).await?, Some(c)),
+        None => (Opts(def.options.clone().into_iter().collect()), None),
+    };
     let opts = match env.settings() {
         Some((etcd, dc)) => over_global(opts, &etcd, &dc),
         None => opts,
@@ -972,6 +973,9 @@ pub async fn run_sink_task_of(
         }
         SourceSpec::Queue { .. } => {
             run_queue_task(env, tenant, sink, task_no, cancel, c, store, def, opts).await
+        }
+        SourceSpec::Changes { .. } => {
+            run_changes_task(env, tenant, sink, task_no, cancel, c, store, def, opts).await
         }
         other => Err(err(
             SprigCode::SinkOptionInvalid,
@@ -1005,12 +1009,11 @@ async fn run_fan_in_task(
     task_no: TaskNo,
     of: u32,
     cancel: Cancel,
-    c: mysql_async::Conn,
+    c: Option<mysql_async::Conn>,
     store: SinksStore,
     def: Arc<SinkDef>,
     opts: Opts,
 ) -> Result<TaskEnd> {
-    let (cat_pool, cat_schema) = env.catalog(tenant).await?;
     // A fan-in queue task takes its members' messages under a lease
     // tag, as a queue task does, and gives back a dead
     // predecessor's in each member it opens.
@@ -1117,10 +1120,9 @@ async fn run_fan_in_task(
             .map(crate::filter::parse)
             .transpose()?,
         projection: def.projection.clone(),
-        transform: load_transform(&cat_pool, &cat_schema, &def, &opts).await?,
+        transform: load_transform(env.records().as_ref(), tenant, &def, &opts).await?,
     };
     let control = Arc::new(CatalogControl {
-        pool: cat_pool.clone(),
         store: store.clone(),
         sink,
         task: task_no,
@@ -1362,12 +1364,11 @@ async fn run_queue_task(
     sink: SinkId,
     task_no: TaskNo,
     cancel: Cancel,
-    c: mysql_async::Conn,
+    c: Option<mysql_async::Conn>,
     store: SinksStore,
     def: Arc<SinkDef>,
     opts: Opts,
 ) -> Result<TaskEnd> {
-    let (cat_pool, cat_schema) = env.catalog(tenant).await?;
     let SourceSpec::Queue { id, name } = &def.source else {
         return Ok(TaskEnd::Stopped);
     };
@@ -1459,10 +1460,9 @@ async fn run_queue_task(
             .map(crate::filter::parse)
             .transpose()?,
         projection: def.projection.clone(),
-        transform: load_transform(&cat_pool, &cat_schema, &def, &opts).await?,
+        transform: load_transform(env.records().as_ref(), tenant, &def, &opts).await?,
     };
     let control = Arc::new(CatalogControl {
-        pool: cat_pool.clone(),
         store: store.clone(),
         sink,
         task: task_no,
@@ -1498,6 +1498,151 @@ async fn run_queue_task(
     .await;
     metrics::gauge!("sprig_sink_tasks", "state" => "running").decrement(1.0);
     tracing::info!(tenant = %tenant, sink = sink.0, task = task_no.0, end = ?end, "queue sink task ended");
+    end
+}
+
+/// A `CHANGES OF` sink's task (one per sink): its engine tables' changes
+/// read through a gateway's change log as the sink's owner
+/// ([`crate::change_source`]), resuming after the position its row
+/// saved.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn run_changes_task(
+    env: Arc<dyn SinkEnv>,
+    tenant: TenantId,
+    sink: SinkId,
+    task_no: TaskNo,
+    cancel: Cancel,
+    c: Option<mysql_async::Conn>,
+    store: SinksStore,
+    def: Arc<SinkDef>,
+    opts: Opts,
+) -> Result<TaskEnd> {
+    let SourceSpec::Changes { objects } = &def.source else {
+        return Ok(TaskEnd::Stopped);
+    };
+    let peer = env.peer().ok_or_else(|| {
+        err(
+            SprigCode::SinkOptionInvalid,
+            "change sources need the DC's gateways, and this worker reaches none",
+        )
+    })?;
+    let who = run_as(env.as_ref(), tenant, &def, &opts).await?;
+    let me = env.worker_id();
+    let saved = store
+        .task_claim(sink, task_no)
+        .await?
+        .and_then(|(_, _, part)| crate::change_source::saved_token(&part));
+    let part = match &saved {
+        Some(t) => json!({"source": "changes", "token": t}),
+        None => json!({"source": "changes"}),
+    };
+    let epoch = store.claim_task(sink, task_no, &part, &me).await?;
+    let mut conns = Vec::new();
+    for r in &def.connections {
+        conns.push(open_conn(env.as_ref(), tenant, &store, r, &opts).await?);
+    }
+    drop(c);
+    let info = TaskInfo {
+        tenant: tenant.0,
+        sink: sink.0,
+        task_no: task_no.0,
+        epoch,
+    };
+    let (conn, extra) = if def.target.kind() == TargetKind::Script {
+        (None, conns)
+    } else {
+        let mut it = conns.into_iter();
+        (it.next(), it.collect())
+    };
+    let ctx = TargetCtx {
+        task: info.clone(),
+        sink: Arc::clone(&def),
+        conn,
+        extra,
+        opts: opts.clone(),
+        db_name: opts.get("__db_name").unwrap_or("").to_owned(),
+    };
+    let mut settings = run_settings(&opts, &def)?;
+    if def.target.kind() == TargetKind::S3 {
+        crate::target::s3::run_settings_override(&opts, &mut settings)?;
+    }
+    let db = script_db(env.as_ref(), tenant, &def, &opts).await?;
+    let target = build_target_with(&ctx, db).await?;
+    // Without a saved position: START AT EARLIEST reads from the oldest
+    // change the log holds, a time from that time, and LATEST (the
+    // default) from the sink's creation, so a task that restarts before
+    // saving a position loses nothing.
+    let from_ms = match def.start_at {
+        crate::model::StartAt::Earliest => 0,
+        crate::model::StartAt::Timestamp { ms } => ms.max(1),
+        crate::model::StartAt::Latest | crate::model::StartAt::Snapshot => store
+            .created_ms(sink)
+            .await?
+            .unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+            })
+            .max(1),
+    };
+    let source = crate::change_source::ChangeSource::new(
+        peer,
+        who,
+        objects.iter().map(|(o, _)| *o).collect(),
+        saved,
+        from_ms,
+        sink.0,
+        format!("{}/{}", sink.0, task_no.0),
+        Some(crate::change_source::Saver {
+            store: store.clone(),
+            sink,
+            task_no,
+            epoch,
+        }),
+    );
+    let prepare = SinkPrepare {
+        condition: def
+            .filter_sql
+            .as_deref()
+            .map(crate::filter::parse)
+            .transpose()?,
+        projection: def.projection.clone(),
+        transform: load_transform(env.records().as_ref(), tenant, &def, &opts).await?,
+    };
+    let control = Arc::new(CatalogControl {
+        store: store.clone(),
+        sink,
+        task: task_no,
+        epoch,
+        definition_ver: def.definition_ver,
+        delivered: AtomicU64::new(0),
+        rls: None,
+        regroup: None,
+        owner: OwnerCheck::new(&env, tenant, &def),
+    });
+    let dead = Arc::new(CatalogDead {
+        store: store.clone(),
+        sink,
+    });
+    tracing::info!(tenant = %tenant, sink = sink.0, task = task_no.0, tables = objects.len(), "change sink task started");
+    metrics::gauge!("sprig_sink_tasks", "state" => "running").increment(1.0);
+    let end = run_task(
+        TaskParts {
+            info,
+            source: Box::new(source),
+            target,
+            dead,
+            control,
+            prepare: Arc::new(prepare),
+            settings,
+            seed: None,
+            reject_via_source: false,
+        },
+        cancel,
+    )
+    .await;
+    metrics::gauge!("sprig_sink_tasks", "state" => "running").decrement(1.0);
+    tracing::info!(tenant = %tenant, sink = sink.0, task = task_no.0, end = ?end, "change sink task ended");
     end
 }
 

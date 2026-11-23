@@ -5,6 +5,7 @@
 
 use bson::oid::ObjectId;
 use bson::{Bson, Document, doc};
+use sprig_engine::observe::hint::HintOp;
 use sprig_proto_mongo::errors::{MongoError, code};
 
 use super::catalog::IndexMeta;
@@ -257,6 +258,7 @@ impl DocStore {
         if t.get_current(&key)?.is_some() {
             return Err(dup_error(&ns, None, &d));
         }
+        t.hint(&key, HintOp::Insert)?;
         t.put(key, layout::doc_value(&bytes))?;
         for (pos, idx) in c.meta.indexes.iter().enumerate() {
             let (entries, multi) = super::keys::entries(&d, idx)?;
@@ -279,13 +281,16 @@ impl DocStore {
         idk: &[u8],
         old: &Document,
         new: &Document,
+        op: HintOp,
     ) -> Result<(), MongoError> {
         let ns = c.ns();
         if let Some(r) = crate::validate::Rules::of(&c.meta.options)? {
             r.check_update(&ns, old, new)?;
         }
         let (_, bytes) = checked(new)?;
-        t.put(c.space.doc(idk), layout::doc_value(&bytes))?;
+        let key = c.space.doc(idk);
+        t.hint(&key, op)?;
+        t.put(key, layout::doc_value(&bytes))?;
         for (pos, idx) in c.meta.indexes.iter().enumerate() {
             let (before, _) = super::keys::entries(old, idx)?;
             let (after, multi) = super::keys::entries(new, idx)?;
@@ -319,7 +324,9 @@ impl DocStore {
         idk: &[u8],
         old: &Document,
     ) -> Result<(), MongoError> {
-        t.delete(c.space.doc(idk))?;
+        let key = c.space.doc(idk);
+        t.hint(&key, HintOp::Delete)?;
+        t.delete(key)?;
         for idx in &c.meta.indexes {
             // A document stored before an index existed can't fail here
             // (its build indexed it); a damaged one is skipped.
@@ -404,7 +411,12 @@ impl DocStore {
                     out.n += 1;
                     if changed {
                         let new = with_id(new);
-                        self.replace_doc(t, c, &idk, &old, &new).await?;
+                        let op = if matches!(spec, UpdateSpec::Replace(_)) {
+                            HintOp::Replace
+                        } else {
+                            HintOp::Update
+                        };
+                        self.replace_doc(t, c, &idk, &old, &new, op).await?;
                         out.modified += 1;
                         out.new = Some(new);
                     } else {

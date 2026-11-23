@@ -55,7 +55,7 @@ impl Tenants {
             .map(Self::Only)
     }
 
-    fn has(&self, t: u64) -> bool {
+    pub(super) fn has(&self, t: u64) -> bool {
         match self {
             Self::All => true,
             Self::Only(s) => s.contains(&t),
@@ -63,7 +63,7 @@ impl Tenants {
     }
 }
 
-fn tenants() -> &'static Tenants {
+pub(super) fn tenants() -> &'static Tenants {
     static T: OnceLock<Tenants> = OnceLock::new();
     T.get_or_init(|| {
         std::env::var(TENANTS_VAR)
@@ -146,7 +146,7 @@ fn action_of(name: &str) -> Action {
 }
 
 /// Whether `db` of the connection's tenant is on the engine.
-fn on_engine(c: &mut Conn, db: &str) -> Result<bool, MongoError> {
+pub(super) fn on_engine(c: &mut Conn, db: &str) -> Result<bool, MongoError> {
     let tenant = owner(c).tenant;
     if tenant == 0 || db == "admin" || db == "local" || db == "config" {
         return Ok(false);
@@ -210,6 +210,18 @@ pub(super) async fn route(
     } else {
         db
     };
+    // Change streams open on the command path, which reads engine
+    // collections' changes from the change log.
+    if name == "aggregate"
+        && body
+            .get_array("pipeline")
+            .ok()
+            .and_then(|p| p.first())
+            .and_then(Bson::as_document)
+            .is_some_and(|st| st.contains_key("$changeStream"))
+    {
+        return None;
+    }
     match on_engine(c, target_db) {
         Ok(false) => return None,
         Ok(true) => {}

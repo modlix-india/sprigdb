@@ -100,6 +100,12 @@ pub struct LogConfig {
     pub compress_min_bytes: u64,
     /// Crash simulation for the log's files, in tests.
     pub sim: Option<Arc<SimDisk>>,
+    /// No writer thread: the owner writes queued proposals with
+    /// [`LocalLog::step`] and syncs relaxed ones with
+    /// [`LocalLog::sync_now`], on its own executor and timers (the
+    /// simulator). Waits that block a thread ([`Ticket::wait`]) then only
+    /// return once someone steps.
+    pub manual: bool,
 }
 
 impl Default for LogConfig {
@@ -113,6 +119,7 @@ impl Default for LogConfig {
             target_file_size: 16 << 20,
             compress_min_bytes: 4 << 10,
             sim: None,
+            manual: false,
         }
     }
 }
@@ -184,6 +191,16 @@ pub trait Consensus: Send + Sync {
             .into_iter()
             .map(|(u, p)| self.propose(u, p, durability))
             .collect()
+    }
+
+    /// Whether entries become durable in the order they were proposed,
+    /// across all of this log's units: a crash keeps a prefix of the
+    /// proposals, never a later entry without an earlier one. A transaction
+    /// across units then queues every step of its commit protocol at once
+    /// instead of waiting for each step to be durable before the next. The
+    /// default is no (a replicated log, where each unit has its own quorum).
+    fn durable_in_order(&self) -> bool {
+        false
     }
 
     /// The highest index of `unit` that is synced.
@@ -403,6 +420,22 @@ impl ProposalProgress {
         self.state.wake();
     }
 
+    /// Entries up to `index` are durable and applied, with one wake-up of
+    /// the waiters, and none when that was already known. A replicated log
+    /// reports each committed entry: many proposals share this progress
+    /// (every client of a unit), so waking all its waiters per entry costs
+    /// entries x waiters wake-ups.
+    pub fn set_done(&self, index: u64) {
+        let s = &self.state;
+        if s.synced.load(Ordering::Acquire) >= index && s.applied.load(Ordering::Acquire) >= index {
+            return;
+        }
+        s.written.fetch_max(index, Ordering::AcqRel);
+        s.synced.fetch_max(index, Ordering::AcqRel);
+        s.applied.fetch_max(index, Ordering::AcqRel);
+        s.wake();
+    }
+
     /// Entries up to `index` are applied.
     pub fn set_applied(&self, index: u64) {
         self.state.applied.fetch_max(index, Ordering::AcqRel);
@@ -504,6 +537,8 @@ pub struct LocalLog {
     sh: Arc<Shared>,
     writer: Mutex<Option<JoinHandle<()>>>,
     dir: PathBuf,
+    /// Manual mode: the closing drain ran.
+    closed_manually: AtomicBool,
 }
 
 impl std::fmt::Debug for LocalLog {
@@ -602,15 +637,22 @@ impl LocalLog {
             }
             Ok(())
         })?;
-        let w = Arc::clone(&sh);
-        let writer = std::thread::Builder::new()
-            .name("sprig-log-writer".into())
-            .spawn(move || run(&w))
-            .map_err(|e| SprigError::internal("commit log: spawn writer").with_source(e))?;
+        let writer = if sh.cfg.manual {
+            None
+        } else {
+            let w = Arc::clone(&sh);
+            Some(
+                std::thread::Builder::new()
+                    .name("sprig-log-writer".into())
+                    .spawn(move || run(&w))
+                    .map_err(|e| SprigError::internal("commit log: spawn writer").with_source(e))?,
+            )
+        };
         Ok(Self {
             sh,
-            writer: Mutex::new(Some(writer)),
+            writer: Mutex::new(writer),
             dir,
+            closed_manually: AtomicBool::new(false),
         })
     }
 
@@ -782,9 +824,53 @@ impl LocalLog {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
-        if let Some(h) = h {
+        // An apply observer on the writer thread can drop the last handle
+        // of the engine; the writer then ends on its own once this returns
+        // (the queue is closed), and it can't wait for itself.
+        if let Some(h) = h
+            && h.thread().id() != std::thread::current().id()
+        {
             let _ = h.join();
         }
+        if self.sh.cfg.manual && !self.closed_manually.swap(true, Ordering::AcqRel) {
+            let halted = lock_queue(&self.sh).halted;
+            if !halted {
+                while self.write_next() {}
+                sync_all(&self.sh);
+            }
+            close_units(&self.sh);
+        }
+    }
+
+    /// Manual mode: writes one group of the queued proposals (synced if
+    /// any needs it) and applies it, as the writer thread does. Returns
+    /// whether there was anything to write.
+    ///
+    /// # Panics
+    /// When the log isn't in manual mode.
+    pub fn step(&self) -> bool {
+        assert!(self.sh.cfg.manual, "LocalLog::step needs a manual log");
+        self.write_next()
+    }
+
+    fn write_next(&self) -> bool {
+        let mut group = Vec::new();
+        {
+            let mut q = lock_queue(&self.sh);
+            if q.halted || q.items.is_empty() {
+                return false;
+            }
+            take_group(&self.sh, &mut q, &mut group);
+        }
+        let mut due = None;
+        write_group(&self.sh, &mut group, &mut due);
+        true
+    }
+
+    /// Syncs everything written so far (manual mode's relaxed-sync timer,
+    /// or a caller that wants it now).
+    pub fn sync_now(&self) {
+        sync_all(&self.sh);
     }
 }
 
@@ -816,8 +902,23 @@ fn unit_state(sh: &Shared, id: UnitId) -> Arc<UnitState> {
     {
         return Arc::clone(u);
     }
+    // A unit the log holds no entries of (never written, trimmed, or the
+    // node unit right after a one-unit directory moved to units): what
+    // the state machine applied is durable already (it came from the
+    // store), so the unit's progress starts there, not at 0.
+    let applied = if id.0 == SYNC_GROUP {
+        0
+    } else {
+        sh.sm.applied_index(id).unwrap_or(0)
+    };
     let mut units = sh.units.write().unwrap_or_else(PoisonError::into_inner);
-    Arc::clone(units.entry(id).or_default())
+    Arc::clone(units.entry(id).or_insert_with(|| {
+        let u = UnitState::default();
+        for w in [&u.written, &u.synced, &u.applied] {
+            w.store(applied, Ordering::Release);
+        }
+        Arc::new(u)
+    }))
 }
 
 /// Replays `unit`'s entries above the state machine's applied index, and
@@ -922,6 +1023,12 @@ impl Consensus for LocalLog {
             index,
             sync: durability.needs_sync(),
         })
+    }
+
+    /// One writer takes proposals in queue order and writes them in groups,
+    /// one after another, into one append-only log: a crash keeps a prefix.
+    fn durable_in_order(&self) -> bool {
+        true
     }
 
     /// Every part goes into the same group, so into one raft-engine write
@@ -1051,22 +1158,32 @@ fn run(sh: &Shared) {
                     .0;
             }
         }
-        let mut bytes = 0;
-        while let Some(p) = q.items.front() {
-            // The parts of one atomic write stay in one group.
-            if !group.is_empty() && !p.joined && bytes + p.payload.len() > sh.cfg.group_max_bytes {
-                break;
-            }
-            bytes += p.payload.len();
-            if let Some(p) = q.items.pop_front() {
-                group.push(p);
-            }
-        }
-        q.bytes -= bytes;
+        take_group(sh, &mut q, &mut group);
         drop(q);
         last_group = group.len();
         write_group(sh, &mut group, &mut relaxed_due);
     }
+    close_units(sh);
+}
+
+/// Moves queued proposals into `group`, up to the group's byte limit; the
+/// parts of one atomic write stay in one group.
+fn take_group(sh: &Shared, q: &mut Queue, group: &mut Vec<Proposal>) {
+    let mut bytes = 0;
+    while let Some(p) = q.items.front() {
+        if !group.is_empty() && !p.joined && bytes + p.payload.len() > sh.cfg.group_max_bytes {
+            break;
+        }
+        bytes += p.payload.len();
+        if let Some(p) = q.items.pop_front() {
+            group.push(p);
+        }
+    }
+    q.bytes -= bytes;
+}
+
+/// Fails every waiter still waiting: the log is closed.
+fn close_units(sh: &Shared) {
     for u in sh
         .units
         .read()

@@ -135,6 +135,8 @@ pub struct Bounds {
 /// A proposed append, to wait for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Pending {
+    /// The unit whose log holds the entry: the stream's tenant's.
+    pub unit: u64,
     /// The log entry.
     pub index: u64,
     /// The note's position in it.
@@ -175,7 +177,12 @@ struct PartMeta {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct Manifest {
     version: u32,
+    /// The node unit's floor (where stream appends rode before each
+    /// tenant's unit carried its own).
     floor: u64,
+    /// Each tenant unit's floor: (unit, index).
+    #[serde(default)]
+    floors: Vec<(u64, u64)>,
     epoch: i32,
     dropped: Vec<(u64, u64)>,
     parts: Vec<PartMeta>,
@@ -196,10 +203,23 @@ impl Part {
 /// The apply step's own state.
 #[derive(Debug, Default)]
 struct ApplyState {
-    /// The last log index handed to the applier.
-    applied: u64,
-    /// The node's leader epoch.
+    /// The last log index handed to the applier, per unit.
+    applied: BTreeMap<u64, u64>,
+    /// Units whose log keeps entries for this log (a floor is set on them):
+    /// the units of every tenant that ever appended.
+    floored: BTreeSet<u64>,
+    /// The newest leader epoch handed out: each start of the log takes a
+    /// new one, and so does each unit this node takes the leadership of.
     epoch: i32,
+    /// The epoch of a unit whose leadership this node took since the
+    /// start (others use the start's epoch).
+    unit_epochs: HashMap<u64, i32>,
+    /// The epoch this start of the log took.
+    epoch_at_start: i32,
+    /// Per unit, the index through which a unit snapshot brought the
+    /// unit's partitions here: durable in their files, whatever this
+    /// node's log holds.
+    ingested: HashMap<u64, u64>,
     /// Dropped streams (ids are never reused).
     dropped: BTreeSet<(u64, u64)>,
     /// Changed since the last manifest, beyond partition state.
@@ -214,7 +234,8 @@ struct Inner {
     cfg: SegConfig,
     apply: Mutex<ApplyState>,
     parts: RwLock<HashMap<PartKey, Arc<Part>>>,
-    results: Mutex<BTreeMap<(u64, u32), Outcome>>,
+    /// Outcomes by (unit, index, slot).
+    results: Mutex<BTreeMap<(u64, u64, u32), Outcome>>,
     changed: tokio::sync::watch::Sender<u64>,
     flushing: Mutex<()>,
     policies: Mutex<HashMap<(u64, u64), Policy>>,
@@ -259,13 +280,248 @@ struct Applier(Weak<Inner>);
 impl ApplyObserver for Applier {
     fn applied(&self, unit: sprig_engine::UnitId, entries: &[LogEntry]) {
         if let Some(i) = self.0.upgrade() {
-            // Stream appends ride on the engine's notes unit; its index
-            // sequence is the one this log tracks.
-            if unit == i.engine.notes_unit() {
-                i.apply(entries);
-            }
+            // A stream append rides on its tenant's unit (older ones on
+            // the node unit): every unit's index sequence is tracked.
+            i.apply(unit.0, entries);
         }
     }
+}
+
+/// Takes a new leader epoch for a unit this node starts to lead.
+struct Leadership(Weak<Inner>);
+
+impl sprig_engine::leader::LeaderListener for Leadership {
+    fn leader_changed(&self, unit: sprig_engine::UnitId, epoch: u64) {
+        let Some(inner) = self.0.upgrade() else {
+            return;
+        };
+        if epoch == 0 {
+            return;
+        }
+        {
+            let mut a = lock(&inner.apply);
+            a.epoch += 1;
+            let e = a.epoch;
+            a.unit_epochs.insert(unit.0, e);
+            a.dirty = true;
+        }
+        // Recorded before any append uses it: a restart starts above it.
+        if let Err(e) = (SegLog { inner }).flush() {
+            tracing::warn!(error = %e, unit = unit.0, "stream log: recording a new leader epoch failed");
+        }
+    }
+}
+
+/// The stream log's part of a unit snapshot: the partitions of the unit's
+/// tenant, with their segment files.
+struct SnapshotPart(Weak<Inner>);
+
+/// What a snapshot's stream part holds before the segment bytes (each
+/// partition's segments in order, `len` bytes each).
+#[derive(Debug, Serialize, Deserialize)]
+struct UnitStreams {
+    /// The unit's index the partitions are at (the snapshot's or later).
+    applied: u64,
+    dropped: Vec<(u64, u64)>,
+    parts: Vec<PartMeta>,
+}
+
+impl sprig_engine::snapshot::UnitSnapshotPart for SnapshotPart {
+    fn name(&self) -> &'static str {
+        "streams"
+    }
+
+    fn export(&self, unit: sprig_engine::UnitId, index: u64, out: &mut dyn Write) -> Result<()> {
+        let inner = self
+            .0
+            .upgrade()
+            .ok_or_else(|| SprigError::internal("stream log: closed"))?;
+        inner.export_unit(unit.0, index, out)
+    }
+
+    fn ingest(
+        &self,
+        unit: sprig_engine::UnitId,
+        index: u64,
+        input: &mut dyn io::Read,
+    ) -> Result<()> {
+        let inner = self
+            .0
+            .upgrade()
+            .ok_or_else(|| SprigError::internal("stream log: closed"))?;
+        SegLog { inner }.ingest_unit(unit.0, index, input)
+    }
+}
+
+impl Inner {
+    /// Writes `unit`'s partitions as of its index `index` or later.
+    fn export_unit(&self, unit: u64, index: u64, out: &mut dyn Write) -> Result<()> {
+        // The stream log applies after the store: wait until it has
+        // applied through the snapshot's index (a unit that never had an
+        // append here has nothing to wait for).
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let a = lock(&self.apply);
+            if !a.floored.contains(&unit) || a.applied.get(&unit).is_some_and(|x| *x >= index) {
+                break;
+            }
+            drop(a);
+            if std::time::Instant::now() >= deadline {
+                return Err(SprigError::internal(
+                    "stream log: not caught up with the unit's snapshot index",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // One point: no append applies while the partitions are read.
+        let (head, segs) = {
+            let a = lock(&self.apply);
+            let applied = a.applied.get(&unit).copied().unwrap_or(index).max(index);
+            let parts: Vec<(PartKey, Arc<Part>)> = self
+                .parts
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .filter(|(k, _)| unit_of(k.tenant) == unit)
+                .map(|(k, p)| (*k, Arc::clone(p)))
+                .collect();
+            let mut metas = Vec::with_capacity(parts.len());
+            let mut segs: Vec<(Arc<fs::File>, u64)> = Vec::new();
+            for (k, p) in parts {
+                let st = p.lock();
+                metas.push(meta_of(k, &st));
+                // An open handle reads what the segment held now, even if a
+                // compaction or retention replaces or removes the file.
+                segs.extend(st.segments.iter().map(|s| (s.handle(), s.len)));
+            }
+            let head = UnitStreams {
+                applied,
+                dropped: a
+                    .dropped
+                    .iter()
+                    .filter(|(t, _)| unit_of(*t) == unit)
+                    .copied()
+                    .collect(),
+                parts: metas,
+            };
+            (head, segs)
+        };
+        let body = serde_json::to_vec(&head)
+            .map_err(|e| SprigError::internal(format!("stream log: snapshot: {e}")))?;
+        let w =
+            |out: &mut dyn Write, b: &[u8]| out.write_all(b).map_err(|e| io_err("snapshot", &e));
+        w(
+            out,
+            &u32::try_from(body.len()).unwrap_or(u32::MAX).to_be_bytes(),
+        )?;
+        w(out, &body)?;
+        let mut buf = vec![0u8; 1 << 20];
+        for (f, len) in segs {
+            let mut at = 0u64;
+            while at < len {
+                let n = usize::try_from((len - at).min(buf.len() as u64)).unwrap_or(buf.len());
+                std::os::unix::fs::FileExt::read_exact_at(&*f, &mut buf[..n], at)
+                    .map_err(|e| io_err("snapshot: read segment", &e))?;
+                w(out, &buf[..n])?;
+                at += n as u64;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl SegLog {
+    /// Replaces `unit`'s partitions with a snapshot's (see
+    /// [`SnapshotPart`]): files written and synced, then the partitions
+    /// taken over, the manifest written.
+    fn ingest_unit(&self, unit: u64, index: u64, input: &mut dyn io::Read) -> Result<()> {
+        let r = |input: &mut dyn io::Read, b: &mut [u8]| {
+            input
+                .read_exact(b)
+                .map_err(|e| io_err("snapshot: read", &e))
+        };
+        let mut n = [0u8; 4];
+        r(input, &mut n)?;
+        let mut body = vec![0u8; u32::from_be_bytes(n) as usize];
+        r(input, &mut body)?;
+        let head: UnitStreams = serde_json::from_slice(&body)
+            .map_err(|e| SprigError::internal(format!("stream log: snapshot is corrupt: {e}")))?;
+        let applied = head.applied.max(index);
+        // What the unit had here goes first (a follower restoring).
+        let old: Vec<PartKey> = self
+            .inner
+            .parts
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .keys()
+            .filter(|k| unit_of(k.tenant) == unit)
+            .copied()
+            .collect();
+        for k in &old {
+            let _ = fs::remove_dir_all(part_dir(&self.inner.dir, k));
+        }
+        let mut buf = vec![0u8; 1 << 20];
+        for pm in &head.parts {
+            let dir = part_dir(&self.inner.dir, &pm.key);
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).map_err(|e| io_err("snapshot: create", &e))?;
+            for sm in &pm.segments {
+                let path = dir.join(segment::file_name(sm.base));
+                let mut f = fs::File::create(&path).map_err(|e| io_err("snapshot: create", &e))?;
+                let mut left = sm.len;
+                while left > 0 {
+                    let k = usize::try_from(left.min(buf.len() as u64)).unwrap_or(buf.len());
+                    r(input, &mut buf[..k])?;
+                    f.write_all(&buf[..k])
+                        .map_err(|e| io_err("snapshot: write", &e))?;
+                    left -= k as u64;
+                }
+                f.sync_all().map_err(|e| io_err("snapshot: sync", &e))?;
+            }
+            sync_dir(&dir);
+            if let Some(t) = dir.parent() {
+                sync_dir(t);
+            }
+        }
+        sync_dir(&self.inner.dir);
+        let mut restored = Vec::with_capacity(head.parts.len());
+        for pm in &head.parts {
+            restored.push((
+                pm.key,
+                Arc::new(Part {
+                    st: Mutex::new(restore_part(&self.inner, pm)?),
+                }),
+            ));
+        }
+        {
+            let mut a = lock(&self.inner.apply);
+            let mut w = self
+                .inner
+                .parts
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
+            for k in &old {
+                w.remove(k);
+            }
+            for (k, p) in restored {
+                w.insert(k, p);
+            }
+            drop(w);
+            a.applied.insert(unit, applied);
+            a.floored.insert(unit);
+            a.ingested.insert(unit, applied);
+            a.dropped.retain(|(t, _)| unit_of(*t) != unit);
+            a.dropped.extend(head.dropped.iter().copied());
+            a.dirty = true;
+        }
+        self.inner.changed.send_modify(|g| *g += 1);
+        self.flush()
+    }
+}
+
+/// The engine unit holding `tenant`'s keys, and its stream appends.
+fn unit_of(tenant: u64) -> u64 {
+    Engine::unit_of_tenant(tenant).0
 }
 
 fn part_dir(root: &Path, k: &PartKey) -> PathBuf {
@@ -319,15 +575,16 @@ impl Inner {
         lock(&self.policies).get(&(tenant, stream)).copied()
     }
 
-    /// The apply step for a group of committed entries.
-    fn apply(&self, entries: &[LogEntry]) {
+    /// The apply step for a group of committed entries of `unit`.
+    fn apply(&self, unit: u64, entries: &[LogEntry]) {
         let Some(last) = entries.last() else {
             return;
         };
         let mut a = lock(&self.apply);
+        let done = a.applied.get(&unit).copied().unwrap_or(0);
         let mut outs = Vec::new();
         for e in entries {
-            if e.index <= a.applied {
+            if e.index <= done {
                 continue;
             }
             let Ok(notes) = sprig_engine::log::payload::notes(&e.data) else {
@@ -344,25 +601,42 @@ impl Inner {
                     log_append_time,
                     batch,
                 } = op;
-                let out = self.apply_append(&mut a, key, now_ms, log_append_time, batch);
-                outs.push(((e.index, slot), out));
+                let out = self.apply_append(&mut a, unit, key, now_ms, log_append_time, batch);
+                outs.push(((unit, e.index, slot), out));
             }
         }
-        a.applied = a.applied.max(last.index);
-        drop(a);
-        if !outs.is_empty() {
+        // The outcomes go in before the applied index moves: a waiter that
+        // sees the index past its entry must find the entry's outcome, or it
+        // reports the append lost though it was appended.
+        let appended = !outs.is_empty();
+        if appended {
             let mut r = lock(&self.results);
             r.extend(outs);
             while r.len() > RESULTS_KEPT {
                 r.pop_first();
             }
         }
-        self.changed.send_replace(last.index);
+        a.applied.insert(unit, done.max(last.index));
+        drop(a);
+        // Only appends change what waiters look at (high watermarks and
+        // outcomes); other entries of the unit (SQL commits) don't wake them.
+        if appended {
+            self.changed.send_modify(|g| *g += 1);
+        }
+    }
+
+    /// The leader epoch appends of `unit` get.
+    fn unit_epoch(a: &ApplyState, unit: u64) -> i32 {
+        a.unit_epochs
+            .get(&unit)
+            .copied()
+            .unwrap_or(a.epoch_at_start)
     }
 
     fn apply_append(
         &self,
         a: &mut ApplyState,
+        unit: u64,
         key: PartKey,
         now_ms: i64,
         log_append_time: bool,
@@ -382,7 +656,7 @@ impl Inner {
         }
         let p = self.part(key);
         let mut st = p.lock();
-        let epoch = st.epoch(a.epoch);
+        let epoch = st.epoch(Self::unit_epoch(a, unit));
         let mut bytes = batch.to_vec();
         match st.append(
             &mut bytes,
@@ -430,38 +704,71 @@ impl SegLog {
             flushing: Mutex::new(()),
             policies: Mutex::new(HashMap::new()),
         });
-        let mut from = if let Some(m) = &manifest {
+        // Where each unit's catch-up starts: the manifest's floors, raised
+        // to the engine's (a floor set after the manifest was written).
+        let node = engine.notes_unit();
+        let mut from: BTreeMap<u64, u64> = BTreeMap::new();
+        if let Some(m) = &manifest {
             restore(&inner, m)?;
-            m.floor.max(engine.log_floor(FLOOR).unwrap_or(0))
+            from.insert(node.0, m.floor);
+            for (u, f) in &m.floors {
+                from.insert(*u, *f);
+            }
+            for (u, f) in engine.log_floors(FLOOR) {
+                let e = from.entry(u.0).or_insert(f);
+                *e = (*e).max(f);
+            }
         } else {
             clear_parts(&dir);
-            engine.consensus().applied_index(engine.notes_unit())
-        };
-        if let Some(held) = catch_up_start(from, engine.log_first_index(), engine.last_applied()) {
-            // The commit log was trimmed past the floor: a binary that
-            // didn't keep observer floors ran on this directory. Catch up
-            // from what the log still holds; appends in the gap (only a
-            // crash before a floor flush leaves any) are gone.
-            tracing::warn!(
-                floor = from,
-                resumed_at = held,
-                parts = manifest.as_ref().map_or(0, |m| m.parts.len()),
-                "stream log: the commit log no longer holds entries above the stream log's \
-                 floor (trimmed by a binary that didn't keep it); catching up from the \
-                 oldest entry it holds"
-            );
-            from = held;
+            from.insert(node.0, engine.consensus().applied_index(node));
         }
-        lock(&inner.apply).applied = from;
-        let top = engine.observe(
+        for (u, f) in &mut from {
+            let unit = sprig_engine::UnitId(*u);
+            if let Some(held) = catch_up_start(
+                *f,
+                engine.log_first_index_of(unit),
+                engine.last_applied_of(unit),
+            ) {
+                // The commit log was trimmed past the floor: a binary that
+                // didn't keep observer floors ran on this directory. Catch
+                // up from what the log still holds; appends in the gap
+                // (only a crash before a floor flush leaves any) are gone.
+                tracing::warn!(
+                    unit = *u,
+                    floor = *f,
+                    resumed_at = held,
+                    parts = manifest.as_ref().map_or(0, |m| m.parts.len()),
+                    "stream log: the commit log no longer holds entries above the stream log's \
+                     floor (trimmed by a binary that didn't keep it); catching up from the \
+                     oldest entry it holds"
+                );
+                *f = held;
+            }
+        }
+        {
+            let mut a = lock(&inner.apply);
+            a.applied.clone_from(&from);
+            a.floored = from.keys().copied().collect();
+        }
+        let listed: Vec<(sprig_engine::UnitId, u64)> = from
+            .iter()
+            .map(|(u, f)| (sprig_engine::UnitId(*u), *f))
+            .collect();
+        let tops = engine.observe_units(
             Arc::new(Applier(Arc::downgrade(&inner))) as Arc<dyn ApplyObserver>,
-            from,
+            &listed,
         )?;
+        engine.on_leader_change(Arc::new(Leadership(Arc::downgrade(&inner))));
+        engine.add_snapshot_part(Arc::new(SnapshotPart(Arc::downgrade(&inner))));
         let log = SegLog { inner };
         {
             let mut a = lock(&log.inner.apply);
-            a.applied = a.applied.max(top);
+            for (u, top) in tops {
+                let e = a.applied.entry(u.0).or_insert(top);
+                *e = (*e).max(top);
+            }
             a.epoch += 1;
+            a.epoch_at_start = a.epoch;
             a.dirty = true;
         }
         log.flush()?;
@@ -479,10 +786,34 @@ impl SegLog {
         lock(&self.inner.policies).insert((tenant, stream), p);
     }
 
-    /// The node's current leader epoch.
+    /// The newest leader epoch on this node.
     #[must_use]
     pub fn epoch(&self) -> i32 {
         lock(&self.inner.apply).epoch
+    }
+
+    /// The leader epoch of `tenant`'s partitions on this node.
+    #[must_use]
+    pub fn epoch_of(&self, tenant: u64) -> i32 {
+        Inner::unit_epoch(&lock(&self.inner.apply), unit_of(tenant))
+    }
+
+    /// Makes sure `unit`'s log keeps entries for this log before an append
+    /// rides on it: a floor at its applied index, set once.
+    fn ensure_floor(&self, unit: u64) -> Result<()> {
+        if lock(&self.inner.apply).floored.contains(&unit) {
+            return Ok(());
+        }
+        let e = &self.inner.engine;
+        let u = sprig_engine::UnitId(unit);
+        let at = e.consensus().applied_index(u);
+        if e.log_floor_of(u, FLOOR).is_none() {
+            e.set_log_floors(FLOOR, &[(u, at)])?;
+        }
+        let mut a = lock(&self.inner.apply);
+        a.floored.insert(unit);
+        a.applied.entry(unit).or_insert(at);
+        Ok(())
     }
 
     /// Proposes one batch (a whole, checked magic-2 batch) for `key`.
@@ -494,14 +825,17 @@ impl SegLog {
             .inner
             .policy(key.tenant, key.stream)
             .is_some_and(|p| p.log_append_time);
+        let unit = unit_of(key.tenant);
+        self.ensure_floor(unit)?;
         let mut p = Payload::with_capacity(batch.len() + 48);
         p.note(&note::encode_append(key, now_ms(), lat, batch));
         let t = self.inner.engine.consensus().propose(
-            self.inner.engine.notes_unit(),
+            sprig_engine::UnitId(unit),
             p.into_bytes(),
             self.inner.cfg.durability,
         )?;
         Ok(Pending {
+            unit,
             index: t.index(),
             slot: 0,
         })
@@ -509,31 +843,85 @@ impl SegLog {
 
     /// Proposes several batches in one log entry: they are in the log
     /// together or not at all (a multi-row SQL publish over several
-    /// partitions). One pending append per batch, in order.
+    /// partitions). One pending append per batch, in order. Batches of
+    /// several tenants commit together through an engine transaction
+    /// across their units.
     ///
     /// # Errors
     /// The log refused the entry.
     pub fn propose_many(&self, batches: &[(PartKey, Vec<u8>)]) -> Result<Vec<Pending>> {
+        let mut tenants: Vec<u64> = batches.iter().map(|(k, _)| unit_of(k.tenant)).collect();
+        tenants.sort_unstable();
+        tenants.dedup();
+        if tenants.len() > 1 {
+            return self.propose_across(batches);
+        }
         let now = now_ms();
-        let mut p = Payload::with_capacity(batches.iter().map(|b| b.1.len() + 48).sum());
+        // One payload for the statement's unit.
+        let mut units: Vec<(u64, Payload, u32)> = Vec::new();
+        let mut at: Vec<(usize, u32)> = Vec::with_capacity(batches.len());
         for (key, batch) in batches {
+            let unit = unit_of(key.tenant);
+            self.ensure_floor(unit)?;
             let lat = self
                 .inner
                 .policy(key.tenant, key.stream)
                 .is_some_and(|p| p.log_append_time);
-            p.note(&note::encode_append(*key, now, lat, batch));
+            let i = if let Some(i) = units.iter().position(|(u, ..)| *u == unit) {
+                i
+            } else {
+                units.push((unit, Payload::with_capacity(batch.len() + 48), 0));
+                units.len() - 1
+            };
+            let part = &mut units[i];
+            part.1.note(&note::encode_append(*key, now, lat, batch));
+            at.push((i, part.2));
+            part.2 += 1;
         }
-        let t = self.inner.engine.consensus().propose(
-            self.inner.engine.notes_unit(),
-            p.into_bytes(),
-            self.inner.cfg.durability,
-        )?;
-        Ok((0..batches.len())
-            .map(|slot| Pending {
-                index: t.index(),
-                slot: u32::try_from(slot).unwrap_or(u32::MAX),
+        let ids: Vec<u64> = units.iter().map(|(u, ..)| *u).collect();
+        let parts: Vec<(sprig_engine::UnitId, Vec<u8>)> = units
+            .into_iter()
+            .map(|(u, p, _)| (sprig_engine::UnitId(u), p.into_bytes()))
+            .collect();
+        let tickets = self
+            .inner
+            .engine
+            .consensus()
+            .propose_many(parts, self.inner.cfg.durability)?;
+        Ok(at
+            .into_iter()
+            .map(|(i, slot)| Pending {
+                unit: ids[i],
+                index: tickets[i].index(),
+                slot,
             })
             .collect())
+    }
+
+    /// [`SegLog::propose_many`] over several tenants: one engine
+    /// transaction carrying every batch as a note of its tenant's unit.
+    fn propose_across(&self, batches: &[(PartKey, Vec<u8>)]) -> Result<Vec<Pending>> {
+        let mut t = self.inner.engine.begin(sprig_engine::txn::TxnOptions {
+            durability: Some(self.inner.cfg.durability),
+            ..sprig_engine::txn::TxnOptions::default()
+        })?;
+        let mut at = Vec::with_capacity(batches.len());
+        for (key, batch) in batches {
+            let slot = self.append_in(&mut t, *key, batch)?;
+            at.push((unit_of(key.tenant), slot));
+        }
+        let c = t.commit()?;
+        at.into_iter()
+            .map(|(unit, slot)| {
+                let index = c
+                    .log_ticket_of(unit)
+                    .map(sprig_engine::log::Ticket::index)
+                    .ok_or_else(|| {
+                        SprigError::internal("stream append: no log entry for a unit")
+                    })?;
+                Ok(Pending { unit, index, slot })
+            })
+            .collect()
     }
 
     /// Adds an append of `batch` to `txn`: it happens when (and if) the
@@ -554,8 +942,9 @@ impl SegLog {
             .inner
             .policy(key.tenant, key.stream)
             .is_some_and(|p| p.log_append_time);
-        let slot = u32::try_from(txn.notes()).unwrap_or(u32::MAX);
-        txn.add_note(note::encode_append(key, now_ms(), lat, batch))?;
+        self.ensure_floor(unit_of(key.tenant))?;
+        let slot = u32::try_from(txn.notes_for_tenant(key.tenant)).unwrap_or(u32::MAX);
+        txn.add_note_for_tenant(key.tenant, note::encode_append(key, now_ms(), lat, batch))?;
         Ok(slot)
     }
 
@@ -564,14 +953,21 @@ impl SegLog {
     /// idempotent retry then finds it).
     pub async fn outcome(&self, p: Pending, deadline: tokio::time::Instant) -> Option<Outcome> {
         let mut rx = self.inner.changed.subscribe();
+        let at = (p.unit, p.index, p.slot);
         loop {
-            if let Some(o) = lock(&self.inner.results).remove(&(p.index, p.slot)) {
+            rx.borrow_and_update();
+            if let Some(o) = lock(&self.inner.results).remove(&at) {
                 return Some(o);
             }
-            if *rx.borrow_and_update() >= p.index {
+            let applied = lock(&self.inner.apply)
+                .applied
+                .get(&p.unit)
+                .copied()
+                .unwrap_or(0);
+            if applied >= p.index {
                 // Applied, but no outcome: the entry carried no note we
                 // read (cannot happen for our own proposals).
-                if let Some(o) = lock(&self.inner.results).remove(&(p.index, p.slot)) {
+                if let Some(o) = lock(&self.inner.results).remove(&at) {
                     return Some(o);
                 }
                 return Some(Outcome::Refused {
@@ -602,7 +998,7 @@ impl SegLog {
     /// A partition's bounds (zeros for one never written).
     #[must_use]
     pub fn bounds(&self, key: PartKey) -> Bounds {
-        let epoch = self.epoch();
+        let epoch = self.epoch_of(key.tenant);
         match self.inner.existing(&key) {
             None => Bounds {
                 log_start: 0,
@@ -632,7 +1028,7 @@ impl SegLog {
         offset: i64,
         max_bytes: usize,
     ) -> std::result::Result<(Bounds, Vec<u8>), std::result::Result<OutOfRange, SprigError>> {
-        let epoch = self.epoch();
+        let epoch = self.epoch_of(key.tenant);
         let Some(p) = self.inner.existing(&key) else {
             let b = Bounds {
                 log_start: 0,
@@ -768,7 +1164,7 @@ impl SegLog {
     /// The largest epoch at most `epoch` and where its records end.
     #[must_use]
     pub fn epoch_end(&self, key: PartKey, epoch: i32) -> (i32, i64) {
-        let current = self.epoch();
+        let current = self.epoch_of(key.tenant);
         match self.inner.existing(&key) {
             None => (current, 0),
             Some(p) => {
@@ -865,13 +1261,16 @@ impl SegLog {
         out
     }
 
-    /// Whether the commit log is durable through `index`, waiting up to
-    /// two seconds for it.
-    fn log_durable_through(&self, index: u64) -> bool {
-        let e = &self.inner.engine;
-        let c = e.consensus();
+    /// Whether every unit's commit log is durable through its index in
+    /// `floors`, waiting up to two seconds for it.
+    fn log_durable_through(&self, floors: &[(u64, u64)]) -> bool {
+        let c = self.inner.engine.consensus();
+        let ingested = lock(&self.inner.apply).ingested.clone();
         for _ in 0..200 {
-            if c.durable_index(e.notes_unit()) >= index {
+            if floors.iter().all(|(u, i)| {
+                c.durable_index(sprig_engine::UnitId(*u)) >= *i
+                    || ingested.get(u).is_some_and(|x| x >= i)
+            }) {
                 return true;
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -884,6 +1283,7 @@ impl SegLog {
     ///
     /// # Errors
     /// A sync or the manifest write failed.
+    #[allow(clippy::too_many_lines)]
     pub fn flush(&self) -> Result<()> {
         let _one = lock(&self.inner.flushing);
         // What this pass takes from the in-memory state, to give back if a
@@ -902,14 +1302,19 @@ impl SegLog {
                 .collect();
             let any_dirty = a.dirty || parts.iter().any(|(_, p)| p.lock().dirty);
             if !any_dirty {
-                let floor = a.applied;
+                let floors = floors_of(&a);
                 drop(a);
                 // Never above what the log holds durably (see below).
                 let e = &self.inner.engine;
-                let floor = floor.min(e.consensus().durable_index(e.notes_unit()));
-                if self.inner.engine.log_floor(FLOOR).is_none_or(|f| f < floor) {
-                    self.inner.engine.set_log_floor(FLOOR, floor)?;
-                }
+                let raise: Vec<(sprig_engine::UnitId, u64)> = floors
+                    .into_iter()
+                    .map(|(u, f)| {
+                        let u = sprig_engine::UnitId(u);
+                        (u, f.min(e.consensus().durable_index(u)))
+                    })
+                    .filter(|(u, f)| e.log_floor_of(*u, FLOOR).is_none_or(|x| x < *f))
+                    .collect();
+                e.set_log_floors(FLOOR, &raise)?;
                 return Ok(());
             }
             let mut files = Vec::new();
@@ -940,9 +1345,14 @@ impl SegLog {
                 metas.push(meta_of(*k, &st));
             }
             a.dirty = false;
+            let node = self.inner.engine.notes_unit().0;
             let m = Manifest {
                 version: 1,
-                floor: a.applied,
+                floor: a.applied.get(&node).copied().unwrap_or(0),
+                floors: floors_of(&a)
+                    .into_iter()
+                    .filter(|(u, _)| *u != node)
+                    .collect(),
                 epoch: a.epoch,
                 dropped: a.dropped.iter().copied().collect(),
                 parts: metas,
@@ -954,7 +1364,11 @@ impl SegLog {
         // applied before it is durable, and a crash would leave files and a
         // floor above what the log kept. Wait for the log; if it doesn't
         // get there, this pass gives everything back for the next one.
-        let durable = if self.log_durable_through(m.floor) {
+        let all_floors: Vec<(u64, u64)> =
+            std::iter::once((self.inner.engine.notes_unit().0, m.floor))
+                .chain(m.floors.iter().copied())
+                .collect();
+        let durable = if self.log_durable_through(&all_floors) {
             Ok(())
         } else {
             Err(SprigError::internal(
@@ -984,7 +1398,11 @@ impl SegLog {
             }
             return Err(e);
         }
-        self.inner.engine.set_log_floor(FLOOR, m.floor)?;
+        let set: Vec<(sprig_engine::UnitId, u64)> = all_floors
+            .into_iter()
+            .map(|(u, f)| (sprig_engine::UnitId(u), f))
+            .collect();
+        self.inner.engine.set_log_floors(FLOOR, &set)?;
         Ok(())
     }
 
@@ -1075,6 +1493,14 @@ impl SegLog {
     }
 }
 
+/// The floor of every unit the log keeps entries of: its applied index.
+fn floors_of(a: &ApplyState) -> Vec<(u64, u64)> {
+    a.floored
+        .iter()
+        .map(|u| (*u, a.applied.get(u).copied().unwrap_or(0)))
+        .collect()
+}
+
 fn meta_of(k: PartKey, st: &PartState) -> PartMeta {
     PartMeta {
         key: k,
@@ -1156,83 +1582,90 @@ fn catch_up_start(floor: u64, first_held: Option<u64>, last_applied: u64) -> Opt
     }
 }
 
+/// One partition as the manifest lists it: its active segment cut back to
+/// the recorded length, files it doesn't list removed.
+fn restore_part(inner: &Inner, pm: &PartMeta) -> Result<PartState> {
+    let dir = part_dir(&inner.dir, &pm.key);
+    let mut st = PartState::new(dir.clone());
+    st.next_offset = pm.next_offset;
+    st.log_start = pm.log_start;
+    st.cleaned_to = pm.cleaned_to;
+    st.epochs.clone_from(&pm.epochs);
+    st.producers = pm
+        .producers
+        .iter()
+        .map(|p| {
+            (
+                p.id,
+                Producer {
+                    epoch: p.epoch,
+                    batches: p.batches.iter().copied().collect(),
+                    last_ms: p.last_ms,
+                },
+            )
+        })
+        .collect();
+    let names: BTreeSet<String> = pm
+        .segments
+        .iter()
+        .map(|s| segment::file_name(s.base))
+        .collect();
+    if let Ok(rd) = fs::read_dir(&dir) {
+        for e in rd.flatten() {
+            if !names.contains(&*e.file_name().to_string_lossy()) {
+                let _ = fs::remove_file(e.path());
+            }
+        }
+    }
+    let n = pm.segments.len();
+    for (i, sm) in pm.segments.iter().enumerate() {
+        let path = dir.join(segment::file_name(sm.base));
+        let active = i + 1 == n;
+        match Segment::open(
+            &path,
+            sm.base,
+            active.then_some(sm.len),
+            sm.created_ms,
+            inner.cfg.index_interval,
+        ) {
+            Ok(s) => st.segments.push(s),
+            Err(e) if e.kind() == io::ErrorKind::NotFound && !active => {
+                // Retention removed it after the manifest was written.
+                if let Some(next) = pm.segments.get(i + 1) {
+                    st.log_start = st.log_start.max(next.base);
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                fs::create_dir_all(&dir).map_err(|e| io_err("restore", &e))?;
+                st.segments.push(
+                    Segment::create(&dir, sm.base, sm.created_ms, inner.cfg.index_interval)
+                        .map_err(|e| io_err("restore", &e))?,
+                );
+            }
+            Err(e) => return Err(io_err("restore", &e)),
+        }
+    }
+    // The active segment ends where the manifest's offsets do.
+    if let Some(s) = st.segments.last()
+        && s.next != pm.next_offset
+        && !s.is_empty()
+    {
+        return Err(SprigError::internal(format!(
+            "stream log: partition {}/{}/{} ends at {} but the manifest says {}",
+            pm.key.tenant, pm.key.stream, pm.key.partition, s.next, pm.next_offset
+        )));
+    }
+    st.dirty = false;
+    st.new_files = false;
+    Ok(st)
+}
+
 fn restore(inner: &Inner, m: &Manifest) -> Result<()> {
     let mut listed: BTreeSet<PathBuf> = BTreeSet::new();
     let mut parts = HashMap::new();
     for pm in &m.parts {
-        let dir = part_dir(&inner.dir, &pm.key);
-        listed.insert(dir.clone());
-        let mut st = PartState::new(dir.clone());
-        st.next_offset = pm.next_offset;
-        st.log_start = pm.log_start;
-        st.cleaned_to = pm.cleaned_to;
-        st.epochs.clone_from(&pm.epochs);
-        st.producers = pm
-            .producers
-            .iter()
-            .map(|p| {
-                (
-                    p.id,
-                    Producer {
-                        epoch: p.epoch,
-                        batches: p.batches.iter().copied().collect(),
-                        last_ms: p.last_ms,
-                    },
-                )
-            })
-            .collect();
-        let names: BTreeSet<String> = pm
-            .segments
-            .iter()
-            .map(|s| segment::file_name(s.base))
-            .collect();
-        if let Ok(rd) = fs::read_dir(&dir) {
-            for e in rd.flatten() {
-                if !names.contains(&*e.file_name().to_string_lossy()) {
-                    let _ = fs::remove_file(e.path());
-                }
-            }
-        }
-        let n = pm.segments.len();
-        for (i, sm) in pm.segments.iter().enumerate() {
-            let path = dir.join(segment::file_name(sm.base));
-            let active = i + 1 == n;
-            match Segment::open(
-                &path,
-                sm.base,
-                active.then_some(sm.len),
-                sm.created_ms,
-                inner.cfg.index_interval,
-            ) {
-                Ok(s) => st.segments.push(s),
-                Err(e) if e.kind() == io::ErrorKind::NotFound && !active => {
-                    // Retention removed it after the manifest was written.
-                    if let Some(next) = pm.segments.get(i + 1) {
-                        st.log_start = st.log_start.max(next.base);
-                    }
-                }
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                    fs::create_dir_all(&dir).map_err(|e| io_err("restore", &e))?;
-                    st.segments.push(
-                        Segment::create(&dir, sm.base, sm.created_ms, inner.cfg.index_interval)
-                            .map_err(|e| io_err("restore", &e))?,
-                    );
-                }
-                Err(e) => return Err(io_err("restore", &e)),
-            }
-        }
-        // The active segment ends where the manifest's offsets do.
-        if let Some(s) = st.segments.last()
-            && s.next != pm.next_offset
-            && !s.is_empty()
-        {
-            return Err(SprigError::internal(format!(
-                "stream log: partition {}/{}/{} ends at {} but the manifest says {}",
-                pm.key.tenant, pm.key.stream, pm.key.partition, s.next, pm.next_offset
-            )));
-        }
-        st.dirty = false;
-        st.new_files = false;
+        listed.insert(part_dir(&inner.dir, &pm.key));
+        let st = restore_part(inner, pm)?;
         parts.insert(pm.key, Arc::new(Part { st: Mutex::new(st) }));
     }
     // Partition directories the manifest doesn't know were created after
@@ -1251,6 +1684,7 @@ fn restore(inner: &Inner, m: &Manifest) -> Result<()> {
     *inner.parts.write().unwrap_or_else(PoisonError::into_inner) = parts;
     let mut a = lock(&inner.apply);
     a.epoch = m.epoch;
+    a.epoch_at_start = m.epoch;
     a.dropped = m.dropped.iter().copied().collect();
     Ok(())
 }

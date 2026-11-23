@@ -1,4 +1,4 @@
-//! Bolt statements on graphs stored in the storage engine
+//! Bolt statements on native graphs, stored in the storage engine
 //! ([`crate::graphs::engine`]).
 //!
 //! - **Auto-commit:** one engine transaction per statement; a write is
@@ -57,19 +57,10 @@ impl EngineTx {
     }
 }
 
-/// A Bolt transaction that would use a graph on the engine and one on
-/// MariaDB: their commits can't be made one.
-pub(super) fn mixed_graphs() -> SprigError {
-    SprigError::new(
-        SprigCode::GraphUnsupported,
-        "a transaction can't use a graph stored in the storage engine together with a graph stored in MariaDB",
-    )
-}
-
 fn other_graph() -> SprigError {
     SprigError::new(
         SprigCode::GraphUnsupported,
-        "a transaction on a graph stored in the storage engine can't use another graph",
+        "a transaction can't use more than one graph",
     )
 }
 
@@ -151,11 +142,6 @@ impl GwSession {
         let Some(t) = self.tx.as_mut() else {
             return Err(SprigError::internal("no transaction"));
         };
-        t.ran += 1;
-        if t.engine.is_none() && t.ran > 1 {
-            // Earlier statements ran on a graph stored in MariaDB.
-            return Err(mixed_graphs());
-        }
         let et = t.engine.get_or_insert_with(|| EngineTx {
             g: Arc::clone(&eg),
             tx: Some(eg.begin(false)),

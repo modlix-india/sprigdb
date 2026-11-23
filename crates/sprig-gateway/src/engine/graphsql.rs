@@ -57,11 +57,6 @@ impl<'c> EngineSql<'c> {
         }
     }
 
-    /// Whether database `db` is the engine's (its tables are read here).
-    pub(crate) fn serves(cat: &TenantCatalog, db: DbId) -> bool {
-        catalog::of(cat).is_some_and(|e| e.dbs.contains(&db))
-    }
-
     /// The columns of engine table `table` of database `db` in their
     /// order, as its definition lists them; `None` when there is no such
     /// table.
