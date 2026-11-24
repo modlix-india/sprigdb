@@ -247,6 +247,10 @@ pub fn unavailable(what: impl std::fmt::Display) -> SprigError {
 /// The catalog's.
 pub async fn migrate(svc: &TenantServices, tenant: TenantId) -> Result<()> {
     let ep = svc.locator.writer(tenant).await?;
+    // A catalog of engine records only needs no MariaDB run.
+    if sprig_catalog::migrate::records_catalog(ep.store.schema()).await? {
+        return Ok(());
+    }
     let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
         SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
     })?;

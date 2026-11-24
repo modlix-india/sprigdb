@@ -437,6 +437,20 @@ impl ClusterPools for RegistryPools {
     }
 
     async fn writer(&self, cluster: &ClusterId) -> Result<Pool> {
+        // A tenant placed with no MariaDB cluster in the DC: a pool that
+        // never connects (nothing of such a tenant may reach MariaDB; a use
+        // fails with a connection error).
+        if cluster.as_str() == crate::tenants::ENGINE_ONLY_CLUSTER {
+            let opts = OptsBuilder::default()
+                .ip_or_hostname("127.0.0.1")
+                .tcp_port(9)
+                .pool_opts(
+                    PoolOpts::default()
+                        .with_constraints(PoolConstraints::new(0, 1).unwrap_or_default())
+                        .with_inactive_connection_ttl(Duration::from_secs(5)),
+                );
+            return Ok(Pool::new(opts));
+        }
         let stored = self.registry.get(cluster).await?.ok_or_else(|| {
             SprigError::new(
                 SprigCode::ClusterNotFound,

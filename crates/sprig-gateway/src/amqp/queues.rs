@@ -177,12 +177,17 @@ impl GatewayMq {
             .writer(TenantId(tenant))
             .await
             .map_err(unavailable)?;
-        let mut conn = ep.pool.get_conn_bounded().await.map_err(unavailable)?;
+        // A catalog of engine records only needs no MariaDB run.
         let schema = ep.store.schema().to_owned();
-        sprig_queues::catalog::migrate(&mut conn, &schema)
+        if !sprig_catalog::migrate::records_catalog(&schema)
             .await
-            .map_err(unavailable)?;
-        drop(conn);
+            .map_err(unavailable)?
+        {
+            let mut conn = ep.pool.get_conn_bounded().await.map_err(unavailable)?;
+            sprig_queues::catalog::migrate(&mut conn, &schema)
+                .await
+                .map_err(unavailable)?;
+        }
         let secret = MqStore::token_secret(&*self.svc.records, TenantId(tenant))
             .await
             .map_err(unavailable)?;

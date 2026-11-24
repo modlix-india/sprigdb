@@ -386,6 +386,11 @@ impl BalancerLoop {
             by_cluster.entry(c).or_default().push(t);
         }
         for (c, tenants) in by_cluster {
+            // Tenants placed with no MariaDB cluster have nothing there to
+            // measure.
+            if c.as_str() == crate::tenants::ENGINE_ONLY_CLUSTER {
+                continue;
+            }
             let scan = tokio::time::timeout(CALL_TIMEOUT, self.scan(&c, &tenants));
             let sizes = match scan
                 .await

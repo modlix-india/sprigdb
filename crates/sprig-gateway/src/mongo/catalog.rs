@@ -286,8 +286,15 @@ impl CatalogDocs {
             return Ok(());
         }
         let ep = self.svc.locator.writer(tenant).await?;
-        let mut conn = ep.pool.get_conn().await.map_err(map_err)?;
-        migrate(&mut conn, ep.store.schema()).await?;
+        // A tenant whose catalog is engine records only needs no MariaDB
+        // connection for a module without MariaDB tables.
+        if !Migrator::new(&[DOC_MODULE])?
+            .skips(ep.store.schema())
+            .await?
+        {
+            let mut conn = ep.pool.get_conn().await.map_err(map_err)?;
+            migrate(&mut conn, ep.store.schema()).await?;
+        }
         lock(&self.migrated).insert(tenant.0);
         Ok(())
     }

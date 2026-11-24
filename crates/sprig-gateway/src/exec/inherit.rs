@@ -611,10 +611,14 @@ impl sprig_inherit::Runner for InhRunner<'_, '_, '_> {
         let tenant = ts.tenant;
         if !self.migrated {
             let ep = svc.locator.writer(tenant).await?;
-            let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
-                SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
-            })?;
-            sprig_inherit::store::migrate(&mut conn, ep.store.schema()).await?;
+            // A catalog of engine records only needs no MariaDB run.
+            if !sprig_catalog::migrate::records_catalog(ep.store.schema()).await? {
+                let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
+                    SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable")
+                        .with_source(e)
+                })?;
+                sprig_inherit::store::migrate(&mut conn, ep.store.schema()).await?;
+            }
             self.migrated = true;
         }
         let mut c = svc.catalog.change(tenant, VersionKind::Catalog).await?;

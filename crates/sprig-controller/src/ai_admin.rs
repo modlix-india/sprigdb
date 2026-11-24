@@ -477,7 +477,7 @@ impl Reconciler for AiPurgeLoop {
         if !self.ours(entry.body()) {
             return Ok(Outcome::Done);
         }
-        // A tenant whose catalog schema was never made (EC-124) has no
+        // A tenant whose catalog schema was never made has no
         // assistant messages: nothing to ask MariaDB.
         if sprig_catalog::migrate::lazy_schema(*key)
             .await?

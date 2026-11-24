@@ -2542,6 +2542,10 @@ impl PassSession {
         };
         let svc = Arc::clone(ts.services());
         let cluster = ts.principal.backend.cluster.clone();
+        // No MariaDB cluster: no accounts to make (the statement is refused).
+        if cluster.as_str() == crate::tenant::locator::ENGINE_ONLY_CLUSTER {
+            return;
+        }
         if let Err(e) = svc.authz.ensure_needed(&svc, &cat, &cluster).await {
             tracing::warn!(tenant = %ts.tenant, error = %e, "backend account not made before a statement for MariaDB");
         }

@@ -1688,8 +1688,8 @@ where
                 let tables = live.iter().filter(|o| o.kind == ObjectKind::Table).count() as u64;
                 let it = intent(IntentOp::DropDatabase { db: d.db_id });
                 tx.put_internal(&it.row(previous, now)?).await?;
-                // A tenant that never had anything on MariaDB (EC-124) has
-                // no schema of the database there either (EC-120).
+                // A tenant that never had anything on MariaDB has
+                // no schema of the database there either.
                 let on_mariadb = crate::migrate::lazy_schema(tenant)
                     .await?
                     .is_none_or(|l| l.mariadb);

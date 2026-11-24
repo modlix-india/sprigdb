@@ -365,7 +365,7 @@ static FORMAT_RECORDS: std::sync::OnceLock<Arc<dyn crate::records::RecordStore>>
 /// From now on, every migration run in this process writes the tenant's
 /// new `sprig.catalog_format` into the tenant's catalog records too
 /// (before its MariaDB row), where cache loads read it without opening a
-/// MariaDB snapshot (EC-90). Set once, at process start; later calls are
+/// MariaDB snapshot. Set once, at process start; later calls are
 /// ignored. A catalog schema not named `t<id>_sprig` isn't mirrored.
 pub fn mirror_formats(records: Arc<dyn crate::records::RecordStore>) {
     let _ = FORMAT_RECORDS.set(records);
@@ -401,7 +401,7 @@ async fn mirror_format(schema: &str, state: &FormatState, version: u64) -> Resul
 }
 
 /// Records key of a tenant whose catalog schema `t<id>_sprig` is made
-/// only when something first needs it (bootstrap since EC-124): a
+/// only when something first needs it (bootstrap of new tenants): a
 /// [`LazySchema`].
 pub const SCHEMA_KEY: &str = "sprig.catalog_schema";
 
@@ -431,6 +431,20 @@ pub async fn lazy_schema(tenant: sprig_common::ids::TenantId) -> Result<Option<L
     v?.map(serde_json::from_value)
         .transpose()
         .map_err(|e| SprigError::internal(format!("bad {SCHEMA_KEY}: {e}")))
+}
+
+/// Whether catalog `schema` belongs to a tenant bootstrapped without it
+/// (its catalog is engine records only, [`LazySchema`]): a migration run of
+/// the core module or of modules without MariaDB tables does nothing for
+/// it, so callers open no MariaDB connection for one.
+///
+/// # Errors
+/// The records' errors.
+pub async fn records_catalog(schema: &str) -> Result<bool> {
+    match tenant_of(schema) {
+        Some(t) => Ok(lazy_schema(t).await?.is_some()),
+        None => Ok(false),
+    }
 }
 
 async fn put_lazy(
@@ -470,6 +484,33 @@ pub async fn note_mariadb_use(tenant: sprig_common::ids::TenantId) -> Result<()>
                 &LazySchema {
                     mark: l.mark,
                     mariadb: true,
+                },
+            )
+            .await
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Notes that nothing of `tenant` can be on MariaDB (it was placed with no
+/// MariaDB cluster), so its database drops and cleanup ask MariaDB nothing,
+/// whatever an earlier [`note_mariadb_use`] recorded. Nothing for a tenant
+/// without a [`LazySchema`] record.
+///
+/// # Errors
+/// The records' errors.
+pub async fn note_no_mariadb(tenant: sprig_common::ids::TenantId) -> Result<()> {
+    let Some(records) = FORMAT_RECORDS.get() else {
+        return Ok(());
+    };
+    match lazy_schema(tenant).await? {
+        Some(l) if l.mariadb => {
+            put_lazy(
+                &**records,
+                tenant,
+                &LazySchema {
+                    mark: l.mark,
+                    mariadb: false,
                 },
             )
             .await
@@ -747,7 +788,7 @@ impl Migrator {
         state
     }
 
-    /// Bootstrap of a catalog kept in engine records (EC-124): writes the
+    /// Bootstrap of a catalog kept in engine records: writes the
     /// format ([`Self::newest_state`]) and the tenant's [`LazySchema`]
     /// record with `owner` as the mark into `records`; MariaDB is told
     /// nothing. The schema `t<id>_sprig` is made, with that mark, by the
@@ -809,6 +850,25 @@ impl Migrator {
             .collect()
     }
 
+    /// Whether a [`Self::run`] on catalog `schema` does nothing at all, so a
+    /// caller needs no MariaDB connection for it: the tenant was
+    /// bootstrapped without its schema and every module of this
+    /// migrator is the core module or has no MariaDB migrations (its rows
+    /// are engine records).
+    ///
+    /// # Errors
+    /// The records' errors.
+    pub async fn skips(&self, schema: &str) -> Result<bool> {
+        if !self
+            .modules
+            .iter()
+            .all(|m| m.name == CORE_MODULE.name || m.migrations.is_empty())
+        {
+            return Ok(false);
+        }
+        records_catalog(schema).await
+    }
+
     /// Creates the schema if needed (`utf8mb4_bin`, so names compare
     /// exactly), then applies every pending migration the ceilings allow,
     /// core module first. Safe to call concurrently from several processes
@@ -831,15 +891,12 @@ impl Migrator {
         // named lock: the connection is reset when it goes back to its pool,
         // even a catalog pool that keeps its connections as they are.
         conn.reset_connection(true);
-        // A tenant bootstrapped without its schema (EC-124): a run of the
-        // core module alone (its tables' rows are engine records) needs
-        // none, made or not (a later run with another module brings the
-        // core tables along); a run with another module makes a missing
-        // one, with its mark, below.
-        if let Some(t) = tenant_of(schema)
-            && self.modules.iter().all(|m| m.name == CORE_MODULE.name)
-            && lazy_schema(t).await?.is_some()
-        {
+        // A tenant bootstrapped without its schema: a run of the
+        // core module and modules whose rows are all engine records needs
+        // none, made or not (a later run with a module that has MariaDB
+        // tables brings the core tables along); a run with such a module
+        // makes a missing one, with its mark, below.
+        if self.skips(schema).await? {
             return Ok(MigrateReport {
                 applied: Vec::new(),
                 blocked: Vec::new(),

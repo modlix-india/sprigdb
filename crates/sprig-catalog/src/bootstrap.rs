@@ -295,7 +295,7 @@ pub async fn write_progress(
         .await
 }
 
-/// [`write_progress`] for a catalog kept in engine records (EC-124):
+/// [`write_progress`] for a catalog kept in engine records:
 /// `sprig.bootstrap` in the tenant's records.
 ///
 /// # Errors

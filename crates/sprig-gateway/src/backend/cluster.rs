@@ -458,6 +458,14 @@ impl ClusterSource for RegistryClusters {
                     .insert(id.clone(), (Instant::now(), Arc::clone(&v)));
                 Ok(v)
             }
+            // A tenant placed with no MariaDB cluster: what needs MariaDB
+            // is refused plainly.
+            Ok(None) if id.as_str() == crate::tenant::locator::ENGINE_ONLY_CLUSTER => {
+                Err(SprigError::new(
+                    SprigCode::NotOnEngine,
+                    "this statement needs MariaDB, and the tenant has no MariaDB cluster",
+                ))
+            }
             Ok(None) => Err(SprigError::new(
                 SprigCode::ClusterNotFound,
                 format!("no cluster {id} in this data center"),

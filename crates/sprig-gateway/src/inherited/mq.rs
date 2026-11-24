@@ -230,18 +230,21 @@ pub async fn ensure_vhost(
     // runs before), then the member's database. Not at the same time: a
     // catalog load that starts before a module's tables exist fails with 1412
     // when it reads them (seen when they ran together).
-    {
+    // A tenant whose catalog is engine records only needs no MariaDB
+    // connection: neither module has MariaDB tables.
+    let migrator = sprig_catalog::Migrator::new(&[
+        sprig_inherit::msg::store::MSG_MODULE,
+        sprig_queues::catalog::MQ_MODULE,
+    ])?;
+    if !migrator.skips(ep.store.schema()).await? {
         let mut c = ep.pool.get_conn_bounded().await.map_err(cat_err)?;
-        sprig_catalog::Migrator::new(&[
-            sprig_inherit::msg::store::MSG_MODULE,
-            sprig_queues::catalog::MQ_MODULE,
-        ])?
-        .run(
-            &mut c,
-            ep.store.schema(),
-            &sprig_catalog::migrate::MigrateOpts::existing(),
-        )
-        .await?;
+        migrator
+            .run(
+                &mut c,
+                ep.store.schema(),
+                &sprig_catalog::migrate::MigrateOpts::existing(),
+            )
+            .await?;
     }
     let cat = super::ensure_database(svc, t, &db_name).await?;
     let prepared_ms = started.elapsed().as_millis();

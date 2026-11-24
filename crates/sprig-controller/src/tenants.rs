@@ -267,6 +267,15 @@ pub const CLEANUP_JOBS_RECHECK: Duration = Duration::from_secs(2);
 /// went only at the catalog reconciler's next pass, up to 5 minutes).
 pub const CLEANUP_DATABASES_RECHECK: Duration = Duration::from_secs(5);
 
+/// The cluster id a tenant's catalog shard map names when its DC has no
+/// MariaDB cluster: no cluster has it, so nothing of the tenant can reach
+/// MariaDB.
+pub const ENGINE_ONLY_CLUSTER: &str = "engine-only";
+
+fn engine_only_cluster() -> Result<ClusterId> {
+    ClusterId::new(ENGINE_ONLY_CLUSTER).map_err(|e| SprigError::internal(e.to_string()))
+}
+
 fn placement_unavailable(message: String) -> SprigError {
     SprigError::new(SprigCode::PlacementUnavailable, message)
 }
@@ -333,6 +342,16 @@ where
     /// [`DELETED_DATABASES_GRACE`] are marked dropped in the catalog,
     /// whose schemas step 3 drops by id anyway. Returns how many are left.
     async fn drop_databases(&self, id: TenantId) -> Result<u64> {
+        // A tenant placed with no MariaDB cluster has nothing there, even
+        // if an older build noted otherwise: its drops ask MariaDB nothing.
+        if self
+            .locator
+            .cluster_of(id)
+            .await?
+            .is_some_and(|c| c.as_str() == ENGINE_ONLY_CLUSTER)
+        {
+            sprig_catalog::migrate::note_no_mariadb(id).await?;
+        }
         let mut live = cleanup::live_databases(id).await?;
         if live == 0 {
             self.waiting_dbs
@@ -685,8 +704,8 @@ where
         let store = Store::new(self.locator.schema(id));
         let mark = owner_mark(&b);
         // Under the real naming the catalog is engine records only: no
-        // `t<id>_sprig` until a module beyond the core one first needs it
-        // (EC-124). A test's naming keeps the schema made here.
+        // `t<id>_sprig` until a module beyond the core one first needs it.
+        // A test's naming keeps the schema made here.
         let records_only = store.schema() == SchemaName::catalog(id).to_string();
         if records_only {
             self.migrator
@@ -860,7 +879,9 @@ where
         SprigError::new(SprigCode::TenantNotReady, why)
     }
 
-    /// Step 1: the recorded placement, or a new one written once.
+    /// Step 1: the recorded placement, or a new one written once. With no
+    /// MariaDB cluster in the DC the placement is
+    /// [`ENGINE_ONLY_CLUSTER`].
     async fn place(
         &self,
         b: &DirectoryEntry,
@@ -896,20 +917,17 @@ where
                     self.dc
                 )));
             }
-            None => {
-                let best = considered
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|(i, (_, n))| (*n, *i))
-                    .map(|(_, (c, _))| c.clone())
-                    .ok_or_else(|| {
-                        placement_unavailable(format!(
-                            "dc {} has no active cluster for tenant {}'s catalog",
-                            self.dc, b.name
-                        ))
-                    })?;
-                (best, "fewest_tenants")
-            }
+            None => match considered
+                .iter()
+                .enumerate()
+                .min_by_key(|(i, (_, n))| (*n, *i))
+                .map(|(_, (c, _))| c.clone())
+            {
+                Some(best) => (best, "fewest_tenants"),
+                // No MariaDB cluster in the DC: the tenant lives on the
+                // engine only; its shard map names no real cluster.
+                None => (engine_only_cluster()?, "engine_only"),
+            },
         };
         let map = ShardMap::catalog(b.tenant_id, cluster.clone(), b.epoch);
         let mut when = vec![Cmp::Missing(key.clone())];
@@ -1067,10 +1085,15 @@ where
         let mark = owner_mark(e.body());
         let catalog_cluster = self.locator.cluster_of(id).await?;
         // A tenant bootstrapped without its catalog schema that never made
-        // it, nor backend accounts (EC-124), has nothing on MariaDB.
-        let on_mariadb = sprig_catalog::migrate::lazy_schema(id)
-            .await?
-            .is_none_or(|l| l.mariadb);
+        // it, nor backend accounts, has nothing on MariaDB.
+        // Nor does one placed with no MariaDB cluster.
+        let engine_only = catalog_cluster
+            .as_ref()
+            .is_some_and(|c| c.as_str() == ENGINE_ONLY_CLUSTER);
+        let on_mariadb = !engine_only
+            && sprig_catalog::migrate::lazy_schema(id)
+                .await?
+                .is_none_or(|l| l.mariadb);
         let mut catalog: Option<CatalogEndpoint> = None;
         let mut db_ids = std::collections::BTreeSet::new();
         if let Some(c) = catalog_cluster.as_ref().filter(|_| on_mariadb) {

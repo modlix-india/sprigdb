@@ -500,6 +500,10 @@ async fn migrate_for(svc: &TenantServices, t: TenantId, records: &Records) -> Re
         return Ok(());
     }
     let ep = svc.locator.writer(t).await?;
+    // A catalog of engine records only needs no MariaDB run.
+    if sprig_catalog::migrate::records_catalog(ep.store.schema()).await? {
+        return Ok(());
+    }
     let mut conn = ep.pool.get_conn().await.map_err(|e| {
         SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
     })?;

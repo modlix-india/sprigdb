@@ -327,7 +327,7 @@ impl AuthzServices {
         cat: &TenantCatalog,
         cluster: &ClusterId,
     ) -> Result<()> {
-        // A tenant bootstrapped without its catalog schema (EC-124) notes
+        // A tenant bootstrapped without its catalog schema notes
         // that it now has accounts on MariaDB, for its cleanup.
         if !lock(&self.needed).contains(&cat.tenant) {
             sprig_catalog::migrate::note_mariadb_use(cat.tenant).await?;

@@ -1591,8 +1591,12 @@ impl Host for DeployHost {
     async fn commit(&mut self, change: Change) -> Result<()> {
         let tenant = self.cat.tenant;
         if !self.migrated {
-            let (mut conn, schema) = self.conn().await?;
-            sprig_sinks::store::migrate(&mut conn, &schema).await?;
+            let ep = self.svc.locator.writer(tenant).await?;
+            // A catalog of engine records only needs no MariaDB run.
+            if !sprig_catalog::migrate::records_catalog(ep.store.schema()).await? {
+                let (mut conn, schema) = self.conn().await?;
+                sprig_sinks::store::migrate(&mut conn, &schema).await?;
+            }
             self.migrated = true;
         }
         let mut c = self

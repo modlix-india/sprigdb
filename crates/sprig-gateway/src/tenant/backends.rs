@@ -288,6 +288,25 @@ impl BackendResolver for TenantBackends {
             })?;
             return Ok(p.target(cluster, tenant.id, user.row.user_id));
         }
+        // A tenant placed with no MariaDB cluster needs no account: a target
+        // that names the placeholder cluster, which never connects.
+        if !self.tenants.contains_key(&tenant.name)
+            && self.default.is_none()
+            && self
+                .locator
+                .cached_cluster(tenant.id)
+                .is_some_and(|c| c.as_str() == super::locator::ENGINE_ONLY_CLUSTER)
+        {
+            return Ok(BackendTarget {
+                cluster: ClusterId::new(super::locator::ENGINE_ONLY_CLUSTER)
+                    .map_err(|e| SprigError::internal(e.to_string()))?,
+                user: String::new(),
+                credentials: SecretRef {
+                    source: SecretSource::Env("SPRIGDB_NO_BACKEND_ACCOUNT".to_owned()),
+                    section: None,
+                },
+            });
+        }
         let e = self
             .tenants
             .get(&tenant.name)

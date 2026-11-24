@@ -38,6 +38,10 @@ use sprig_provision::credentials::CredentialConnector;
 use sprig_shard::Placement;
 use tokio::sync::watch;
 
+/// The cluster a tenant's shard map names when its DC has no MariaDB
+/// cluster (the controller places it so): nothing of it reaches MariaDB.
+pub const ENGINE_ONLY_CLUSTER: &str = "engine-only";
+
 use crate::backend::Backends;
 
 /// Connections per cluster in each of the three `sprig_ctl` pools (see
@@ -602,6 +606,14 @@ impl GatewayLocator {
     /// # Errors
     /// As [`Self::ctl_pool`].
     pub async fn ctl_opts(&self, cluster: &ClusterId) -> Result<mysql_async::Opts> {
+        // A tenant placed with no MariaDB cluster in the DC: options that
+        // never connect (nothing of such a tenant may reach MariaDB).
+        if cluster.as_str() == ENGINE_ONLY_CLUSTER {
+            return Ok(OptsBuilder::default()
+                .ip_or_hostname("127.0.0.1")
+                .tcp_port(9)
+                .into());
+        }
         let stored = self.registry.get(cluster).await?.ok_or_else(|| {
             SprigError::new(
                 SprigCode::ClusterNotFound,
@@ -631,6 +643,9 @@ impl GatewayLocator {
     /// # Errors
     /// 39104 for an unknown cluster; the registry's.
     pub async fn is_galera(&self, cluster: &ClusterId) -> Result<bool> {
+        if cluster.as_str() == ENGINE_ONLY_CLUSTER {
+            return Ok(false);
+        }
         let stored = self.registry.get(cluster).await?.ok_or_else(|| {
             SprigError::new(
                 SprigCode::ClusterNotFound,
@@ -648,6 +663,9 @@ impl GatewayLocator {
     /// # Errors
     /// As [`Self::ctl_pool`].
     pub async fn ctl_replica_opts(&self, cluster: &ClusterId) -> Result<Vec<mysql_async::Opts>> {
+        if cluster.as_str() == ENGINE_ONLY_CLUSTER {
+            return Ok(Vec::new());
+        }
         let stored = self.registry.get(cluster).await?.ok_or_else(|| {
             SprigError::new(
                 SprigCode::ClusterNotFound,
@@ -904,6 +922,25 @@ impl GatewayLocator {
     async fn pool_of(&self, cluster: &ClusterId, budget: Budget) -> Result<Pool> {
         let catalog = budget == Budget::Catalog;
         let key = (budget, cluster.clone());
+        if cluster.as_str() == ENGINE_ONLY_CLUSTER {
+            // A tenant placed with no MariaDB cluster: a pool that never
+            // connects (a use fails with a connection error).
+            let mut pools = self.pools.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some((_, p)) = pools.get(&key) {
+                return Ok(p.clone());
+            }
+            let opts = OptsBuilder::default()
+                .ip_or_hostname("127.0.0.1")
+                .tcp_port(9)
+                .pool_opts(
+                    PoolOpts::default()
+                        .with_constraints(PoolConstraints::new(0, 1).unwrap_or_default())
+                        .with_inactive_connection_ttl(IDLE_TTL),
+                );
+            let pool = Pool::new(opts);
+            pools.insert(key, (ENGINE_ONLY_CLUSTER.to_owned(), pool.clone()));
+            return Ok(pool);
+        }
         let stored = self.pool_record(cluster).await?;
         let rec = stored.body();
         let writer = match self.backends.writer(cluster, ShardId(0)).await {

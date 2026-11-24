@@ -240,15 +240,22 @@ impl<H: crate::tenants::BootstrapHooks> crate::tenants::BootstrapHooks for WithM
             ..sprig_catalog::migrate::MigrateOpts::existing()
         };
         let run = async {
+            let migrator = sprig_catalog::Migrator::new(&modules)?;
+            // A tenant whose catalog is engine records only: the messaging
+            // modules have no MariaDB tables, so nothing to make there.
+            if migrator.skips(catalog.store.schema()).await? {
+                return Ok(());
+            }
             let mut c = catalog.pool.get_conn_bounded().await.map_err(|e| {
                 sprig_common::SprigError::new(
                     sprig_common::SprigCode::CatalogUnavailable,
                     format!("catalog: {e}"),
                 )
             })?;
-            sprig_catalog::Migrator::new(&modules)?
+            migrator
                 .run(&mut c, catalog.store.schema(), &opts)
                 .await
+                .map(|_| ())
         };
         if let Err(e) = run.await {
             tracing::warn!(tenant = %tenant.tenant_id, error = %e, "messaging catalog modules not made at creation; the first publish makes them");

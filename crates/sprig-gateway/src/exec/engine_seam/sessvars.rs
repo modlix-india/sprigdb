@@ -619,7 +619,12 @@ pub(super) fn user_sets(sql: &[u8], opts: LexOptions) -> Option<Vec<(String, Str
 
 /// Every database of the tenant is on the engine.
 pub(super) fn all_engine(cat: &TenantCatalog) -> bool {
-    catalog::of(cat).is_some_and(|e| cat.databases.iter().all(|d| e.dbs.contains(&d.db_id)))
+    // A tenant with no database yet counts: every new database is an
+    // engine database.
+    let engine = catalog::of(cat);
+    cat.databases
+        .iter()
+        .all(|d| engine.is_some_and(|e| e.dbs.contains(&d.db_id)))
 }
 
 /// The session's variables, read once per statement.
