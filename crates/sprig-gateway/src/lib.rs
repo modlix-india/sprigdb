@@ -64,6 +64,7 @@
 #![recursion_limit = "256"]
 
 pub mod amqp;
+pub(crate) mod autoindex;
 pub mod backend;
 pub mod backup;
 // The Bolt listener on 7687.
@@ -331,6 +332,19 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
         clock.clone(),
         stop.clone(),
     )?;
+    // Automatic indexing: the loop over the tenants whose engine this
+    // process hosts (it opens parameter samples with the workload keys).
+    if let Some(t) = &tenants {
+        let keyring: Arc<dyn sprig_workload::keyring::TenantKeyring> =
+            match &rctx.config.gateway.workload_key_file {
+                Some(p) => match sprig_workload::keyring::MasterKeyring::from_file(p) {
+                    Ok(k) => Arc::new(k),
+                    Err(_) => Arc::new(sprig_workload::keyring::NoKeys),
+                },
+                None => Arc::new(sprig_workload::keyring::NoKeys),
+            };
+        let _loop = autoindex::spawn(Arc::clone(t), keyring, stop.clone());
+    }
     // Every front end's requests pass the workload hook into the one
     // executor.
     // Admission in front of everything, so a statement waiting for a slot

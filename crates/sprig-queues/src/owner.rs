@@ -457,6 +457,10 @@ struct Core {
     next_seq: u64,
     hwm: u64,
     hwm_target: u64,
+    /// The highest sequence number handed out (or marked by an earlier
+    /// owner): the mark a planned hand-off leaves, since the mark planned
+    /// ahead covers messages nobody was given yet.
+    delivered_max: u64,
     ready: BTreeMap<(u8, u64), Entry>,
     cache_bytes: u64,
     complete: bool,
@@ -564,6 +568,7 @@ pub async fn run_owned(
         next_seq: claim.state.next_seq.max(1),
         hwm: claim.state.delivered_hwm,
         hwm_target: claim.state.delivered_hwm,
+        delivered_max: claim.state.delivered_hwm,
         ready: BTreeMap::new(),
         cache_bytes: 0,
         complete: false,
@@ -871,13 +876,13 @@ impl Core {
 
     fn full_for(&self, size: u64, extra: u64) -> bool {
         let count = self.ready_count + extra;
-        let pending_bytes: u64 = self.inserts.iter().map(|(e, _)| e.size).sum();
         self.p.cfg.max_length.is_some_and(|n| count >= n)
-            || self
-                .p
-                .cfg
-                .max_length_bytes
-                .is_some_and(|n| self.ready_bytes + pending_bytes + size > n)
+            || self.p.cfg.max_length_bytes.is_some_and(|n| {
+                // Summed only when a byte limit is set: per message over a
+                // batch of thousands, it is the publish path's main cost.
+                let pending_bytes: u64 = self.inserts.iter().map(|(e, _)| e.size).sum();
+                self.ready_bytes + pending_bytes + size > n
+            })
     }
 
     async fn enqueue(&mut self, items: Vec<(Incoming, Option<Reply<()>>)>) {
@@ -1088,21 +1093,46 @@ impl Core {
     // ------------------------------------------------------------------
 
     /// How far `delivered_hwm` must reach so the messages consumers can
-    /// take next are covered.
+    /// take before the next write lands are covered: their credit now, plus
+    /// what they hold unacknowledged (acks arriving during the write give
+    /// that credit back, and a delivery past the mark must wait for the
+    /// write after). Covering a message that then isn't delivered only
+    /// flags it `redelivered` should the owner move.
     fn plan_hwm(&mut self) {
-        let credit: u64 = self
-            .eligible()
+        if self.handoff.is_some() {
+            return;
+        }
+        let eligible = self.eligible();
+        if eligible.is_empty() {
+            return;
+        }
+        let credit: u64 = eligible
             .iter()
             .map(|&i| u64::from(self.consumers[i].credit))
             .sum();
-        if credit == 0 {
+        let window = credit + self.unacked.len() as u64;
+        if window == 0 {
             return;
         }
-        let mut keys: Vec<(u8, u64)> = self.ready.keys().copied().collect();
-        keys.extend(self.inserts.iter().map(|(e, _)| e.key()));
-        keys.sort_unstable();
-        let take = usize::try_from(credit).unwrap_or(usize::MAX);
-        if let Some(max) = keys.iter().take(take).map(|k| k.1).max()
+        let take = usize::try_from(window).unwrap_or(usize::MAX);
+        // The next `take` messages in dispatch order: the cache's (in
+        // order already) merged with the batch's.
+        let mut batch: Vec<(u8, u64)> = self.inserts.iter().map(|(e, _)| e.key()).collect();
+        batch.sort_unstable();
+        let mut cached = self.ready.keys().copied().peekable();
+        let mut fresh = batch.into_iter().peekable();
+        let mut max = None;
+        for _ in 0..take {
+            let next = match (cached.peek(), fresh.peek()) {
+                (Some(a), Some(b)) if a <= b => cached.next(),
+                (_, Some(_)) => fresh.next(),
+                (Some(_), None) => cached.next(),
+                (None, None) => None,
+            };
+            let Some(k) = next else { break };
+            max = max.max(Some(k.1));
+        }
+        if let Some(max) = max
             && max > self.hwm_target
         {
             self.hwm_target = max;
@@ -1257,6 +1287,7 @@ impl Core {
             }
             let e = self.cache_take(k)?;
             self.dec_ready(e.size);
+            self.delivered_max = self.delivered_max.max(e.seq);
             if e.expires_at_ms.is_some_and(|t| t <= now) {
                 self.dead_letter(e, DeadLetterReason::Expired, true);
                 continue;
@@ -1948,7 +1979,14 @@ impl Core {
                 break "stopped".to_owned();
             }
             if self.handoff.is_some() {
-                // Drain what is in flight, so nothing is redelivered.
+                // Drain what is in flight, so nothing is redelivered, and
+                // leave the mark at what was handed out: the next owner
+                // flags everything under it redelivered.
+                if self.hwm > self.delivered_max {
+                    self.hwm = self.delivered_max;
+                    self.hwm_target = self.delivered_max;
+                    self.hwm_dirty = true;
+                }
                 match self.flush().await {
                     Ok(()) => break "handed off".to_owned(),
                     Err(e) => {

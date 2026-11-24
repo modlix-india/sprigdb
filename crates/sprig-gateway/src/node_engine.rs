@@ -17,11 +17,14 @@
 //!   `SPRIGDB_ENGINE_RAFT_LISTEN` is the address the Raft listener binds
 //!   (default: this node's own entry). Unset: one node, as before.
 //! - `SPRIGDB_ENGINE_STREAM_GROUPS`: on a replicated node, the partition
-//!   groups per tenant (default: one per replica; `0` keeps every
-//!   partition in its tenant's unit). Partition `p` of a stream commits
-//!   through its tenant's group unit `p % n`, each group's leader
-//!   preferably on a different replica, so Kafka writes spread over the
-//!   nodes. Every replica must use the same value.
+//!   groups per tenant (default `0`: every partition in its tenant's
+//!   unit). With `n` groups, partition `p` of a stream commits through its
+//!   tenant's group unit `p % n`, each group's leader preferably on a
+//!   different replica, so Kafka writes spread over the nodes. Off by
+//!   default: measured, the spread made produce slower, because each
+//!   node's one Raft loop then syncs for a group it leads and groups it
+//!   follows in turn, and commits wait on more of those syncs. Every
+//!   replica must use the same value.
 //! - `SPRIGDB_ENGINE_RAFT_JOIN=true`: this node replaces a lost replica.
 //!   It starts with no units of its own and takes each unit only from the
 //!   unit's leader, once an operator runs `sprigctl engine replace-replica`
@@ -146,24 +149,23 @@ fn preferred_leader(voters: &[u64], unit: u64) -> Option<u64> {
 }
 
 /// The partition groups per tenant for this node's stream log: 0 on one
-/// node; on a replicated node [`STREAM_GROUPS_VAR`], else the number of
-/// replicas.
+/// node; on a replicated node [`STREAM_GROUPS_VAR`], else 0.
 #[must_use]
 pub fn stream_groups() -> u32 {
     groups_from(|k| std::env::var(k).ok())
 }
 
 fn groups_from(lookup: impl Fn(&str) -> Option<String>) -> u32 {
-    let Ok(Some(r)) = raft_from(&lookup) else {
+    let Ok(Some(_)) = raft_from(&lookup) else {
         return 0;
     };
     match lookup(STREAM_GROUPS_VAR).map(|v| v.trim().parse::<u32>()) {
         Some(Ok(n)) => n.min(255),
         Some(Err(_)) => {
-            tracing::warn!("{STREAM_GROUPS_VAR} isn't a number; one group per replica");
-            u32::try_from(r.peers.len()).unwrap_or(0)
+            tracing::warn!("{STREAM_GROUPS_VAR} isn't a number; no partition groups");
+            0
         }
-        None => u32::try_from(r.peers.len()).unwrap_or(0),
+        None => 0,
     }
 }
 
@@ -610,7 +612,7 @@ mod tests {
         };
         assert_eq!(groups(&[]), 0, "one node: no groups");
         let repl = [(RAFT_ID_VAR, "1"), (RAFT_PEERS_VAR, peers)];
-        assert_eq!(groups(&repl), 3, "one group per replica");
+        assert_eq!(groups(&repl), 0, "off unless asked for");
         let mut set = repl.to_vec();
         set.push((STREAM_GROUPS_VAR, "0"));
         assert_eq!(groups(&set), 0);

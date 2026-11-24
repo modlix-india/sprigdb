@@ -574,7 +574,7 @@ fn access(def: &TableDef, filter: Option<CExpr>) -> (Access, Option<CExpr>, Opti
         }
     }
     // Equality on a secondary index's first column (kept in the filter).
-    for (ix, x) in def.indexes.iter().enumerate() {
+    for (ix, x) in def.indexes.iter().enumerate().filter(|(_, x)| !x.ignored) {
         if let Some(v) = terms.iter().find_map(|t| eq_on(t, x.cols[0])) {
             return (Access::IndexEq { ix, val: v }, rebuild(terms), None);
         }

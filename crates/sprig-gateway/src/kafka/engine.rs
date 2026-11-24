@@ -1,16 +1,12 @@
 //! Kafka topics stored on SprigDB's own storage engine.
 //!
-//! A topic `<database>.<stream>` is stored on the engine when its database
-//! is an engine database of the tenant, or when the node puts whole
-//! tenants there: `SPRIGDB_ENGINE_STREAMS_TENANTS` (`all`, or tenant ids
-//! separated by commas). Such topics live in the node's stream log
-//! (`<engine dir>/streams`, segment files fed by the engine's commit log)
-//! and their offsets and groups are engine records; they never touch
-//! MariaDB, the outbox or the sequencer. Every other topic is served as
-//! before.
+//! Every tenant's topics `<database>.<stream>` are stored on the engine,
+//! in the node's stream log (`<engine dir>/streams`, segment files fed by
+//! the engine's commit log); their offsets and groups are engine records.
+//! They never touch MariaDB.
 //!
 //! The stream log opens with the front end when the node has an engine
-//! (`SPRIGDB_ENGINE_DIR` set, or tenants named in the variable above); if
+//! (`SPRIGDB_ENGINE_DIR` set); if
 //! it can't open, engine topics are not served and the node's log says
 //! why.
 
@@ -23,9 +19,6 @@ use sprig_streams::seg::SegConfig;
 use sprig_streams::seg::kafka::{EngineStreams, Gate, Need};
 
 use super::data::GatewayData;
-
-/// The variable naming whole tenants whose streams are on the engine.
-pub const TENANTS_VAR: &str = "SPRIGDB_ENGINE_STREAMS_TENANTS";
 
 /// Which tenants are wholly on the engine: every one, or these.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,21 +54,18 @@ impl Tenants {
     }
 }
 
-/// The tenants named in `SPRIGDB_ENGINE_STREAMS_TENANTS`.
+/// The tenants whose topics are on the engine: every one (the engine is
+/// the only stream store).
+#[must_use]
 pub fn tenants() -> &'static Tenants {
-    static T: OnceLock<Tenants> = OnceLock::new();
-    T.get_or_init(|| {
-        std::env::var(TENANTS_VAR)
-            .ok()
-            .and_then(|v| Tenants::parse(&v))
-            .unwrap_or_else(|| Tenants::Only(std::collections::BTreeSet::new()))
-    })
+    static T: Tenants = Tenants::All;
+    &T
 }
 
 /// Whether the node has an engine for streams to be stored on.
 fn configured() -> bool {
     let set = |k: &str| std::env::var(k).is_ok_and(|v| !v.trim().is_empty());
-    set(crate::node_engine::DIR_VAR) || set(TENANTS_VAR)
+    set(crate::node_engine::DIR_VAR)
 }
 
 /// The node's engine-stored streams, opened on first use (with their

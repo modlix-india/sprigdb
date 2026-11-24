@@ -91,6 +91,10 @@ pub struct IndexDef {
     pub unique: bool,
     /// The key's columns, in order.
     pub parts: Vec<IndexPart>,
+    /// MariaDB's `IGNORED` (MySQL's `INVISIBLE`): every write keeps the
+    /// key's entries, and no plan reads them. [`TableDef::keys`] leaves
+    /// such a key out.
+    pub ignored: bool,
 }
 
 impl IndexDef {
@@ -101,7 +105,15 @@ impl IndexDef {
             name: name.to_owned(),
             unique,
             parts,
+            ignored: false,
         }
+    }
+
+    /// The same key, ignored by plans when `ignored`.
+    #[must_use]
+    pub fn ignored(mut self, ignored: bool) -> Self {
+        self.ignored = ignored;
+        self
     }
 }
 
@@ -149,12 +161,14 @@ impl TableDef {
         }
     }
 
-    /// Every key of the table, the primary key first.
+    /// Every key a plan may read, the primary key first: ignored
+    /// secondary indexes are left out.
     pub fn keys(&self) -> impl Iterator<Item = (KeyId, &IndexDef)> {
         self.primary.iter().map(|k| (KeyId::Primary, k)).chain(
             self.indexes
                 .iter()
                 .enumerate()
+                .filter(|(_, k)| !k.ignored)
                 .map(|(i, k)| (KeyId::Index(i), k)),
         )
     }

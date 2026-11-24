@@ -362,11 +362,118 @@ const COLS: &[(&str, &str, u16, u32, u8, u16)] = &[
     ("VIEWS", "CHARACTER_SET_CLIENT", 224, 128, 0xfd, 0x1001),
     ("VIEWS", "COLLATION_CONNECTION", 224, 256, 0xfd, 0x1001),
     ("VIEWS", "ALGORITHM", 224, 40, 0xfd, 0x1001),
+    ("ROUTINES", "SPECIFIC_NAME", 224, 256, 0xfd, 0x1001),
+    ("ROUTINES", "ROUTINE_CATALOG", 224, 2048, 0xfd, 0x1001),
+    ("ROUTINES", "ROUTINE_SCHEMA", 224, 256, 0xfd, 0x1001),
+    ("ROUTINES", "ROUTINE_NAME", 224, 256, 0xfd, 0x1001),
+    ("ROUTINES", "ROUTINE_TYPE", 224, 52, 0xfd, 0x1001),
+    ("ROUTINES", "DATA_TYPE", 224, 256, 0xfd, 0x1001),
+    ("ROUTINES", "CHARACTER_MAXIMUM_LENGTH", 63, 21, 0x03, 0x1000),
+    ("ROUTINES", "CHARACTER_OCTET_LENGTH", 63, 21, 0x03, 0x1000),
+    ("ROUTINES", "NUMERIC_PRECISION", 63, 21, 0x03, 0x1000),
+    ("ROUTINES", "NUMERIC_SCALE", 63, 21, 0x03, 0x1000),
+    ("ROUTINES", "DATETIME_PRECISION", 63, 21, 0x08, 0x1020),
+    ("ROUTINES", "CHARACTER_SET_NAME", 224, 256, 0xfd, 0x1000),
+    ("ROUTINES", "COLLATION_NAME", 224, 256, 0xfd, 0x1000),
+    ("ROUTINES", "DTD_IDENTIFIER", 224, 786_420, 0xfc, 0x1010),
+    ("ROUTINES", "ROUTINE_BODY", 224, 32, 0xfd, 0x1001),
+    ("ROUTINES", "ROUTINE_DEFINITION", 224, 786_420, 0xfc, 0x1010),
+    ("ROUTINES", "EXTERNAL_NAME", 224, 256, 0xfd, 0x1000),
+    ("ROUTINES", "EXTERNAL_LANGUAGE", 224, 256, 0xfd, 0x1000),
+    ("ROUTINES", "PARAMETER_STYLE", 224, 32, 0xfd, 0x1001),
+    ("ROUTINES", "IS_DETERMINISTIC", 224, 12, 0xfd, 0x1001),
+    ("ROUTINES", "SQL_DATA_ACCESS", 224, 256, 0xfd, 0x1001),
+    ("ROUTINES", "SQL_PATH", 224, 256, 0xfd, 0x1000),
+    ("ROUTINES", "SECURITY_TYPE", 224, 28, 0xfd, 0x1001),
+    ("ROUTINES", "CREATED", 63, 19, 0x0c, 0x1081),
+    ("ROUTINES", "LAST_ALTERED", 63, 19, 0x0c, 0x1081),
+    ("ROUTINES", "SQL_MODE", 224, 32768, 0xfd, 0x1001),
+    ("ROUTINES", "ROUTINE_COMMENT", 224, 786_420, 0xfc, 0x1011),
+    ("ROUTINES", "DEFINER", 224, 1536, 0xfd, 0x1001),
+    ("ROUTINES", "CHARACTER_SET_CLIENT", 224, 128, 0xfd, 0x1001),
+    ("ROUTINES", "COLLATION_CONNECTION", 224, 256, 0xfd, 0x1001),
+    ("ROUTINES", "DATABASE_COLLATION", 224, 256, 0xfd, 0x1001),
+    ("PARAMETERS", "SPECIFIC_CATALOG", 224, 2048, 0xfd, 0x1001),
+    ("PARAMETERS", "SPECIFIC_SCHEMA", 224, 256, 0xfd, 0x1001),
+    ("PARAMETERS", "SPECIFIC_NAME", 224, 256, 0xfd, 0x1001),
+    ("PARAMETERS", "ORDINAL_POSITION", 63, 21, 0x03, 0x1001),
+    ("PARAMETERS", "PARAMETER_MODE", 224, 20, 0xfd, 0x1000),
+    ("PARAMETERS", "PARAMETER_NAME", 224, 256, 0xfd, 0x1000),
+    ("PARAMETERS", "DATA_TYPE", 224, 256, 0xfd, 0x1001),
+    (
+        "PARAMETERS",
+        "CHARACTER_MAXIMUM_LENGTH",
+        63,
+        21,
+        0x03,
+        0x1000,
+    ),
+    ("PARAMETERS", "CHARACTER_OCTET_LENGTH", 63, 21, 0x03, 0x1000),
+    ("PARAMETERS", "NUMERIC_PRECISION", 63, 21, 0x03, 0x1000),
+    ("PARAMETERS", "NUMERIC_SCALE", 63, 21, 0x03, 0x1000),
+    ("PARAMETERS", "DATETIME_PRECISION", 63, 21, 0x08, 0x1020),
+    ("PARAMETERS", "CHARACTER_SET_NAME", 224, 256, 0xfd, 0x1000),
+    ("PARAMETERS", "COLLATION_NAME", 224, 256, 0xfd, 0x1000),
+    ("PARAMETERS", "DTD_IDENTIFIER", 224, 786_420, 0xfc, 0x1011),
+    ("PARAMETERS", "ROUTINE_TYPE", 224, 36, 0xfd, 0x1001),
+    ("TRIGGERS", "TRIGGER_CATALOG", 224, 2048, 0xfd, 0x1001),
+    ("TRIGGERS", "TRIGGER_SCHEMA", 224, 256, 0xfd, 0x1001),
+    ("TRIGGERS", "TRIGGER_NAME", 224, 256, 0xfd, 0x1001),
+    ("TRIGGERS", "EVENT_MANIPULATION", 224, 24, 0xfd, 0x1001),
+    ("TRIGGERS", "EVENT_OBJECT_CATALOG", 224, 2048, 0xfd, 0x1001),
+    ("TRIGGERS", "EVENT_OBJECT_SCHEMA", 224, 256, 0xfd, 0x1001),
+    ("TRIGGERS", "EVENT_OBJECT_TABLE", 224, 256, 0xfd, 0x1001),
+    ("TRIGGERS", "ACTION_ORDER", 63, 4, 0x08, 0x1001),
+    ("TRIGGERS", "ACTION_CONDITION", 224, 786_420, 0xfc, 0x1010),
+    ("TRIGGERS", "ACTION_STATEMENT", 224, 786_420, 0xfc, 0x1011),
+    ("TRIGGERS", "ACTION_ORIENTATION", 224, 36, 0xfd, 0x1001),
+    ("TRIGGERS", "ACTION_TIMING", 224, 24, 0xfd, 0x1001),
+    (
+        "TRIGGERS",
+        "ACTION_REFERENCE_OLD_TABLE",
+        224,
+        256,
+        0xfd,
+        0x1000,
+    ),
+    (
+        "TRIGGERS",
+        "ACTION_REFERENCE_NEW_TABLE",
+        224,
+        256,
+        0xfd,
+        0x1000,
+    ),
+    (
+        "TRIGGERS",
+        "ACTION_REFERENCE_OLD_ROW",
+        224,
+        12,
+        0xfd,
+        0x1001,
+    ),
+    (
+        "TRIGGERS",
+        "ACTION_REFERENCE_NEW_ROW",
+        224,
+        12,
+        0xfd,
+        0x1001,
+    ),
+    ("TRIGGERS", "CREATED", 63, 22, 0x0c, 0x1080),
+    ("TRIGGERS", "SQL_MODE", 224, 32768, 0xfd, 0x1001),
+    ("TRIGGERS", "DEFINER", 224, 1536, 0xfd, 0x1001),
+    ("TRIGGERS", "CHARACTER_SET_CLIENT", 224, 128, 0xfd, 0x1001),
+    ("TRIGGERS", "COLLATION_CONNECTION", 224, 256, 0xfd, 0x1001),
+    ("TRIGGERS", "DATABASE_COLLATION", 224, 256, 0xfd, 0x1001),
 ];
 
 /// The tables built here.
-pub(crate) const TABLES: [&str; 9] = [
+pub(crate) const TABLES: [&str; 12] = [
     "SCHEMATA",
+    "TRIGGERS",
+    "ROUTINES",
+    "PARAMETERS",
     "TABLES",
     "VIEWS",
     "COLUMNS",
@@ -436,6 +543,10 @@ fn s(x: impl Into<String>) -> V {
 fn row_of(t: &str, vals: &HashMap<&str, V>) -> Vec<Datum> {
     cols_of(t)
         .map(|c| match vals.get(c.1) {
+            // A time (a routine's `CREATED`): its value, not its text.
+            Some(V::S(x)) if c.4 == 0x0c => super::temporal::datetime_from_str(x.as_bytes())
+                .and_then(|r| super::temporal::settle(&r, 0, false))
+                .map_or(Datum::Null, Datum::DateTime),
             Some(V::S(x)) => Datum::Str(Bytes::from(x.clone().into_bytes())),
             // A signed column (no UNSIGNED flag) takes a signed value.
             Some(V::U(n)) if c.5 & 0x20 == 0 => Datum::Int(i64::try_from(*n).unwrap_or(i64::MAX)),
@@ -1076,6 +1187,232 @@ fn add_view(db: &mut MemDb, schema: &str, v: &super::view::ViewDef, mysql: bool)
     put("VIEWS", w);
 }
 
+/// The type facts `information_schema` shows for a routine's parameter
+/// or return type `ty`: (`DATA_TYPE`, char length, octet length,
+/// precision, scale, datetime precision, character set, collation,
+/// `DTD_IDENTIFIER`).
+fn type_facts(ty: &str, db_cs: &(String, String)) -> Option<[V; 9]> {
+    let cx = define::Ctx {
+        mysql: false,
+        db_cs: db_cs.clone(),
+    };
+    let define::Created::Def(def) =
+        define::create(&format!("CREATE TABLE `r` (`v` {ty})"), &cx).ok()?
+    else {
+        return None;
+    };
+    let c = def.cols.first()?;
+    let (cl, ol) = lengths(c);
+    let (p, sc, dp) = numeric(c);
+    let (cs, co) = match &c.ty.cs {
+        Some((cs, co)) => (s(cs.clone()), s(co.clone())),
+        None if matches!(cl, V::U(_))
+            && !c.ty.base.contains("binary")
+            && !c.ty.base.contains("blob") =>
+        {
+            (s(db_cs.0.clone()), s(db_cs.1.clone()))
+        }
+        None => (V::N, V::N),
+    };
+    Some([
+        s(c.ty.base.clone()),
+        cl,
+        ol,
+        p,
+        sc,
+        dp,
+        cs,
+        co,
+        s(c.ty.print()),
+    ])
+}
+
+/// A stored procedure or function: its `ROUTINES` row and its
+/// `PARAMETERS` rows.
+/// The `TRIGGERS` rows of database `dbid`, in table, event, timing and
+/// action order.
+fn add_triggers(db: &mut MemDb, schema: &str, eng: &super::catalog::EngineCatalog, dbid: DbId) {
+    let mut ts: Vec<_> = eng
+        .triggers
+        .values()
+        .filter(|t| t.db == dbid && t.def.is_ok())
+        .collect();
+    let table = |t: &super::routine::trigger::Trigger| {
+        eng.tables
+            .get(&t.table)
+            .and_then(|p| p.as_ref().as_ref().ok().map(|d| d.name.clone()))
+            .unwrap_or_default()
+    };
+    let rank = |e: super::routine::parse::Event| e as u8;
+    ts.sort_by_key(|t| (table(t), t.when().map(|(b, e)| (rank(e), !b)), t.cx.order));
+    let mut last: Option<(String, Option<(bool, super::routine::parse::Event)>)> = None;
+    let mut order = 0u64;
+    for t in ts {
+        let Ok(d) = &t.def else { continue };
+        let key = (table(t), t.when());
+        order = if last.as_ref() == Some(&key) {
+            order + 1
+        } else {
+            1
+        };
+        last = Some(key.clone());
+        let mut v = HashMap::new();
+        v.insert("TRIGGER_CATALOG", s("def"));
+        v.insert("TRIGGER_SCHEMA", s(schema));
+        v.insert("TRIGGER_NAME", s(t.name.clone()));
+        v.insert("EVENT_MANIPULATION", s(d.event.word()));
+        v.insert("EVENT_OBJECT_CATALOG", s("def"));
+        v.insert("EVENT_OBJECT_SCHEMA", s(schema));
+        v.insert("EVENT_OBJECT_TABLE", s(key.0));
+        v.insert("ACTION_ORDER", V::U(order));
+        v.insert("ACTION_CONDITION", V::N);
+        v.insert("ACTION_STATEMENT", s(d.body_text.clone()));
+        v.insert("ACTION_ORIENTATION", s("ROW"));
+        v.insert(
+            "ACTION_TIMING",
+            s(if d.before { "BEFORE" } else { "AFTER" }),
+        );
+        v.insert("ACTION_REFERENCE_OLD_TABLE", V::N);
+        v.insert("ACTION_REFERENCE_NEW_TABLE", V::N);
+        v.insert("ACTION_REFERENCE_OLD_ROW", s("OLD"));
+        v.insert("ACTION_REFERENCE_NEW_ROW", s("NEW"));
+        v.insert("CREATED", s(t.cx.created.clone()));
+        v.insert("SQL_MODE", s(t.cx.sql_mode.clone()));
+        v.insert(
+            "DEFINER",
+            s(format!("{}@{}", t.cx.definer.0, t.cx.definer.1)),
+        );
+        v.insert("CHARACTER_SET_CLIENT", s(t.cx.charset_client.clone()));
+        v.insert("COLLATION_CONNECTION", s(t.cx.collation_connection.clone()));
+        v.insert("DATABASE_COLLATION", s(t.cx.db_collation.clone()));
+        if let Err(e) = db.insert("TRIGGERS", row_of("TRIGGERS", &v)) {
+            tracing::warn!(error = %e.message, "information_schema: a TRIGGERS row doesn't fit its table");
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)] // one row of each table
+fn add_routine(
+    db: &mut MemDb,
+    schema: &str,
+    r: &super::routine::Routine,
+    db_cs: &(String, String),
+) {
+    use super::routine::Kind;
+    let mut put = |t: &str, vals: HashMap<&str, V>| {
+        if let Err(e) = db.insert(t, row_of(t, &vals)) {
+            tracing::warn!(table = t, error = %e.message, "information_schema: a row doesn't fit its table");
+        }
+    };
+    let Ok((c, _)) = &r.def else { return };
+    let function = r.kind == Kind::Function;
+    let kind = if function { "FUNCTION" } else { "PROCEDURE" };
+    let mut v = HashMap::new();
+    v.insert("SPECIFIC_NAME", s(r.name.clone()));
+    v.insert("ROUTINE_CATALOG", s("def"));
+    v.insert("ROUTINE_SCHEMA", s(schema));
+    v.insert("ROUTINE_NAME", s(r.name.clone()));
+    v.insert("ROUTINE_TYPE", s(kind));
+    v.insert("DATA_TYPE", s(""));
+    if let Some(ty) = c.returns.as_deref()
+        && let Some(f) = type_facts(ty, db_cs)
+    {
+        let names = [
+            "DATA_TYPE",
+            "CHARACTER_MAXIMUM_LENGTH",
+            "CHARACTER_OCTET_LENGTH",
+            "NUMERIC_PRECISION",
+            "NUMERIC_SCALE",
+            "DATETIME_PRECISION",
+            "CHARACTER_SET_NAME",
+            "COLLATION_NAME",
+            "DTD_IDENTIFIER",
+        ];
+        for (n, x) in names.into_iter().zip(f) {
+            v.insert(n, x);
+        }
+    }
+    v.insert("ROUTINE_BODY", s("SQL"));
+    v.insert("ROUTINE_DEFINITION", s(c.body_text.clone()));
+    v.insert("PARAMETER_STYLE", s("SQL"));
+    v.insert(
+        "IS_DETERMINISTIC",
+        s(if c.chars.deterministic == Some(true) {
+            "YES"
+        } else {
+            "NO"
+        }),
+    );
+    v.insert(
+        "SQL_DATA_ACCESS",
+        s(c.chars.access.unwrap_or_default().words()),
+    );
+    v.insert(
+        "SECURITY_TYPE",
+        s(if c.chars.invoker == Some(true) {
+            "INVOKER"
+        } else {
+            "DEFINER"
+        }),
+    );
+    v.insert("CREATED", s(r.cx.created.clone()));
+    v.insert("LAST_ALTERED", s(r.cx.modified.clone()));
+    v.insert("SQL_MODE", s(r.cx.sql_mode.clone()));
+    v.insert(
+        "ROUTINE_COMMENT",
+        s(c.chars.comment.clone().unwrap_or_default()),
+    );
+    v.insert(
+        "DEFINER",
+        s(format!("{}@{}", r.cx.definer.0, r.cx.definer.1)),
+    );
+    v.insert("CHARACTER_SET_CLIENT", s(r.cx.charset_client.clone()));
+    v.insert("COLLATION_CONNECTION", s(r.cx.collation_connection.clone()));
+    v.insert("DATABASE_COLLATION", s(r.cx.db_collation.clone()));
+    put("ROUTINES", v);
+    let names = [
+        "DATA_TYPE",
+        "CHARACTER_MAXIMUM_LENGTH",
+        "CHARACTER_OCTET_LENGTH",
+        "NUMERIC_PRECISION",
+        "NUMERIC_SCALE",
+        "DATETIME_PRECISION",
+        "CHARACTER_SET_NAME",
+        "COLLATION_NAME",
+        "DTD_IDENTIFIER",
+    ];
+    let base = |v: &mut HashMap<&str, V>| {
+        v.insert("SPECIFIC_CATALOG", s("def"));
+        v.insert("SPECIFIC_SCHEMA", s(schema));
+        v.insert("SPECIFIC_NAME", s(r.name.clone()));
+        v.insert("ROUTINE_TYPE", s(kind));
+    };
+    if let Some(ty) = c.returns.as_deref() {
+        let mut v = HashMap::new();
+        base(&mut v);
+        v.insert("ORDINAL_POSITION", V::U(0));
+        if let Some(f) = type_facts(ty, db_cs) {
+            for (n, x) in names.into_iter().zip(f) {
+                v.insert(n, x);
+            }
+        }
+        put("PARAMETERS", v);
+    }
+    for (i, p) in c.params.iter().enumerate() {
+        let mut v = HashMap::new();
+        base(&mut v);
+        v.insert("ORDINAL_POSITION", V::U(i as u64 + 1));
+        v.insert("PARAMETER_MODE", s(p.mode.word()));
+        v.insert("PARAMETER_NAME", s(p.name.clone()));
+        if let Some(f) = type_facts(&p.ty, db_cs) {
+            for (n, x) in names.into_iter().zip(f) {
+                v.insert(n, x);
+            }
+        }
+        put("PARAMETERS", v);
+    }
+}
+
 /// The physical schemas of tenant `tenant` that `sql` names, with their
 /// databases.
 fn schemas_named(sql: &str, tenant: u64) -> Vec<(String, DbId)> {
@@ -1106,6 +1443,7 @@ fn schemas_named(sql: &str, tenant: u64) -> Vec<(String, DbId)> {
 /// character set) is the string itself, and the conjuncts that hide keys
 /// on hidden columns, `AND (a, b) NOT IN (SELECT ...)`, go (the engine's
 /// tables have no hidden columns).
+#[allow(clippy::too_many_lines)] // one pass per form the name layer writes
 fn simplify(sql: &str) -> String {
     // Functional key parts (the MySQL port's hidden `_sprig_fx_` columns)
     // don't exist on the engine: their join and the columns it feeds go.
@@ -1138,6 +1476,18 @@ fn simplify(sql: &str) -> String {
                 .replace(&def, "`_sprig_my_default`")
                 .replace(&extra, "`_sprig_my_extra`");
         }
+    }
+    // A definer column read through the tenant's account names: the
+    // engine's rows already hold the tenant's names.
+    let head = "CONVERT(IFNULL((SELECT `account` FROM `__sprig_sys`.`__sprig_names_v` WHERE `name` = SUBSTRING_INDEX(`";
+    while let Some(a) = owned.find(head) {
+        let rest = &owned[a + head.len()..];
+        let Some(col_end) = rest.find('`') else { break };
+        let col = rest[..col_end].to_owned();
+        let tail = format!("`, '@', 1)), `{col}`) USING utf8mb3)");
+        let Some(b) = rest.find(&tail) else { break };
+        let end = a + head.len() + b + tail.len();
+        owned.replace_range(a..end, &format!("`{col}`"));
     }
     let sql = owned.as_str();
     let mut out = String::with_capacity(sql.len());
@@ -1399,6 +1749,18 @@ fn try_answer(sql: &str, src: &Source<'_>, mysql: bool) -> Result<Answer, String
                 Clone::clone,
             );
         add_schema(&mut db, &schema, &cs, &coll);
+        let mut routines: Vec<_> = src
+            .eng
+            .routines
+            .iter()
+            .filter(|((d, _, _), _)| *d == dbid)
+            .map(|(_, r)| r)
+            .collect();
+        routines.sort_by(|a, b| a.name.cmp(&b.name));
+        for r in routines {
+            add_routine(&mut db, &schema, r, &(cs.clone(), coll.clone()));
+        }
+        add_triggers(&mut db, &schema, src.eng, dbid);
         let mut seqs: Vec<&String> = src
             .eng
             .seq_names

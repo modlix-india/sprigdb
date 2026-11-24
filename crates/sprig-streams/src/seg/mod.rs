@@ -252,7 +252,7 @@ struct Inner {
     apply: Mutex<ApplyState>,
     parts: RwLock<HashMap<PartKey, Arc<Part>>>,
     /// Outcomes by (unit, index, slot).
-    results: Mutex<BTreeMap<(u64, u64, u32), Outcome>>,
+    results: Mutex<Results>,
     changed: tokio::sync::watch::Sender<u64>,
     flushing: Mutex<()>,
     policies: Mutex<HashMap<(u64, u64), Policy>>,
@@ -290,6 +290,50 @@ pub fn now_ms() -> i64 {
 
 /// Results kept for producers that stopped waiting.
 const RESULTS_KEPT: usize = 100_000;
+
+/// Append outcomes waiting for their proposers, dropped oldest-applied
+/// first past a cap. Every replica records the outcome of every append it
+/// applies, and nobody waits for the ones other nodes proposed, so the cap
+/// must drop by age: dropping by key would drop the lowest unit's fresh
+/// outcomes (a partition group led here) while other units' unclaimed ones
+/// pile up, and its producers would hear "append lost".
+struct Results {
+    by_key: HashMap<(u64, u64, u32), Outcome>,
+    /// Keys in the order they were applied (some already taken).
+    order: std::collections::VecDeque<(u64, u64, u32)>,
+    kept: usize,
+}
+
+impl Results {
+    fn new(kept: usize) -> Results {
+        Results {
+            by_key: HashMap::new(),
+            order: std::collections::VecDeque::new(),
+            kept,
+        }
+    }
+
+    fn extend(&mut self, outs: Vec<((u64, u64, u32), Outcome)>) {
+        for (k, o) in outs {
+            self.by_key.insert(k, o);
+            self.order.push_back(k);
+        }
+        while self.order.len() > self.kept {
+            if let Some(k) = self.order.pop_front() {
+                self.by_key.remove(&k);
+            }
+        }
+    }
+
+    fn take(&mut self, k: &(u64, u64, u32)) -> Option<Outcome> {
+        let o = self.by_key.remove(k);
+        // Taken in apply order (the usual case): forget the key too.
+        if o.is_some() && self.order.front() == Some(k) {
+            self.order.pop_front();
+        }
+        o
+    }
+}
 
 /// The apply observer the engine calls.
 struct Applier(Weak<Inner>);
@@ -706,11 +750,7 @@ impl Inner {
                 .map_or(done, |e| e.index - 1)
         });
         if appended {
-            let mut r = lock(&self.results);
-            r.extend(outs);
-            while r.len() > RESULTS_KEPT {
-                r.pop_first();
-            }
+            lock(&self.results).extend(outs);
         }
         a.applied.insert(unit, done.max(last.index));
         drop(a);
@@ -832,7 +872,7 @@ impl SegLog {
             cfg,
             apply: Mutex::new(ApplyState::default()),
             parts: RwLock::new(HashMap::new()),
-            results: Mutex::new(BTreeMap::new()),
+            results: Mutex::new(Results::new(RESULTS_KEPT)),
             changed: tx,
             flushing: Mutex::new(()),
             policies: Mutex::new(HashMap::new()),
@@ -1122,7 +1162,7 @@ impl SegLog {
         let at = (p.unit, p.index, p.slot);
         loop {
             rx.borrow_and_update();
-            if let Some(o) = lock(&self.inner.results).remove(&at) {
+            if let Some(o) = lock(&self.inner.results).take(&at) {
                 return Some(o);
             }
             let applied = lock(&self.inner.apply)
@@ -1132,8 +1172,9 @@ impl SegLog {
                 .unwrap_or(0);
             if applied >= p.index {
                 // Applied, but no outcome: the entry carried no note we
-                // read (cannot happen for our own proposals).
-                if let Some(o) = lock(&self.inner.results).remove(&at) {
+                // read, or the outcome was dropped as too old (more than
+                // `RESULTS_KEPT` appends applied since).
+                if let Some(o) = lock(&self.inner.results).take(&at) {
                     return Some(o);
                 }
                 return Some(Outcome::Refused {

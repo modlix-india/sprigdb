@@ -1,19 +1,13 @@
 //! Redis databases stored on SprigDB's own storage engine.
 //!
-//! A tenant's Redis databases live on the engine when the logical database
-//! that holds them (`redis.logical_database`, `redis` by default) is placed
-//! there: `ALTER DATABASE redis SPRIG SET (storage.placement = 'engine')`,
-//! set before the tenant stores any keys. A node may also put whole tenants
-//! there: `SPRIGDB_ENGINE_REDIS_TENANTS` (`all`, or tenant ids separated by
-//! commas). Their data commands then run on the engine
-//! (`sprig-redis-engine`); every other tenant's run on MariaDB as before.
+//! Every tenant's Redis databases live on the engine: their data commands
+//! run there (`sprig-redis-engine`), never on MariaDB.
 //!
 //! They run on the node's one engine ([`crate::node_engine`]), opened on
 //! first use. If it can't open, those tenants' data commands are refused
 //! with an error: their keys are never read from or written to MariaDB
 //! instead.
 
-use std::collections::BTreeSet;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -22,9 +16,6 @@ use bytes::Bytes;
 use sprig_proto_redis::Frame;
 use sprig_redis::engine::{EngineBackend, EngineDatabase, session_command};
 use sprig_redis_engine::{Backend, EngineUnit, Tenants};
-
-/// The variable naming whole tenants on the engine.
-pub const TENANTS_VAR: &str = "SPRIGDB_ENGINE_REDIS_TENANTS";
 
 /// The node's Redis databases on the engine, started on first use.
 #[derive(Debug)]
@@ -38,10 +29,8 @@ impl NodeEngine {
     /// From the environment; `databases` is `redis.databases`.
     #[must_use]
     pub fn from_env(databases: u32) -> Self {
-        let tenants = std::env::var(TENANTS_VAR)
-            .ok()
-            .and_then(|v| Tenants::parse(&v))
-            .unwrap_or_else(|| Tenants::Only(BTreeSet::new()));
+        // Every tenant: the engine is the only key-value store.
+        let tenants = Tenants::All;
         Self {
             tenants,
             databases,

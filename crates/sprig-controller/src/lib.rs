@@ -61,6 +61,7 @@ pub fn catalog_records() -> Arc<dyn sprig_catalog::RecordStore> {
 pub mod admin;
 // Approvals and recommendations for every automatic decision.
 pub mod approvals;
+pub mod autoindex_admin;
 // The BackupMissed alert's gauge, from the backup tools' records.
 pub mod backups;
 pub mod balancer_loop;
@@ -329,6 +330,8 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
         dc.clone(),
         Some(settings.live.clone()),
     );
+    // Automatic indexing's records, for the Admin API.
+    let autoindex_dir = Directory::new(Arc::clone(&stores.global));
     // Rollup and retention of the workload tables.
     let workload_rollup = workload_rollup::WorkloadRollup::new(
         Directory::new(Arc::clone(&stores.global)),
@@ -837,6 +840,9 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
                 ai_incidents::IncidentsApi::new(Arc::clone(&reg_store), incident_env),
             )))
             .merge(ai_health::router(ai_health))
+            .merge(autoindex_admin::router(Arc::new(
+                autoindex_admin::AutoIndexApi::new(autoindex_dir, Arc::clone(&auth_records)),
+            )))
             .layer(axum::middleware::from_fn_with_state(
                 guard,
                 operators::guard::layer,

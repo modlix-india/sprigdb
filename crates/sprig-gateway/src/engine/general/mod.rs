@@ -220,6 +220,32 @@ pub(crate) fn bind_tableless(
     bind_in(cx, stmt, text, None, true)
 }
 
+/// [`bind`] for any query that names no table at all (not even
+/// `information_schema`'s): constants, functions, set operations. For a
+/// tenant whose every database is on the engine, where MariaDB has nothing
+/// to answer.
+///
+/// # Errors
+/// As for [`bind`].
+pub(crate) fn bind_no_tables(
+    cx: &BindCtx<'_>,
+    stmt: &Statement,
+    text: Option<&str>,
+) -> Result<Option<General>> {
+    if !matches!(stmt, Statement::Query(_)) {
+        return Ok(None);
+    }
+    let mut names_table = false;
+    let _ = sqlparser::ast::visit_relations(stmt, |_| {
+        names_table = true;
+        std::ops::ControlFlow::<()>::Break(())
+    });
+    if names_table {
+        return Ok(None);
+    }
+    bind_in(cx, stmt, text, None, true)
+}
+
 fn bind_in(
     cx: &BindCtx<'_>,
     stmt: &Statement,
@@ -636,6 +662,9 @@ impl Engine {
                 ..PlanOptions::for_persona(session.persona)
             };
             let mut plan = planner.plan(&g.stmt, a.params)?;
+            if !g.explain && !dry {
+                crate::autoindex::usage::note_plan(a.tenant, g, &plan.explain);
+            }
             let mut ctx = Ctx::with_params(&session, a.params);
             let mut rows = Vec::new();
             let mut done = dry;
@@ -802,6 +831,69 @@ impl Engine {
     ///
     /// # Errors
     /// The errors the servers raise when they prepare the statement.
+    /// Automatic indexing's what-if planning: plans the bound `SELECT`
+    /// `g` with `params` as the tables are, and also with `hypo` added
+    /// (a hypothetical index), in a read-only transaction of its own that
+    /// takes no locks and is rolled back. Nothing is executed.
+    ///
+    /// # Errors
+    /// The planner's, or the engine's.
+    pub(crate) async fn general_whatif(
+        &self,
+        tenant: u64,
+        g: &General,
+        params: &[Datum],
+        seed: &Seed,
+        hypo: Option<&sprig_plan::whatif::Hypothetical>,
+    ) -> Result<(
+        sprig_plan::whatif::Estimate,
+        Option<sprig_plan::whatif::Estimate>,
+    )> {
+        use sprig_plan::whatif::{Prepared, estimate};
+        let spaces = self.general_spaces(tenant, g, None).await?;
+        let tx = self.begin(TxnOptions::default())?;
+        let bounds: Vec<Bound> = g
+            .tables
+            .iter()
+            .zip(spaces)
+            .map(|(t, sp)| Bound::new(t, sp, None))
+            .collect();
+        let storage = TxStorage::new(Some(tx), bounds, None);
+        let catalog = names::PlanCatalog::new(g);
+        let session = seed.now();
+        let options = PlanOptions {
+            only_full_group_by: seed.only_full_group_by,
+            memory_limit: Some(MEMORY_LIMIT),
+            ..PlanOptions::for_persona(session.persona)
+        };
+        let base = estimate(
+            &catalog,
+            storage.shared(),
+            &session,
+            Some(options.clone()),
+            &g.stmt,
+            params,
+        );
+        let with = hypo.map(|h| {
+            Prepared::new(&catalog, storage.shared(), h)
+                .and_then(|p| p.estimate(&session, Some(options.clone()), &g.stmt, params))
+        });
+        let (tx, failed) = storage.finish();
+        if let Some(tx) = tx {
+            tx.rollback();
+        }
+        if let Some(e) = failed {
+            return Err(e);
+        }
+        let base = base.map_err(sql_error)?;
+        let with = match with {
+            Some(Ok(e)) => Some(e),
+            Some(Err(e)) => return Err(sql_error(e)),
+            None => None,
+        };
+        Ok((base, with))
+    }
+
     pub(crate) fn general_describe(g: &General, seed: &Seed) -> Result<Vec<sprig_plan::Column>> {
         let spaces = g
             .tables

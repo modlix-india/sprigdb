@@ -275,6 +275,9 @@ pub(crate) struct Index {
     pub parts: Vec<KeyColumn>,
     /// `UNIQUE`.
     pub unique: bool,
+    /// MariaDB's `IGNORED`: every write keeps its entries, no plan reads
+    /// them (an index being built online, or one an operator set aside).
+    pub ignored: bool,
 }
 
 /// What a foreign key does when its parent row is deleted or its key
@@ -1217,7 +1220,7 @@ pub(crate) fn parse(object: ObjectId, version: u64, db: DbId, create_sql: &str) 
     }
     let mut cols: Vec<RawCol> = Vec::new();
     let mut pk: Vec<RawPart> = Vec::new();
-    let mut keys: Vec<(String, Vec<RawPart>, bool)> = Vec::new();
+    let mut keys: Vec<(String, Vec<RawPart>, bool, bool)> = Vec::new();
     // `CHECK` constraints: the column they were declared on, their name,
     // their expression.
     let mut raw_checks: Vec<(Option<usize>, Option<String>, String)> = Vec::new();
@@ -1418,7 +1421,17 @@ pub(crate) fn parse(object: ObjectId, version: u64, db: DbId, create_sql: &str) 
                 if p.word("COMMENT") && !matches!(p.next(), Some(Tok::Str(_))) {
                     return bad("an index comment");
                 }
-                keys.push((n, l, unique));
+                // MariaDB's `IGNORED` (and `NOT IGNORED`): every write keeps
+                // the entries, no plan reads them.
+                let ignored = if p.word("NOT") {
+                    if !p.word("IGNORED") {
+                        return bad("NOT after an index");
+                    }
+                    false
+                } else {
+                    p.word("IGNORED")
+                };
+                keys.push((n, l, unique, ignored));
             }
             Some(Tok::Word(w)) if w == "FULLTEXT" || w == "SPATIAL" || w == "VECTOR" => {
                 return bad(&format!("a {} index", w.to_ascii_lowercase()));
@@ -1710,14 +1723,14 @@ pub(crate) fn parse(object: ObjectId, version: u64, db: DbId, create_sql: &str) 
     // it. Without one either, the rows are keyed by a hidden row number.
     let mut pk_name = String::from("PRIMARY");
     if pk.is_empty()
-        && let Some(at) = keys.iter().position(|(_, parts, unique)| {
+        && let Some(at) = keys.iter().position(|(_, parts, unique, _)| {
             *unique
                 && parts.iter().all(|rp| {
                     rp.prefix.is_none() && find(&rp.name).is_some_and(|i| !columns[i].nullable)
                 })
         })
     {
-        let (n, parts, _) = keys.remove(at);
+        let (n, parts, _, _) = keys.remove(at);
         pk = parts;
         pk_name = n;
     }
@@ -1736,7 +1749,7 @@ pub(crate) fn parse(object: ObjectId, version: u64, db: DbId, create_sql: &str) 
         pk_parts.push(KeyColumn::new(HIDDEN_TYPE));
     }
     let mut indexes = Vec::new();
-    for (n, l, unique) in &keys {
+    for (n, l, unique, ignored) in &keys {
         let mut idx = Vec::new();
         let mut parts = Vec::new();
         for rp in l {
@@ -1751,6 +1764,7 @@ pub(crate) fn parse(object: ObjectId, version: u64, db: DbId, create_sql: &str) 
             cols: idx,
             parts,
             unique: *unique,
+            ignored: *ignored,
         });
     }
     let auto_inc = columns.iter().position(|c| c.auto_inc);

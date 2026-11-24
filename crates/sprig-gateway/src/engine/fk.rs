@@ -125,9 +125,10 @@ fn key_on(def: &TableDef, cols: &[usize]) -> Option<KeyOf> {
     if !def.hidden && leads(&def.pk, &def.pk_parts) {
         return Some(KeyOf::Primary);
     }
+    // An ignored index may be one an online build is still filling.
     def.indexes
         .iter()
-        .position(|x| leads(&x.cols, &x.parts))
+        .position(|x| !x.ignored && leads(&x.cols, &x.parts))
         .map(KeyOf::Index)
 }
 

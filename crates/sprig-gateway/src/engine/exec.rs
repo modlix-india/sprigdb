@@ -1474,6 +1474,7 @@ fn locate<'p>(sp: &Space, plan: &'p Plan, a: &Args<'_>) -> Result<(Found, Option
         }
         Access::IndexEq { ix, val } => {
             let x = &def.indexes[*ix];
+            crate::autoindex::usage::note_read(sp.tenant, def.object.0, &x.name);
             let v = expr::eval(val, &[], a)?;
             match key_const(&v, &def.columns[x.cols[0]], &a.env) {
                 KeyConst::Exact(d) => {

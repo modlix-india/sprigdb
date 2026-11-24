@@ -934,6 +934,7 @@ pub(crate) fn plan_table(def: &TableDef, db_name: &str) -> PlanTable {
                         .map(|(&c, kc)| part(c, kc))
                         .collect(),
                 )
+                .ignored(x.ignored)
             })
             .collect(),
     }

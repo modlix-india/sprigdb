@@ -37,7 +37,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use sprig_common::{ErrorKind, Result, SprigError};
 use sprig_engine::keys::kind;
-use sprig_engine::txn::TxnOptions;
+use sprig_engine::txn::{LockMode, TxnOptions, Wait};
 
 use super::alter::{self, Alter, Plan, Src};
 use super::assign::{self, Env, Store};
@@ -49,6 +49,20 @@ use super::meta;
 use super::row::{self, Datum};
 use super::table::{ColDefault, ColType, Column, Family, TableDef};
 use super::{Engine, Pace, WALK_BATCH, exec, not_on_engine, object_of, temporal};
+
+tokio::task_local! {
+    /// Set while automatic indexing adds an index online: a change that
+    /// only adds `IGNORED` indexes named `sprig_auto_*` publishes them
+    /// without entries (every later write keeps them), and
+    /// [`Engine::backfill_index`] writes the entries of the rows there are,
+    /// a batch at a time, without holding the table.
+    pub(crate) static ONLINE_BUILD: ();
+}
+
+/// Whether `name` is an automatic index's.
+fn auto_named(name: &str) -> bool {
+    name.len() >= 11 && name[..11].eq_ignore_ascii_case("sprig_auto_")
+}
 
 /// What a change needs from the session that asked for it.
 #[derive(Debug, Clone)]
@@ -815,7 +829,23 @@ impl Engine {
                 now,
                 unchanged,
             };
-            let n = match self.carry(&sp0, &sp1, &mut cv, copy, &fresh).await {
+            // An online build adds its index without entries: writes keep
+            // it from the publish on, and the backfill writes the rest.
+            let online = ONLINE_BUILD.try_with(|()| ()).is_ok()
+                && !copy
+                && cv.validate.is_empty()
+                && !fresh.is_empty()
+                && fresh.iter().all(|&q| {
+                    d1.indexes[q].ignored
+                        && !d1.indexes[q].unique
+                        && auto_named(&d1.indexes[q].name)
+                });
+            let carried = if online {
+                Ok(0)
+            } else {
+                self.carry(&sp0, &sp1, &mut cv, copy, &fresh).await
+            };
+            let n = match carried {
                 Ok(n) => n,
                 Err(e) => {
                     self.collect(tenant, object, &mut reserve).await?;
@@ -864,6 +894,76 @@ impl Engine {
             rows,
             conds: Vec::new(),
         })
+    }
+
+    /// The backfill of an online index build: writes index `name`'s entry
+    /// for every row of the table, a batch of `batch` rows per transaction,
+    /// pausing `pause` between batches. Each batch reads its rows with
+    /// shared locks, so a write to one of them waits for the batch (and the
+    /// batch for a write in flight): an entry is always written from the
+    /// row's latest committed value, and every write after the index was
+    /// published keeps the entry itself. `current` gives the table's newest
+    /// definition before each batch; when its version is no longer `def`'s,
+    /// the backfill stops (the next build starts it again).
+    ///
+    /// # Errors
+    /// 1412 when the definition changed; lock waits; the store's.
+    pub(crate) async fn backfill_index(
+        &self,
+        tenant: u64,
+        def: &TableDef,
+        name: &str,
+        batch: usize,
+        pause: Duration,
+        current: &(dyn Fn() -> Option<u64> + Send + Sync),
+    ) -> Result<(u64, u64)> {
+        let Some(ix) = def
+            .indexes
+            .iter()
+            .position(|x| x.name.eq_ignore_ascii_case(name))
+        else {
+            return Err(SprigError::internal(format!(
+                "engine: the table has no index {name} to build"
+            )));
+        };
+        let batch = batch.max(1);
+        let (mut rows, mut batches) = (0u64, 0u64);
+        let mut lo: Option<Vec<u8>> = None;
+        loop {
+            if current() != Some(def.version) {
+                return Err(definition_changed());
+            }
+            let sp = self.space(tenant, def).await?;
+            let p = sp.rows();
+            let end = keys::prefix_end(&p);
+            let from = lo.clone().unwrap_or(p);
+            let mut tx = self.begin(TxnOptions::default())?;
+            let got = tx
+                .scan_lock_entries(&from, &end, batch, LockMode::Shared, Wait::Block)
+                .await?;
+            for (k, v) in &got {
+                let row = row::decode(def, &sp, k, v)?;
+                let Some((ik, iv)) = keys::index_entry(&sp, def, ix, &row) else {
+                    return Err(SprigError::internal(
+                        "engine: an index value of the wrong type",
+                    ));
+                };
+                tx.put(Bytes::from(ik), iv).await?;
+            }
+            tx.finish().await?;
+            drop(sp);
+            rows += got.len() as u64;
+            batches += 1;
+            match got.last() {
+                Some((k, _)) if got.len() == batch => lo = Some(keys::prefix_end(k)),
+                _ => return Ok((rows, batches)),
+            }
+            if pause.is_zero() {
+                tokio::task::yield_now().await;
+            } else {
+                tokio::time::sleep(pause).await;
+            }
+        }
     }
 
     /// Step 3: the catalog published `def`, the definition the staged

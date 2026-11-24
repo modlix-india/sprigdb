@@ -887,6 +887,7 @@ impl PassSession {
     /// always, unless the routine is an engine-tier wrapper, which the
     /// gateway answers by running the version.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_lines)] // SQL routines, engine-tier wrappers, the relay
     pub(super) async fn tenant_call(
         &mut self,
         cx: &mut ExecCtx<'_>,
@@ -898,6 +899,11 @@ impl PassSession {
         map: &dyn NameMap,
         out: &mut dyn ResultSink,
     ) -> Result<Step> {
+        // A SQL stored procedure of an engine database
+        // (`engine_seam::routine`).
+        if let Some(r) = Box::pin(self.engine_sql_call(cx, original, more, format, out)).await {
+            return r;
+        }
         // A function in a staged rollout: its calls are
         // counted per version (`exec::logic_rollout`).
         let pick = self.rollout_pick(original).await;

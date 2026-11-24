@@ -8,6 +8,11 @@
 //! | `SET [SESSION] transaction_read_only \| tx_read_only = ...` | both names, `ON` / `OFF` |
 //! | `SET [SESSION] innodb_lock_wait_timeout = n` (1 to 1073741824), `= DEFAULT` | the engine's lock wait |
 //! | `SET SESSION TRANSACTION ISOLATION LEVEL ... \| READ ONLY \| READ WRITE` | the two variables above |
+//! | `SET [SESSION] sql_mode = '...'` | 3306: MySQL 8.4's rules (the client's view, and the backend value); 3307: MariaDB's member names (combination modes such as `ANSI` stay MariaDB's) |
+//! | `SET [SESSION] time_zone = 'SYSTEM' \| '+HH:MM'` (-12:00 to +14:00) | as the servers show it |
+//! | `SET sql_select_limit = DEFAULT` | as is |
+//! | `SET wait_timeout \| interactive_timeout \| net_read_timeout \| net_write_timeout = n` | the gateway's own (backend connections keep theirs) |
+//! | `SET group_concat_max_len = n`, `max_execution_time = n` (3306), `max_statement_time = x` (3307) | as is |
 //! | `SET NAMES cs [COLLATE c]` (a character set the engine knows) | `character_set_client`, `_connection`, `_results`, `collation_connection` (without `COLLATE`: the session's `character_set_collations` entry, else the default) |
 //!
 //! Switches: `autocommit`, `foreign_key_checks`, `unique_checks`,
@@ -53,6 +58,95 @@ const SWITCHES: &[&str] = &[
     "big_tables",
 ];
 
+/// Gateway-owned timeouts a client may set (whole seconds).
+const GATEWAY_TIMEOUTS: &[&str] = &[
+    "wait_timeout",
+    "interactive_timeout",
+    "net_read_timeout",
+    "net_write_timeout",
+];
+
+/// MariaDB 11.8's `sql_mode` members, in the order it shows them. The
+/// combination modes (`ANSI`, `TRADITIONAL`, `ORACLE`, ...) are left to
+/// MariaDB.
+const MARIADB_MODES: &[&str] = &[
+    "REAL_AS_FLOAT",
+    "PIPES_AS_CONCAT",
+    "ANSI_QUOTES",
+    "IGNORE_SPACE",
+    "IGNORE_BAD_TABLE_OPTIONS",
+    "ONLY_FULL_GROUP_BY",
+    "NO_UNSIGNED_SUBTRACTION",
+    "NO_DIR_IN_CREATE",
+    "NO_KEY_OPTIONS",
+    "NO_TABLE_OPTIONS",
+    "NO_FIELD_OPTIONS",
+    "NO_AUTO_VALUE_ON_ZERO",
+    "NO_BACKSLASH_ESCAPES",
+    "STRICT_TRANS_TABLES",
+    "STRICT_ALL_TABLES",
+    "NO_ZERO_IN_DATE",
+    "NO_ZERO_DATE",
+    "ALLOW_INVALID_DATES",
+    "ERROR_FOR_DIVISION_BY_ZERO",
+    "NO_AUTO_CREATE_USER",
+    "HIGH_NOT_PRECEDENCE",
+    "NO_ENGINE_SUBSTITUTION",
+    "PAD_CHAR_TO_FULL_LENGTH",
+    "EMPTY_STRING_IS_NULL",
+    "SIMULTANEOUS_ASSIGNMENT",
+    "TIME_ROUND_FRACTIONAL",
+];
+
+/// A MariaDB `sql_mode` value as MariaDB shows it: members only, in its
+/// order, upper case; `None` for anything else (MariaDB answers).
+fn mariadb_mode(v: &str) -> Option<String> {
+    let mut set = Vec::new();
+    for item in v.split(',') {
+        if item.is_empty() {
+            continue;
+        }
+        let i = MARIADB_MODES
+            .iter()
+            .position(|m| m.eq_ignore_ascii_case(item))?;
+        set.push(i);
+    }
+    set.sort_unstable();
+    set.dedup();
+    Some(
+        set.into_iter()
+            .map(|i| MARIADB_MODES[i])
+            .collect::<Vec<_>>()
+            .join(","),
+    )
+}
+
+/// A `time_zone` value both servers take without time zone tables:
+/// `SYSTEM`, or an offset `+HH:MM` from -12:00 to +14:00; `None` for
+/// anything else (the server answers).
+fn time_zone(v: &str) -> Option<String> {
+    if v.eq_ignore_ascii_case("SYSTEM") {
+        return Some("SYSTEM".to_owned());
+    }
+    let (sign, rest) = match v.as_bytes().first()? {
+        b'+' => ('+', &v[1..]),
+        b'-' => ('-', &v[1..]),
+        _ => return None,
+    };
+    let (h, m) = rest.split_once(':')?;
+    if h.is_empty() || h.len() > 2 || m.len() != 2 {
+        return None;
+    }
+    let (h, m): (u32, u32) = (h.parse().ok()?, m.parse().ok()?);
+    let ok = m < 60
+        && if sign == '+' {
+            h < 14 || (h == 14 && m == 0)
+        } else {
+            h < 12 || (h == 12 && m == 0)
+        };
+    ok.then(|| format!("{sign}{h:02}:{m:02}"))
+}
+
 const ISOLATION: &[&str] = &["transaction_isolation", "tx_isolation"];
 const READ_ONLY: &[&str] = &["transaction_read_only", "tx_read_only"];
 
@@ -72,6 +166,26 @@ pub(super) enum Assign {
     },
     /// `innodb_lock_wait_timeout`: seconds, or `None` for `DEFAULT`.
     LockWait(Option<u64>),
+    /// `sql_mode`: the text written (each persona reads it its way).
+    SqlMode(String),
+    /// A gateway-owned variable (a timeout the client may set): kept for
+    /// the gateway to answer; backend connections keep the gateway's.
+    Gateway {
+        /// The variable.
+        name: &'static str,
+        /// Its value.
+        value: String,
+    },
+    /// A variable only one persona has: kept when the session's persona
+    /// is that one, else MariaDB answers (its error).
+    PersonaVar {
+        /// The variable.
+        name: &'static str,
+        /// Its value.
+        value: String,
+        /// The MySQL persona's (else MariaDB's).
+        mysql: bool,
+    },
     /// `SET NAMES cs [COLLATE c]`: the character set as the server names
     /// it, and the collation (checked to belong to it) when one is given.
     Names {
@@ -208,6 +322,7 @@ fn target(t: &[Token], sql: &[u8], i: &mut usize) -> Option<(String, bool)> {
     }
 }
 
+#[allow(clippy::too_many_lines)] // one arm per variable
 fn assignment(name: &str, value: &Token, sql: &[u8], opts: LexOptions) -> Option<Assign> {
     if let Some(n) = SWITCHES.iter().find(|s| **s == name) {
         return Some(Assign::Var {
@@ -233,6 +348,77 @@ fn assignment(name: &str, value: &Token, sql: &[u8], opts: LexOptions) -> Option
                 READ_ONLY.to_vec()
             },
             value: switch(value, sql)?.to_owned(),
+        });
+    }
+    if name == "sql_mode" {
+        if value.kind != TokenKind::String {
+            return None;
+        }
+        let v = String::from_utf8(lex::string_value(
+            value.bytes(sql),
+            opts.no_backslash_escapes,
+        )?)
+        .ok()?;
+        return Some(Assign::SqlMode(v));
+    }
+    if name == "time_zone" {
+        if value.kind != TokenKind::String {
+            return None;
+        }
+        let v = String::from_utf8(lex::string_value(
+            value.bytes(sql),
+            opts.no_backslash_escapes,
+        )?)
+        .ok()?;
+        return Some(Assign::Var {
+            names: vec!["time_zone"],
+            value: time_zone(&v)?,
+        });
+    }
+    if name == "sql_select_limit" && word(value, sql).as_deref() == Some("default") {
+        return Some(Assign::Var {
+            names: vec!["sql_select_limit"],
+            value: "18446744073709551615".to_owned(),
+        });
+    }
+    let number = || -> Option<u64> {
+        (value.kind == TokenKind::Number)
+            .then(|| std::str::from_utf8(value.bytes(sql)).ok()?.parse().ok())
+            .flatten()
+    };
+    if let Some(n) = GATEWAY_TIMEOUTS.iter().find(|g| **g == name) {
+        let v = number().filter(|v| (1..=31_536_000).contains(v))?;
+        return Some(Assign::Gateway {
+            name: n,
+            value: v.to_string(),
+        });
+    }
+    if name == "group_concat_max_len" {
+        let v = number().filter(|v| *v >= 4)?;
+        return Some(Assign::Var {
+            names: vec!["group_concat_max_len"],
+            value: v.to_string(),
+        });
+    }
+    if name == "max_execution_time" {
+        return Some(Assign::PersonaVar {
+            name: "max_execution_time",
+            value: number().filter(|v| u32::try_from(*v).is_ok())?.to_string(),
+            mysql: true,
+        });
+    }
+    if name == "max_statement_time" {
+        if value.kind != TokenKind::Number {
+            return None;
+        }
+        let v: f64 = std::str::from_utf8(value.bytes(sql)).ok()?.parse().ok()?;
+        if !(0.0..=31_536_000.0).contains(&v) {
+            return None;
+        }
+        return Some(Assign::PersonaVar {
+            name: "max_statement_time",
+            value: format!("{v:.6}"),
+            mysql: false,
         });
     }
     if name == "innodb_lock_wait_timeout" {
@@ -353,6 +539,7 @@ fn all_engine(cat: &TenantCatalog) -> bool {
 impl PassSession {
     /// A `SET` the gateway keeps (see the module docs): `Some` once
     /// answered, `None` when MariaDB still answers it.
+    #[allow(clippy::too_many_lines)]
     pub(super) async fn engine_set(
         &mut self,
         cx: &mut ExecCtx<'_>,
@@ -387,9 +574,39 @@ impl PassSession {
                 return self.fail(out, &e).await.map(Some);
             }
         }
+        // Each persona's own variables, and `sql_mode` as each reads it.
+        let on_mysql = self.persona == sprig_proto_mysql::Persona::MySql84;
+        let mut new_sql_mode: Option<(Option<String>, String)> = None;
+        for a in &assigns {
+            match a {
+                Assign::PersonaVar { mysql, .. } if *mysql != on_mysql => return Ok(None),
+                Assign::SqlMode(text) => {
+                    new_sql_mode = Some(if on_mysql {
+                        match sprig_sql::compat::sqlmode::parse_mysql(text) {
+                            Ok(m) => (Some(m.render()), m.backend()),
+                            Err(_) => return Ok(None),
+                        }
+                    } else {
+                        match mariadb_mode(text) {
+                            Some(m) => (None, m),
+                            None => return Ok(None),
+                        }
+                    });
+                }
+                _ => {}
+            }
+        }
         let mut changes = Vec::new();
         {
             let bs = self.bs(cx);
+            if let Some((client, backend)) = &new_sql_mode {
+                bs.vars_mut()
+                    .vars
+                    .insert("sql_mode".to_owned(), backend.clone());
+                if on_mysql {
+                    bs.vars_mut().client_sql_mode.clone_from(client);
+                }
+            }
             for a in &assigns {
                 match a {
                     Assign::Var { names, value } => {
@@ -424,7 +641,15 @@ impl PassSession {
                             });
                         }
                     }
-                    Assign::LockWait(_) => {}
+                    Assign::Gateway { name, value } => {
+                        bs.vars_mut()
+                            .gateway_vars
+                            .insert((*name).to_owned(), value.clone());
+                    }
+                    Assign::PersonaVar { name, value, .. } => {
+                        bs.vars_mut().vars.insert((*name).to_owned(), value.clone());
+                    }
+                    Assign::SqlMode(_) | Assign::LockWait(_) => {}
                 }
             }
         }
@@ -565,6 +790,38 @@ mod tests {
     }
 
     #[test]
+    fn modes_and_zones() {
+        assert_eq!(
+            mariadb_mode("strict_trans_tables,,ANSI_QUOTES"),
+            Some("ANSI_QUOTES,STRICT_TRANS_TABLES".into())
+        );
+        assert_eq!(mariadb_mode(""), Some(String::new()));
+        assert_eq!(mariadb_mode("TRADITIONAL"), None);
+        assert_eq!(time_zone("+5:30"), Some("+05:30".into()));
+        assert_eq!(time_zone("-12:00"), Some("-12:00".into()));
+        assert_eq!(time_zone("+14:01"), None);
+        assert_eq!(time_zone("system"), Some("SYSTEM".into()));
+        assert_eq!(time_zone("Europe/Paris"), None);
+        assert_eq!(
+            p("SET SESSION sql_mode = 'ANSI_QUOTES', time_zone = '+00:00'"),
+            Some(vec![
+                Assign::SqlMode("ANSI_QUOTES".into()),
+                var(&["time_zone"], "+00:00")
+            ])
+        );
+        assert_eq!(
+            p("SET SQL_SELECT_LIMIT=DEFAULT, wait_timeout = 600"),
+            Some(vec![
+                var(&["sql_select_limit"], "18446744073709551615"),
+                Assign::Gateway {
+                    name: "wait_timeout",
+                    value: "600".into()
+                }
+            ])
+        );
+    }
+
+    #[test]
     fn left_to_mariadb() {
         for s in [
             "SET GLOBAL autocommit = 0",
@@ -574,12 +831,14 @@ mod tests {
             "SET autocommit = 'ON'",
             "SET autocommit = 2",
             "SET autocommit = 1 + 0",
-            "SET sql_mode = 'ANSI'",
+            "SET sql_mode = CONCAT('A', 'NSI')",
+            "SET time_zone = @tz",
+            "SET wait_timeout = 0",
             "SET transaction_isolation = 'READ COMMITTED'",
             "SET @@transaction_isolation = 'READ-COMMITTED'",
             "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
             "SET GLOBAL TRANSACTION READ ONLY",
-            "SET autocommit = 0, sql_mode = ''",
+            "SET autocommit = 0, sql_mode = CONCAT('')",
             "SET autocommit",
             "SELECT 1",
         ] {

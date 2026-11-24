@@ -21,8 +21,8 @@
 //!   traffic <tenant>`: see [`dcmove`];
 //! - `sprigctl shard move <tenant> --to <cluster>` and `sprigctl job
 //!   list|show|cancel|cutover`: see [`mover`];
-//! - `sprigctl index list|show|recommendations|approve|reject|drop|pin|unpin`
-//!   and `sprigctl explain query <fingerprint>`: see [`index`];
+//! - `sprigctl index list|events`: automatic indexes and the loop's
+//!   decisions, see [`index`];
 //!   `sprigctl explain decision|placement`: see [`placement`].
 //!
 //! - `sprigctl logic compile|deploy|list|show`: see [`logic`].
@@ -58,6 +58,7 @@ mod export;
 mod failover;
 mod gateway;
 mod graph;
+mod index;
 mod inherit;
 // Token issuers (external tokens).
 mod issuer;
@@ -502,6 +503,7 @@ fn cli() -> Command {
         .subcommand(tenant_group())
         .subcommand(settings::group())
         .subcommand(recommendations::group())
+        .subcommand(index::group())
         .subcommand(placement::explain_group())
         .subcommand(mover::shard_group())
         .subcommand(mover::job_group())
@@ -607,6 +609,9 @@ fn main() -> ExitCode {
                 .await
                 .map(|()| ExitCode::SUCCESS),
             "recommendations" => recommendations::run(&client, &matches, sub, output(&matches))
+                .await
+                .map(|()| ExitCode::SUCCESS),
+            "index" => index::run(&client, sub, output(&matches))
                 .await
                 .map(|()| ExitCode::SUCCESS),
             "explain" => placement::explain(&client, sub, output(&matches))

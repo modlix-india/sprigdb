@@ -82,20 +82,11 @@ impl std::fmt::Debug for GatewayMq {
     }
 }
 
-/// The variable naming whole tenants whose queue messages are on the
-/// engine (`all`, or tenant ids separated by commas).
-pub const ENGINE_TENANTS_VAR: &str = "SPRIGDB_ENGINE_QUEUES_TENANTS";
-
+/// The tenants whose queue messages are on the engine: every one (the
+/// engine is the only message store).
 fn engine_tenants() -> &'static crate::kafka::engine::Tenants {
-    static T: std::sync::OnceLock<crate::kafka::engine::Tenants> = std::sync::OnceLock::new();
-    T.get_or_init(|| {
-        std::env::var(ENGINE_TENANTS_VAR)
-            .ok()
-            .and_then(|v| crate::kafka::engine::Tenants::parse(&v))
-            .unwrap_or_else(|| {
-                crate::kafka::engine::Tenants::Only(std::collections::BTreeSet::new())
-            })
-    })
+    static T: crate::kafka::engine::Tenants = crate::kafka::engine::Tenants::All;
+    &T
 }
 
 /// Whether the node puts every queue message of `tenant` on the engine.
@@ -125,9 +116,8 @@ pub(crate) fn engine_queues() -> Option<Arc<sprig_queues::enginestore::EngineQue
 }
 
 impl GatewayMq {
-    /// Whether vhost `v`'s messages are stored on the engine: its database
-    /// is an engine database, or its tenant is named in
-    /// `SPRIGDB_ENGINE_QUEUES_TENANTS`.
+    /// Whether vhost `v`'s messages are stored on the engine: every
+    /// tenant's are.
     async fn on_engine(&self, v: &VhostRef) -> bool {
         if v.tenant == 0 {
             return false;

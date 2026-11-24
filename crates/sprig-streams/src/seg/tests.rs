@@ -1013,3 +1013,50 @@ async fn partition_groups_put_partitions_in_units_of_their_own() {
     assert_eq!(base(&put(&l, key(3), &batch_bytes(1, 1_000, 10)).await), 3);
     assert_eq!(all(&l, key(3)).len(), 4);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unclaimed_outcomes_of_other_units_never_push_out_a_fresh_one() {
+    // A replica records the outcome of every append it applies, also the
+    // ones other nodes proposed (nobody here waits for those). Past the
+    // cap, the oldest go: never the fresh outcome of the lowest unit, a
+    // partition group led here whose producer is about to read it.
+    let d = TempDir::new("results-cap");
+    let grouped = SegConfig { groups: 3, ..cfg() };
+    let l = SegLog::open(&engine(d.path()), d.path().join("seg"), grouped).unwrap();
+    lock(&l.inner.results).kept = 8;
+    let mut unclaimed = Vec::new();
+    for _ in 0..20 {
+        unclaimed.push(l.propose(key(2), &batch_bytes(1, 1_000, 10)).unwrap());
+    }
+    let last = unclaimed.last().unwrap().index;
+    let until = std::time::Instant::now() + W;
+    while l
+        .engine()
+        .consensus()
+        .applied_index(sprig_engine::UnitId(group_unit(5, 2)))
+        < last
+    {
+        assert!(std::time::Instant::now() < until, "group 2 not applied");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    for i in 0..3 {
+        assert_eq!(
+            base(&put(&l, key(0), &batch_bytes(1, 1_000, 10)).await),
+            i,
+            "group 0's own append {i} kept its outcome"
+        );
+    }
+    // The oldest unclaimed ones went; the newest are still there.
+    let newest = *unclaimed.last().unwrap();
+    assert!(
+        lock(&l.inner.results)
+            .take(&(newest.unit, newest.index, newest.slot))
+            .is_some()
+    );
+    let oldest = unclaimed[0];
+    assert!(
+        lock(&l.inner.results)
+            .take(&(oldest.unit, oldest.index, oldest.slot))
+            .is_none()
+    );
+}

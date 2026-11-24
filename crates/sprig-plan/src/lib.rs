@@ -69,6 +69,7 @@ mod plan;
 mod range;
 mod resolve;
 mod sources;
+pub mod whatif;
 
 pub use explain::ExplainRow;
 pub use plan::{AccessStat, Column, Plan, PlanOptions, Planner};

@@ -2060,6 +2060,7 @@ async fn a_write_that_read_the_whole_table_says_so() {
 mod ddl;
 mod fk;
 mod hidden;
+mod online;
 mod types;
 
 #[tokio::test]

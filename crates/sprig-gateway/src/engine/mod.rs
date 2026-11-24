@@ -60,6 +60,7 @@ pub(crate) mod multiwrite;
 pub(crate) mod paramtype;
 pub(crate) mod plan;
 pub(crate) mod plancache;
+pub(crate) mod routine;
 pub(crate) mod row;
 pub(crate) mod sequence;
 pub(crate) mod session;

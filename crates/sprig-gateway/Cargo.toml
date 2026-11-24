@@ -40,6 +40,8 @@ serde_json.workspace = true
 sprig-auth.workspace = true
 # Recommendations in SQL.
 sprig-approvals.workspace = true
+# Automatic indexing's decision logic (the loop runs here, beside the engine).
+sprig-advisor.workspace = true
 # The balancer's load report and write sketches.
 sprig-balancer.workspace = true
 # Logic declarations.

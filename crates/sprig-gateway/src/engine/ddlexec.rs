@@ -52,6 +52,10 @@ pub(crate) struct Report {
     pub conds: Vec<Condition>,
 }
 
+/// A routine a statement produced: (schema, function, name, its catalog
+/// text; `None` for one it removed).
+type ProducedRoutine = (SchemaName, ObjectKind, String, Option<String>);
+
 /// One statement's engine state across the catalog's phases.
 pub(crate) struct Hook {
     eng: &'static Engine,
@@ -76,6 +80,11 @@ pub(crate) struct Hook {
     /// The gateway's services: the newest catalog, for the check that a
     /// change starts from the table's current definition.
     svc: Option<Arc<crate::tenant::TenantServices>>,
+    /// A routine statement's session context.
+    routine: Option<super::routine::ddl::Session>,
+    /// The routines this statement produced: (schema, function, name, its
+    /// catalog text; `None` for one it removed).
+    routines: Mutex<Vec<ProducedRoutine>>,
 }
 
 impl std::fmt::Debug for Hook {
@@ -108,7 +117,100 @@ impl Hook {
             produced: Mutex::new(Vec::new()),
             seq_resets: Mutex::new(Vec::new()),
             svc: None,
+            routine: None,
+            routines: Mutex::new(Vec::new()),
         }
+    }
+
+    /// The same hook, for a routine statement of a session in `cx`.
+    #[must_use]
+    pub(crate) fn with_routine(mut self, cx: super::routine::ddl::Session) -> Self {
+        self.routine = Some(cx);
+        self
+    }
+
+    /// The catalog text of routine `name` (`function`) of `schema`, as
+    /// this statement left it.
+    fn routine_text(&self, schema: &SchemaName, kind: ObjectKind, name: &str) -> Option<String> {
+        let trigger = kind == ObjectKind::Trigger;
+        let produced = self.routines.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some((_, _, _, t)) = produced.iter().rev().find(|(s, k, n, _)| {
+            s == schema && *k == kind && (n == name || (!trigger && n.eq_ignore_ascii_case(name)))
+        }) {
+            return t.clone();
+        }
+        drop(produced);
+        let db = schema.db()?;
+        if trigger {
+            let t = catalog::of(&self.cat)?
+                .triggers
+                .get(&(db, name.to_owned()))?;
+            return Some(super::routine::stored(&t.cx, &t.show));
+        }
+        let function = kind == ObjectKind::Function;
+        let kind = if function {
+            super::routine::Kind::Function
+        } else {
+            super::routine::Kind::Procedure
+        };
+        let r = catalog::of(&self.cat)?.routine(db, kind, name)?;
+        Some(super::routine::stored(&r.cx, &r.show))
+    }
+
+    fn produce_routine(&self, schema: SchemaName, kind: ObjectKind, name: &str, t: Option<String>) {
+        self.routines
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((schema, kind, name.to_owned(), t));
+    }
+
+    /// The catalog text of `CREATE TRIGGER` `sql` in database `db`.
+    fn trigger_text(&self, sql: &str, db: Option<DbId>, name: &str) -> Result<String> {
+        let rs = self.routine.clone().unwrap_or_default();
+        let text = rs.entry.as_deref().unwrap_or(sql);
+        let (tdb, table) = super::routine::trigger::table_of(text)
+            .or_else(|| super::routine::trigger::table_of(sql))
+            .ok_or_else(|| SprigError::internal("CREATE TRIGGER without its table"))?;
+        let cat = catalog::of(&self.cat);
+        let db = match tdb {
+            Some(d) => cat.and_then(|c| {
+                c.dbs
+                    .iter()
+                    .copied()
+                    .find(|x| self.db_name(*x).eq_ignore_ascii_case(&d))
+            }),
+            None => db,
+        };
+        let def = db
+            .and_then(|d| cat?.table(d, &table, self.lctn))
+            .and_then(|p| p.as_ref().as_ref().ok().cloned());
+        let Some(def) = def else {
+            return Err(SprigError::standard(
+                1146,
+                *b"42S02",
+                format!("Table '{}.{table}' doesn't exist", self.sess.db),
+            ));
+        };
+        let cols: Vec<String> = def.columns.iter().map(|c| c.name.clone()).collect();
+        let others: Vec<(String, bool, super::routine::parse::Event, i64)> = cat
+            .map(|c| {
+                c.triggers
+                    .values()
+                    .filter(|t| t.table == def.object && t.name != name)
+                    .filter_map(|t| t.when().map(|(b, e)| (t.name.clone(), b, e, t.cx.order)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let cx = db.map_or_else(|| self.ctx(DbId(0)), |d| self.ctx(d));
+        super::routine::trigger::create(
+            sql,
+            &rs,
+            &self.sess.account,
+            self.sess.env.mysql,
+            &cx.db_cs,
+            &cols,
+            &others,
+        )
     }
 
     /// The same hook, able to read the newest catalog.
@@ -1209,6 +1311,69 @@ impl DdlExecutor for EngineDdl<'_> {
                 }
                 Ok(())
             }
+            Effect::Create {
+                kind: kind @ (ObjectKind::Procedure | ObjectKind::Function),
+                name,
+            } => {
+                let db = stmt.schema.db();
+                let db_name =
+                    db.map_or_else(|| self.hook.sess.db.clone(), |d| self.hook.db_name(d));
+                let cx = db.map_or_else(|| self.hook.ctx(DbId(0)), |d| self.hook.ctx(d));
+                let rs = self.hook.routine.clone().unwrap_or_default();
+                let text = super::routine::ddl::create(
+                    &stmt.sql,
+                    &rs,
+                    &db_name,
+                    &self.hook.sess.account,
+                    self.hook.sess.env.mysql,
+                    &cx.db_cs,
+                )?;
+                self.hook
+                    .produce_routine(stmt.schema, *kind, name, Some(text));
+                Ok(())
+            }
+            Effect::Create {
+                kind: ObjectKind::Trigger,
+                name,
+            } => {
+                let text = self.hook.trigger_text(&stmt.sql, stmt.schema.db(), name)?;
+                self.hook
+                    .produce_routine(stmt.schema, ObjectKind::Trigger, name, Some(text));
+                Ok(())
+            }
+            Effect::Alter {
+                kind: kind @ (ObjectKind::Procedure | ObjectKind::Function),
+                name,
+            } => {
+                let function = *kind == ObjectKind::Function;
+                let Some(old) = self.hook.routine_text(&stmt.schema, *kind, name) else {
+                    return Err(SprigError::standard(
+                        1305,
+                        *b"42000",
+                        format!(
+                            "{} {}.{name} does not exist",
+                            if function { "FUNCTION" } else { "PROCEDURE" },
+                            self.hook.sess.db
+                        ),
+                    ));
+                };
+                let rs = self.hook.routine.clone().unwrap_or_default();
+                let sql = rs.entry.clone().unwrap_or_else(|| stmt.sql.clone());
+                let text = super::routine::ddl::alter(&old, &sql, &rs)?;
+                self.hook
+                    .produce_routine(stmt.schema, *kind, name, Some(text));
+                Ok(())
+            }
+            // A routine has nothing but its catalog record.
+            Effect::Drop {
+                kind: kind @ (ObjectKind::Procedure | ObjectKind::Function | ObjectKind::Trigger),
+                names,
+            } => {
+                for n in names {
+                    self.hook.produce_routine(stmt.schema, *kind, n, None);
+                }
+                Ok(())
+            }
             Effect::CreateSchema | Effect::AlterSchema | Effect::Drop { .. } => {
                 self.inner.execute(stmt).await
             }
@@ -1235,6 +1400,12 @@ impl DdlExecutor for EngineDdl<'_> {
         }
         if kind == ObjectKind::Sequence {
             return Ok(self.hook.seq_text(schema, name));
+        }
+        if matches!(
+            kind,
+            ObjectKind::Procedure | ObjectKind::Function | ObjectKind::Trigger
+        ) {
+            return Ok(self.hook.routine_text(schema, kind, name));
         }
         self.inner.show_create(schema, kind, name).await
     }

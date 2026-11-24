@@ -60,6 +60,11 @@ pub(crate) struct EngineCatalog {
     /// The session's temporary tables, in a session's own copy of this
     /// state (`super::temp`); empty in the catalog's.
     pub temps: HashSet<ObjectId>,
+    /// Stored procedures and functions by (database, kind, lower-case
+    /// name): routine names compare without case.
+    pub routines: HashMap<(DbId, super::routine::Kind, String), Arc<super::routine::Routine>>,
+    /// SQL triggers by (database, name).
+    pub triggers: HashMap<(DbId, String), Arc<super::routine::trigger::Trigger>>,
 }
 
 impl ExtState for EngineCatalog {
@@ -94,6 +99,16 @@ impl EngineCatalog {
             self.seq_names.get(&(db, name.to_owned()))?
         };
         self.seq_by_object.get(o)
+    }
+
+    /// The routine `name` of kind `kind` in database `db`.
+    pub(crate) fn routine(
+        &self,
+        db: DbId,
+        kind: super::routine::Kind,
+        name: &str,
+    ) -> Option<&Arc<super::routine::Routine>> {
+        self.routines.get(&(db, kind, name.to_lowercase()))
     }
 
     /// The view `name` of database `db` (names compare as for tables).
@@ -137,6 +152,7 @@ impl CatalogExtension for EngineExtension {
         Some(VersionKind::Catalog)
     }
 
+    #[allow(clippy::too_many_lines)] // one branch per object kind
     async fn load(
         &self,
         tx: &mut SnapshotTx<'_>,
@@ -185,6 +201,43 @@ impl CatalogExtension for EngineExtension {
                         text,
                     }),
                 );
+                continue;
+            }
+            if o.kind == ObjectKind::Trigger
+                && o.state == ObjectState::Active
+                && state.dbs.contains(&o.db_id)
+                && let Some(table) = o.parent_id
+            {
+                let text = tx
+                    .schema_version(o.object_id, o.schema_version)
+                    .await?
+                    .and_then(|v| v.create_sql)
+                    .unwrap_or_default();
+                let t = super::routine::trigger::load(o.db_id, table, &o.name, &text);
+                state
+                    .triggers
+                    .insert((o.db_id, o.name.clone()), Arc::new(t));
+                continue;
+            }
+            if matches!(o.kind, ObjectKind::Procedure | ObjectKind::Function)
+                && o.state == ObjectState::Active
+                && state.dbs.contains(&o.db_id)
+            {
+                let text = tx
+                    .schema_version(o.object_id, o.schema_version)
+                    .await?
+                    .and_then(|v| v.create_sql)
+                    .unwrap_or_default();
+                let db_name = db_names.get(&o.db_id).cloned().unwrap_or_default();
+                let mut r = super::routine::load(o.object_id, o.db_id, &db_name, &o.name, &text);
+                r.kind = if o.kind == ObjectKind::Function {
+                    super::routine::Kind::Function
+                } else {
+                    super::routine::Kind::Procedure
+                };
+                state
+                    .routines
+                    .insert((o.db_id, r.kind, o.name.to_lowercase()), Arc::new(r));
                 continue;
             }
             if o.kind == ObjectKind::View

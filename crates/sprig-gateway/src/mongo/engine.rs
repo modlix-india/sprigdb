@@ -1,19 +1,14 @@
 //! MongoDB collections stored on SprigDB's own storage engine.
 //!
-//! A database's collections live on the engine when the tenant's logical
-//! database of that name is placed there (`storage.placement = 'engine'`),
-//! or when the node puts whole tenants there:
-//! `SPRIGDB_ENGINE_MONGO_TENANTS` (`all`, or tenant ids separated by
-//! commas). Their commands then run on the node's engine
-//! (`sprig_doc::docstore`) and never touch MariaDB; every other database
-//! runs as before. If the engine can't open, those databases' commands are
-//! refused, never answered from MariaDB.
+//! Every tenant's collections live on the engine: their commands run on
+//! the node's engine (`sprig_doc::docstore`) and never touch MariaDB. If
+//! the engine can't open, the commands are refused, never answered from
+//! MariaDB.
 //!
 //! Cursors share the connection's cursor table: an engine cursor is a
 //! [`CursorPlan`] over the store's cursor. Multi-document transactions on
 //! engine databases are the store's own, by `lsid`.
 
-use std::collections::BTreeSet;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -27,51 +22,6 @@ use sprig_proto_mongo::errors::{MongoError, code};
 use super::commands::owner;
 use super::conn::Conn;
 use super::cursors::CursorTable;
-
-/// The variable naming whole tenants on the engine.
-pub const TENANTS_VAR: &str = "SPRIGDB_ENGINE_MONGO_TENANTS";
-
-/// Which tenants are wholly on the engine.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Tenants {
-    /// Every tenant.
-    All,
-    /// These tenants.
-    Only(BTreeSet<u64>),
-}
-
-impl Tenants {
-    /// Parses `all` or a comma-separated id list (`None`: malformed).
-    #[must_use]
-    pub fn parse(v: &str) -> Option<Self> {
-        let v = v.trim();
-        if v.eq_ignore_ascii_case("all") {
-            return Some(Self::All);
-        }
-        v.split(',')
-            .filter(|x| !x.trim().is_empty())
-            .map(|x| x.trim().parse().ok())
-            .collect::<Option<BTreeSet<u64>>>()
-            .map(Self::Only)
-    }
-
-    pub(super) fn has(&self, t: u64) -> bool {
-        match self {
-            Self::All => true,
-            Self::Only(s) => s.contains(&t),
-        }
-    }
-}
-
-pub(super) fn tenants() -> &'static Tenants {
-    static T: OnceLock<Tenants> = OnceLock::new();
-    T.get_or_init(|| {
-        std::env::var(TENANTS_VAR)
-            .ok()
-            .and_then(|v| Tenants::parse(&v))
-            .unwrap_or_else(|| Tenants::Only(BTreeSet::new()))
-    })
-}
 
 /// The node's document store, opened on first use with its TTL sweeper
 /// and its idle-transaction reaper.
@@ -145,17 +95,13 @@ fn action_of(name: &str) -> Action {
     }
 }
 
-/// Whether `db` of the connection's tenant is on the engine.
+/// Whether `db` of the connection's tenant is on the engine (every tenant
+/// database is; the `Result` is kept for the callers' error paths).
+#[allow(clippy::unnecessary_wraps)]
 pub(super) fn on_engine(c: &mut Conn, db: &str) -> Result<bool, MongoError> {
     let tenant = owner(c).tenant;
-    if tenant == 0 || db == "admin" || db == "local" || db == "config" {
-        return Ok(false);
-    }
-    if tenants().has(tenant) {
-        return Ok(true);
-    }
-    let sql = c.sql()?;
-    Ok(sql.engine_database(db))
+    // Every tenant database is on the engine.
+    Ok(!(tenant == 0 || db == "admin" || db == "local" || db == "config"))
 }
 
 /// Answers the command when it belongs to the engine store: `None` sends
@@ -191,7 +137,7 @@ pub(super) async fn route(
             return Some(run(c, &s, name, body, db).await);
         }
         "listDatabases" => {
-            if who.tenant == 0 || !tenants().has(who.tenant) {
+            if who.tenant == 0 {
                 return None;
             }
             let Some(s) = store() else {
@@ -254,17 +200,15 @@ pub(super) async fn route(
             format!("{name} is not supported on databases stored on the SprigDB engine yet"),
         )));
     }
-    if !tenants().has(who.tenant) {
-        match denied(c, name, body) {
-            Ok(false) => {}
-            Ok(true) => {
-                return Some(Err(MongoError::new(
-                    code::UNAUTHORIZED,
-                    format!("not authorized on {target_db} to execute command {name}"),
-                )));
-            }
-            Err(e) => return Some(Err(e)),
+    match denied(c, name, body) {
+        Ok(false) => {}
+        Ok(true) => {
+            return Some(Err(MongoError::new(
+                code::UNAUTHORIZED,
+                format!("not authorized on {target_db} to execute command {name}"),
+            )));
         }
+        Err(e) => return Some(Err(e)),
     }
     Some(run(c, &s, name, body, target_db).await)
 }
@@ -456,11 +400,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tenant_lists_parse() {
-        assert_eq!(Tenants::parse("all"), Some(Tenants::All));
-        let t = Tenants::parse("1, 2").unwrap();
-        assert!(t.has(2) && !t.has(3));
-        assert_eq!(Tenants::parse("x"), None);
+    fn actions() {
         assert!(action_of("insert") == Action::Insert);
     }
 }

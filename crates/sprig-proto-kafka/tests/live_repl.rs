@@ -26,7 +26,8 @@
     clippy::single_match_else,
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
-    clippy::cast_sign_loss
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
 )]
 
 use rustls::pki_types::pem::PemObject as _;
@@ -811,4 +812,201 @@ async fn live_kill_loop() {
         &gaps[..gaps.len().min(5)]
     );
     assert_eq!(missing, 0, "acknowledged records lost");
+}
+
+/// Produce throughput the way kafka-producer-perf-test runs it (acks=all,
+/// batches of `SPRIG_KAFKA_TP_BATCH` records of `SPRIG_KAFKA_TP_SIZE`
+/// bytes, `SPRIG_KAFKA_TP_INFLIGHT` requests in flight per partition), each
+/// partition's batches sent to the leader Metadata names. Fails if any
+/// append was answered KAFKA_STORAGE_ERROR (an append the gateway
+/// reported lost) or the partitions hold more records than were
+/// acknowledged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs three gateways whose engines replicate, with the kafka listener"]
+async fn live_repl_throughput() {
+    let total: usize = env("SPRIG_KAFKA_TP_RECORDS").map_or(200_000, |v| v.parse().unwrap());
+    let size: usize = env("SPRIG_KAFKA_TP_SIZE").map_or(1024, |v| v.parse().unwrap());
+    let per: usize = env("SPRIG_KAFKA_TP_BATCH").map_or(16, |v| v.parse().unwrap());
+    let inflight: usize = env("SPRIG_KAFKA_TP_INFLIGHT").map_or(5, |v| v.parse().unwrap());
+    let parts: i32 = env("SPRIG_KAFKA_TP_PARTITIONS").map_or(6, |v| v.parse().unwrap());
+    let db = env("SPRIG_KAFKA_DB").unwrap();
+    let topic = format!("{db}.tp_{}", std::process::id());
+    let mut v = View::default();
+    v.refresh(None).await;
+    let create = CreateTopicsRequest {
+        topics: vec![create_topics_request::CreatableTopic {
+            name: topic.clone(),
+            num_partitions: parts,
+            replication_factor: -1,
+            ..Default::default()
+        }],
+        timeout_ms: 30_000,
+        ..Default::default()
+    };
+    let r: CreateTopicsResponse = v
+        .conn(v.controller)
+        .await
+        .unwrap()
+        .call(7, &create)
+        .await
+        .unwrap();
+    assert_eq!(r.topics[0].error_code, 0, "{:?}", r.topics[0].error_message);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    // Every partition answers once before the clock starts.
+    for p in 0..parts {
+        produce(
+            &mut v,
+            &topic,
+            p,
+            &batch("w", 0, 1),
+            Duration::from_secs(60),
+        )
+        .await;
+    }
+    println!("leaders {:?}", v.leaders);
+    let n = total / parts as usize;
+    let value = vec![b'x'; size];
+    let t0 = Instant::now();
+    let mut tasks = Vec::new();
+    for part in 0..parts {
+        let topic = topic.clone();
+        let value = value.clone();
+        let addr = v.brokers[&v.leaders[&part]].clone();
+        tasks.push(tokio::spawn(async move {
+            let mut c = login(&addr).await.unwrap();
+            let mut pending = std::collections::VecDeque::new();
+            let (mut sent, mut acked) = (0usize, 0usize);
+            let mut errors: BTreeMap<i16, usize> = BTreeMap::new();
+            let mut retried = 0usize;
+            let mut lat = Vec::new();
+            let make = |first: usize, k: usize| {
+                RecordBatch {
+                    last_offset_delta: k as i32 - 1,
+                    producer_id: -1,
+                    producer_epoch: -1,
+                    base_sequence: -1,
+                    records: (0..k)
+                        .map(|i| Record {
+                            offset_delta: i as i32,
+                            key: Some(format!("k{}", first + i).into_bytes()),
+                            value: Some(value.clone()),
+                            ..Record::default()
+                        })
+                        .collect(),
+                    ..RecordBatch::default()
+                }
+                .to_bytes()
+                .unwrap()
+            };
+            while acked < n {
+                while sent < n && pending.len() < inflight {
+                    let k = per.min(n - sent);
+                    let b = make(sent, k);
+                    let id = c
+                        .send(9, &produce_req(&topic, part, b.clone()))
+                        .await
+                        .unwrap();
+                    pending.push_back((id, k, Instant::now(), b));
+                    sent += k;
+                }
+                let (id, k, at, b) = pending.pop_front().unwrap();
+                let r: ProduceResponse = c.recv(9, id).await.unwrap();
+                let p = &r.responses[0].partition_responses[0];
+                if p.error_code != err::NONE {
+                    *errors.entry(p.error_code).or_default() += 1;
+                    retried += k;
+                    assert!(
+                        errors.values().sum::<usize>() < 200,
+                        "partition {part}: errors {errors:?} (last {:?})",
+                        p.error_message
+                    );
+                    let id = c
+                        .send(9, &produce_req(&topic, part, b.clone()))
+                        .await
+                        .unwrap();
+                    pending.push_back((id, k, at, b));
+                    continue;
+                }
+                lat.push(at.elapsed());
+                acked += k;
+            }
+            lat.sort();
+            let q = |f: f64| lat[((lat.len() - 1) as f64 * f) as usize].as_secs_f64() * 1e3;
+            (part, acked, q(0.5), q(0.99), errors, retried)
+        }));
+    }
+    let mut results = Vec::new();
+    for t in tasks {
+        results.push(t.await.unwrap());
+    }
+    let secs = t0.elapsed().as_secs_f64();
+    let acked: usize = results.iter().map(|r| r.1).sum();
+    println!(
+        "produce: {acked} records of {size} B in {secs:.2} s: {:.0} records/s; batches of {per}, {inflight} in flight per partition",
+        acked as f64 / secs
+    );
+    let mut storage = 0;
+    for (part, n, p50, p99, errors, _) in &results {
+        println!(
+            "partition {part}: {n} acked, p50 {p50:.1} ms, p99 {p99:.1} ms, errors {errors:?}"
+        );
+        storage += errors.get(&err::KAFKA_STORAGE_ERROR).copied().unwrap_or(0);
+    }
+    v.refresh(Some(&topic)).await;
+    let mut extra = 0i64;
+    // A retried batch may have been appended the first time too (these
+    // producers aren't idempotent): those copies are allowed.
+    let retried: usize = results.iter().map(|r| r.5).sum();
+    for p in 0..parts {
+        let leader = v.leaders[&p];
+        let r: ListOffsetsResponse = v
+            .conn(leader)
+            .await
+            .unwrap()
+            .call(
+                7,
+                &ListOffsetsRequest {
+                    replica_id: -1,
+                    topics: vec![list_offsets_request::ListOffsetsTopic {
+                        name: topic.clone(),
+                        partitions: vec![list_offsets_request::ListOffsetsPartition {
+                            partition_index: p,
+                            current_leader_epoch: -1,
+                            timestamp: -1,
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let held = r.topics[0].partitions[0].offset;
+        // The warm-up record plus every acknowledged one.
+        extra += held - 1 - results[p as usize].1 as i64;
+    }
+    println!("records held beyond those acknowledged: {extra} ({retried} records retried)");
+    let _: DeleteTopicsResponse = v
+        .conn(v.controller)
+        .await
+        .unwrap()
+        .call(
+            6,
+            &DeleteTopicsRequest {
+                topics: vec![delete_topics_request::DeleteTopicState {
+                    name: Some(topic.clone()),
+                    ..Default::default()
+                }],
+                timeout_ms: 30_000,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(storage, 0, "appends answered KAFKA_STORAGE_ERROR");
+    assert!(
+        (0..=retried as i64).contains(&extra),
+        "partitions hold {extra} records beyond those acknowledged ({retried} retried)"
+    );
 }

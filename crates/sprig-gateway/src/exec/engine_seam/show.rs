@@ -49,6 +49,20 @@ impl PassSession {
                 .any(|t| t.bytes(sql).eq_ignore_ascii_case(b"EXISTS"));
             return self.engine_show_create_database(&info, if_not_exists);
         }
+        // Stored procedures and functions (`routine`).
+        if matches!(
+            info.kind,
+            ShowKind::CreateProcedure
+                | ShowKind::CreateFunction
+                | ShowKind::ProcedureStatus
+                | ShowKind::FunctionStatus
+        ) {
+            return self.engine_show_routine(&info, sql);
+        }
+        // SQL triggers (`routine::trigger`).
+        if matches!(info.kind, ShowKind::CreateTrigger | ShowKind::Triggers) {
+            return self.engine_show_trigger(&info, sql);
+        }
         if !matches!(
             info.kind,
             ShowKind::CreateTable

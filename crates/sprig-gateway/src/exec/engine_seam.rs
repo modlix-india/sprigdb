@@ -79,7 +79,12 @@ mod fast;
 // General SELECTs (joins, grouping, subqueries) through the planner.
 mod general;
 // `SET` of session variables kept in the gateway.
+mod routine;
 mod setvars;
+// Reads of system and user variables, and `SET @x`, kept in the gateway.
+mod sessvars;
+// `GET_LOCK` and its kin, kept in the gateway.
+mod locks;
 mod show;
 // DDL on the session's temporary tables.
 mod temp;
@@ -122,7 +127,14 @@ pub(super) struct SessVars {
 
 /// The session's engine state.
 #[derive(Debug, Default)]
+#[allow(clippy::struct_excessive_bools)]
 pub(super) struct EngineState {
+    /// The named locks (`GET_LOCK`) the session holds, released when it
+    /// ends.
+    locks: Option<locks::Owner>,
+    /// A named-lock statement's answer is running (its text isn't the
+    /// client's).
+    lock_answer: bool,
     /// Its transaction on the engine.
     pub(super) txn: SessionTxn,
     /// The session's variables as last read; `None`: read them again.
@@ -835,6 +847,17 @@ impl PassSession {
         if self.persona == sprig_proto_mysql::Persona::MySql84
             && locking.is_none()
             && let Ok(Some(g)) = crate::engine::general::bind_tableless(&cx, &stmt, plain)
+        {
+            return Ok(Bound::General(Box::new(g)));
+        }
+        // A tenant with only engine databases: a query without tables is
+        // planned here too (MariaDB has nothing of the tenant's).
+        // (A variable read the gateway couldn't answer stays out: the
+        // planner would take it for a column.)
+        if locking.is_none()
+            && !sessvars::reads_vars(text, self.lex_opts().0)
+            && sessvars::all_engine(cat)
+            && let Ok(Some(g)) = crate::engine::general::bind_no_tables(&cx, &stmt, plain)
         {
             return Ok(Bound::General(Box::new(g)));
         }
@@ -2044,9 +2067,47 @@ impl PassSession {
         format: RowFormat,
         out: &mut dyn ResultSink,
     ) -> Result<Option<Step>> {
+        // Calls of stored functions (`routine`): run first, then the
+        // statement with their values.
+        if let Some(step) =
+            Box::pin(self.engine_sql_functions(cx, cat, logical, more, format, out)).await?
+        {
+            return Ok(Some(step));
+        }
+        // An `INSERT`, `UPDATE` or `DELETE` that fires SQL triggers: run
+        // row by row (`routine::trigger`).
+        if let Some(step) =
+            Box::pin(self.engine_sql_triggers(cx, cat, logical, sql, more, out)).await?
+        {
+            return Ok(Some(step));
+        }
         // A `SET` of session variables the gateway keeps.
         if let Some(step) = Box::pin(self.engine_set(cx, cat, sql, more, out)).await? {
             return Ok(Some(step));
+        }
+        // `SET @x = ...`, and reads of variables, kept in the gateway.
+        if let Some(step) = Box::pin(self.engine_user_set(cx, cat, current, sql, more, out)).await?
+        {
+            return Ok(Some(step));
+        }
+        // The client's own text (the name layer scopes lock names for
+        // MariaDB), unless this is the lock's own answer.
+        let client = self.eng.entry.clone().unwrap_or_else(|| sql.clone());
+        if !self.eng.lock_answer
+            && let Some(step) =
+                Box::pin(self.engine_named_lock(cx, cat, current, &client, more, format, out))
+                    .await?
+        {
+            return Ok(Some(step));
+        }
+        if let Some(step) = Box::pin(self.engine_do(cx, cat, current, sql, more, out)).await? {
+            return Ok(Some(step));
+        }
+        if let Some(text) = self.engine_var_reads(cx, cat, sql) {
+            return Box::pin(
+                self.engine_text_in(cx, cat, current, &text, logical, more, format, out),
+            )
+            .await;
         }
         if let Some(ctl) = control::parse(sql) {
             return Box::pin(self.engine_control(cx, cat, current, ctl, more, out)).await;
@@ -2475,6 +2536,15 @@ impl PassSession {
             }
             (Arc::clone(&e.plan), s.recheck.clone(), s.logical.clone())
         };
+        // A table with SQL triggers: its changes run row by row, from text
+        // only (`routine::trigger`).
+        if let Some(l) = &logical
+            && self.engine_prepared_fires(l)
+        {
+            return Err(crate::engine::not_on_engine(
+                "a prepared INSERT, UPDATE or DELETE of a table with triggers",
+            ));
+        }
         // Privileges, as the general execute checks them.
         if let Some(rc) = &recheck
             && let Some(ts) = self.tenant.as_deref_mut()
@@ -2813,10 +2883,14 @@ impl PassSession {
                             Err(why) => refuse(&why),
                         }
                     }
-                    DdlKind::Table | DdlKind::View | DdlKind::Sequence => Ok(()),
-                    // Stored code, triggers, events and sequences aren't
-                    // the engine's yet.
-                    _ => refuse("stored routines, triggers, events and sequences"),
+                    DdlKind::Table
+                    | DdlKind::View
+                    | DdlKind::Sequence
+                    | DdlKind::Procedure
+                    | DdlKind::Function
+                    | DdlKind::Trigger => Ok(()),
+                    // Events aren't the engine's yet.
+                    DdlKind::Event => refuse("events"),
                 }
             }
             DdlTarget::AlterObject {
@@ -2873,7 +2947,7 @@ impl PassSession {
     /// empties or drops tables of an engine database: the executor the
     /// catalog's DDL path runs the statement through
     /// (`crate::engine::ddlexec`).
-    #[allow(clippy::match_same_arms)] // tables and views, each kind its own arm
+    #[allow(clippy::match_same_arms, clippy::too_many_lines)] // one arm per object kind
     pub(super) fn engine_ddl_hook(
         &mut self,
         cx: &ExecCtx<'_>,
@@ -2931,6 +3005,22 @@ impl PassSession {
                 ..
             } => of_name(name),
             DdlTarget::RenameTables { pairs, .. } => pairs.iter().find_map(|(a, _)| of_name(a)),
+            // Stored procedures and functions (`crate::engine::routine`).
+            DdlTarget::CreateObject {
+                kind: DdlKind::Procedure | DdlKind::Function | DdlKind::Trigger,
+                name,
+                ..
+            }
+            | DdlTarget::AlterObject {
+                kind: DdlKind::Procedure | DdlKind::Function,
+                name,
+                ..
+            } => of_name(name),
+            DdlTarget::DropObjects {
+                kind: DdlKind::Procedure | DdlKind::Function | DdlKind::Trigger,
+                names,
+                ..
+            } => names.iter().find_map(of_name),
             DdlTarget::DropObjects {
                 kind: DdlKind::Table,
                 names,
@@ -2948,12 +3038,13 @@ impl PassSession {
             }
         );
         let eng = engine::engine().ok()?;
+        let routine = self.routine_ddl_session(cx, target);
         let sv = self.engine_vars(cx);
         // `lock_wait_timeout`: how long a definition change waits for the
         // statements and transactions using its table.
         let default = if sv.mysql { 31_536_000 } else { 86_400 };
         let wait = self.eng.ddl_wait.unwrap_or(default);
-        Some(crate::engine::ddlexec::Hook::new(
+        let hook = crate::engine::ddlexec::Hook::new(
             eng,
             tenant,
             cat,
@@ -2966,7 +3057,11 @@ impl PassSession {
                 account,
             },
             creates,
-        ))
+        );
+        Some(match routine {
+            Some(r) => hook.with_routine(r),
+            None => hook,
+        })
     }
 
     /// The catalog answered a DDL statement the engine took part in

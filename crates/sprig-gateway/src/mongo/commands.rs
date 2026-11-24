@@ -1315,7 +1315,7 @@ async fn open_change_stream(
     // stream) the whole tenant is.
     let on_engine = if db == "admin" {
         let t = owner(c).tenant;
-        t != 0 && super::engine::tenants().has(t)
+        t != 0
     } else {
         super::engine::on_engine(c, db)?
     };
