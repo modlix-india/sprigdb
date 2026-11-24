@@ -150,6 +150,7 @@ pub(crate) fn create(
         modified: sess.now.clone(),
         definer,
         order,
+        event: None,
     };
     Ok(super::stored(&cx, &show))
 }

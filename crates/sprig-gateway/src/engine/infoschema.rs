@@ -466,12 +466,37 @@ const COLS: &[(&str, &str, u16, u32, u8, u16)] = &[
     ("TRIGGERS", "CHARACTER_SET_CLIENT", 224, 128, 0xfd, 0x1001),
     ("TRIGGERS", "COLLATION_CONNECTION", 224, 256, 0xfd, 0x1001),
     ("TRIGGERS", "DATABASE_COLLATION", 224, 256, 0xfd, 0x1001),
+    ("EVENTS", "EVENT_CATALOG", 224, 256, 0xfd, 0x1001),
+    ("EVENTS", "EVENT_SCHEMA", 224, 256, 0xfd, 0x1001),
+    ("EVENTS", "EVENT_NAME", 224, 256, 0xfd, 0x1001),
+    ("EVENTS", "DEFINER", 224, 1536, 0xfd, 0x1001),
+    ("EVENTS", "TIME_ZONE", 224, 256, 0xfd, 0x1001),
+    ("EVENTS", "EVENT_BODY", 224, 32, 0xfd, 0x1001),
+    ("EVENTS", "EVENT_DEFINITION", 224, 786_420, 0xfc, 0x1011),
+    ("EVENTS", "EVENT_TYPE", 224, 36, 0xfd, 0x1001),
+    ("EVENTS", "EXECUTE_AT", 63, 19, 0xc, 0x1080),
+    ("EVENTS", "INTERVAL_VALUE", 224, 1024, 0xfd, 0x1000),
+    ("EVENTS", "INTERVAL_FIELD", 224, 72, 0xfd, 0x1000),
+    ("EVENTS", "SQL_MODE", 224, 32_768, 0xfd, 0x1001),
+    ("EVENTS", "STARTS", 63, 19, 0xc, 0x1080),
+    ("EVENTS", "ENDS", 63, 19, 0xc, 0x1080),
+    ("EVENTS", "STATUS", 224, 72, 0xfd, 0x1001),
+    ("EVENTS", "ON_COMPLETION", 224, 48, 0xfd, 0x1001),
+    ("EVENTS", "CREATED", 63, 19, 0xc, 0x1081),
+    ("EVENTS", "LAST_ALTERED", 63, 19, 0xc, 0x1081),
+    ("EVENTS", "LAST_EXECUTED", 63, 19, 0xc, 0x1080),
+    ("EVENTS", "EVENT_COMMENT", 224, 256, 0xfd, 0x1001),
+    ("EVENTS", "ORIGINATOR", 63, 10, 0x8, 0x1001),
+    ("EVENTS", "CHARACTER_SET_CLIENT", 224, 128, 0xfd, 0x1001),
+    ("EVENTS", "COLLATION_CONNECTION", 224, 256, 0xfd, 0x1001),
+    ("EVENTS", "DATABASE_COLLATION", 224, 256, 0xfd, 0x1001),
 ];
 
 /// The tables built here.
-pub(crate) const TABLES: [&str; 12] = [
+pub(crate) const TABLES: [&str; 13] = [
     "SCHEMATA",
     "TRIGGERS",
+    "EVENTS",
     "ROUTINES",
     "PARAMETERS",
     "TABLES",
@@ -1291,6 +1316,63 @@ fn add_triggers(db: &mut MemDb, schema: &str, eng: &super::catalog::EngineCatalo
     }
 }
 
+/// The `EVENTS` rows of database `dbid`, by name.
+fn add_events(db: &mut MemDb, schema: &str, src: &Source<'_>, dbid: DbId, mysql: bool) {
+    use super::routine::event;
+    let mut es: Vec<_> = src.eng.events.values().filter(|e| e.db == dbid).collect();
+    es.sort_by(|a, b| a.name.cmp(&b.name));
+    for e in es {
+        let Ok(d) = &e.def else { continue };
+        let t = |x: &Option<(String, i64)>| x.as_ref().map_or(V::N, |v| s(v.0.clone()));
+        let mut v = HashMap::new();
+        v.insert("EVENT_CATALOG", s("def"));
+        v.insert("EVENT_SCHEMA", s(schema));
+        v.insert("EVENT_NAME", s(e.name.clone()));
+        v.insert(
+            "DEFINER",
+            s(format!("{}@{}", e.cx.definer.0, e.cx.definer.1)),
+        );
+        v.insert("TIME_ZONE", s(d.time_zone.clone()));
+        v.insert("EVENT_BODY", s("SQL"));
+        v.insert("EVENT_DEFINITION", s(e.body.clone()));
+        v.insert(
+            "EVENT_TYPE",
+            s(if d.at.is_some() { "ONE TIME" } else { "RECURRING" }),
+        );
+        v.insert("EXECUTE_AT", t(&d.at));
+        v.insert(
+            "INTERVAL_VALUE",
+            d.every.as_ref().map_or(V::N, |x| s(x.0.clone())),
+        );
+        v.insert(
+            "INTERVAL_FIELD",
+            d.every.as_ref().map_or(V::N, |x| s(x.1.clone())),
+        );
+        v.insert("SQL_MODE", s(e.cx.sql_mode.clone()));
+        v.insert("STARTS", t(&d.starts));
+        v.insert("ENDS", t(&d.ends));
+        v.insert("STATUS", s(event::status_word(d.status, mysql)));
+        v.insert(
+            "ON_COMPLETION",
+            s(if d.preserve { "PRESERVE" } else { "NOT PRESERVE" }),
+        );
+        v.insert("CREATED", s(e.cx.created.clone()));
+        v.insert("LAST_ALTERED", s(e.cx.modified.clone()));
+        v.insert(
+            "LAST_EXECUTED",
+            event::last_run(src.tenant, dbid, &e.name).map_or(V::N, s),
+        );
+        v.insert("EVENT_COMMENT", s(d.comment.clone()));
+        v.insert("ORIGINATOR", V::U(1));
+        v.insert("CHARACTER_SET_CLIENT", s(e.cx.charset_client.clone()));
+        v.insert("COLLATION_CONNECTION", s(e.cx.collation_connection.clone()));
+        v.insert("DATABASE_COLLATION", s(e.cx.db_collation.clone()));
+        if let Err(err) = db.insert("EVENTS", row_of("EVENTS", &v)) {
+            tracing::warn!(error = %err.message, "information_schema: an EVENTS row doesn't fit its table");
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines)] // one row of each table
 fn add_routine(
     db: &mut MemDb,
@@ -1761,6 +1843,7 @@ fn try_answer(sql: &str, src: &Source<'_>, mysql: bool) -> Result<Answer, String
             add_routine(&mut db, &schema, r, &(cs.clone(), coll.clone()));
         }
         add_triggers(&mut db, &schema, src.eng, dbid);
+        add_events(&mut db, &schema, src, dbid, mysql);
         let mut seqs: Vec<&String> = src
             .eng
             .seq_names
@@ -1849,6 +1932,11 @@ fn try_answer(sql: &str, src: &Source<'_>, mysql: bool) -> Result<Answer, String
             .iter()
             .map(|v| match v {
                 Datum::Null => None,
+                // A time (`CREATED`, an event's `STARTS`): its text.
+                Datum::DateTime(d) => {
+                    let fsp = if d.micros == 0 { 0 } else { 6 };
+                    Some(Bytes::from(super::temporal::datetime_text(*d, fsp)))
+                }
                 Datum::Str(b) | Datum::Bytes(b) => Some(b.clone()),
                 Datum::UInt(n) => Some(Bytes::from(n.to_string())),
                 Datum::Int(n) => Some(Bytes::from(n.to_string())),

@@ -21,6 +21,8 @@ pub(crate) struct Session {
     pub collation_connection: String,
     /// Now, as `YYYY-MM-DD hh:mm:ss`.
     pub now: String,
+    /// An event statement's schedule, as the session evaluated it.
+    pub event: Option<super::event::Eval>,
 }
 
 /// The default `sql_mode` of each server.
@@ -161,6 +163,7 @@ pub(crate) fn create(
         modified: sess.now.clone(),
         definer,
         order: 0,
+        event: None,
     };
     Ok(stored(&cx, &show))
 }

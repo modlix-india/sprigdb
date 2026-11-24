@@ -63,6 +63,10 @@ impl PassSession {
         if matches!(info.kind, ShowKind::CreateTrigger | ShowKind::Triggers) {
             return self.engine_show_trigger(&info, sql);
         }
+        // SQL events (`routine::event`).
+        if matches!(info.kind, ShowKind::CreateEvent | ShowKind::Events) {
+            return self.engine_show_event(&info, sql);
+        }
         if !matches!(
             info.kind,
             ShowKind::CreateTable

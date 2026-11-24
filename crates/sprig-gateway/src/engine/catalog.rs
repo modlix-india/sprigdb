@@ -65,6 +65,9 @@ pub(crate) struct EngineCatalog {
     pub routines: HashMap<(DbId, super::routine::Kind, String), Arc<super::routine::Routine>>,
     /// SQL triggers by (database, name).
     pub triggers: HashMap<(DbId, String), Arc<super::routine::trigger::Trigger>>,
+    /// SQL events by (database, lower-case name): event names compare
+    /// without case.
+    pub events: HashMap<(DbId, String), Arc<super::routine::event::Event>>,
 }
 
 impl ExtState for EngineCatalog {
@@ -217,6 +220,22 @@ impl CatalogExtension for EngineExtension {
                 state
                     .triggers
                     .insert((o.db_id, o.name.clone()), Arc::new(t));
+                continue;
+            }
+            if o.kind == ObjectKind::Event
+                && o.state == ObjectState::Active
+                && state.dbs.contains(&o.db_id)
+            {
+                let text = tx
+                    .schema_version(o.object_id, o.schema_version)
+                    .await?
+                    .and_then(|v| v.create_sql)
+                    .unwrap_or_default();
+                let db_name = db_names.get(&o.db_id).cloned().unwrap_or_default();
+                let e = super::routine::event::load(o.db_id, &db_name, &o.name, &text);
+                state
+                    .events
+                    .insert((o.db_id, o.name.to_lowercase()), Arc::new(e));
                 continue;
             }
             if matches!(o.kind, ObjectKind::Procedure | ObjectKind::Function)

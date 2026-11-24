@@ -108,6 +108,7 @@ pub mod tenant;
 pub mod tls;
 // Workers' runs of triggers on streams and queues.
 pub mod triggers;
+pub(crate) mod sql_events;
 pub mod workload;
 
 use std::sync::Arc;
@@ -401,6 +402,15 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
         languages: http::lang::Languages::default(),
     });
     let txn_reaper = tokio::spawn(Arc::clone(&engine).reap(stop.clone()));
+    // SQL events of engine databases, run on the tenant's leader.
+    if let Some(t) = &tenants {
+        let _events = sql_events::spawn(
+            Arc::clone(t),
+            Arc::clone(&login),
+            Arc::clone(&engine),
+            stop.clone(),
+        );
+    }
     let drain_lc = lifecycle.clone();
     let core = Arc::new(http::Core {
         engine: Arc::clone(&engine),

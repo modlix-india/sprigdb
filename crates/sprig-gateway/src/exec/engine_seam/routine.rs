@@ -37,6 +37,7 @@ use crate::exec::tenant::Step;
 use crate::pipeline::{EndOfRows, ExecCtx, ResultSink, RowFormat, RowValues, Wire};
 use crate::tenant::session::LocalWarning;
 
+mod event;
 mod trigger;
 
 tokio::task_local! {
@@ -473,10 +474,10 @@ impl PassSession {
         let routine = matches!(
             target,
             DdlTarget::CreateObject {
-                kind: DdlKind::Procedure | DdlKind::Function | DdlKind::Trigger,
+                kind: DdlKind::Procedure | DdlKind::Function | DdlKind::Trigger | DdlKind::Event,
                 ..
             } | DdlTarget::AlterObject {
-                kind: DdlKind::Procedure | DdlKind::Function,
+                kind: DdlKind::Procedure | DdlKind::Function | DdlKind::Event,
                 ..
             }
         );
@@ -505,6 +506,7 @@ impl PassSession {
             charset_client: get("character_set_client"),
             collation_connection: get("collation_connection"),
             now: now.to_string(),
+            event: self.eng.event_eval.take(),
         })
     }
 

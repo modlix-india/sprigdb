@@ -96,6 +96,10 @@ impl PassSession {
         status: StatusFlags,
         out: &mut dyn ResultSink,
     ) -> Option<Result<Step>> {
+        // `CREATE` / `ALTER EVENT`: the schedule, evaluated here.
+        if let Some(r) = Box::pin(self.engine_event_prepare(cx, target, text, status, out)).await {
+            return Some(r);
+        }
         let ours = match target {
             DdlTarget::CreateObject {
                 kind: DdlKind::Table,

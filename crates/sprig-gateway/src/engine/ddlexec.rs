@@ -147,6 +147,12 @@ impl Hook {
                 .get(&(db, name.to_owned()))?;
             return Some(super::routine::stored(&t.cx, &t.show));
         }
+        if kind == ObjectKind::Event {
+            let e = catalog::of(&self.cat)?
+                .events
+                .get(&(db, name.to_lowercase()))?;
+            return Some(super::routine::stored(&e.cx, &e.body));
+        }
         let function = kind == ObjectKind::Function;
         let kind = if function {
             super::routine::Kind::Function
@@ -1341,6 +1347,46 @@ impl DdlExecutor for EngineDdl<'_> {
                     .produce_routine(stmt.schema, ObjectKind::Trigger, name, Some(text));
                 Ok(())
             }
+            Effect::Create {
+                kind: ObjectKind::Event,
+                name,
+            }
+            | Effect::Alter {
+                kind: ObjectKind::Event,
+                name,
+            } => {
+                let alter = matches!(&stmt.effect, Effect::Alter { .. });
+                let old = if alter {
+                    let Some(old) = self.hook.routine_text(&stmt.schema, ObjectKind::Event, name)
+                    else {
+                        return Err(SprigError::standard(
+                            1539,
+                            *b"HY000",
+                            format!("Unknown event '{name}'"),
+                        ));
+                    };
+                    Some(old)
+                } else {
+                    None
+                };
+                let db = stmt.schema.db();
+                let db_name =
+                    db.map_or_else(|| self.hook.sess.db.clone(), |d| self.hook.db_name(d));
+                let cx = db.map_or_else(|| self.hook.ctx(DbId(0)), |d| self.hook.ctx(d));
+                let rs = self.hook.routine.clone().unwrap_or_default();
+                let text = super::routine::event::create(
+                    &stmt.sql,
+                    &rs,
+                    &self.hook.sess.account,
+                    self.hook.sess.env.mysql,
+                    &cx.db_cs,
+                    &db_name,
+                    old.as_deref(),
+                )?;
+                self.hook
+                    .produce_routine(stmt.schema, ObjectKind::Event, name, Some(text));
+                Ok(())
+            }
             Effect::Alter {
                 kind: kind @ (ObjectKind::Procedure | ObjectKind::Function),
                 name,
@@ -1366,7 +1412,11 @@ impl DdlExecutor for EngineDdl<'_> {
             }
             // A routine has nothing but its catalog record.
             Effect::Drop {
-                kind: kind @ (ObjectKind::Procedure | ObjectKind::Function | ObjectKind::Trigger),
+                kind:
+                    kind @ (ObjectKind::Procedure
+                    | ObjectKind::Function
+                    | ObjectKind::Trigger
+                    | ObjectKind::Event),
                 names,
             } => {
                 for n in names {
@@ -1403,7 +1453,7 @@ impl DdlExecutor for EngineDdl<'_> {
         }
         if matches!(
             kind,
-            ObjectKind::Procedure | ObjectKind::Function | ObjectKind::Trigger
+            ObjectKind::Procedure | ObjectKind::Function | ObjectKind::Trigger | ObjectKind::Event
         ) {
             return Ok(self.hook.routine_text(schema, kind, name));
         }

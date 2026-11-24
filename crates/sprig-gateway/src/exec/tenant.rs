@@ -1278,6 +1278,10 @@ impl PassSession {
         if let Some(step) = Box::pin(self.tenant_msg_trigger(cx, text, more, out)).await? {
             return Ok(step);
         }
+        // A run of an SQL event (from this process's scheduler only).
+        if let Some(step) = Box::pin(self.engine_sql_event_run(cx, text, more, out)).await? {
+            return Ok(step);
+        }
         // Row-level security: an image check for a change stream or a
         // keyspace notification (from this process only).
         if let Some(step) = Box::pin(self.tenant_rls_images(cx, text, more, out)).await? {

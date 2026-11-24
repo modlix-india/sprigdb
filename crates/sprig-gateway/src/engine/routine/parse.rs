@@ -1538,9 +1538,272 @@ pub(crate) fn parse_trigger(text: &str) -> Result<TrigCreate> {
     })
 }
 
+/// An event's schedule as written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Schedule {
+    /// `AT expr`.
+    At(Frag),
+    /// `EVERY value unit [STARTS expr] [ENDS expr]`.
+    Every {
+        /// The interval's value.
+        value: Frag,
+        /// The unit, upper case.
+        unit: String,
+        /// `STARTS expr`.
+        starts: Option<Frag>,
+        /// `ENDS expr`.
+        ends: Option<Frag>,
+    },
+}
+
+/// `ENABLE`, `DISABLE`, `DISABLE ON SLAVE | REPLICA`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum EvStatus {
+    /// Scheduled.
+    Enabled,
+    /// Not scheduled.
+    Disabled,
+    /// Created through replication: not scheduled here.
+    SlaveDisabled,
+}
+
+/// A `CREATE EVENT` or `ALTER EVENT` statement.
+#[derive(Debug, Clone)]
+pub(crate) struct EvStmt {
+    /// `CREATE` (else `ALTER`).
+    pub create: bool,
+    /// `DEFINER = ...` as for a routine.
+    pub definer: Option<(String, String)>,
+    /// The database, when written.
+    pub db: Option<String>,
+    /// The name.
+    pub name: String,
+    /// `ON SCHEDULE ...`.
+    pub schedule: Option<Schedule>,
+    /// `ON COMPLETION [NOT] PRESERVE`: `Some(true)` for `PRESERVE`.
+    pub preserve: Option<bool>,
+    /// `ENABLE` / `DISABLE` / `DISABLE ON SLAVE`.
+    pub status: Option<EvStatus>,
+    /// `COMMENT '...'`.
+    pub comment: Option<String>,
+    /// `RENAME TO [db.]name`.
+    pub rename: Option<(Option<String>, String)>,
+    /// The body's text, after `DO`.
+    pub body_text: Option<String>,
+    /// The body.
+    pub body: Option<Stmt>,
+}
+
+/// The interval units of `EVERY`.
+pub(crate) const UNITS: [&str; 20] = [
+    "YEAR",
+    "QUARTER",
+    "MONTH",
+    "WEEK",
+    "DAY",
+    "HOUR",
+    "MINUTE",
+    "SECOND",
+    "YEAR_MONTH",
+    "DAY_HOUR",
+    "DAY_MINUTE",
+    "DAY_SECOND",
+    "HOUR_MINUTE",
+    "HOUR_SECOND",
+    "MINUTE_SECOND",
+    "MICROSECOND",
+    "DAY_MICROSECOND",
+    "HOUR_MICROSECOND",
+    "MINUTE_MICROSECOND",
+    "SECOND_MICROSECOND",
+];
+
+/// Parses `CREATE [OR REPLACE] [DEFINER = ...] EVENT [IF NOT EXISTS]
+/// [db.]name ON SCHEDULE schedule [ON COMPLETION [NOT] PRESERVE] [ENABLE |
+/// DISABLE | DISABLE ON SLAVE] [COMMENT '...'] DO body`, and `ALTER
+/// [DEFINER = ...] EVENT [db.]name [ON SCHEDULE ...] [ON COMPLETION ...]
+/// [RENAME TO name] [ENABLE | DISABLE ...] [COMMENT ...] [DO body]`.
+#[allow(clippy::too_many_lines)] // the clauses, in order
+pub(crate) fn parse_event(text: &str) -> Result<EvStmt> {
+    const TAIL: [&str; 6] = ["ON", "ENABLE", "DISABLE", "COMMENT", "DO", "RENAME"];
+    let mut p = P::new(text)?;
+    let create = if p.eat("CREATE") {
+        if p.eat("OR") {
+            p.want("REPLACE")?;
+        }
+        true
+    } else {
+        p.want("ALTER")?;
+        false
+    };
+    let mut definer = None;
+    if p.eat("DEFINER") {
+        p.want_op("=")?;
+        let from = p.i;
+        if p.eat("CURRENT_USER") {
+            if p.eat_op("(") {
+                p.want_op(")")?;
+            }
+            definer = Some((String::new(), String::new()));
+        } else {
+            while p.peek().is_some() && !p.is("EVENT") {
+                p.i += 1;
+            }
+            definer = Some(user_host(&p.slice(from)).ok_or_else(|| p.err())?);
+        }
+    }
+    p.want("EVENT")?;
+    if create && p.is("IF") && p.is_at(1, "NOT") && p.is_at(2, "EXISTS") {
+        p.i += 3;
+    }
+    let (db, name) = p.qualified()?;
+    let mut ev = EvStmt {
+        create,
+        definer,
+        db,
+        name,
+        schedule: None,
+        preserve: None,
+        status: None,
+        comment: None,
+        rename: None,
+        body_text: None,
+        body: None,
+    };
+    if create && !(p.is("ON") && p.is_at(1, "SCHEDULE")) {
+        return Err(p.err());
+    }
+    loop {
+        if p.is("ON") && p.is_at(1, "SCHEDULE") {
+            p.i += 2;
+            if p.eat("AT") {
+                ev.schedule = Some(Schedule::At(p.expr_until(&TAIL)?));
+            } else {
+                p.want("EVERY")?;
+                let value = p.expr_until(&UNITS)?;
+                let unit = p.name()?.to_ascii_uppercase();
+                if !UNITS.contains(&unit.as_str()) {
+                    return Err(p.err());
+                }
+                let mut starts = None;
+                let mut ends = None;
+                if p.eat("STARTS") {
+                    let mut stops = TAIL.to_vec();
+                    stops.push("ENDS");
+                    starts = Some(p.expr_until(&stops)?);
+                }
+                if p.eat("ENDS") {
+                    ends = Some(p.expr_until(&TAIL)?);
+                }
+                ev.schedule = Some(Schedule::Every {
+                    value,
+                    unit,
+                    starts,
+                    ends,
+                });
+            }
+        } else if p.is("ON") && p.is_at(1, "COMPLETION") {
+            p.i += 2;
+            let not = p.eat("NOT");
+            p.want("PRESERVE")?;
+            ev.preserve = Some(!not);
+        } else if p.eat("ENABLE") {
+            ev.status = Some(EvStatus::Enabled);
+        } else if p.eat("DISABLE") {
+            if p.is("ON") && (p.is_at(1, "SLAVE") || p.is_at(1, "REPLICA")) {
+                p.i += 2;
+                ev.status = Some(EvStatus::SlaveDisabled);
+            } else {
+                ev.status = Some(EvStatus::Disabled);
+            }
+        } else if p.eat("COMMENT") {
+            match p.peek().map(|t| &t.t) {
+                Some(T::Str(s)) => {
+                    ev.comment = Some(s.clone());
+                    p.i += 1;
+                }
+                _ => return Err(p.err()),
+            }
+        } else if !create && p.is("RENAME") && p.is_at(1, "TO") {
+            p.i += 2;
+            ev.rename = Some(p.qualified()?);
+        } else {
+            break;
+        }
+    }
+    if p.eat("DO") {
+        let body_from = p.at();
+        if p.peek().is_none() {
+            return Err(p.err());
+        }
+        ev.body = Some(p.statement(true)?);
+        ev.body_text = Some(
+            text[body_from..]
+                .trim_end()
+                .trim_end_matches(';')
+                .trim_end()
+                .to_owned(),
+        );
+    } else if create {
+        return Err(p.err());
+    }
+    while p.eat_op(";") {}
+    if p.peek().is_some() {
+        return Err(p.err());
+    }
+    if !create
+        && ev.schedule.is_none()
+        && ev.preserve.is_none()
+        && ev.status.is_none()
+        && ev.comment.is_none()
+        && ev.rename.is_none()
+        && ev.body.is_none()
+        && ev.definer.is_none()
+    {
+        return Err(p.err());
+    }
+    Ok(ev)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_event_and_its_schedule_read() {
+        let e = parse_event(
+            "CREATE EVENT IF NOT EXISTS e1 ON SCHEDULE EVERY '1:30' HOUR_MINUTE STARTS NOW() + INTERVAL 1 DAY ENDS '2031-01-01' ON COMPLETION PRESERVE DISABLE ON SLAVE COMMENT 'it''s' DO BEGIN INSERT INTO t VALUES (1); END",
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(e.name, "e1");
+        assert_eq!(
+            e.schedule,
+            Some(Schedule::Every {
+                value: "'1:30'".into(),
+                unit: "HOUR_MINUTE".into(),
+                starts: Some("NOW() + INTERVAL 1 DAY".into()),
+                ends: Some("'2031-01-01'".into()),
+            })
+        );
+        assert_eq!(e.preserve, Some(true));
+        assert_eq!(e.status, Some(EvStatus::SlaveDisabled));
+        assert_eq!(e.comment.as_deref(), Some("it's"));
+        assert_eq!(
+            e.body_text.as_deref(),
+            Some("BEGIN INSERT INTO t VALUES (1); END")
+        );
+        let a = parse_event("ALTER EVENT d.e1 RENAME TO e2 ENABLE").unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(a.rename, Some((None, "e2".into())));
+        assert_eq!(a.status, Some(EvStatus::Enabled));
+        assert!(parse_event("ALTER EVENT e1").is_err());
+        assert!(parse_event("CREATE EVENT e1 DO SELECT 1").is_err());
+        let at = parse_event("CREATE EVENT e ON SCHEDULE AT CURRENT_TIMESTAMP + INTERVAL 1 HOUR DO SET @a = 1")
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            at.schedule,
+            Some(Schedule::At("CURRENT_TIMESTAMP + INTERVAL 1 HOUR".into()))
+        );
+    }
 
     #[test]
     fn a_procedure_and_its_body_read() {

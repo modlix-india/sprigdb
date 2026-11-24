@@ -183,6 +183,9 @@ pub(super) struct EngineState {
     /// MySQL: the open transaction created (bit 1) or dropped (bit 2)
     /// temporary tables, which its rollback can't undo (1751, 1752).
     pub(super) temp_txn: u8,
+    /// The running `CREATE` / `ALTER EVENT`'s schedule, as evaluated
+    /// before the catalog's DDL path stores it.
+    pub(super) event_eval: Option<crate::engine::routine::event::Eval>,
 }
 
 impl EngineState {
@@ -2541,9 +2544,33 @@ impl PassSession {
         if let Some(l) = &logical
             && self.engine_prepared_fires(l)
         {
-            return Err(crate::engine::not_on_engine(
-                "a prepared INSERT, UPDATE or DELETE of a table with triggers",
-            ));
+            // The bound values as literals, then the text path.
+            let values: Vec<String> = self
+                .stmts
+                .get_mut(stmt)?
+                .params_for_backend(params, persona)?
+                .iter()
+                .map(crate::exec::search::param_literal)
+                .collect();
+            let text = std::str::from_utf8(l)
+                .ok()
+                .and_then(|t| sprig_search::sqlscan::interpolate(t, &values))
+                .map(Bytes::from)
+                .ok_or_else(|| SprigError::internal("a prepared write's parameters"))?;
+            let step = Box::pin(self.tenant_text(
+                cx,
+                &text,
+                &crate::exec::QueryAttrs::default(),
+                false,
+                RowFormat::Binary,
+                out,
+            ))
+            .await?;
+            return Ok(Some(ExecSummary {
+                status: step.status,
+                prepared: None,
+                db: None,
+            }));
         }
         // Privileges, as the general execute checks them.
         if let Some(rc) = &recheck
@@ -2888,9 +2915,8 @@ impl PassSession {
                     | DdlKind::Sequence
                     | DdlKind::Procedure
                     | DdlKind::Function
-                    | DdlKind::Trigger => Ok(()),
-                    // Events aren't the engine's yet.
-                    DdlKind::Event => refuse("events"),
+                    | DdlKind::Trigger
+                    | DdlKind::Event => Ok(()),
                 }
             }
             DdlTarget::AlterObject {
@@ -3007,17 +3033,17 @@ impl PassSession {
             DdlTarget::RenameTables { pairs, .. } => pairs.iter().find_map(|(a, _)| of_name(a)),
             // Stored procedures and functions (`crate::engine::routine`).
             DdlTarget::CreateObject {
-                kind: DdlKind::Procedure | DdlKind::Function | DdlKind::Trigger,
+                kind: DdlKind::Procedure | DdlKind::Function | DdlKind::Trigger | DdlKind::Event,
                 name,
                 ..
             }
             | DdlTarget::AlterObject {
-                kind: DdlKind::Procedure | DdlKind::Function,
+                kind: DdlKind::Procedure | DdlKind::Function | DdlKind::Event,
                 name,
                 ..
             } => of_name(name),
             DdlTarget::DropObjects {
-                kind: DdlKind::Procedure | DdlKind::Function | DdlKind::Trigger,
+                kind: DdlKind::Procedure | DdlKind::Function | DdlKind::Trigger | DdlKind::Event,
                 names,
                 ..
             } => names.iter().find_map(of_name),

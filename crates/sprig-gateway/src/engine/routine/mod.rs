@@ -6,10 +6,11 @@
 //! text is parsed ([`parse`]) and compiled ([`code`]) once per catalog
 //! load into a [`code::Program`]: bytecode over SQL fragments, run by the
 //! session (`exec/engine_seam/routine.rs`). Procedures, functions and,
-//! later, triggers and events share that one runtime.
+//! triggers and events share that one runtime.
 
 pub(crate) mod code;
 pub(crate) mod ddl;
+pub(crate) mod event;
 pub(crate) mod parse;
 pub(crate) mod subst;
 pub(crate) mod trigger;
@@ -47,6 +48,9 @@ pub(crate) struct Context {
     /// and event (smaller first).
     #[serde(default)]
     pub order: i64,
+    /// An event's schedule and options.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event: Option<event::EvDef>,
 }
 
 /// The first line of a stored definition.

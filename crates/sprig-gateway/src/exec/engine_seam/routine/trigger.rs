@@ -97,6 +97,8 @@ enum Dml {
         mode: Mode,
         rows: Vec<Vec<Option<String>>>,
         query: Option<String>,
+        /// `ON DUPLICATE KEY UPDATE`: (column, expression) pairs.
+        upsert: Vec<(String, String)>,
     },
     /// `UPDATE`: (column, expression) pairs; the `FROM ... WHERE ...
     /// ORDER BY ... LIMIT` tail.
@@ -159,8 +161,24 @@ fn read(text: &str) -> Option<std::result::Result<(ObjectName, Dml), String>> {
             let TableObject::TableName(name) = &ins.table else {
                 return None;
             };
-            if ins.on.is_some() {
-                return refuse("INSERT ... ON DUPLICATE KEY UPDATE on a table with triggers");
+            let mut upsert = Vec::new();
+            match &ins.on {
+                None => {}
+                Some(sqlparser::ast::OnInsert::DuplicateKeyUpdate(sets))
+                    if ins.insert_alias.is_none() =>
+                {
+                    for a in sets {
+                        let AssignmentTarget::ColumnName(n) = &a.target else {
+                            return refuse("ON DUPLICATE KEY UPDATE with a column tuple");
+                        };
+                        upsert.push((last_part(n)?, src(text, &a.value, a.value.to_string())));
+                    }
+                }
+                Some(_) => {
+                    return refuse(
+                        "INSERT ... AS alias ON DUPLICATE KEY UPDATE on a table with triggers",
+                    );
+                }
             }
             let mode = if ins.replace_into {
                 Mode::Replace
@@ -205,6 +223,7 @@ fn read(text: &str) -> Option<std::result::Result<(ObjectName, Dml), String>> {
                     mode,
                     rows,
                     query,
+                    upsert,
                 },
             )))
         }
@@ -272,6 +291,58 @@ fn value_text(text: &str, e: &Expr) -> Option<String> {
 
 fn q(n: &str) -> String {
     format!("`{}`", n.replace('`', "``"))
+}
+
+/// `ON DUPLICATE KEY UPDATE`'s (column, expression) pairs.
+type Upsert = [(String, String)];
+
+/// An `ON DUPLICATE KEY UPDATE` expression with each `VALUES(col)` (the
+/// value the row would have been inserted with) replaced by that value.
+fn values_subst(e: &str, def: &TableDef, new: &[Datum]) -> String {
+    let b = e.as_bytes();
+    let mut out = String::with_capacity(e.len());
+    let mut i = 0;
+    let mut quote: Option<u8> = None;
+    while i < b.len() {
+        let ch = b[i];
+        if let Some(qc) = quote {
+            if ch == qc {
+                quote = None;
+            }
+            out.push(char::from(ch));
+            i += 1;
+            continue;
+        }
+        if ch == b'\'' || ch == b'"' {
+            quote = Some(ch);
+            out.push(char::from(ch));
+            i += 1;
+            continue;
+        }
+        let word_start = i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_');
+        if word_start && e.get(i..i + 6).is_some_and(|w| w.eq_ignore_ascii_case("VALUES")) {
+            let rest = &e[i + 6..];
+            let open = rest.len() - rest.trim_start().len();
+            if rest.trim_start().starts_with('(')
+                && let Some(close) = rest.find(')')
+            {
+                let name = rest[open + 1..close].trim().trim_matches('`');
+                if let Some(k) = def
+                    .columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(name))
+                {
+                    out.push_str(&literal(&new[k], Some(&def.columns[k])));
+                    i += 6 + close + 1;
+                    continue;
+                }
+            }
+        }
+        let c = e[i..].chars().next().unwrap_or(' ');
+        out.push(c);
+        i += c.len_utf8();
+    }
+    out
 }
 
 /// The table an `INSERT | REPLACE | UPDATE | DELETE` names first.
@@ -386,7 +457,9 @@ impl PassSession {
         let ev = dml.event();
         let before = firing(eng.triggers.values(), def.object, true, ev);
         let after = firing(eng.triggers.values(), def.object, false, ev);
-        // `REPLACE` also fires the `DELETE` triggers of the rows it removes.
+        // `REPLACE` also fires the `DELETE` triggers of the rows it
+        // removes; `ON DUPLICATE KEY UPDATE` the `UPDATE` triggers of the
+        // rows it changes.
         let del = match &dml {
             Dml::Insert {
                 mode: Mode::Replace,
@@ -394,6 +467,10 @@ impl PassSession {
             } => (
                 firing(eng.triggers.values(), def.object, true, Event::Delete),
                 firing(eng.triggers.values(), def.object, false, Event::Delete),
+            ),
+            Dml::Insert { upsert, .. } if !upsert.is_empty() => (
+                firing(eng.triggers.values(), def.object, true, Event::Update),
+                firing(eng.triggers.values(), def.object, false, Event::Update),
             ),
             _ => (Vec::new(), Vec::new()),
         };
@@ -507,12 +584,13 @@ impl PassSession {
                 mode,
                 rows,
                 query,
+                upsert,
             } => {
                 Box::pin(self.trg_insert(
                     cx,
                     &def,
                     &db,
-                    (cols.as_deref(), *mode),
+                    (cols.as_deref(), *mode, upsert),
                     rows,
                     query.as_deref(),
                     [&before, &after, &del_before, &del_after],
@@ -700,13 +778,133 @@ impl PassSession {
         }
     }
 
+    /// The rows holding one of `new`'s unique keys, locked.
+    async fn trg_conflicts(
+        &mut self,
+        cx: &mut ExecCtx<'_>,
+        def: &TableDef,
+        db: &str,
+        new: &[Datum],
+    ) -> Result<Option<Ran>> {
+        let mut keys: Vec<&[usize]> = def
+            .indexes
+            .iter()
+            .filter(|x| x.unique)
+            .map(|x| x.cols.as_slice())
+            .collect();
+        if !def.hidden {
+            keys.push(&def.pk);
+        }
+        let ors: Vec<String> = keys
+            .iter()
+            .filter(|k| k.iter().all(|&i| !new[i].is_null()))
+            .map(|k| {
+                let ands: Vec<String> = k
+                    .iter()
+                    .map(|&i| {
+                        let c = &def.columns[i];
+                        format!("{} = {}", q(&c.name), literal(&new[i], Some(c)))
+                    })
+                    .collect();
+                format!("({})", ands.join(" AND "))
+            })
+            .collect();
+        if ors.is_empty() {
+            return Ok(None);
+        }
+        let sql = format!(
+            "SELECT {} FROM {}.{} WHERE {} FOR UPDATE",
+            Self::trg_select_list(def),
+            q(db),
+            q(&def.name),
+            ors.join(" OR ")
+        );
+        Ok(Some(self.trg_raw(cx, &sql).await?))
+    }
+
+    /// `ON DUPLICATE KEY UPDATE` of the row `old` that holds a key of
+    /// `new`: its `UPDATE` triggers around the change. The affected-row
+    /// count it adds (2 changed, 0 unchanged).
+    #[allow(clippy::too_many_arguments)]
+    async fn trg_upsert(
+        &mut self,
+        cx: &mut ExecCtx<'_>,
+        def: &TableDef,
+        db: &str,
+        upsert: &[(String, String)],
+        new: &[Datum],
+        old: &[Datum],
+        [bu, au]: [&[Arc<Trigger>]; 2],
+    ) -> Result<u64> {
+        let env = self.engine_vars(cx).env;
+        let mut idx = Vec::with_capacity(upsert.len());
+        let mut exprs = Vec::with_capacity(upsert.len());
+        for (c, e) in upsert {
+            let Some(i) = def
+                .columns
+                .iter()
+                .position(|x| x.name.eq_ignore_ascii_case(c))
+            else {
+                return Err(SprigError::standard(
+                    1054,
+                    *b"42S22",
+                    format!("Unknown column '{c}' in 'field list'"),
+                ));
+            };
+            idx.push(i);
+            exprs.push(values_subst(e, def, new));
+        }
+        let sql = format!(
+            "SELECT {} FROM {}.{}{}",
+            exprs.join(", "),
+            q(db),
+            q(&def.name),
+            Self::trg_match(def, old)
+        );
+        let ran = self.trg_raw(cx, &sql).await?;
+        let one = ran.rows.into_iter().next().unwrap_or_default();
+        let mut upd = old.to_vec();
+        let mut conds = Vec::new();
+        for (k, &i) in idx.iter().enumerate() {
+            let v = ran.columns.get(k).map_or(Datum::Null, |cd| {
+                wire_datum(one.get(k).and_then(|v| v.as_deref()), cd)
+            });
+            upd[i] = store(Some(&def.columns[i]), v, env, &mut conds)?;
+        }
+        self.trg_fire(cx, def, db, bu, &mut upd, old).await?;
+        let sets: Vec<String> = def
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(i, c)| {
+                c.generated.is_none() && literal(&upd[*i], Some(c)) != literal(&old[*i], Some(c))
+            })
+            .map(|(i, c)| format!("{} = {}", q(&c.name), literal(&upd[i], Some(c))))
+            .collect();
+        let mut n = 0;
+        if !sets.is_empty() {
+            let sql = format!(
+                "UPDATE {}.{} SET {}{}",
+                q(db),
+                q(&def.name),
+                sets.join(", "),
+                Self::trg_match(def, old)
+            );
+            self.trg_raw(cx, &sql).await?;
+            n = 2;
+        }
+        let mut stored = self.trg_reread(cx, def, db, &upd).await?.unwrap_or(upd);
+        self.trg_fire(cx, def, db, au, &mut stored, old).await?;
+        Ok(n)
+    }
+
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     async fn trg_insert(
         &mut self,
         cx: &mut ExecCtx<'_>,
         def: &TableDef,
         db: &str,
-        (cols, mode): (Option<&[String]>, Mode),
+        (cols, mode, upsert): (Option<&[String]>, Mode, &Upsert),
         rows: &[Vec<Option<String>>],
         query: Option<&str>,
         [before, after, del_before, del_after]: [&[Arc<Trigger>]; 4],
@@ -826,40 +1024,25 @@ impl PassSession {
                     lits.push(lit);
                 }
             }
+            // `ON DUPLICATE KEY UPDATE`: a row holding one of the new row's
+            // unique keys is changed instead (its `UPDATE` triggers fire).
+            if !upsert.is_empty()
+                && let Some(found) = self.trg_conflicts(cx, def, db, &new).await?
+                && let Some(r) = found.rows.first()
+            {
+                let old = self.trg_row(cx, def, &found.columns, r)?;
+                let n = Box::pin(self.trg_upsert(cx, def, db, upsert, &new, &old, [
+                    del_before, del_after,
+                ]))
+                .await?;
+                done.affected += n;
+                done.rows += 1;
+                done.dups += 1;
+                continue;
+            }
             if mode == Mode::Replace {
                 // The rows holding any of the new row's unique keys go first.
-                let mut keys: Vec<&[usize]> = def
-                    .indexes
-                    .iter()
-                    .filter(|x| x.unique)
-                    .map(|x| x.cols.as_slice())
-                    .collect();
-                if !def.hidden {
-                    keys.push(&def.pk);
-                }
-                let ors: Vec<String> = keys
-                    .iter()
-                    .filter(|k| k.iter().all(|&i| !new[i].is_null()))
-                    .map(|k| {
-                        let ands: Vec<String> = k
-                            .iter()
-                            .map(|&i| {
-                                let c = &def.columns[i];
-                                format!("{} = {}", q(&c.name), literal(&new[i], Some(c)))
-                            })
-                            .collect();
-                        format!("({})", ands.join(" AND "))
-                    })
-                    .collect();
-                if !ors.is_empty() {
-                    let sql = format!(
-                        "SELECT {} FROM {}.{} WHERE {} FOR UPDATE",
-                        Self::trg_select_list(def),
-                        q(db),
-                        q(&def.name),
-                        ors.join(" OR ")
-                    );
-                    let found = self.trg_raw(cx, &sql).await?;
+                if let Some(found) = self.trg_conflicts(cx, def, db, &new).await? {
                     for r in &found.rows {
                         let old = self.trg_row(cx, def, &found.columns, r)?;
                         self.trg_fire(cx, def, db, del_before, &mut [], &old)
