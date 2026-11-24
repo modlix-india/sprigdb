@@ -27,6 +27,14 @@ use sprig_streams::seg::{SegConfig, SegLog};
 const VOTERS: [u64; 3] = [1, 2, 3];
 const TENANT: u64 = 7_300;
 const W: Duration = Duration::from_secs(10);
+const GROUPS: u32 = 3;
+
+/// The preferred leader of a partition group's unit, as the gateway picks
+/// it: the voters in order, from the tenant's offset.
+fn preferred(unit: u64) -> Option<u64> {
+    let (tenant, g) = sprig_streams::seg::group_of_unit(unit)?;
+    Some(VOTERS[usize::try_from((tenant % 3 + u64::from(g)) % 3).unwrap()])
+}
 
 struct Replica {
     streams: EngineStreams,
@@ -39,6 +47,8 @@ struct Cluster {
     dir: PathBuf,
     net: Arc<MemNetwork>,
     replicas: BTreeMap<u64, Replica>,
+    /// Partition groups per tenant (0: the tenant's unit).
+    groups: u32,
 }
 
 fn key() -> PartKey {
@@ -100,6 +110,14 @@ impl Cluster {
         .unwrap();
         self.net.register(node.node());
         let thread = Some(node.spawn().unwrap());
+        if self.groups > 0 {
+            node.prefer_leaders(
+                Arc::new(|u: UnitId| preferred(u.0)),
+                Duration::from_millis(50),
+                Duration::ZERO,
+            )
+            .unwrap();
+        }
         // After the replicated log is attached: the stream log catches up
         // from it.
         let streams = EngineStreams::open(
@@ -108,6 +126,7 @@ impl Cluster {
             SegConfig {
                 segment_bytes: 4096,
                 index_interval: 512,
+                groups: self.groups,
                 ..SegConfig::default()
             },
             Default::default(),
@@ -157,14 +176,46 @@ impl Cluster {
         }
     }
 
+    /// The replica whose engine leads `unit`.
+    fn leader_of(&self, unit: u64) -> Option<u64> {
+        self.replicas
+            .iter()
+            .find(|(_, r)| r.engine.leader_epoch(UnitId(unit)) > 0)
+            .map(|(id, _)| *id)
+    }
+
+    /// Appends `n` records to `k` through the leader of its unit, retrying
+    /// across leader changes; returns the batch's base offset.
+    async fn append_to(&self, k: PartKey, n: i32) -> i64 {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            assert!(Instant::now() < deadline, "no append to {k:?}");
+            let unit = self.replicas.values().next().unwrap().log().unit_of_part(k);
+            if let Some(l) = self.leader_of(unit)
+                && let Ok(Outcome::Appended { base, .. }) = self.replicas[&l]
+                    .log()
+                    .append(k, &batch_bytes(n, 1, 10), W)
+                    .await
+            {
+                return base;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     /// Every record replica `id`'s stream log holds, by offset.
     fn records(&self, id: u64) -> Vec<i64> {
+        self.records_of(id, key())
+    }
+
+    /// Every record of `k` replica `id`'s stream log holds, by offset.
+    fn records_of(&self, id: u64, k: PartKey) -> Vec<i64> {
         let l = self.replicas[&id].log();
-        let b = l.bounds(key());
+        let b = l.bounds(k);
         let mut out = Vec::new();
         let mut at = b.log_start;
         while at < b.high_watermark {
-            let Ok((_, bytes)) = l.read(key(), at, 1 << 20) else {
+            let Ok((_, bytes)) = l.read(k, at, 1 << 20) else {
                 break;
             };
             if bytes.is_empty() {
@@ -203,6 +254,7 @@ async fn every_replica_writes_the_streams_segments() {
         dir,
         net: MemNetwork::new(),
         replicas: BTreeMap::new(),
+        groups: 0,
     };
     for id in VOTERS {
         c.start(id);
@@ -224,12 +276,18 @@ async fn every_replica_writes_the_streams_segments() {
     }
     // The leader dies; the next one appends after the same offsets.
     let l = c.leader().unwrap();
+    let before = c.replicas[&l].log().bounds(key()).epoch;
     c.kill(l);
     for _ in 0..5 {
         let base = c.append(2).await;
         assert_eq!(base, *want.last().unwrap() + 1, "offsets go on in order");
         want.extend(base..base + 2);
     }
+    // The new leader's epoch is the unit's new Raft term: above the old
+    // leader's, whichever node took over.
+    let now = c.leader().unwrap();
+    let after = c.replicas[&now].log().bounds(key()).epoch;
+    assert!(after > before, "leader epoch {after} after {before}");
     // Restarted, the old leader's stream log catches up.
     c.start(l);
     for id in VOTERS {
@@ -237,6 +295,13 @@ async fn every_replica_writes_the_streams_segments() {
             (c.records(id) == want).then_some(())
         })
         .await;
+    }
+    // Every replica stored the same bytes (epochs stamped from the terms),
+    // and reports the same epoch.
+    let bytes = |id: u64| c.replicas[&id].log().read(key(), 0, 1 << 24).unwrap().1;
+    for id in VOTERS {
+        assert_eq!(bytes(id), bytes(VOTERS[0]), "replica {id}'s batches");
+        assert_eq!(c.replicas[&id].log().bounds(key()).epoch, after);
     }
 }
 
@@ -272,6 +337,7 @@ async fn topic_records_reach_every_replica() {
         dir,
         net: MemNetwork::new(),
         replicas: BTreeMap::new(),
+        groups: 0,
     };
     for id in VOTERS {
         c.start(id);
@@ -324,4 +390,130 @@ async fn topic_records_reach_every_replica() {
         })
         .await;
     }
+}
+
+/// The partitions whose records differ from `want`, per replica.
+fn differences(c: &Cluster, want: &BTreeMap<u32, Vec<i64>>) -> String {
+    use std::fmt::Write as _;
+    let mut d = String::new();
+    for id in c.replicas.keys() {
+        for (p, w) in want {
+            let k = PartKey {
+                tenant: TENANT,
+                stream: 1,
+                partition: *p,
+            };
+            let got = c.records_of(*id, k);
+            if got != *w {
+                let _ = write!(
+                    d,
+                    "replica {id} partition {p}: {} records, want {}; ",
+                    got.len(),
+                    w.len()
+                );
+            }
+        }
+    }
+    d
+}
+
+/// With partition groups each group of partitions commits through a unit of
+/// its own, led by its preferred replica (so the three groups' leaders are
+/// three different nodes); every replica writes the same records at the
+/// same offsets, through the loss of one group's leader, and the restarted
+/// node takes its group back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn partition_groups_spread_their_leaders_and_replicate() {
+    use sprig_streams::seg::group_unit;
+    let dir = std::env::temp_dir().join(format!("sprig-repl-groups-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut c = Cluster {
+        dir,
+        net: MemNetwork::new(),
+        replicas: BTreeMap::new(),
+        groups: GROUPS,
+    };
+    for id in VOTERS {
+        c.start(id);
+    }
+    let part = |p: u32| PartKey {
+        tenant: TENANT,
+        stream: 1,
+        partition: p,
+    };
+    for p in 0..6 {
+        let want = group_unit(TENANT, p % GROUPS);
+        for id in VOTERS {
+            assert_eq!(c.replicas[&id].log().unit_of_part(part(p)), want);
+        }
+    }
+    // Every group starts on node 1; each moves to its preferred replica.
+    for g in 0..GROUPS {
+        c.replicas[&1]
+            .node
+            .start_unit(UnitId(group_unit(TENANT, g)), &VOTERS)
+            .unwrap();
+    }
+    let leaders = |c: &Cluster| -> Vec<Option<u64>> {
+        (0..GROUPS)
+            .map(|g| c.leader_of(group_unit(TENANT, g)))
+            .collect()
+    };
+    let prefs: Vec<Option<u64>> = (0..GROUPS)
+        .map(|g| preferred(group_unit(TENANT, g)))
+        .collect();
+    until("each group led by its preferred replica", || {
+        (leaders(&c) == prefs).then_some(())
+    })
+    .await;
+    let mut distinct = prefs.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    assert_eq!(distinct.len(), 3, "three groups, three leaders: {prefs:?}");
+    // The tenant's own unit isn't involved.
+    assert!(c.leader().is_none(), "no append touched the tenant's unit");
+    let mut want: BTreeMap<u32, Vec<i64>> = BTreeMap::new();
+    for round in 0..4 {
+        for p in 0..6 {
+            let base = c.append_to(part(p), 2 + round).await;
+            want.entry(p)
+                .or_default()
+                .extend(base..base + i64::from(2 + round));
+        }
+    }
+    let same = |c: &Cluster, want: &BTreeMap<u32, Vec<i64>>| {
+        c.replicas
+            .keys()
+            .all(|id| want.iter().all(|(p, w)| c.records_of(*id, part(*p)) == *w))
+    };
+    until("every replica's partitions", || {
+        same(&c, &want).then_some(())
+    })
+    .await;
+    // Group 0's leader dies: its partitions go on through a new leader.
+    let l0 = prefs[0].unwrap();
+    c.kill(l0);
+    for p in [0, 3] {
+        let base = c.append_to(part(p), 3).await;
+        let w = want.get_mut(&p).unwrap();
+        assert_eq!(base, *w.last().unwrap() + 1, "offsets go on in order");
+        w.extend(base..base + 3);
+    }
+    // Restarted, it catches up and takes its group back.
+    c.start(l0);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !same(&c, &want) {
+        assert!(
+            Instant::now() < deadline,
+            "the restarted replica {l0}'s partitions differ: {}",
+            differences(&c, &want)
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    until("group 0 back on its preferred replica", || {
+        (c.leader_of(group_unit(TENANT, 0)) == Some(l0)).then_some(())
+    })
+    .await;
+    let base = c.append_to(part(0), 1).await;
+    assert_eq!(base, *want[&0].last().unwrap() + 1);
 }

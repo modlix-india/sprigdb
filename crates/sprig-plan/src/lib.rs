@@ -59,6 +59,8 @@
 pub mod access;
 mod block;
 pub mod catalog;
+mod dependent;
+pub mod dialect;
 mod explain;
 mod exprs;
 mod keyval;

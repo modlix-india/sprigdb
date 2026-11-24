@@ -459,10 +459,11 @@ fn what_e0_doesnt_run_is_refused_and_other_databases_pass() {
         refused("INSERT INTO sbtest1 SELECT * FROM sbtest1"),
         NOT_ON_ENGINE
     );
-    assert_eq!(
-        refused("REPLACE INTO sbtest1(id) VALUES (1)"),
-        NOT_ON_ENGINE
-    );
+    // The upserts are the engine's.
+    assert!(matches!(
+        bind(&f, "REPLACE INTO sbtest1(id) VALUES (1)"),
+        Ok(Some(_))
+    ));
     assert_eq!(refused("SELECT * FROM v_view"), NOT_ON_ENGINE);
     assert_eq!(refused("SELECT * FROM nosuch"), 1146);
     assert_eq!(refused("SELECT zz FROM sbtest1"), 1054);
@@ -2241,4 +2242,41 @@ async fn null_bounds_and_descending_order_through_an_index() {
             vec![Datum::Int(21)]
         ]
     );
+}
+
+#[tokio::test]
+async fn an_insert_takes_the_rows_a_query_gave() {
+    let (e, f, _d) = sysbench(2).await;
+    let stmt = Parser::parse_sql(
+        &MySqlDialect {},
+        "INSERT INTO sbtest1 (k, c, pad) SELECT k, c, pad FROM sbtest1",
+    )
+    .unwrap()
+    .remove(0);
+    let sqlparser::ast::Statement::Insert(ins) = &stmt else {
+        panic!("an insert");
+    };
+    assert!(plan::insert_select(ins));
+    let cx = BindCtx {
+        tenant: TENANT,
+        names: &f,
+        current: Some(DB),
+        backslash: true,
+    };
+    let rows = vec![
+        vec![Datum::Int(7), s("x"), s("p")],
+        vec![Datum::Int(8), s("y"), s("q")],
+    ];
+    let p = plan::bind_insert_rows(&cx, ins, &rows, 3).unwrap().unwrap();
+    let o = exec(&e, &p, &[]).await.unwrap();
+    assert_eq!((o.affected, o.last_insert_id), (2, 3));
+    let o = run(&e, &f, "SELECT c FROM sbtest1 WHERE id = 4", &[])
+        .await
+        .unwrap();
+    assert_eq!(o.rows, vec![vec![s("y")]]);
+    // The query's width must match the insert's columns, rows or none.
+    let e1136 = plan::bind_insert_rows(&cx, ins, &[], 2)
+        .err()
+        .map(|e| e.protocol().mysql_errno);
+    assert_eq!(e1136, Some(1136));
 }

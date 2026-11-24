@@ -65,6 +65,7 @@
 
 pub mod amqp;
 pub mod backend;
+pub mod backup;
 // The Bolt listener on 7687.
 pub mod bolt;
 pub mod changelog;

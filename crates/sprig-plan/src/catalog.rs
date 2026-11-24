@@ -206,4 +206,61 @@ pub trait Catalog {
 
     /// The session's current database, used for unqualified table names.
     fn default_schema(&self) -> Option<String>;
+
+    /// A copy the plan can keep, for subqueries planned again while the
+    /// statement runs; `None` when the catalog can't give one (such
+    /// subqueries are then refused).
+    fn shared(&self) -> Option<Arc<dyn Catalog>> {
+        None
+    }
+
+    /// The sequence `name` of database `schema` (MariaDB's sequences), as
+    /// the identity the expression engine's sequence functions take.
+    ///
+    /// # Errors
+    /// 4091 when there is no such sequence, 4089 when `name` is a table.
+    fn sequence(&self, schema: &str, name: &str) -> Result<String, sprig_exec::SqlError> {
+        let _ = schema;
+        Err(sprig_exec::SqlError::new(
+            4091,
+            "42S02",
+            format!("Unknown SEQUENCE: '{name}'"),
+        ))
+    }
+}
+
+/// A catalog of a fixed list of tables: `(database, table, definition)`.
+/// A name matches exactly first, then without case when only one table
+/// matches so.
+#[derive(Debug, Clone, Default)]
+pub struct Snapshot {
+    /// The tables: database, table name, definition.
+    pub tables: Vec<(String, String, Arc<TableDef>)>,
+    /// The current database.
+    pub default: Option<String>,
+}
+
+impl Catalog for Snapshot {
+    fn table(&self, schema: &str, name: &str) -> Option<Arc<TableDef>> {
+        let same_db = |d: &String| d.eq_ignore_ascii_case(schema);
+        if let Some((_, _, t)) = self.tables.iter().find(|(d, n, _)| same_db(d) && n == name) {
+            return Some(t.clone());
+        }
+        let mut hits = self
+            .tables
+            .iter()
+            .filter(|(d, n, _)| same_db(d) && n.eq_ignore_ascii_case(name));
+        match (hits.next(), hits.next()) {
+            (Some((_, _, t)), None) => Some(t.clone()),
+            _ => None,
+        }
+    }
+
+    fn default_schema(&self) -> Option<String> {
+        self.default.clone()
+    }
+
+    fn shared(&self) -> Option<Arc<dyn Catalog>> {
+        Some(Arc::new(self.clone()))
+    }
 }

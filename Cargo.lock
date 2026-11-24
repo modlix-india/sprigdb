@@ -5656,6 +5656,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "sprig-backup"
+version = "0.0.1"
+dependencies = [
+ "bytes",
+ "flate2",
+ "ring",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sprig-common",
+ "sprig-engine",
+ "sprig-settings",
+ "tracing",
+]
+
+[[package]]
 name = "sprig-balancer"
 version = "0.0.1"
 dependencies = [
@@ -5998,6 +6014,7 @@ dependencies = [
  "sprig-api",
  "sprig-approvals",
  "sprig-auth",
+ "sprig-backup",
  "sprig-balancer",
  "sprig-binlog",
  "sprig-catalog",

@@ -61,11 +61,14 @@ pub(crate) mod paramtype;
 pub(crate) mod plan;
 pub(crate) mod plancache;
 pub(crate) mod row;
+pub(crate) mod sequence;
 pub(crate) mod session;
 pub(crate) mod show;
 pub(crate) mod store;
 pub(crate) mod table;
+pub(crate) mod temp;
 pub(crate) mod temporal;
+pub(crate) mod view;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock};
@@ -226,6 +229,8 @@ pub(crate) struct Engine {
     /// Tenants whose dropped tables' keys were swept in this process
     /// (`Engine::sweep_once`).
     swept: Mutex<std::collections::HashSet<u64>>,
+    /// This node's cache of each sequence, per (tenant, object).
+    seqs: Mutex<HashMap<(u64, u32), sequence::Cache>>,
 }
 
 impl std::fmt::Debug for Engine {
@@ -293,6 +298,7 @@ impl Engine {
             spaces: RwLock::new(HashMap::new()),
             tables: Mutex::new(HashMap::new()),
             swept: Mutex::new(std::collections::HashSet::new()),
+            seqs: Mutex::new(HashMap::new()),
         }
     }
 

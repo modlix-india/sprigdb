@@ -25,6 +25,8 @@ use crate::pubsub::{Kind, Msg};
 use crate::reply;
 use crate::spec::{self, Spec};
 
+mod lua_engine;
+
 /// A logged-in principal: its SQL, its tenant and its name.
 pub struct Login {
     /// The principal's own SQL session.
@@ -277,16 +279,26 @@ impl Session {
         // A database on the storage engine: the engine runs its data
         // commands, the session only connection, server and pub/sub ones.
         if let Some(e) = self.engine.clone() {
+            // Another connection's script runs long: Redis answers BUSY.
+            if let Some(f) = self.engine_busy(&name, &c.args) {
+                return vec![f];
+            }
             if self.multi.is_some() && !spec.has('m') {
                 // Queued for EXEC below, which runs the engine's commands
-                // as one transaction.
-                if !e.runs(&name) && !crate::engine::session_command(&name) {
+                // (and scripts) as one transaction.
+                if !e.runs(&name)
+                    && !crate::engine::session_command(&name)
+                    && !lua_engine::runs_script(&name)
+                {
                     self.multi_err = true;
                     return vec![crate::engine::not_on_engine(&name)];
                 }
             } else {
                 if e.runs(&name) {
                     return e.run(&[&c.args[..]], self.resp3()).await;
+                }
+                if lua_engine::handles(&name) {
+                    return vec![self.lua_on_engine(&e, &name, &c.args).await];
                 }
                 if !crate::engine::session_command(&name) {
                     return vec![crate::engine::not_on_engine(&name)];
@@ -364,6 +376,10 @@ impl Session {
             return 0;
         };
         if (self.subscribed() && self.proto == Proto::Resp2) || self.multi.is_some() {
+            return 0;
+        }
+        // A script runs long: the commands go one by one, to answer BUSY.
+        if self.busy_run().is_some() {
             return 0;
         }
         cmds.iter()
@@ -1300,6 +1316,9 @@ impl Session {
             .collect();
         self.watched.clear();
         let names: Vec<String> = queue.iter().map(Command::name_lower).collect();
+        if names.iter().any(|n| lua_engine::runs_script(n)) {
+            return self.exec_engine_scripted(e, queue, &watched).await;
+        }
         // The engine also takes SELECT: the commands after it run in that
         // database, in the same transaction.
         let to_engine = |n: &str| e.runs(n) || n == "select";
@@ -2070,7 +2089,12 @@ impl Session {
             }
             let mut started =
                 lua::start(body.clone(), keys.clone(), args.clone(), self.resp3(), &cfg);
-            let run_id = env.scripts.add(&scope, function, &started.state);
+            // Removed however the run ends, even if the client goes away.
+            let guard = lua_engine::RunGuard {
+                id: env.scripts.add(&scope, function, &started.state),
+                env: Arc::clone(&env),
+                state: Arc::clone(&started.state),
+            };
             let mut retry: Option<SqlError> = None;
             let outcome = loop {
                 tokio::select! {
@@ -2095,7 +2119,7 @@ impl Session {
                     }
                 }
             };
-            env.scripts.remove(run_id);
+            drop(guard);
             if let Some(e) = retry {
                 if !in_txn {
                     let _ = self.sql_exec("ROLLBACK").await;

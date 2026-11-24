@@ -3,8 +3,11 @@
 
 mod datetime;
 mod hash;
+mod json;
+pub(crate) mod misc;
 mod numeric;
 mod regexp;
+pub(crate) mod sequence;
 mod string;
 mod strtail;
 
@@ -29,6 +32,20 @@ fn take<const N: usize>(name: &str, args: Vec<Node>) -> Result<[Node; N]> {
 
 /// Compiles the call of built-in function `name`.
 pub(crate) fn build(name: &str, args: &[Expr], env: Env<'_>) -> Result<Node> {
+    if sequence::NAMES.contains(&name) {
+        let nodes = args
+            .iter()
+            .skip(1)
+            .filter(|a| !matches!(a, Expr::Keyword(_)))
+            .map(|a| build_expr(a, env))
+            .collect::<Result<Vec<_>>>()?;
+        let nodes = if name == "SPRIG_SEQUENCE_STATE" {
+            Vec::new()
+        } else {
+            nodes
+        };
+        return sequence::build(name, args, nodes, env);
+    }
     let nodes = args
         .iter()
         .filter(|a| !matches!(a, Expr::Keyword(_)))
@@ -233,6 +250,129 @@ pub(crate) fn build(name: &str, args: &[Expr], env: Env<'_>) -> Result<Node> {
                 name.starts_with("DATE_SUB") || name == "SUBDATE",
                 env,
             )
+        }
+        "UUID_TO_BIN" | "BIN_TO_UUID" if env.maria() => Err(SqlError::no_function(name)),
+        "IS_UUID" if env.maria() => Err(SqlError::no_function(name)),
+        "UUID_TO_BIN" | "BIN_TO_UUID" => {
+            arity(name, &nodes, 1, 2)?;
+            let mut it = nodes.into_iter();
+            let (Some(a), swap) = (it.next(), it.next()) else {
+                return Err(SqlError::param_count(name));
+            };
+            Ok(if name == "UUID_TO_BIN" {
+                misc::uuid_to_bin(a, swap, env)
+            } else {
+                misc::bin_to_uuid(a, swap, env)
+            })
+        }
+        "IS_UUID" => {
+            let [a] = take(name, nodes)?;
+            Ok(misc::is_uuid(a, env))
+        }
+        "TO_BASE64" => {
+            let [a] = take(name, nodes)?;
+            Ok(misc::to_base64(a, env))
+        }
+        "FROM_BASE64" => {
+            let [a] = take(name, nodes)?;
+            Ok(misc::from_base64(a, env))
+        }
+        "INET_ATON" => {
+            let [a] = take(name, nodes)?;
+            Ok(misc::inet_aton(a, env))
+        }
+        "INET6_ATON" => {
+            let [a] = take(name, nodes)?;
+            Ok(misc::inet6_aton(a, env))
+        }
+        "INET6_NTOA" => {
+            let [a] = take(name, nodes)?;
+            Ok(misc::inet6_ntoa(a, env))
+        }
+        "INET_NTOA" => {
+            let [a] = take(name, nodes)?;
+            Ok(misc::inet_ntoa(a, env))
+        }
+        "BIT_COUNT" => {
+            let [a] = take(name, nodes)?;
+            Ok(misc::bit_count(a, env))
+        }
+        "FROM_DAYS" => {
+            let [a] = take(name, nodes)?;
+            Ok(misc::from_days(a))
+        }
+        "MAKEDATE" => {
+            let [y, d] = take(name, nodes)?;
+            Ok(misc::makedate(y, d))
+        }
+        "SEC_TO_TIME" => {
+            let [a] = take(name, nodes)?;
+            Ok(misc::sec_to_time(a))
+        }
+        "UUID" => {
+            arity(name, &nodes, 0, 0)?;
+            Ok(misc::uuid(env))
+        }
+        "JSON_EXTRACT" => json::extract(nodes, env),
+        "JSON_UNQUOTE" => {
+            let [a] = take(name, nodes)?;
+            Ok(json::unquote(a, env))
+        }
+        "JSON_VALUE" => {
+            let [d, p] = take(name, nodes)?;
+            Ok(json::value(d, p, env))
+        }
+        "JSON_TYPE" => {
+            let [a] = take(name, nodes)?;
+            Ok(json::type_of(a, env))
+        }
+        "JSON_VALID" => {
+            let [a] = take(name, nodes)?;
+            Ok(json::valid(a, env))
+        }
+        "JSON_LENGTH" | "JSON_KEYS" => json::length_or_keys(name == "JSON_KEYS", nodes, env),
+        "JSON_OBJECT" | "JSON_ARRAY" => json::build(name == "JSON_OBJECT", nodes, env),
+        "JSON_QUOTE" => {
+            let [a] = take(name, nodes)?;
+            Ok(json::quote(a, env))
+        }
+        "JSON_CONTAINS" => json::contains_fn(nodes, env),
+        "JSON_SET" => json::modify(json::Modify::Set, nodes, env),
+        "JSON_INSERT" => json::modify(json::Modify::Insert, nodes, env),
+        "JSON_REPLACE" => json::modify(json::Modify::Replace, nodes, env),
+        "JSON_REMOVE" => json::remove_fn(nodes, env),
+        "JSON_ARRAY_APPEND" => json::array_append(nodes, env),
+        "JSON_MERGE_PATCH" => json::merge_patch_fn(nodes, env),
+        "MEMBER OF" if !env.maria() => {
+            let [x, d] = take(name, nodes)?;
+            Ok(json::member_of(x, d, env))
+        }
+        "TIME_TO_SEC" => {
+            let [a] = take(name, nodes)?;
+            Ok(misc::time_to_sec(a, env))
+        }
+        "MAKETIME" => {
+            let [h, m, sec] = take(name, nodes)?;
+            Ok(misc::maketime(h, m, sec))
+        }
+        "TIMEDIFF" => {
+            let [a, b] = take(name, nodes)?;
+            Ok(misc::timediff(a, b))
+        }
+        "SOUNDEX" => {
+            let [a] = take(name, nodes)?;
+            Ok(misc::soundex(a, env))
+        }
+        "TIME_FORMAT" => {
+            let [d, f] = take(name, nodes)?;
+            Ok(datetime::time_format(d, f, env))
+        }
+        "DATABASE" | "SCHEMA" | "CONNECTION_ID" | "LAST_INSERT_ID" | "USER" | "SESSION_USER"
+        | "SYSTEM_USER" | "CURRENT_USER" | "VERSION" => {
+            if !nodes.is_empty() {
+                return Err(SqlError::unsupported(&format!("{name} with an argument")));
+            }
+            misc::session_value(name, env)
         }
         "DATEDIFF" => {
             let [a, b] = take(name, nodes)?;

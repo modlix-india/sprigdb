@@ -1714,6 +1714,10 @@ impl PassSession {
             }));
         }
         if let Some(target) = &sp.info.ddl {
+            // The session's temporary tables of engine databases.
+            if let Some(r) = Box::pin(self.engine_temp_ddl(cx, target, original, s, out)).await {
+                return r.map(Route::Done);
+            }
             // DDL an engine database's rows can't follow.
             if let Err(e) = self.engine_ddl_check(target, original) {
                 return Ok(Route::Done(self.fail(out, &e).await?));

@@ -124,6 +124,13 @@ fn unknown(name: &str) -> TopicError {
     )
 }
 
+/// How long a replica that doesn't lead a tenant's unit reuses the topic
+/// records it read: with partition groups it serves produce and fetch for
+/// partitions it leads while another replica leads the tenant's unit, and
+/// a read through the read barrier on every request would cost a round
+/// trip each.
+const FOLLOWER_FRESH: std::time::Duration = std::time::Duration::from_millis(1000);
+
 /// Streams stored on the node's engine: the segment log and the records.
 pub struct EngineStreams {
     log: SegLog,
@@ -135,6 +142,10 @@ pub struct EngineStreams {
     /// Tenants whose topic records were read (their policies are set), with
     /// the tenant unit's leader epoch at that read.
     loaded: Mutex<HashMap<u64, u64>>,
+    /// When a replica that doesn't lead a tenant's unit last read its topic
+    /// records: reads within [`FOLLOWER_FRESH`] reuse them (a name not
+    /// found reads again).
+    read_at: Mutex<HashMap<u64, std::time::Instant>>,
     /// Generations of cache reads and writes.
     generation: std::sync::atomic::AtomicU64,
     /// Inherited values of new streams' settings.
@@ -170,14 +181,14 @@ fn ticket_of(p: Pending, partition: i32, count: usize) -> AppendTicket {
 }
 
 /// The pending append of a ticket from [`ticket_of`]: its entry is in
-/// `tenant`'s unit.
-fn pending_of(t: &AppendTicket, tenant: u64) -> Pending {
+/// `unit` (the partition's, [`SegLog::unit_of_part`]).
+fn pending_of(t: &AppendTicket, unit: u64) -> Pending {
     let mut i = [0u8; 8];
     i.copy_from_slice(&t.first_event[..8]);
     let mut s = [0u8; 4];
     s.copy_from_slice(&t.first_event[8..12]);
     Pending {
-        unit: sprig_engine::Engine::unit_of_tenant(tenant).0,
+        unit,
         index: u64::from_be_bytes(i),
         slot: u32::from_be_bytes(s),
     }
@@ -218,6 +229,7 @@ impl EngineStreams {
             engine: engine.clone(),
             cache: Mutex::new(HashMap::new()),
             loaded: Mutex::new(HashMap::new()),
+            read_at: Mutex::new(HashMap::new()),
             generation: std::sync::atomic::AtomicU64::new(0),
             defaults,
         };
@@ -274,6 +286,11 @@ impl EngineStreams {
     /// lead the unit every call reads them (through the read barrier):
     /// they change through replication, not through this node.
     fn load(&self, tenant: u64) -> Result<()> {
+        self.load_with(tenant, false)
+    }
+
+    /// [`EngineStreams::load`]; `again` skips a follower's recent read.
+    fn load_with(&self, tenant: u64, again: bool) -> Result<()> {
         let unit = Engine::unit_of_tenant(tenant);
         let replicated = self.engine.is_replicated_unit(unit);
         let epoch = if replicated {
@@ -287,6 +304,17 @@ impl EngineStreams {
         {
             return Ok(());
         }
+        if replicated
+            && epoch == 0
+            && !again
+            && lock(&self.loaded).get(&tenant) == Some(&0)
+            && lock(&self.read_at)
+                .get(&tenant)
+                .is_some_and(|t| t.elapsed() < FOLLOWER_FRESH)
+        {
+            return Ok(());
+        }
+        let read_started = std::time::Instant::now();
         let started = self.next_gen();
         let recs = self.records.topics(tenant)?;
         for r in &recs {
@@ -310,7 +338,21 @@ impl EngineStreams {
             }
         }
         lock(&self.loaded).insert(tenant, epoch);
+        if replicated && epoch == 0 {
+            lock(&self.read_at).insert(tenant, read_started);
+        }
         Ok(())
+    }
+
+    /// Whether a lookup that found nothing should read the records again (a
+    /// follower's reuse of a recent read may predate the topic).
+    fn reread(&self, tenant: u64) -> Result<bool> {
+        let unit = Engine::unit_of_tenant(tenant);
+        if !self.engine.is_replicated_unit(unit) || self.engine.leader_epoch(unit) != 0 {
+            return Ok(false);
+        }
+        self.load_with(tenant, true)?;
+        Ok(true)
     }
 
     /// Every topic record of a tenant.
@@ -318,7 +360,9 @@ impl EngineStreams {
     /// # Errors
     /// The records can't be read.
     pub fn topics(&self, tenant: u64) -> Result<Vec<TopicRecord>> {
-        self.load(tenant)?;
+        // A listing (Metadata for every topic) can't tell a topic created
+        // elsewhere since a follower's last read: always read again there.
+        self.load_with(tenant, true)?;
         let mut v: Vec<TopicRecord> = lock(&self.cache)
             .iter()
             .filter(|((t, _), _)| *t == tenant)
@@ -334,9 +378,15 @@ impl EngineStreams {
     /// The records can't be read.
     pub fn topic(&self, tenant: u64, name: &str) -> Result<Option<TopicRecord>> {
         self.load(tenant)?;
-        Ok(lock(&self.cache)
-            .get(&(tenant, name.to_owned()))
-            .map(|(r, _)| r.clone()))
+        let find = || {
+            lock(&self.cache)
+                .get(&(tenant, name.to_owned()))
+                .map(|(r, _)| r.clone())
+        };
+        match find() {
+            None if self.reread(tenant)? => Ok(find()),
+            r => Ok(r),
+        }
     }
 
     /// One topic record by stream id.
@@ -345,10 +395,16 @@ impl EngineStreams {
     /// The records can't be read.
     pub fn topic_by_id(&self, tenant: u64, id: u64) -> Result<Option<TopicRecord>> {
         self.load(tenant)?;
-        Ok(lock(&self.cache)
-            .iter()
-            .find(|((t, _), (r, _))| *t == tenant && r.stream_id == id)
-            .map(|(_, (r, _))| r.clone()))
+        let find = || {
+            lock(&self.cache)
+                .iter()
+                .find(|((t, _), (r, _))| *t == tenant && r.stream_id == id)
+                .map(|(_, (r, _))| r.clone())
+        };
+        match find() {
+            None if self.reread(tenant)? => Ok(find()),
+            r => Ok(r),
+        }
     }
 
     /// Creates a stream; `Ok(None)` when the name is taken.
@@ -1168,7 +1224,15 @@ impl StreamData for RoutedData {
             return self.inner()?.sequenced(p, t, ticket, deadline).await;
         }
         self.eng
-            .outcome(pending_of(ticket, p.tenant_id), deadline)
+            .outcome(
+                pending_of(
+                    ticket,
+                    self.eng
+                        .log()
+                        .unit_of_part(key(p.tenant_id, t.stream_id, ticket.partition)),
+                ),
+                deadline,
+            )
             .await
     }
 

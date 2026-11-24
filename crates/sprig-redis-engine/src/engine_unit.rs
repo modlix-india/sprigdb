@@ -94,6 +94,8 @@ pub struct EngineBatch {
     txn: Txn,
     /// The keys `begin` locked, sorted.
     held: Vec<Bytes>,
+    /// Every read is a current read (a script's batch).
+    latest: bool,
 }
 
 impl Unit for EngineUnit {
@@ -106,7 +108,11 @@ impl Unit for EngineUnit {
                 .await
                 .map_err(|e| conv(&e))?;
         }
-        Ok(EngineBatch { txn, held: keys })
+        Ok(EngineBatch {
+            txn,
+            held: keys,
+            latest: false,
+        })
     }
 
     fn leader_epoch(&self, key: &[u8]) -> u64 {
@@ -144,7 +150,7 @@ impl Batch for EngineBatch {
     // so its latest version is the same as the view's, without opening
     // one (the hot-key path).
     fn get(&mut self, key: &[u8]) -> StoreResult<Option<Bytes>> {
-        if self.held.binary_search_by(|k| k.as_ref().cmp(key)).is_ok() {
+        if self.latest || self.held.binary_search_by(|k| k.as_ref().cmp(key)).is_ok() {
             return self.txn.read_current(key).map_err(|e| conv(&e));
         }
         self.txn.get_snapshot(key).map_err(|e| conv(&e))
@@ -164,6 +170,12 @@ impl Batch for EngineBatch {
 
     fn scan(&mut self, start: &[u8], end: &[u8], limit: usize) -> StoreResult<Vec<(Bytes, Bytes)>> {
         let r = KeyRange::new(start, end);
+        if self.latest {
+            return self
+                .txn
+                .scan_current(&r, Dir::Forward, limit)
+                .map_err(|e| conv(&e));
+        }
         self.txn
             .scan(&r, Dir::Forward, limit, ReadMode::Snapshot)
             .map(|rows| rows.into_iter().map(|(k, v)| (Bytes::from(k), v)).collect())
@@ -177,10 +189,32 @@ impl Batch for EngineBatch {
         limit: usize,
     ) -> StoreResult<Vec<(Bytes, Bytes)>> {
         let r = KeyRange::new(start, end);
+        if self.latest {
+            return self
+                .txn
+                .scan_current(&r, Dir::Reverse, limit)
+                .map_err(|e| conv(&e));
+        }
         self.txn
             .scan(&r, Dir::Reverse, limit, ReadMode::Snapshot)
             .map(|rows| rows.into_iter().map(|(k, v)| (Bytes::from(k), v)).collect())
             .map_err(|e| conv(&e))
+    }
+
+    async fn hold(&mut self, keys: Vec<Bytes>) -> StoreResult<()> {
+        for k in &keys {
+            self.txn
+                .lock(k, LockRequest::write())
+                .await
+                .map_err(|e| conv(&e))?;
+        }
+        self.held.extend(keys);
+        self.held.sort_unstable();
+        Ok(())
+    }
+
+    fn read_latest(&mut self) {
+        self.latest = true;
     }
 
     fn put(&mut self, key: Bytes, value: Bytes) -> StoreResult<()> {

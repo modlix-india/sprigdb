@@ -6,13 +6,13 @@
 
 use std::sync::Arc;
 
-use sprig_common::Result;
 use sprig_common::ids::DbId;
 use sprig_common::names::SchemaName;
+use sprig_common::{Result, SprigError};
 use sprig_sql::names::show::{ShowKind, classify, like_match};
 
 use crate::engine::show::{self, Answer};
-use crate::engine::{self, catalog, define};
+use crate::engine::{self, catalog, define, not_on_engine};
 use crate::exec::PassSession;
 
 impl PassSession {
@@ -51,13 +51,21 @@ impl PassSession {
         }
         if !matches!(
             info.kind,
-            ShowKind::CreateTable | ShowKind::Columns | ShowKind::Index | ShowKind::Tables
+            ShowKind::CreateTable
+                | ShowKind::CreateView
+                | ShowKind::CreateSequence
+                | ShowKind::Columns
+                | ShowKind::Index
+                | ShowKind::Tables
         ) {
             return None;
         }
         // `SHOW ... WHERE expr`: the answer's rows the condition keeps.
         if let Some(range) = info.filter.clone() {
-            if info.kind == ShowKind::CreateTable {
+            if matches!(
+                info.kind,
+                ShowKind::CreateTable | ShowKind::CreateView | ShowKind::CreateSequence
+            ) {
                 return None;
             }
             let mut plain = info.clone();
@@ -112,12 +120,15 @@ impl PassSession {
 
     /// The engine's answer to one `SHOW` about a table or the tables of a
     /// database (no `WHERE`); `None`: not the engine's.
+    #[allow(clippy::too_many_lines)] // one answer per SHOW kind
     async fn engine_show_of(
         &self,
         info: &sprig_sql::names::show::ShowInfo,
     ) -> Option<Result<Answer>> {
         let ts = self.tenant.as_deref()?;
-        let cat = Arc::clone(ts.catalog()?);
+        let base = Arc::clone(ts.catalog()?);
+        // The session's temporary tables hide tables of the same name.
+        let cat = self.eng.temps.overlay(&base);
         let eng = catalog::of(&cat)?;
         let lctn = ts.lower_case_table_names();
         let schema_name = match &info.schema {
@@ -139,15 +150,48 @@ impl PassSession {
         }
         let ci = lctn;
         if info.kind == ShowKind::Tables {
-            let mut names: Vec<String> = eng
+            // The catalog's tables (a temporary table hides none of them
+            // here); MariaDB lists the session's temporary tables first.
+            let eng = catalog::of(&base)?;
+            let mut temps: Vec<(String, &'static str)> = Vec::new();
+            if self.persona != sprig_proto_mysql::packets::Persona::MySql84 {
+                temps = self
+                    .eng
+                    .temps
+                    .iter()
+                    .filter(|t| t.db == db)
+                    .filter(|t| {
+                        info.like
+                            .as_deref()
+                            .is_none_or(|p| like_match(p, &t.name, ci))
+                    })
+                    .map(|t| (t.name.clone(), "TEMPORARY TABLE"))
+                    .collect();
+                temps.sort();
+            }
+            let mut names: Vec<(String, &'static str)> = eng
                 .by_name
                 .keys()
                 .filter(|(d, n)| *d == db && !n.starts_with("__sprig_"))
-                .map(|(_, n)| n.clone())
-                .filter(|n| info.like.as_deref().is_none_or(|p| like_match(p, n, ci)))
+                .map(|(_, n)| (n.clone(), "BASE TABLE"))
+                .chain(
+                    eng.views
+                        .keys()
+                        .filter(|(d, _)| *d == db)
+                        .map(|(_, n)| (n.clone(), "VIEW")),
+                )
+                .chain(
+                    eng.seq_names
+                        .keys()
+                        .filter(|(d, _)| *d == db)
+                        .map(|(_, n)| (n.clone(), "SEQUENCE")),
+                )
+                .filter(|(n, _)| info.like.as_deref().is_none_or(|p| like_match(p, n, ci)))
                 .collect();
             names.sort();
-            return Some(Ok(show::tables(
+            temps.append(&mut names);
+            let names = temps;
+            return Some(Ok(show::tables_typed(
                 &schema_name,
                 &names,
                 info.full,
@@ -155,6 +199,78 @@ impl PassSession {
             )));
         }
         let name = info.object.clone()?;
+        // A sequence: its own text, or the table MariaDB keeps it in.
+        if matches!(info.kind, ShowKind::CreateTable | ShowKind::CreateSequence)
+            && let Some(s) = eng.sequence(db, &name, lctn)
+        {
+            let shown = s.def.as_ref().map_or(name.as_str(), |d| d.name.as_str());
+            return Some(Ok(show::create_table(
+                shown,
+                &if info.kind == ShowKind::CreateSequence {
+                    s.text.clone()
+                } else {
+                    crate::engine::sequence::table_text(shown)
+                },
+            )));
+        }
+        if info.kind == ShowKind::CreateSequence {
+            let db_name = cat
+                .databases
+                .get(db)
+                .map_or_else(String::new, |d| d.name.clone());
+            return Some(Err(if eng.table(db, &name, lctn).is_some() {
+                SprigError::standard(
+                    4090,
+                    *b"42S02",
+                    format!("'{db_name}.{name}' is not a SEQUENCE"),
+                )
+            } else {
+                SprigError::standard(
+                    1146,
+                    *b"42S02",
+                    format!("Table '{db_name}.{name}' doesn't exist"),
+                )
+            }));
+        }
+        if matches!(info.kind, ShowKind::CreateTable | ShowKind::CreateView)
+            && let Some(v) = eng.view(db, &name, lctn)
+        {
+            return Some(match v.as_ref() {
+                Ok(v) => {
+                    let (cs, coll) = self.view_charsets();
+                    Ok(show::create_view(&v.name, &v.text, &cs, &coll))
+                }
+                Err(why) => Err(not_on_engine(why)),
+            });
+        }
+        if info.kind == ShowKind::CreateView {
+            let db_name = cat
+                .databases
+                .get(db)
+                .map_or_else(String::new, |d| d.name.clone());
+            // A table: the servers' 1347; nothing: 1146.
+            let Some(td) = eng.table(db, &name, lctn) else {
+                return Some(Err(SprigError::standard(
+                    1146,
+                    *b"42S02",
+                    format!("Table '{db_name}.{name}' doesn't exist"),
+                )));
+            };
+            let shown = td
+                .as_ref()
+                .as_ref()
+                .map_or_else(|_| name.clone(), |d| d.name.clone());
+            let mysql = self.persona == sprig_proto_mysql::packets::Persona::MySql84;
+            return Some(Err(SprigError::standard(
+                1347,
+                *b"HY000",
+                if mysql {
+                    format!("'{db_name}.{shown}' is not VIEW")
+                } else {
+                    format!("'{db_name}.{shown}' is not of type 'VIEW'")
+                },
+            )));
+        }
         let parsed = eng.table(db, &name, lctn)?;
         let td = parsed.as_ref().as_ref().ok()?;
         let text = eng.texts.get(&td.object)?;
@@ -168,6 +284,10 @@ impl PassSession {
         };
         Some(match info.kind {
             ShowKind::CreateTable => match e.next_counter(ts.tenant.0, td).await {
+                Ok(next) if eng.temps.contains(&td.object) => Ok(show::create_table(
+                    &def.name,
+                    &crate::engine::temp::shown(&show::with_counter(&def, next)),
+                )),
                 Ok(next) => Ok(show::create_table(
                     &def.name,
                     &show::with_counter(&def, next),
@@ -211,7 +331,8 @@ fn mysql_show_meta(
         return;
     }
     let tables = &first.org_table[..] == b"TABLE_NAMES";
-    let create = first.table.is_empty() && &first.name[..] == b"Table";
+    let create =
+        first.table.is_empty() && (&first.name[..] == b"Table" || &first.name[..] == b"View");
     if !tables && !create {
         return;
     }
@@ -233,6 +354,16 @@ fn mysql_show_meta(
         if tables && i == 0 {
             c.length = 256;
             c.flags |= sprig_proto_mysql::resultset::ColumnFlags::BINARY.bits();
+        }
+        // MySQL 8.4's `Table_type` is its dictionary's enumeration.
+        if tables && i == 1 {
+            c.col_type = 0xfe;
+            c.length = 44;
+            c.flags = 0x1181;
+        }
+        // `SHOW CREATE VIEW`'s `collation_connection`.
+        if !tables && i == 3 && &c.name[..] == b"collation_connection" {
+            c.length = 128;
         }
         defs.push(c.encode(caps));
     }
@@ -507,6 +638,29 @@ impl PassSession {
 }
 
 impl PassSession {
+    /// The session's `character_set_client` and `collation_connection`,
+    /// as `SHOW CREATE VIEW` shows them.
+    #[allow(clippy::redundant_closure_for_method_calls)] // the backend session's type is private
+    fn view_charsets(&self) -> (String, String) {
+        let mysql = self.persona == sprig_proto_mysql::packets::Persona::MySql84;
+        let vars = self.bs.as_ref().map(|b| b.vars());
+        let get = |k: &str| {
+            vars.and_then(|v| v.vars.get(k))
+                .map(ToString::to_string)
+                .filter(|x| !x.is_empty())
+        };
+        (
+            get("character_set_client").unwrap_or_else(|| "utf8mb4".into()),
+            get("collation_connection").unwrap_or_else(|| {
+                if mysql {
+                    "utf8mb4_0900_ai_ci".into()
+                } else {
+                    "utf8mb4_uca1400_ai_ci".into()
+                }
+            }),
+        )
+    }
+
     /// The engine's `SHOW CREATE TABLE` text for `sql` (a rewritten `SHOW
     /// CREATE TABLE`), when the table is the engine's.
     pub(in crate::exec) async fn engine_show_create_text(
@@ -539,7 +693,13 @@ impl PassSession {
             return None;
         }
         let ts = self.tenant.as_deref()?;
-        let cat = Arc::clone(ts.catalog()?);
+        // `SHOW COLUMNS` and `SHOW INDEX` of a temporary table read it;
+        // other queries list the catalog's tables only.
+        let cat = if strip_probe(text).is_some() {
+            self.eng.temps.overlay(ts.catalog()?)
+        } else {
+            Arc::clone(ts.catalog()?)
+        };
         let eng = catalog::of(&cat)?;
         // The MySQL port's `SHOW COLUMNS` and `SHOW INDEX` (queries over
         // `COLUMNS` and `STATISTICS`) read the table itself, for 1146 when

@@ -21,12 +21,15 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use bytes::Bytes;
 use sprig_proto_redis::Frame;
-use sprig_redis::engine::{EngineDatabase, Watched};
+use sprig_redis::engine::{EngineDatabase, LuaStore, Watched};
 use tokio::sync::{Notify, oneshot};
 
 use crate::exec::{self, Cx};
 use crate::layout::Space;
 use crate::store::{Batch, StoreError, Ticket, Unit};
+
+mod script;
+pub use script::ScriptTxn;
 
 /// A batch's replies and the ticket they wait for.
 type Outcome<T> = Result<(Vec<Frame>, T), StoreError>;
@@ -342,6 +345,10 @@ impl Waiters {
     }
 }
 
+/// Times a multi-key batch that failed retryably (a deadlock with a
+/// script) runs again before its error reaches the client.
+const BATCH_RETRIES: u32 = 5;
+
 /// How long a blocked client waits before trying again on its own.
 const BLOCK_POLL: Duration = Duration::from_secs(1);
 
@@ -579,18 +586,29 @@ impl<U: Unit> EngineDb<U> {
         keys.dedup();
         let protos = vec![resp3; cmds.len()];
         let all_failed = |e: &StoreError| Some(cmds.iter().map(|_| failed(e)).collect());
-        let (mut uids, epoch) = match self
-            .uids
-            .reserve(names.iter().map(|n| exec::uids_needed(n)).sum())
-            .await
-        {
-            Ok(u) => u,
-            Err(e) => return all_failed(&e),
+        let mut attempt = 0;
+        let out = loop {
+            let (mut uids, epoch) = match self
+                .uids
+                .reserve(names.iter().map(|n| exec::uids_needed(n)).sum())
+                .await
+            {
+                Ok(u) => u,
+                Err(e) => return all_failed(&e),
+            };
+            let out = self
+                .execute_with(keys.clone(), cmds, &names, &protos, &mut uids, watched)
+                .await;
+            self.uids.give_back(uids, epoch);
+            // Lost a deadlock to a script: nothing changed, run it again.
+            match out {
+                Err(e) if e.retryable && attempt < BATCH_RETRIES => {
+                    attempt += 1;
+                    tokio::time::sleep(Duration::from_millis(1 << attempt)).await;
+                }
+                other => break other,
+            }
         };
-        let out = self
-            .execute_with(keys, cmds, &names, &protos, &mut uids, watched)
-            .await;
-        self.uids.give_back(uids, epoch);
         match out {
             Ok(None) => None,
             Ok(Some((replies, ticket))) => match ticket.durable().await {
@@ -735,7 +753,18 @@ impl<U: Unit> EngineDb<U> {
             .await
         } else {
             let protos = vec![resp3; cmds.len()];
-            self.execute(keys, cmds, &names, &protos).await
+            // A batch that lost a deadlock to a script (which takes its keys
+            // one command at a time) changed nothing: run it again.
+            let mut attempt = 0;
+            loop {
+                match self.execute(keys.clone(), cmds, &names, &protos).await {
+                    Err(e) if e.retryable && attempt < BATCH_RETRIES => {
+                        attempt += 1;
+                        tokio::time::sleep(Duration::from_millis(1 << attempt)).await;
+                    }
+                    other => break other,
+                }
+            }
         };
         let all_failed = |e: &StoreError| cmds.iter().map(|_| failed(e)).collect();
         match outcome {
@@ -870,6 +899,41 @@ impl<U: Unit> EngineDatabase for EngineDb<U> {
         resp3: bool,
     ) -> Option<Vec<Frame>> {
         self.exec_watched(cmds, watched, resp3).await
+    }
+
+    async fn script(
+        &self,
+        watched: &[Watched],
+    ) -> Result<Option<Box<dyn sprig_redis::engine::EngineScript>>, Frame> {
+        let me = self
+            .me
+            .upgrade()
+            .ok_or_else(|| Frame::err("the database is closing"))?;
+        match me.begin_script(watched).await {
+            Ok(Some(t)) => Ok(Some(Box::new(t))),
+            Ok(None) => Ok(None),
+            Err(e) => Err(failed(&e)),
+        }
+    }
+
+    async fn lua_get(&self, store: LuaStore, name: &[u8]) -> Result<Option<Bytes>, Frame> {
+        self.lua_read(store, name).await.map_err(|e| failed(&e))
+    }
+
+    async fn lua_swap(
+        &self,
+        store: LuaStore,
+        name: &[u8],
+        expect: Option<Option<Bytes>>,
+        new: Option<Bytes>,
+    ) -> Result<bool, Frame> {
+        self.lua_write(store, name, expect, new)
+            .await
+            .map_err(|e| failed(&e))
+    }
+
+    async fn lua_clear(&self, store: LuaStore) -> Result<(), Frame> {
+        self.lua_wipe(store).await.map_err(|e| failed(&e))
     }
 }
 

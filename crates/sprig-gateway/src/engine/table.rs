@@ -842,9 +842,8 @@ fn sql_of(toks: &[Tok]) -> String {
 /// Compiles expression `text` of `def`'s definition (a `CHECK`, a
 /// `DEFAULT`).
 fn compile_expr(def: &TableDef, text: &str) -> std::result::Result<CExpr, String> {
-    use sqlparser::dialect::MySqlDialect;
     use sqlparser::parser::Parser;
-    let e = Parser::new(&MySqlDialect {})
+    let e = Parser::new(&sprig_plan::dialect::SprigMySql)
         .try_with_sql(text)
         .and_then(|mut p| p.parse_expr())
         .map_err(|_| format!("the expression {text}"))?;
@@ -868,14 +867,91 @@ fn compile_expr(def: &TableDef, text: &str) -> std::result::Result<CExpr, String
 /// engine for both ports. Columns whose stored values it would misread
 /// (`ENUM`, `SET`, `BIT`, `JSON`) are refused.
 fn exec_expr(def: &TableDef, e: &sqlparser::ast::Expr) -> std::result::Result<CExpr, String> {
+    exec_expr_in(def, e, false)
+}
+
+/// `e`, a value that reads no column (`NOW() + INTERVAL 7 DAY`,
+/// `DATE_ADD(CURDATE(), INTERVAL 1 MONTH)`, `CONCAT('a', 'b')`), compiled
+/// by the expression engine, for an `INSERT`'s `VALUES`: evaluated at the
+/// statement's time in the session's time zone and `sql_mode`.
+pub(crate) fn value_expr(
+    def: &TableDef,
+    e: &sqlparser::ast::Expr,
+    seqs: &SeqLookup<'_>,
+) -> std::result::Result<CExpr, String> {
+    exec_expr_with(def, e, true, Some(seqs))
+}
+
+/// Resolves a sequence's name (`schema` empty: the current database) to
+/// the identity the expression engine's sequence functions take.
+pub(crate) type SeqLookup<'a> =
+    dyn Fn(&str, &str) -> std::result::Result<String, sprig_exec::SqlError> + 'a;
+
+/// An empty catalog that knows the statement's sequences.
+struct WithSequences<'a> {
+    inner: &'a sprig_plan::mem::MemDb,
+    seqs: Option<&'a SeqLookup<'a>>,
+}
+
+impl sprig_plan::catalog::Catalog for WithSequences<'_> {
+    fn table(&self, schema: &str, name: &str) -> Option<Arc<sprig_plan::catalog::TableDef>> {
+        sprig_plan::catalog::Catalog::table(self.inner, schema, name)
+    }
+    fn default_schema(&self) -> Option<String> {
+        Some(String::new())
+    }
+    fn sequence(
+        &self,
+        schema: &str,
+        name: &str,
+    ) -> std::result::Result<String, sprig_exec::SqlError> {
+        match self.seqs {
+            Some(f) => f(schema, name),
+            None => Err(sprig_exec::SqlError::new(
+                4091,
+                "42S02",
+                format!("Unknown SEQUENCE: '{name}'"),
+            )),
+        }
+    }
+}
+
+fn exec_expr_in(
+    def: &TableDef,
+    e: &sqlparser::ast::Expr,
+    value: bool,
+) -> std::result::Result<CExpr, String> {
+    exec_expr_with(def, e, value, None)
+}
+
+fn exec_expr_with(
+    def: &TableDef,
+    e: &sqlparser::ast::Expr,
+    value: bool,
+    seqs: Option<&SeqLookup<'_>>,
+) -> std::result::Result<CExpr, String> {
     let table = super::general::names::plan_table(def, "");
-    let mut out = Vec::with_capacity(2);
+    let mut out: Vec<(sprig_exec::Session, sprig_exec::Compiled)> = Vec::with_capacity(2);
     for persona in [sprig_exec::Persona::MariaDb, sprig_exec::Persona::MySql] {
         let session = sprig_exec::Session::new(persona);
         let db = sprig_plan::mem::MemDb::new("");
         let storage: Arc<dyn sprig_plan::access::Storage> = Arc::new(db.clone());
-        let planner = sprig_plan::Planner::new(&db, storage, &session);
-        let (x, read) = planner.scalar(&table, e).map_err(|e| e.message)?;
+        let cat = WithSequences { inner: &db, seqs };
+        let planner = sprig_plan::Planner::new(&cat, storage, &session);
+        let (x, read) = match planner.scalar(&table, e) {
+            Ok(r) => r,
+            // A sequence function, MariaDB's alone: the MySQL form is the
+            // MariaDB one (the MySQL port serves no sequence).
+            Err(err) if err.code == 1305 && seqs.is_some() && !out.is_empty() => {
+                let first = out[0].clone();
+                out.push(first);
+                continue;
+            }
+            Err(err) => return Err(err.message),
+        };
+        if value && !read.is_empty() {
+            return Err("it reads a column".into());
+        }
         if let Some(t) = read
             .iter()
             .filter_map(|&c| def.columns.get(c))
@@ -891,6 +967,7 @@ fn exec_expr(def: &TableDef, e: &sqlparser::ast::Expr) -> std::result::Result<CE
     Ok(CExpr::Exec(Arc::new(super::expr::ExecExpr {
         maria,
         mysql,
+        session_clock: value,
     })))
 }
 

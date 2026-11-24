@@ -121,7 +121,13 @@ impl PassSession {
             return Ok(Some(p));
         };
         let client_host = ts.principal.client_ip.to_string();
+        self.view_definer_checks(cat, g)?;
         for t in &g.tables {
+            // A table only a view's definer reads is checked as that
+            // definer (above).
+            if !g.views.invoker_reads(t.def.db, &t.def.name) {
+                continue;
+            }
             let db_key = database_key(&t.db_name, ts.lower_case_table_names());
             let target = Target::Object {
                 db_key: &db_key,
@@ -144,6 +150,12 @@ impl PassSession {
             // table whose rows the session's row-level security filters:
             // its predicate's columns are in the text but aren't the
             // client's to be told about, so the table is denied as a whole.
+            // Read only through an invoker's view: the servers name the view.
+            let through = g.views.only_through(t.def.db, &t.def.name);
+            if through.is_some() && first_missing.is_some() {
+                let (db, view) = through.unwrap_or_default();
+                return Err(crate::engine::view::errors::invalid(&db, &view));
+            }
             if !(0..t.def.columns.len()).any(may)
                 || first_missing.is_some_and(|c| t.starred[c] || bound.contains(&t.def.object))
             {
@@ -174,9 +186,97 @@ impl PassSession {
         Ok(Some(p))
     }
 
+    /// The views of `g` that run with their definer's rights
+    /// (`SQL SECURITY DEFINER`): the definer must exist and may read
+    /// every table and view their selects name, as the servers check
+    /// when they open the view.
+    ///
+    /// # Errors
+    /// 1449 for a definer that doesn't exist; 1356 for one without the
+    /// rights.
+    fn view_definer_checks(&self, cat: &TenantCatalog, g: &General) -> Result<()> {
+        let Some(ts) = self.tenant.as_deref() else {
+            return Ok(());
+        };
+        let Some(eng) = catalog::of(cat) else {
+            return Ok(());
+        };
+        let lctn = ts.lower_case_table_names();
+        let mut seen: Vec<(String, String)> = Vec::new();
+        for (i, u) in g.views.uses.iter().enumerate() {
+            let Some(j) = g.views.principal(i) else {
+                continue;
+            };
+            let definer = &g.views.uses[j].view.definer;
+            let owner = &g.views.uses[j];
+            let uid = sprig_auth::TenantAuth::of(cat).and_then(|auth| {
+                auth.accounts(&definer.0)
+                    .iter()
+                    .find(|a| a.row.host.eq_ignore_ascii_case(&definer.1))
+                    .map(|a| a.row.user_id)
+            });
+            let Some(uid) = uid else {
+                // The tenant's own administrator account (no user row)
+                // may read everything.
+                if definer.0 == ts.principal.user && ts.principal.user_id.is_none() {
+                    continue;
+                }
+                return Err(SprigError::standard(
+                    1449,
+                    *b"HY000",
+                    format!(
+                        "The user specified as a definer ('{}'@'{}') does not exist",
+                        definer.0, definer.1
+                    ),
+                ));
+            };
+            if seen.contains(definer) && u.tables.is_empty() {
+                continue;
+            }
+            seen.push(definer.clone());
+            let p = crate::tenant::authz::grants_of(ts.services(), cat, Some(uid));
+            if p.unrestricted() {
+                continue;
+            }
+            let Some(cp) = p.as_any().downcast_ref::<CompiledPrivileges>() else {
+                continue;
+            };
+            for (db, name) in &u.tables {
+                let object = match eng.table(*db, name, lctn).map(AsRef::as_ref) {
+                    Some(Ok(d)) => d.object,
+                    _ => match eng.view(*db, name, lctn).map(AsRef::as_ref) {
+                        Some(Ok(v)) => v.object,
+                        _ => continue,
+                    },
+                };
+                let db_name = cat
+                    .databases
+                    .get(*db)
+                    .map_or_else(String::new, |d| d.name.clone());
+                let db_key = database_key(&db_name, lctn);
+                let target = Target::Object {
+                    db_key: &db_key,
+                    db: *db,
+                    object,
+                };
+                let any_column = cp
+                    .columns
+                    .iter()
+                    .any(|((o, _), a)| *o == object && a.has(Action::Select));
+                if !cp.actions_on(target).has(Action::Select) && !any_column {
+                    return Err(crate::engine::view::errors::invalid(
+                        &owner.db_name,
+                        &owner.view.name,
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Runs `g`: as a statement of the session's engine transaction
     /// (opened now when `autocommit` is off), or in its own.
-    async fn general_run(
+    pub(super) async fn general_run(
         &mut self,
         tenant: u64,
         g: &General,
@@ -466,6 +566,7 @@ impl PassSession {
             results: sv.results,
             checked,
             general: Some(Arc::new(g)),
+            temp_gen: self.eng.temps.generation(),
         }));
         let stmt = self.stmts.insert(st);
         metrics::gauge!("sprig_mysql_prepared_statements", "persona" => self.persona.as_str())
@@ -536,7 +637,8 @@ impl PassSession {
             (None, None) => true,
             _ => false,
         };
-        if !same_privileges || !current(&cat, &g) {
+        let same_temps = self.engine_temp_gen_of(stmt) == Some(self.eng.temps.generation());
+        if !same_privileges || !same_temps || !current(&cat, &g) {
             if !Box::pin(self.reprepare_engine(cx, stmt)).await? {
                 return Err(needs_reprepare());
             }

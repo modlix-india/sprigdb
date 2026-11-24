@@ -142,6 +142,14 @@ pub trait Cluster: Send + Sync + 'static {
         let _ = p;
         None
     }
+    /// The broker that leads one partition's data, when one gateway does:
+    /// Metadata names it as the partition's leader, so produce and fetch go
+    /// where the partition commits (partitions of one tenant may be led by
+    /// different gateways). The default: [`Cluster::tenant_leader`].
+    async fn partition_leader(&self, p: &Principal, stream_id: u64, partition: i32) -> Option<i32> {
+        let _ = (stream_id, partition);
+        self.tenant_leader(p).await
+    }
 }
 
 /// An authenticated connection, as handlers see it.

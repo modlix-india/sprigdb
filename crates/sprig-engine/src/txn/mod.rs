@@ -218,7 +218,10 @@ impl Default for UnitConfig {
         Self {
             early_lock_release: true,
             min_retention_ms: 60_000,
-            max_lock_bytes_per_txn: 64 << 20,
+            // 128 MiB: about 1.5 million row locks on short keys (a row
+            // lock costs its key plus 64 bytes), so a one-million-row
+            // transaction fits.
+            max_lock_bytes_per_txn: 128 << 20,
             max_txn_bytes: 2 << 30,
         }
     }

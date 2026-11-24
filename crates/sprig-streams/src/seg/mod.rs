@@ -78,6 +78,12 @@ pub struct SegConfig {
     pub durability: Durability,
     /// Idle producers' state is dropped after this (ms).
     pub producer_expiry_ms: i64,
+    /// Partition groups per tenant: 0 keeps every partition's appends in
+    /// its tenant's unit; `n` puts partition `p` in the tenant's group unit
+    /// `p % n` ([`group_unit`]), a unit of its own whose leader can sit on
+    /// any replica (replicated engines spread them). A stream log keeps
+    /// the value it first ran with while it holds partitions.
+    pub groups: u32,
 }
 
 impl Default for SegConfig {
@@ -89,6 +95,7 @@ impl Default for SegConfig {
             maintain_every: Duration::from_secs(30),
             durability: Durability::Local,
             producer_expiry_ms: 7 * 24 * 3_600_000,
+            groups: 0,
         }
     }
 }
@@ -186,6 +193,10 @@ struct Manifest {
     epoch: i32,
     dropped: Vec<(u64, u64)>,
     parts: Vec<PartMeta>,
+    /// The partition groups the partitions were written with (absent in
+    /// manifests written before groups: 0).
+    #[serde(default)]
+    groups: Option<u32>,
 }
 
 /// One partition.
@@ -214,6 +225,10 @@ struct ApplyState {
     /// The epoch of a unit whose leadership this node took since the
     /// start (others use the start's epoch).
     unit_epochs: HashMap<u64, i32>,
+    /// Per replicated unit, the newest Raft term among its applied
+    /// entries: a replicated unit's leader epoch is its term, the same on
+    /// every replica.
+    unit_terms: HashMap<u64, i32>,
     /// The epoch this start of the log took.
     epoch_at_start: i32,
     /// Per unit, the index through which a unit snapshot brought the
@@ -232,6 +247,8 @@ struct Inner {
     engine: Engine,
     dir: PathBuf,
     cfg: SegConfig,
+    /// The partition groups in force (see [`SegConfig::groups`]).
+    groups: u32,
     apply: Mutex<ApplyState>,
     parts: RwLock<HashMap<PartKey, Arc<Part>>>,
     /// Outcomes by (unit, index, slot).
@@ -298,6 +315,16 @@ impl sprig_engine::leader::LeaderListener for Leadership {
         if epoch == 0 {
             return;
         }
+        if inner.engine.is_replicated_unit(unit) {
+            // The Raft term: every replica agrees on it, and it only grows,
+            // so a client never sees a new leader's epoch below the old
+            // one's (Kafka clients drop such Metadata as stale).
+            let mut a = lock(&inner.apply);
+            let t = term_epoch(epoch);
+            let e = a.unit_epochs.entry(unit.0).or_insert(t);
+            *e = (*e).max(t);
+            return;
+        }
         {
             let mut a = lock(&inner.apply);
             a.epoch += 1;
@@ -354,6 +381,11 @@ impl sprig_engine::snapshot::UnitSnapshotPart for SnapshotPart {
 }
 
 impl Inner {
+    /// The unit carrying `key`'s appends.
+    fn unit_of_part(&self, key: &PartKey) -> u64 {
+        part_unit(self.groups, key)
+    }
+
     /// Writes `unit`'s partitions as of its index `index` or later.
     fn export_unit(&self, unit: u64, index: u64, out: &mut dyn Write) -> Result<()> {
         // The stream log applies after the store: wait until it has
@@ -382,7 +414,7 @@ impl Inner {
                 .read()
                 .unwrap_or_else(PoisonError::into_inner)
                 .iter()
-                .filter(|(k, _)| unit_of(k.tenant) == unit)
+                .filter(|(k, _)| self.unit_of_part(k) == unit)
                 .map(|(k, p)| (*k, Arc::clone(p)))
                 .collect();
             let mut metas = Vec::with_capacity(parts.len());
@@ -399,7 +431,7 @@ impl Inner {
                 dropped: a
                     .dropped
                     .iter()
-                    .filter(|(t, _)| unit_of(*t) == unit)
+                    .filter(|(t, _)| holds_tenant(unit, *t))
                     .copied()
                     .collect(),
                 parts: metas,
@@ -454,7 +486,7 @@ impl SegLog {
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .keys()
-            .filter(|k| unit_of(k.tenant) == unit)
+            .filter(|k| self.inner.unit_of_part(k) == unit)
             .copied()
             .collect();
         for k in &old {
@@ -510,7 +542,9 @@ impl SegLog {
             a.applied.insert(unit, applied);
             a.floored.insert(unit);
             a.ingested.insert(unit, applied);
-            a.dropped.retain(|(t, _)| unit_of(*t) != unit);
+            if group_of_unit(unit).is_none() {
+                a.dropped.retain(|(t, _)| unit_of(*t) != unit);
+            }
             a.dropped.extend(head.dropped.iter().copied());
             a.dirty = true;
         }
@@ -522,6 +556,49 @@ impl SegLog {
 /// The engine unit holding `tenant`'s keys, and its stream appends.
 fn unit_of(tenant: u64) -> u64 {
     Engine::unit_of_tenant(tenant).0
+}
+
+/// A Raft term as a Kafka leader epoch.
+fn term_epoch(term: u64) -> i32 {
+    i32::try_from(term).unwrap_or(i32::MAX)
+}
+
+/// Marks a partition group's unit: no tenant id or engine unit has it.
+const GROUP_UNIT: u64 = 1 << 62;
+
+/// The unit of `tenant`'s partition group `group` (see
+/// [`SegConfig::groups`]). It holds no keys: its log entries carry only
+/// stream appends.
+#[must_use]
+pub fn group_unit(tenant: u64, group: u32) -> u64 {
+    GROUP_UNIT | (tenant << 8) | u64::from(group & 0xff)
+}
+
+/// The tenant and group of a partition group's unit; `None` for any other
+/// unit.
+#[must_use]
+pub fn group_of_unit(unit: u64) -> Option<(u64, u32)> {
+    (unit & GROUP_UNIT != 0 && unit < (1 << 63)).then(|| {
+        (
+            (unit & !GROUP_UNIT) >> 8,
+            u32::try_from(unit & 0xff).unwrap_or(0),
+        )
+    })
+}
+
+/// Whether `unit` carries appends of `tenant`'s streams (its tenant unit or
+/// one of its partition groups).
+fn holds_tenant(unit: u64, tenant: u64) -> bool {
+    group_of_unit(unit).map_or_else(|| unit_of(tenant) == unit, |(t, _)| t == tenant)
+}
+
+/// The unit carrying `key`'s appends with `groups` partition groups.
+fn part_unit(groups: u32, key: &PartKey) -> u64 {
+    if groups == 0 {
+        unit_of(key.tenant)
+    } else {
+        group_unit(key.tenant, key.partition % groups)
+    }
 }
 
 fn part_dir(root: &Path, k: &PartKey) -> PathBuf {
@@ -582,10 +659,16 @@ impl Inner {
         };
         let mut a = lock(&self.apply);
         let done = a.applied.get(&unit).copied().unwrap_or(0);
+        let replicated = self.engine.is_replicated_unit(sprig_engine::UnitId(unit));
         let mut outs = Vec::new();
         for e in entries {
             if e.index <= done {
                 continue;
+            }
+            if replicated {
+                let t = term_epoch(e.term);
+                let held = a.unit_terms.entry(unit).or_insert(t);
+                *held = (*held).max(t);
             }
             let Ok(notes) = sprig_engine::log::payload::notes(&e.data) else {
                 continue;
@@ -609,6 +692,19 @@ impl Inner {
         // sees the index past its entry must find the entry's outcome, or it
         // reports the append lost though it was appended.
         let appended = !outs.is_empty();
+        // A unit this replica never proposed to (it follows the unit's
+        // leader) gets a floor before its first append here, as a proposer
+        // sets one: the log keeps the unit's entries until a flush has
+        // them in files, and a restart catches up from the floor instead
+        // of missing what wasn't flushed yet.
+        let new_floor = (appended && a.floored.insert(unit)).then(|| {
+            a.applied.entry(unit).or_insert(done);
+            a.dirty = true;
+            entries
+                .iter()
+                .find(|e| e.index > done)
+                .map_or(done, |e| e.index - 1)
+        });
         if appended {
             let mut r = lock(&self.results);
             r.extend(outs);
@@ -618,6 +714,14 @@ impl Inner {
         }
         a.applied.insert(unit, done.max(last.index));
         drop(a);
+        if let Some(f) = new_floor {
+            let u = sprig_engine::UnitId(unit);
+            if self.engine.log_floor_of(u, FLOOR).is_none()
+                && let Err(e) = self.engine.set_log_floors(FLOOR, &[(u, f)])
+            {
+                tracing::warn!(unit, error = %e, "stream log: setting a followed unit's log floor failed");
+            }
+        }
         // Only appends change what waiters look at (high watermarks and
         // outcomes); other entries of the unit (SQL commits) don't wake them.
         if appended {
@@ -625,8 +729,19 @@ impl Inner {
         }
     }
 
-    /// The leader epoch appends of `unit` get.
-    fn unit_epoch(a: &ApplyState, unit: u64) -> i32 {
+    /// The leader epoch appends of `unit` get: on a replicated unit the
+    /// newest Raft term this replica knows (its entries' or, where it
+    /// leads, its own), never this node's own counter; elsewhere the epoch
+    /// this node took when it started or took the unit.
+    fn unit_epoch(&self, a: &ApplyState, unit: u64) -> i32 {
+        if self.engine.is_replicated_unit(sprig_engine::UnitId(unit)) {
+            return a
+                .unit_terms
+                .get(&unit)
+                .copied()
+                .max(a.unit_epochs.get(&unit).copied())
+                .unwrap_or(0);
+        }
         a.unit_epochs
             .get(&unit)
             .copied()
@@ -656,7 +771,7 @@ impl Inner {
         }
         let p = self.part(key);
         let mut st = p.lock();
-        let epoch = st.epoch(Self::unit_epoch(a, unit));
+        let epoch = st.epoch(self.unit_epoch(a, unit));
         let mut bytes = batch.to_vec();
         match st.append(
             &mut bytes,
@@ -692,10 +807,28 @@ impl SegLog {
         let dir = dir.into();
         fs::create_dir_all(&dir).map_err(|e| io_err("create dir", &e))?;
         let manifest = read_manifest(&dir)?;
+        // Partitions stay in the units they were written through: a log
+        // holding partitions keeps its groups whatever the setting says.
+        let groups = match &manifest {
+            Some(m) if !m.parts.is_empty() => {
+                let had = m.groups.unwrap_or(0);
+                if had != cfg.groups {
+                    tracing::warn!(
+                        configured = cfg.groups,
+                        kept = had,
+                        "stream log: partition groups can't change while the log holds \
+                         partitions; keeping the groups it was written with"
+                    );
+                }
+                had
+            }
+            _ => cfg.groups,
+        };
         let (tx, _) = tokio::sync::watch::channel(0u64);
         let inner = Arc::new(Inner {
             engine: engine.clone(),
             dir: dir.clone(),
+            groups,
             cfg,
             apply: Mutex::new(ApplyState::default()),
             parts: RwLock::new(HashMap::new()),
@@ -792,10 +925,32 @@ impl SegLog {
         lock(&self.inner.apply).epoch
     }
 
-    /// The leader epoch of `tenant`'s partitions on this node.
+    /// The leader epoch of `tenant`'s partitions in its own unit on this
+    /// node.
     #[must_use]
     pub fn epoch_of(&self, tenant: u64) -> i32 {
-        Inner::unit_epoch(&lock(&self.inner.apply), unit_of(tenant))
+        self.inner
+            .unit_epoch(&lock(&self.inner.apply), unit_of(tenant))
+    }
+
+    /// The leader epoch of `key`'s partition on this node.
+    #[must_use]
+    pub fn epoch_of_part(&self, key: PartKey) -> i32 {
+        self.inner
+            .unit_epoch(&lock(&self.inner.apply), self.inner.unit_of_part(&key))
+    }
+
+    /// The engine unit carrying `key`'s appends: its tenant's unit, or with
+    /// partition groups its group's unit ([`group_unit`]).
+    #[must_use]
+    pub fn unit_of_part(&self, key: PartKey) -> u64 {
+        self.inner.unit_of_part(&key)
+    }
+
+    /// The partition groups in force (see [`SegConfig::groups`]).
+    #[must_use]
+    pub fn groups(&self) -> u32 {
+        self.inner.groups
     }
 
     /// Makes sure `unit`'s log keeps entries for this log before an append
@@ -825,7 +980,7 @@ impl SegLog {
             .inner
             .policy(key.tenant, key.stream)
             .is_some_and(|p| p.log_append_time);
-        let unit = unit_of(key.tenant);
+        let unit = self.inner.unit_of_part(&key);
         self.ensure_floor(unit)?;
         let mut p = Payload::with_capacity(batch.len() + 48);
         p.note(&note::encode_append(key, now_ms(), lat, batch));
@@ -850,7 +1005,10 @@ impl SegLog {
     /// # Errors
     /// The log refused the entry.
     pub fn propose_many(&self, batches: &[(PartKey, Vec<u8>)]) -> Result<Vec<Pending>> {
-        let mut tenants: Vec<u64> = batches.iter().map(|(k, _)| unit_of(k.tenant)).collect();
+        let mut tenants: Vec<u64> = batches
+            .iter()
+            .map(|(k, _)| self.inner.unit_of_part(k))
+            .collect();
         tenants.sort_unstable();
         tenants.dedup();
         if tenants.len() > 1 {
@@ -861,7 +1019,7 @@ impl SegLog {
         let mut units: Vec<(u64, Payload, u32)> = Vec::new();
         let mut at: Vec<(usize, u32)> = Vec::with_capacity(batches.len());
         for (key, batch) in batches {
-            let unit = unit_of(key.tenant);
+            let unit = self.inner.unit_of_part(key);
             self.ensure_floor(unit)?;
             let lat = self
                 .inner
@@ -908,7 +1066,7 @@ impl SegLog {
         let mut at = Vec::with_capacity(batches.len());
         for (key, batch) in batches {
             let slot = self.append_in(&mut t, *key, batch)?;
-            at.push((unit_of(key.tenant), slot));
+            at.push((self.inner.unit_of_part(key), slot));
         }
         let c = t.commit()?;
         at.into_iter()
@@ -942,9 +1100,17 @@ impl SegLog {
             .inner
             .policy(key.tenant, key.stream)
             .is_some_and(|p| p.log_append_time);
-        self.ensure_floor(unit_of(key.tenant))?;
-        let slot = u32::try_from(txn.notes_for_tenant(key.tenant)).unwrap_or(u32::MAX);
-        txn.add_note_for_tenant(key.tenant, note::encode_append(key, now_ms(), lat, batch))?;
+        let unit = self.inner.unit_of_part(&key);
+        self.ensure_floor(unit)?;
+        // A note "for tenant t" rides on the unit named by `t`'s key bytes:
+        // the tenant's unit, or a partition group's unit by its own id.
+        let owner = if unit == unit_of(key.tenant) {
+            key.tenant
+        } else {
+            unit
+        };
+        let slot = u32::try_from(txn.notes_for_tenant(owner)).unwrap_or(u32::MAX);
+        txn.add_note_for_tenant(owner, note::encode_append(key, now_ms(), lat, batch))?;
         Ok(slot)
     }
 
@@ -998,7 +1164,7 @@ impl SegLog {
     /// A partition's bounds (zeros for one never written).
     #[must_use]
     pub fn bounds(&self, key: PartKey) -> Bounds {
-        let epoch = self.epoch_of(key.tenant);
+        let epoch = self.epoch_of_part(key);
         match self.inner.existing(&key) {
             None => Bounds {
                 log_start: 0,
@@ -1028,7 +1194,7 @@ impl SegLog {
         offset: i64,
         max_bytes: usize,
     ) -> std::result::Result<(Bounds, Vec<u8>), std::result::Result<OutOfRange, SprigError>> {
-        let epoch = self.epoch_of(key.tenant);
+        let epoch = self.epoch_of_part(key);
         let Some(p) = self.inner.existing(&key) else {
             let b = Bounds {
                 log_start: 0,
@@ -1164,7 +1330,7 @@ impl SegLog {
     /// The largest epoch at most `epoch` and where its records end.
     #[must_use]
     pub fn epoch_end(&self, key: PartKey, epoch: i32) -> (i32, i64) {
-        let current = self.epoch_of(key.tenant);
+        let current = self.epoch_of_part(key);
         match self.inner.existing(&key) {
             None => (current, 0),
             Some(p) => {
@@ -1356,6 +1522,7 @@ impl SegLog {
                 epoch: a.epoch,
                 dropped: a.dropped.iter().copied().collect(),
                 parts: metas,
+                groups: Some(self.inner.groups),
             };
             (m, files, dirs)
         };

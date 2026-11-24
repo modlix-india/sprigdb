@@ -338,11 +338,37 @@ const COLS: &[(&str, &str, u16, u32, u8, u16)] = &[
         0xfd,
         0x1000,
     ),
+    ("SCHEMATA", "CATALOG_NAME", 224, 2048, 0xfd, 0x1001),
+    ("SCHEMATA", "SCHEMA_NAME", 224, 256, 0xfd, 0x1001),
+    (
+        "SCHEMATA",
+        "DEFAULT_CHARACTER_SET_NAME",
+        224,
+        128,
+        0xfd,
+        0x1001,
+    ),
+    ("SCHEMATA", "DEFAULT_COLLATION_NAME", 224, 256, 0xfd, 0x1001),
+    ("SCHEMATA", "SQL_PATH", 224, 2048, 0xfd, 0x1000),
+    ("SCHEMATA", "SCHEMA_COMMENT", 224, 4096, 0xfd, 0x1001),
+    ("VIEWS", "TABLE_CATALOG", 224, 2048, 0xfd, 0x1001),
+    ("VIEWS", "TABLE_SCHEMA", 224, 256, 0xfd, 0x1001),
+    ("VIEWS", "TABLE_NAME", 224, 256, 0xfd, 0x1001),
+    ("VIEWS", "VIEW_DEFINITION", 224, 786_420, 0xfc, 0x1011),
+    ("VIEWS", "CHECK_OPTION", 224, 32, 0xfd, 0x1001),
+    ("VIEWS", "IS_UPDATABLE", 224, 12, 0xfd, 0x1001),
+    ("VIEWS", "DEFINER", 224, 1536, 0xfd, 0x1001),
+    ("VIEWS", "SECURITY_TYPE", 224, 28, 0xfd, 0x1001),
+    ("VIEWS", "CHARACTER_SET_CLIENT", 224, 128, 0xfd, 0x1001),
+    ("VIEWS", "COLLATION_CONNECTION", 224, 256, 0xfd, 0x1001),
+    ("VIEWS", "ALGORITHM", 224, 40, 0xfd, 0x1001),
 ];
 
 /// The tables built here.
-pub(crate) const TABLES: [&str; 7] = [
+pub(crate) const TABLES: [&str; 9] = [
+    "SCHEMATA",
     "TABLES",
+    "VIEWS",
     "COLUMNS",
     "STATISTICS",
     "TABLE_CONSTRAINTS",
@@ -960,6 +986,96 @@ fn add_table(db: &mut MemDb, schema: &str, def: &Def, next: Option<u64>) {
     }
 }
 
+/// A database's row in `SCHEMATA`, under its physical name (the name
+/// layer's query reads it so, naming it with its logical name).
+fn add_schema(db: &mut MemDb, schema: &str, cs: &str, coll: &str) {
+    let mut t = HashMap::new();
+    t.insert("CATALOG_NAME", s("def"));
+    t.insert("SCHEMA_NAME", s(schema));
+    t.insert("DEFAULT_CHARACTER_SET_NAME", s(cs));
+    t.insert("DEFAULT_COLLATION_NAME", s(coll));
+    t.insert("SQL_PATH", V::N);
+    t.insert("SCHEMA_COMMENT", s(""));
+    if let Err(e) = db.insert("SCHEMATA", row_of("SCHEMATA", &t)) {
+        tracing::warn!(table = "SCHEMATA", error = %e.message, "information_schema: a row doesn't fit its table");
+    }
+}
+
+/// A sequence's row in `TABLES` (type `SEQUENCE`, one row, as MariaDB
+/// lists the table it keeps a sequence in).
+fn add_sequence(db: &mut MemDb, schema: &str, name: &str) {
+    let mut t = HashMap::new();
+    t.insert("TABLE_CATALOG", s("def"));
+    t.insert("TABLE_SCHEMA", s(schema));
+    t.insert("TABLE_NAME", s(name.to_owned()));
+    t.insert("TABLE_TYPE", s("SEQUENCE"));
+    t.insert("ENGINE", s("InnoDB"));
+    t.insert("TABLE_ROWS", V::U(1));
+    if let Err(e) = db.insert("TABLES", row_of("TABLES", &t)) {
+        tracing::warn!(table = "TABLES", error = %e.message, "information_schema: a row doesn't fit its table");
+    }
+}
+
+/// A view's rows: `TABLES` (type `VIEW`) and `VIEWS`.
+fn add_view(db: &mut MemDb, schema: &str, v: &super::view::ViewDef, mysql: bool) {
+    let mut put = |t: &str, vals: HashMap<&str, V>| {
+        if let Err(e) = db.insert(t, row_of(t, &vals)) {
+            tracing::warn!(table = t, error = %e.message, "information_schema: a row doesn't fit its table");
+        }
+    };
+    let mut base = HashMap::new();
+    base.insert("TABLE_CATALOG", s("def"));
+    base.insert("TABLE_SCHEMA", s(schema));
+    base.insert("TABLE_NAME", s(v.name.clone()));
+    let mut t = HashMap::new();
+    for (k, x) in &base {
+        if let V::S(x) = x {
+            t.insert(*k, s(x.clone()));
+        }
+    }
+    t.insert("TABLE_TYPE", s("VIEW"));
+    t.insert("TABLE_COMMENT", s("VIEW"));
+    put("TABLES", t);
+    // The select with every table and column under its database's name
+    // (the stored select names every column with its table already).
+    let cols = |_: &str, _: &str| -> Option<Vec<String>> { None };
+    let definition = super::view::Printer::new(mysql, "", &v.body, &cols).query(&v.query, None);
+    let mut w = base;
+    w.insert("VIEW_DEFINITION", s(definition));
+    w.insert(
+        "CHECK_OPTION",
+        s(match v.check {
+            None => "NONE",
+            Some(super::view::CheckOption::Cascaded) => "CASCADED",
+            Some(super::view::CheckOption::Local) => "LOCAL",
+        }),
+    );
+    w.insert(
+        "IS_UPDATABLE",
+        s(if super::view::updatable(&v.query, v.algorithm, mysql) {
+            "YES"
+        } else {
+            "NO"
+        }),
+    );
+    w.insert("DEFINER", s(v.definer_text()));
+    w.insert(
+        "SECURITY_TYPE",
+        s(if v.invoker { "INVOKER" } else { "DEFINER" }),
+    );
+    w.insert("CHARACTER_SET_CLIENT", s("utf8mb4"));
+    w.insert(
+        "COLLATION_CONNECTION",
+        s(if mysql {
+            "utf8mb4_0900_ai_ci"
+        } else {
+            "utf8mb4_uca1400_ai_ci"
+        }),
+    );
+    w.insert("ALGORITHM", s(v.algorithm.word()));
+    put("VIEWS", w);
+}
+
 /// The physical schemas of tenant `tenant` that `sql` names, with their
 /// databases.
 fn schemas_named(sql: &str, tenant: u64) -> Vec<(String, DbId)> {
@@ -1256,6 +1372,43 @@ fn try_answer(sql: &str, src: &Source<'_>, mysql: bool) -> Result<Answer, String
                 continue;
             };
             add_table(&mut db, &schema, &def, src.counters.get(&o.0).copied());
+        }
+        let mut views: Vec<_> = src
+            .eng
+            .views
+            .iter()
+            .filter(|((d, _), _)| *d == dbid)
+            .filter_map(|(_, v)| v.as_ref().as_ref().ok())
+            .collect();
+        views.sort_by(|a, b| a.name.cmp(&b.name));
+        for v in views {
+            add_view(&mut db, &schema, v, mysql);
+        }
+        let (cs, coll) = src
+            .eng
+            .charsets
+            .get(&dbid)
+            .filter(|(cs, co)| !cs.is_empty() && !co.is_empty())
+            .map_or_else(
+                || {
+                    (
+                        "utf8mb4".to_owned(),
+                        define::default_collation("utf8mb4").to_owned(),
+                    )
+                },
+                Clone::clone,
+            );
+        add_schema(&mut db, &schema, &cs, &coll);
+        let mut seqs: Vec<&String> = src
+            .eng
+            .seq_names
+            .keys()
+            .filter(|(d, _)| *d == dbid)
+            .map(|(_, n)| n)
+            .collect();
+        seqs.sort();
+        for n in seqs {
+            add_sequence(&mut db, &schema, n);
         }
     }
     // The name layer wrote the statement for MariaDB, whichever port the

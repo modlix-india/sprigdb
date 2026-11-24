@@ -48,6 +48,10 @@ pub(crate) struct Outcome {
     pub affected: u64,
     /// The first generated `AUTO_INCREMENT` value, or 0.
     pub last_insert_id: u64,
+    /// The id the OK packet reports when none was generated (an `INSERT
+    /// ... SELECT` reports its last row's), leaving `LAST_INSERT_ID()` as
+    /// it was.
+    pub reported_id: u64,
     /// The OK packet's info text.
     pub info: Option<String>,
     /// The scan used no index (`NO_INDEX_USED`).
@@ -479,6 +483,11 @@ pub(crate) fn duplicate(def: &TableDef, cols: &[usize], row: &[Datum], key: &str
 /// message text this is, so a client sees the same error on either kind
 /// of database).
 fn check_new_row(plan: &Plan, row: &[Datum], a: &Args<'_>) -> Result<()> {
+    if let Some((c, db, view, mysql)) = &plan.view_check
+        && row::truth(&expr::eval(c, row, a)?) != Some(true)
+    {
+        return Err(super::view::check_failed(db, view, *mysql));
+    }
     let Some(c) = &plan.check else {
         return Ok(());
     };
@@ -574,7 +583,7 @@ fn store_cx<'a>(plan: &'a Plan, env: Env, conds: &'a mut Vec<Condition>) -> Stor
 
 /// The count an `UPDATE`'s and a multi-row `INSERT`'s info text reports
 /// as "Warnings": every condition, notes included, as on the servers.
-fn warning_count(conds: &[Condition]) -> usize {
+pub(crate) fn warning_count(conds: &[Condition]) -> usize {
     conds.len()
 }
 
@@ -785,7 +794,9 @@ impl Engine {
                 o.rows = rows;
                 o
             }
-            Op::Insert { cols, rows } => self.insert(sp, tx, plan, a, cols, rows).await?,
+            Op::Insert { cols, rows, on_dup } => {
+                Box::pin(self.insert(sp, tx, plan, a, cols, rows, on_dup, found_rows)).await?
+            }
             Op::Update { sets } => {
                 let mut o = Outcome::default();
                 let matched = locked_rows(
@@ -919,14 +930,40 @@ impl Engine {
         a: &Args<'_>,
         cols: &[usize],
         rows: &[Vec<Option<expr::CExpr>>],
+        on_dup: &super::plan::OnDup,
+        found_rows: bool,
     ) -> Result<Outcome> {
+        use super::plan::OnDup;
         let def = &*plan.table;
         let mut o = Outcome::default();
+        // `INSERT IGNORE`: what strict mode refuses is a warning.
+        let mut env = a.env;
+        if matches!(on_dup, OnDup::Ignore) {
+            env.strict = false;
+        }
+        let ncols = def.columns.len();
+        let mut dups = 0u64;
         let mut conds = Vec::new();
+        // MySQL 8.4 deprecates `VALUES(c)` in `ON DUPLICATE KEY UPDATE`.
+        if let OnDup::Update(_, uses) = on_dup
+            && env.mysql
+        {
+            for _ in 0..*uses {
+                conds.push(Condition {
+                    level: Level::Warning,
+                    code: 1287,
+                    message: "'VALUES function' is deprecated and will be removed in a future \
+                              release. Please use an alias (INSERT INTO ... VALUES (...) AS \
+                              alias) and replace VALUES(col) in the ON DUPLICATE KEY UPDATE \
+                              clause with alias.col instead"
+                        .into(),
+                });
+            }
+        }
         let mut pace = Pace::default();
         for (ri, exprs) in rows.iter().enumerate() {
             pace.add(1).await;
-            let mut cx = store_cx(plan, a.env, &mut conds);
+            let mut cx = store_cx(plan, env, &mut conds);
             cx.row = ri + 1;
             // What the statement gives each column: a value, or nothing
             // (the column isn't listed, or its value is `DEFAULT`).
@@ -990,7 +1027,7 @@ impl Engine {
                         None if c.nullable => Datum::Null,
                         None => {
                             let m = format!("Field '{}' doesn't have a default value", c.name);
-                            if a.env.strict {
+                            if env.strict {
                                 return Err(SprigError::standard(1364, *b"HY000", m));
                             }
                             cx.conds.push(Condition {
@@ -1022,6 +1059,61 @@ impl Engine {
             if def.hidden {
                 row.push(Datum::UInt(self.next_rowid(sp)?));
             }
+            // A key another row has: what the statement says to do.
+            if !matches!(on_dup, OnDup::Error) {
+                let mut done = false;
+                while let Some((ckey, old, kcols, kname)) = conflict(sp, def, tx, &row).await? {
+                    match on_dup {
+                        OnDup::Ignore => {
+                            // MySQL names the key with its table.
+                            let kname = if env.mysql {
+                                format!("{}.{kname}", def.name)
+                            } else {
+                                kname
+                            };
+                            let e = duplicate(def, &kcols, &row, &kname);
+                            dups += 1;
+                            cx.conds.push(Condition {
+                                level: Level::Warning,
+                                code: 1062,
+                                message: e.message,
+                            });
+                            done = true;
+                        }
+                        OnDup::Replace => {
+                            delete_row(sp, def, tx, ckey, &old).await?;
+                            o.affected += 1;
+                            dups += 1;
+                            continue;
+                        }
+                        OnDup::Update(sets, _) => {
+                            let mut both: Vec<Datum> = old[..ncols.min(old.len())].to_vec();
+                            both.extend_from_slice(&row[..ncols.min(row.len())]);
+                            let mut new = old.clone();
+                            for (ci, e) in sets {
+                                let v = expr::eval(e, &both, a)?;
+                                new[*ci] = assign::store(&mut cx, &def.columns[*ci], v)?;
+                            }
+                            if new == old {
+                                if found_rows {
+                                    o.affected += 1;
+                                }
+                            } else {
+                                check_constraints(plan, &new, a)?;
+                                replace_row(sp, def, tx, ckey, &old, &new).await?;
+                                o.affected += 2;
+                            }
+                            dups += 1;
+                            done = true;
+                        }
+                        OnDup::Error => {}
+                    }
+                    break;
+                }
+                if done {
+                    continue;
+                }
+            }
             insert_row(sp, def, tx, &row).await?;
             if let Some(g) = plan.fks.as_deref().filter(|_| !a.env.no_fk_checks) {
                 self.fk_parents(sp.tenant, tx, g, def.object, &row, None)
@@ -1031,7 +1123,7 @@ impl Engine {
         }
         if rows.len() > 1 {
             o.info = Some(format!(
-                "Records: {}  Duplicates: 0  Warnings: {}",
+                "Records: {}  Duplicates: {dups}  Warnings: {}",
                 rows.len(),
                 warning_count(&conds)
             ));
@@ -1069,6 +1161,49 @@ fn now_value(c: &Column, a: &Args<'_>) -> Result<Datum> {
             "CURRENT_TIMESTAMP as this column's value",
         )),
     }
+}
+
+/// The row whose primary or unique key new row `row` would take, locked:
+/// its key, its values, and the key's columns and name. `None` when the
+/// row's keys are free.
+async fn conflict(
+    sp: &Space,
+    def: &TableDef,
+    tx: &mut Tx,
+    row: &[Datum],
+) -> Result<Option<(Bytes, Vec<Datum>, Vec<usize>, String)>> {
+    if !def.hidden {
+        let key = keys::row_key_of(sp, def, row)
+            .ok_or_else(|| SprigError::internal("engine: a key value of the wrong type"))?;
+        let key = Bytes::from(key);
+        if let Some(Some(raw)) = tx.lock_key(&key, LockMode::Exclusive).await? {
+            let old = row::decode(def, sp, &key, &raw)?;
+            return Ok(Some((key, old, def.pk.clone(), def.pk_name.clone())));
+        }
+    }
+    for (ix, x) in def.indexes.iter().enumerate() {
+        if !x.unique || x.cols.iter().any(|&c| row[c].is_null()) {
+            continue;
+        }
+        let Some((k, _)) = keys::index_entry(sp, def, ix, row) else {
+            continue;
+        };
+        let k = Bytes::from(k);
+        let Some(Some(v)) = tx.lock_key(&k, LockMode::Exclusive).await? else {
+            continue;
+        };
+        let Some(t) = keys::entry_target(sp, def, &k, &v) else {
+            continue;
+        };
+        let mut rk = sp.rows();
+        rk.extend_from_slice(t);
+        let rk = Bytes::from(rk);
+        if let Some(Some(raw)) = tx.lock_key(&rk, LockMode::Exclusive).await? {
+            let old = row::decode(def, sp, &rk, &raw)?;
+            return Ok(Some((rk, old, x.cols.clone(), x.name.clone())));
+        }
+    }
+    Ok(None)
 }
 
 async fn insert_row(sp: &Space, def: &TableDef, tx: &mut Tx, row: &[Datum]) -> Result<()> {

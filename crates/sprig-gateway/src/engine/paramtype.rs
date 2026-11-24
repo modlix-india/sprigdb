@@ -171,8 +171,7 @@ mod tests {
     use super::*;
 
     fn types(sql: &str, defs: &[(&str, &TableDef)]) -> Vec<Option<ColType>> {
-        use sqlparser::dialect::MySqlDialect;
-        let stmt = sqlparser::parser::Parser::parse_sql(&MySqlDialect {}, sql)
+        let stmt = sqlparser::parser::Parser::parse_sql(&sprig_plan::dialect::SprigMySql, sql)
             .unwrap()
             .pop()
             .unwrap();

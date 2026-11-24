@@ -53,6 +53,15 @@ pub const KIND_EXPIRY: u8 = b'X';
 pub const KIND_COUNTER: u8 = b'C';
 /// Sorted-set score index.
 pub const KIND_ZSCORE: u8 = b'Z';
+/// The tenant's Lua scripts and functions (database 0 only). It sorts
+/// before every kind `FLUSHDB` deletes: scripts and functions outlive a
+/// flush, as in Redis.
+pub const KIND_SCRIPT: u8 = b'A';
+/// The script cache's index under [`KIND_SCRIPT`]: `str(sha1) -> body`.
+pub const SCRIPT_CACHE: u16 = 0;
+/// The function libraries' index under [`KIND_SCRIPT`]: one entry holding
+/// every library.
+pub const SCRIPT_FUNCTIONS: u16 = 1;
 
 /// The scan index's index number under [`KIND_META`].
 pub const SCAN_INDEX: u16 = 1;
@@ -175,6 +184,26 @@ impl Space {
         self.put_prefix(&mut b, KIND_COUNTER);
         b.put_u8(COUNTER_UID);
         b.freeze()
+    }
+
+    /// Entry `name` of script index `index` ([`SCRIPT_CACHE`],
+    /// [`SCRIPT_FUNCTIONS`]).
+    #[must_use]
+    pub fn script_entry(&self, index: u16, name: &[u8]) -> Bytes {
+        let mut b = BytesMut::with_capacity(21 + name.len());
+        self.put_prefix_at(&mut b, KIND_SCRIPT, index);
+        put_str(&mut b, name);
+        b.freeze()
+    }
+
+    /// Every entry of script index `index`: `[start, end)`.
+    #[must_use]
+    pub fn script_range(&self, index: u16) -> (Vec<u8>, Vec<u8>) {
+        let mut lo = BytesMut::with_capacity(19);
+        self.put_prefix_at(&mut lo, KIND_SCRIPT, index);
+        let mut hi = BytesMut::with_capacity(19);
+        self.put_prefix_at(&mut hi, KIND_SCRIPT, index + 1);
+        (lo.to_vec(), hi.to_vec())
     }
 
     /// The key after every key of `kind` in this database.

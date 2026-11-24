@@ -9,7 +9,7 @@ source: the settings registry (sprig-settings)
 
 Every setting SprigDB declares, with its default, the scopes that may set it, hard bounds and when a change applies. Settings resolve from the most specific scope: object, database, tenant and its ancestors, cluster, data center, global, then the built-in default. Read them with `SHOW SPRIG SETTINGS`, change them with `ALTER TENANT|DATABASE|TABLE … SPRIG SET (key = value)` or `sprigctl settings`.
 
-757 settings in 61 groups.
+763 settings in 62 groups.
 
 ## `advisor`
 
@@ -271,6 +271,17 @@ Every setting SprigDB declares, with its default, the scopes that may set it, ha
 | `backend.net_write_timeout_seconds` | int | `600` | cluster, dc, global | 1 to 86400 | live | Tolerates slow clients |
 | `backend.pool_mode` | text | `transaction` | cluster, dc, global | transaction, session | live | transaction or session |
 | `backend.prepared_budget_pct` | int | `50` | cluster, dc, global | 1 to 100 | live | Share of max_prepared_stmt_count for all gateways |
+
+## `backup`
+
+| Key | Type | Default | Scopes | Bounds | Applies | Description |
+|---|---|---|---|---|---|---|
+| `backup.daily_hour` | int | `2` | dc, global (operator only) | 0 to 23 | live | The hour (UTC) after which each day's backups are taken |
+| `backup.daily_keep_days` | int | `30` | tenant, dc, global (operator only) | 0 to 3650 | live | Daily backups are kept this many days |
+| `backup.enabled` | bool | `true` | tenant, dc, global (operator only) | - | live | Back up the tenant's engine data: a daily backup and the continuous change-log archive |
+| `backup.location` | text | `` | tenant, dc, global (operator only) | - | live | Where backups go: an absolute path, file:///path, or s3://bucket/prefix?endpoint=URL&region=R (empty: <engine dir>/backups) |
+| `backup.pitr_days` | int | `7` | tenant, dc, global (operator only) | 0 to 3650 | live | Any moment in this many past days can be restored |
+| `backup.rate_mb_per_sec` | int | `32` | dc, global (operator only) | 0 to 100000 | live | How fast a backup reads the engine, MiB per second, so live work keeps its latency (0: no limit) |
 
 ## `balancer`
 
@@ -764,7 +775,7 @@ Every setting SprigDB declares, with its default, the scopes that may set it, ha
 | `queue.owner_move_cooldown_seconds` | int | `300` | dc, global | 0 to 86400 | live | Least time between two moves of one queue's owner |
 | `queue.takeover_grace_ms` | int | `2000` | dc, global | 0 to 60000 | live | Re-attachment window after an owner takeover, in ms |
 | `queue.vhost_idle_close_seconds` | int | `300` | dc, global | 0 to 86400 | live | Close a gateway's idle vhost after this many seconds without connections, consumers or work (0 = never) |
-| `queue.write_batch_max_rows` | int | `500` | dc, global | 1 to 100000 | live | Rows per queue owner write batch |
+| `queue.write_batch_max_rows` | int | `4000` | dc, global | 1 to 100000 | live | Rows per queue owner write batch |
 
 ## `reads`
 

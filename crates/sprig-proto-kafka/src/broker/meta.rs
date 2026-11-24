@@ -59,8 +59,7 @@ impl Broker {
         match wanted {
             None => {
                 for t in &all {
-                    resp.topics
-                        .push(self.topic_metadata(s, t, &brokers, lead).await);
+                    resp.topics.push(self.topic_metadata(s, t, &brokers).await);
                 }
             }
             Some(list) => {
@@ -71,8 +70,7 @@ impl Broker {
                         (None, true) => None,
                     };
                     if let Some(t) = found {
-                        resp.topics
-                            .push(self.topic_metadata(s, t, &brokers, lead).await);
+                        resp.topics.push(self.topic_metadata(s, t, &brokers).await);
                     } else {
                         let code = match &want.name {
                             Some(n) if !legal_topic_name(n) => err::INVALID_TOPIC_EXCEPTION,
@@ -106,11 +104,14 @@ impl Broker {
         s: &Session,
         t: &TopicInfo,
         brokers: &[BrokerNode],
-        lead: Option<i32>,
     ) -> metadata_response::MetadataResponseTopic {
         let mut partitions = Vec::with_capacity(usize::try_from(t.partitions).unwrap_or(0));
-        let lead = lead.and_then(|l| brokers.iter().find(|b| b.node_id == l));
         for p in 0..t.partitions {
+            let lead = self
+                .cluster
+                .partition_leader(&s.principal, t.stream_id, p)
+                .await
+                .and_then(|l| brokers.iter().find(|b| b.node_id == l));
             let leader = lead.or_else(|| rendezvous(&partition_key(t.stream_id, p), brokers));
             let epoch = match &self.data {
                 Some(d) => d.leader_epoch(&s.principal, t.stream_id, p).await,

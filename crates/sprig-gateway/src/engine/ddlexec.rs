@@ -70,6 +70,9 @@ pub(crate) struct Hook {
     /// The definitions this statement produced, latest last: (schema,
     /// table, its text; `None` for a table it removed).
     produced: Mutex<Vec<(SchemaName, String, Option<String>)>>,
+    /// Sequences whose stored state the statement sets once its change is
+    /// published (`None`: back to the start).
+    seq_resets: Mutex<Vec<(ObjectId, Option<super::sequence::Record>)>>,
     /// The gateway's services: the newest catalog, for the check that a
     /// change starts from the table's current definition.
     svc: Option<Arc<crate::tenant::TenantServices>>,
@@ -103,6 +106,7 @@ impl Hook {
             staged: Mutex::new(Vec::new()),
             dropped: Mutex::new(Vec::new()),
             produced: Mutex::new(Vec::new()),
+            seq_resets: Mutex::new(Vec::new()),
             svc: None,
         }
     }
@@ -582,6 +586,19 @@ impl Hook {
             std::mem::take(&mut *self.staged.lock().unwrap_or_else(PoisonError::into_inner));
         let dropped =
             std::mem::take(&mut *self.dropped.lock().unwrap_or_else(PoisonError::into_inner));
+        let resets = std::mem::take(
+            &mut *self
+                .seq_resets
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
+        if matches!(outcome, Outcome::Published(_)) {
+            for (object, rec) in resets {
+                if let Err(e) = self.eng.seq_store(self.tenant.0, object, rec) {
+                    tracing::warn!(tenant = %self.tenant, error = %e, "a sequence's stored state wasn't set");
+                }
+            }
+        }
         let mut report = Report::default();
         // Every change of a definition reports its rows (`Records: 0` when
         // none were copied).
@@ -807,6 +824,226 @@ impl EngineDdl<'_> {
 }
 
 /// 1146 for a table that isn't there.
+impl EngineDdl<'_> {
+    /// `CREATE VIEW` / `ALTER VIEW` of `name` in `schema`: its select is
+    /// bound and described against the session's catalog, and the text the
+    /// servers would store is produced (`crate::engine::view`).
+    #[allow(clippy::too_many_lines)] // read, bind, describe, check, print
+    fn view(&self, stmt: &PhysicalDdl, name: &str) -> Result<()> {
+        use super::general::{self, Seed};
+        use super::plan::{BindCtx, CatalogNames, Names as _, physical_db};
+        use super::view::{self, Printer, errors};
+        let Some(db) = stmt.schema.db() else {
+            return Err(SprigError::internal(
+                "engine: CREATE VIEW outside a database",
+            ));
+        };
+        let Some(eng) = catalog::of(&self.hook.cat) else {
+            return Err(SprigError::internal("engine: no engine catalog"));
+        };
+        let mysql = self.hook.sess.env.mysql;
+        let mut h = view::parse_header(&stmt.sql)?;
+        name.clone_into(&mut h.name);
+        // A variable or parameter can't be part of a view.
+        if let Ok(toks) = define::lex::lex(&h.body)
+            && toks.iter().any(|t| {
+                t.op("?") || matches!(&t.t, define::lex::T::Var(v) if !v.starts_with("@@"))
+            })
+        {
+            return Err(errors::variable());
+        }
+        let names = CatalogNames {
+            cat: &self.hook.cat,
+            eng,
+            lower_case: self.hook.lctn,
+        };
+        let db_name = names.db_name(db);
+        // Physical database names, as the session's rewrite wrote them, in
+        // their logical form.
+        let mut body = h.body.clone();
+        let tenant = self.hook.tenant;
+        let prefix = format!("t{tenant}_d");
+        if body.contains(&prefix) {
+            let mut q = view::parse_query(&body)?;
+            let _ = sqlparser::ast::visit_relations_mut(&mut q, |n| {
+                if n.0.len() == 2
+                    && let Some(sqlparser::ast::ObjectNamePart::Identifier(i)) = n.0.first_mut()
+                    && let Some(d) = physical_db(tenant, &i.value)
+                {
+                    *i = sqlparser::ast::Ident::with_quote('`', names.db_name(d));
+                }
+                std::ops::ControlFlow::<()>::Continue(())
+            });
+            let _ = sqlparser::ast::visit_expressions_mut(&mut q, |e| {
+                if let sqlparser::ast::Expr::CompoundIdentifier(p) = e
+                    && p.len() == 3
+                    && let Some(d) = physical_db(tenant, &p[0].value)
+                {
+                    p[0] = sqlparser::ast::Ident::with_quote('`', names.db_name(d));
+                }
+                std::ops::ControlFlow::<()>::Continue(())
+            });
+            body = q.to_string();
+        }
+        let query = view::parse_query(&body)?;
+        let cx = BindCtx {
+            tenant,
+            names: &names,
+            current: Some(db),
+            backslash: true,
+        };
+        let stmt_q = sqlparser::ast::Statement::Query(Box::new(query.clone()));
+        let described = match general::bind_view(&cx, &stmt_q, Some(&body))? {
+            Some(g) => {
+                let seed = Seed::from_vars(mysql, &self.hook.sess.env, |_| None);
+                super::Engine::general_describe(&g, &seed)?
+                    .into_iter()
+                    .map(|c| c.name)
+                    .collect::<Vec<_>>()
+            }
+            None => view::output_names(&query, &body),
+        };
+        let columns = match &h.columns {
+            Some(c) if c.len() != described.len() => return Err(errors::column_counts(mysql)),
+            Some(c) => c.clone(),
+            None => described.clone(),
+        };
+        for (i, c) in columns.iter().enumerate() {
+            if columns[..i].iter().any(|x| x.eq_ignore_ascii_case(c)) {
+                return Err(errors::duplicate_column(c));
+            }
+        }
+        let algorithm = h.algorithm.unwrap_or(view::Algorithm::Undefined);
+        if h.check.is_some() && !view::updatable(&query, algorithm, mysql) {
+            return Err(errors::check_on_non_updatable(&db_name, name, mysql));
+        }
+        let lctn = self.hook.lctn;
+        let cols = |d: &str, t: &str| -> Option<Vec<String>> {
+            let d = names.db_by_name(d)?;
+            if let Some(p) = eng.table(d, t, lctn)
+                && let Ok(def) = p.as_ref()
+            {
+                return Some(
+                    def.columns
+                        .iter()
+                        .filter(|c| !c.invisible)
+                        .map(|c| c.name.clone())
+                        .collect(),
+                );
+            }
+            match eng.view(d, t, lctn).map(AsRef::as_ref) {
+                Some(Ok(v)) => Some(v.columns.clone()),
+                _ => None,
+            }
+        };
+        let top: &[String] = if mysql { &described } else { &columns };
+        let printed = Printer::new(mysql, &db_name, &body, &cols).query(&query, Some(top));
+        let definer = h
+            .definer
+            .clone()
+            .unwrap_or_else(|| self.hook.sess.account.clone());
+        let text = view::render(&h, &definer, mysql, &printed);
+        // The stored text must read back.
+        view::load(ObjectId(0), db, &db_name, &text)?;
+        self.hook.produce(stmt.schema, name, Some(text));
+        Ok(())
+    }
+}
+
+impl Hook {
+    /// The text of sequence `name` of `schema`, as this statement left it.
+    fn seq_text(&self, schema: &SchemaName, name: &str) -> Option<String> {
+        let same = |a: &str, b: &str| {
+            if self.lctn {
+                a.eq_ignore_ascii_case(b)
+            } else {
+                a == b
+            }
+        };
+        let produced = self.produced.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some((_, _, t)) = produced
+            .iter()
+            .rev()
+            .find(|(s, n, _)| s == schema && same(n, name))
+        {
+            return t.clone();
+        }
+        drop(produced);
+        let db = schema.db()?;
+        catalog::of(&self.cat)?
+            .sequence(db, name, self.lctn)
+            .map(|e| e.text.clone())
+    }
+}
+
+impl EngineDdl<'_> {
+    /// `CREATE SEQUENCE` (`creating`) or `ALTER SEQUENCE` of `name` in
+    /// `schema`: the options read, MariaDB's checks made, and the text
+    /// `SHOW CREATE SEQUENCE` shows produced.
+    fn sequence(&self, stmt: &PhysicalDdl, name: &str, creating: bool) -> Result<()> {
+        use super::sequence::{self as seq, Record};
+        let (Some(db), Some(eng)) = (stmt.schema.db(), catalog::of(&self.hook.cat)) else {
+            return Err(SprigError::internal(
+                "engine: a sequence outside a database",
+            ));
+        };
+        let db_name = self
+            .hook
+            .cat
+            .databases
+            .get(db)
+            .map_or_else(String::new, |d| d.name.clone());
+        let st = seq::parse(&stmt.sql)?;
+        let existing = eng.sequence(db, name, self.hook.lctn);
+        let def = if creating {
+            if st.options.restart.is_some() {
+                return Err(SprigError::standard(
+                    1064,
+                    *b"42000",
+                    "You have an error in your SQL syntax; RESTART belongs to ALTER SEQUENCE",
+                ));
+            }
+            let d = seq::define(&db_name, name, &st.options)?;
+            // `CREATE OR REPLACE` of a sequence: its values start over.
+            if let Some(e) = existing {
+                self.hook
+                    .seq_resets
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push((e.object, None));
+            }
+            d
+        } else {
+            let Some(e) = existing else {
+                return Err(SprigError::standard(
+                    4091,
+                    *b"42S02",
+                    format!("Unknown SEQUENCE: '{name}'"),
+                ));
+            };
+            let old = e.def.as_ref().map_err(|w| not_on_engine(w))?;
+            let d = seq::alter(&db_name, old, &st.options)?;
+            if let Some(r) = st.options.restart {
+                self.hook
+                    .seq_resets
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push((
+                        e.object,
+                        Some(Record {
+                            next: r.unwrap_or(d.start),
+                            round: 0,
+                        }),
+                    ));
+            }
+            d
+        };
+        self.hook
+            .produce(stmt.schema, name, Some(seq::render(&def)));
+        Ok(())
+    }
+}
+
 fn unknown_table(schema: &str, name: &str) -> SprigError {
     SprigError::standard(
         1146,
@@ -817,6 +1054,7 @@ fn unknown_table(schema: &str, name: &str) -> SprigError {
 
 #[async_trait::async_trait]
 impl DdlExecutor for EngineDdl<'_> {
+    #[allow(clippy::too_many_lines)] // one arm per effect
     async fn execute(&self, stmt: &PhysicalDdl) -> Result<()> {
         match &stmt.effect {
             Effect::Alter {
@@ -846,6 +1084,23 @@ impl DdlExecutor for EngineDdl<'_> {
                 kind: ObjectKind::Table,
                 names,
             } => {
+                // `DROP TABLE` of a view.
+                if let (Some(db), Some(eng)) = (stmt.schema.db(), catalog::of(&self.hook.cat))
+                    && let Some(n) = names
+                        .iter()
+                        .find(|n| eng.view(db, n, self.hook.lctn).is_some())
+                {
+                    let shown = self.hook.sess.db.clone();
+                    return Err(if self.hook.sess.env.mysql {
+                        SprigError::standard(
+                            1051,
+                            *b"42S02",
+                            format!("Unknown table '{shown}.{n}'"),
+                        )
+                    } else {
+                        SprigError::standard(1965, *b"42S02", format!("'{shown}.{n}' is a view"))
+                    });
+                }
                 let defs: Vec<Arc<TableDef>> = names
                     .iter()
                     .filter_map(|n| self.hook.table(&stmt.schema, n))
@@ -885,6 +1140,75 @@ impl DdlExecutor for EngineDdl<'_> {
                 self.note_dropped(objects);
                 Ok(())
             }
+            Effect::Create {
+                kind: ObjectKind::Sequence,
+                name,
+            } => self.sequence(stmt, name, true),
+            Effect::Alter {
+                kind: ObjectKind::Sequence,
+                name,
+            } => self.sequence(stmt, name, false),
+            Effect::Drop {
+                kind: ObjectKind::Sequence,
+                names,
+            } => {
+                let (Some(db), Some(eng)) = (stmt.schema.db(), catalog::of(&self.hook.cat)) else {
+                    return Err(SprigError::internal(
+                        "engine: DROP SEQUENCE outside a database",
+                    ));
+                };
+                let shown = self.hook.sess.db.clone();
+                if let Some(n) = names
+                    .iter()
+                    .find(|n| eng.sequence(db, n, self.hook.lctn).is_none())
+                {
+                    return Err(SprigError::standard(
+                        4090,
+                        *b"42S02",
+                        format!("'{shown}.{n}' is not a SEQUENCE"),
+                    ));
+                }
+                let objects: Vec<u32> = names
+                    .iter()
+                    .filter_map(|n| eng.sequence(db, n, self.hook.lctn))
+                    .filter_map(|e| u32::try_from(e.object.0).ok())
+                    .collect();
+                for n in names {
+                    self.hook.produce(stmt.schema, n, None);
+                }
+                self.note_dropped(objects);
+                Ok(())
+            }
+            Effect::Create {
+                kind: ObjectKind::View,
+                name,
+            }
+            | Effect::Alter {
+                kind: ObjectKind::View,
+                name,
+            } => self.view(stmt, name),
+            // A view has nothing but its catalog record.
+            Effect::Drop {
+                kind: ObjectKind::View,
+                names,
+            } => {
+                // `DROP VIEW` of a table.
+                if let Some(n) = names
+                    .iter()
+                    .find(|n| self.hook.table(&stmt.schema, n).is_some())
+                {
+                    let db = self.hook.sess.db.clone();
+                    return Err(if self.hook.sess.env.mysql {
+                        SprigError::standard(1347, *b"HY000", format!("'{db}.{n}' is not VIEW"))
+                    } else {
+                        SprigError::standard(4092, *b"42S02", format!("Unknown VIEW: '{db}.{n}'"))
+                    });
+                }
+                for n in names {
+                    self.hook.produce(stmt.schema, n, None);
+                }
+                Ok(())
+            }
             Effect::CreateSchema | Effect::AlterSchema | Effect::Drop { .. } => {
                 self.inner.execute(stmt).await
             }
@@ -906,8 +1230,11 @@ impl DdlExecutor for EngineDdl<'_> {
         kind: ObjectKind,
         name: &str,
     ) -> Result<Option<String>> {
-        if kind == ObjectKind::Table {
+        if kind == ObjectKind::Table || kind == ObjectKind::View {
             return Ok(self.hook.text(schema, name).flatten());
+        }
+        if kind == ObjectKind::Sequence {
+            return Ok(self.hook.seq_text(schema, name));
         }
         self.inner.show_create(schema, kind, name).await
     }

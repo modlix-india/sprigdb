@@ -972,3 +972,44 @@ async fn a_unit_snapshot_carries_the_tenants_streams() {
         assert_eq!(b.bounds(key(1)).high_watermark, 30);
     }
 }
+
+/// Partition groups: partition `p` rides on its tenant's group unit
+/// `p % n`, and a log holding partitions keeps the groups it was written
+/// with when reopened with another setting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn partition_groups_put_partitions_in_units_of_their_own() {
+    assert_eq!(group_of_unit(group_unit(5, 2)), Some((5, 2)));
+    assert_eq!(group_of_unit(5), None);
+    assert_eq!(group_of_unit(Engine::unit_of_tenant(u64::MAX).0), None);
+    let d = TempDir::new("groups");
+    let grouped = SegConfig { groups: 2, ..cfg() };
+    {
+        let l = SegLog::open(&engine(d.path()), d.path().join("seg"), grouped.clone()).unwrap();
+        assert_eq!(l.unit_of_part(key(0)), group_unit(5, 0));
+        assert_eq!(l.unit_of_part(key(3)), group_unit(5, 1));
+        for p in 0..4 {
+            assert_eq!(base(&put(&l, key(p), &batch_bytes(2, 1_000, 10)).await), 0);
+        }
+        assert_eq!(base(&put(&l, key(3), &batch_bytes(1, 1_000, 10)).await), 2);
+        let e = l.engine();
+        assert!(
+            e.consensus()
+                .applied_index(sprig_engine::UnitId(group_unit(5, 1)))
+                >= 3
+        );
+        l.flush().unwrap();
+    }
+    let l = SegLog::open(
+        &engine(d.path()),
+        d.path().join("seg"),
+        SegConfig { groups: 0, ..cfg() },
+    )
+    .unwrap();
+    assert_eq!(
+        l.groups(),
+        2,
+        "kept the groups the partitions were written with"
+    );
+    assert_eq!(base(&put(&l, key(3), &batch_bytes(1, 1_000, 10)).await), 3);
+    assert_eq!(all(&l, key(3)).len(), 4);
+}

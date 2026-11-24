@@ -37,6 +37,10 @@ use crate::store::{
 use crate::token::TokenKey;
 use crate::topology::{Overflow, QueueCfg, QueueDef};
 
+/// Published bytes per write batch at most (with
+/// [`OwnerParams::batch_rows`] rows): large messages make smaller batches.
+pub const BATCH_MAX_BYTES: u64 = 4 << 20;
+
 /// Wall-clock milliseconds (a trait so the simulation can drive time).
 pub trait Clock: Send + Sync + 'static {
     /// Milliseconds since the epoch.
@@ -466,6 +470,8 @@ struct Core {
     last_used_ms: i64,
     // The batch being built.
     inserts: Vec<(Entry, Option<Reply<()>>)>,
+    /// The published bytes in `inserts`.
+    insert_bytes: u64,
     deletes: Vec<MsgRef>,
     counts: Vec<(MsgRef, u32)>,
     outbox: Vec<OutboxRow>,
@@ -570,6 +576,7 @@ pub async fn run_owned(
         had_consumer: false,
         last_used_ms: now,
         inserts: Vec::new(),
+        insert_bytes: 0,
         deletes: Vec::new(),
         counts: Vec::new(),
         outbox: Vec::new(),
@@ -783,6 +790,12 @@ impl Core {
         self.inserts.len() + self.deletes.len() + self.counts.len() + self.outbox.len()
     }
 
+    /// Whether the next batch is full: [`OwnerParams::batch_rows`] rows,
+    /// or [`BATCH_MAX_BYTES`] of published messages.
+    fn batch_full(&self) -> bool {
+        self.batch_rows() >= self.p.batch_rows || self.insert_bytes >= BATCH_MAX_BYTES
+    }
+
     fn needs_write(&self) -> bool {
         self.batch_rows() > 0 || self.hwm_dirty
     }
@@ -961,6 +974,7 @@ impl Core {
             }
             e.seq = self.next_seq;
             self.next_seq += 1;
+            self.insert_bytes += e.size;
             self.inserts.push((e, reply));
         }
     }
@@ -1097,14 +1111,26 @@ impl Core {
     }
 
     async fn flush(&mut self) -> Result<(), StoreError> {
+        let Some((b, inserts)) = self.take_batch() else {
+            return Ok(());
+        };
+        let started = std::time::Instant::now();
+        let res = self.store.write(&b).await;
+        self.finish_batch(res, &b, inserts, started)
+    }
+
+    /// Takes the next write batch out of the core; `None` when nothing
+    /// needs writing.
+    fn take_batch(&mut self) -> Option<(WriteBatch, Vec<(Entry, Option<Reply<()>>)>)> {
         self.plan_hwm();
         for r in self.confirms_now.drain(..) {
             let _ = r.send(Ok(()));
         }
         if !self.needs_write() {
-            return Ok(());
+            return None;
         }
         let inserts = std::mem::take(&mut self.inserts);
+        self.insert_bytes = 0;
         let mut rows = Vec::with_capacity(inserts.len());
         let mut ready_after = (self.ready_count, self.ready_bytes);
         for (e, _) in &inserts {
@@ -1132,8 +1158,19 @@ impl Core {
                 ready_bytes: ready_after.1,
             },
         };
-        let started = std::time::Instant::now();
-        let res = self.store.write(&b).await;
+        Some((b, inserts))
+    }
+
+    /// Takes in the outcome of writing batch `b` (from
+    /// `take_batch`): its messages become ready and are
+    /// confirmed, or their publishers get the error.
+    fn finish_batch(
+        &mut self,
+        res: Result<(), StoreError>,
+        b: &WriteBatch,
+        inserts: Vec<(Entry, Option<Reply<()>>)>,
+        started: std::time::Instant,
+    ) -> Result<(), StoreError> {
         metrics::histogram!("sprig_queue_write_batch_rows").record(b.rows() as f64);
         match res {
             Ok(()) => {
@@ -1839,40 +1876,61 @@ impl Core {
         mut verify: mpsc::UnboundedReceiver<(u64, MsgId, bool)>,
         mut barrier: Option<oneshot::Receiver<()>>,
     ) -> Exit {
+        // Commands taken in while a write was in flight that had to wait
+        // for it.
+        let mut held: std::collections::VecDeque<Cmd> = std::collections::VecDeque::new();
         let reason = loop {
-            let wait = self.next_timer();
-            let barrier_wait = async {
-                match barrier.as_mut() {
-                    Some(b) => {
-                        let _ = b.await;
+            if held.is_empty() {
+                // Rows taken in during the last write go out at once.
+                let wait = if self.needs_write() {
+                    Duration::ZERO
+                } else {
+                    self.next_timer()
+                };
+                let barrier_wait = async {
+                    match barrier.as_mut() {
+                        Some(b) => {
+                            let _ = b.await;
+                        }
+                        None => std::future::pending::<()>().await,
                     }
-                    None => std::future::pending::<()>().await,
-                }
-            };
-            tokio::select! {
-                c = rx.recv() => match c {
-                    None => break "engine gone".to_owned(),
-                    Some(c) => {
-                        if let Err(e) = self.apply(c).await {
-                            break e.to_string();
+                };
+                tokio::select! {
+                    c = rx.recv() => match c {
+                        None => break "engine gone".to_owned(),
+                        Some(c) => {
+                            if let Err(e) = self.apply(c).await {
+                                break e.to_string();
+                            }
+                        }
+                    },
+                    v = verify.recv() => {
+                        if let Some((seq, id, gone)) = v
+                            && self.unacked.get(&seq).is_some_and(|u| u.e.msg_id == id)
+                        {
+                            self.release(seq, gone);
                         }
                     }
-                },
-                v = verify.recv() => {
-                    if let Some((seq, id, gone)) = v
-                        && self.unacked.get(&seq).is_some_and(|u| u.e.msg_id == id)
-                    {
-                        self.release(seq, gone);
+                    () = barrier_wait => {
+                        barrier = None;
+                        self.barrier_done = true;
+                    }
+                    () = tokio::time::sleep(wait) => {}
+                }
+            } else {
+                let mut failed = None;
+                while let Some(c) = held.pop_front() {
+                    if let Err(e) = self.apply(c).await {
+                        failed = Some(e.to_string());
+                        break;
                     }
                 }
-                () = barrier_wait => {
-                    barrier = None;
-                    self.barrier_done = true;
+                if let Some(f) = failed {
+                    break f;
                 }
-                () = tokio::time::sleep(wait) => {}
             }
             let mut failed = None;
-            while self.batch_rows() < self.p.batch_rows && !self.deleted && self.handoff.is_none() {
+            while !self.batch_full() && !self.deleted && self.handoff.is_none() {
                 match rx.try_recv() {
                     Ok(c) => {
                         if let Err(e) = self.apply(c).await {
@@ -1912,7 +1970,7 @@ impl Core {
                     break f;
                 }
             }
-            if let Err(e) = self.settle_loop().await {
+            if let Err(e) = self.settle_loop(&mut rx, &mut held).await {
                 break e.to_string();
             }
             self.report_ready();
@@ -1924,6 +1982,9 @@ impl Core {
             }
         }
         for c in std::mem::take(&mut self.deferred_gets) {
+            fail(c, &moved);
+        }
+        for c in held.drain(..) {
             fail(c, &moved);
         }
         if !self.deleted {
@@ -1968,12 +2029,68 @@ impl Core {
         }
     }
 
+    /// Whether `c` may be applied while a write is in flight: it changes
+    /// only what the next batch and the dispatch see (credit,
+    /// settlements, a cancel, publishes that need no look-up in the
+    /// store).
+    fn overlaps(c: &Cmd) -> bool {
+        match c {
+            Cmd::Credit { .. } | Cmd::Settle(..) | Cmd::Cancel(_) => true,
+            Cmd::Enqueue(items) => items.iter().all(|(i, _)| !i.dedup),
+            _ => false,
+        }
+    }
+
+    /// Writes one batch while taking in commands: credit, settlements
+    /// and publishes go on (into the next batch), and messages already
+    /// committed are dispatched, so consumers aren't held up by the write.
+    /// Other commands wait in `held` until the write is done.
+    async fn write_overlapped(
+        &mut self,
+        rx: &mut mpsc::UnboundedReceiver<Cmd>,
+        held: &mut std::collections::VecDeque<Cmd>,
+    ) -> Result<(), StoreError> {
+        let Some((b, inserts)) = self.take_batch() else {
+            return Ok(());
+        };
+        let started = std::time::Instant::now();
+        let store = Arc::clone(&self.store);
+        let mut w = Box::pin(async move {
+            let r = store.write(&b).await;
+            (r, b)
+        });
+        let mut open = true;
+        let (res, b) = loop {
+            tokio::select! {
+                biased;
+                out = &mut w => break out,
+                c = rx.recv(), if open && held.is_empty() && !self.batch_full() => match c {
+                    Some(c) if Self::overlaps(&c) => {
+                        self.apply(c).await?;
+                        self.dispatch();
+                    }
+                    Some(c) => held.push_back(c),
+                    None => open = false,
+                },
+            }
+        };
+        self.finish_batch(res, &b, inserts, started)
+    }
+
     /// Writes, dispatches and pages in until nothing is left to do.
-    async fn settle_loop(&mut self) -> Result<(), StoreError> {
+    async fn settle_loop(
+        &mut self,
+        rx: &mut mpsc::UnboundedReceiver<Cmd>,
+        held: &mut std::collections::VecDeque<Cmd>,
+    ) -> Result<(), StoreError> {
         for _ in 0..8 {
-            self.flush().await?;
+            self.write_overlapped(rx, held).await?;
             self.dispatch();
-            if !self.complete && self.ready.len() < self.p.page / 2 && !self.needs_write() {
+            // Rows taken in during the write may be waiting: paging in
+            // doesn't wait for them (it reads only past what is loaded,
+            // where no delivered message is), or a queue that publishers
+            // keep busy would never page in again.
+            if !self.complete && self.ready.len() < self.p.page / 2 {
                 self.page_in().await?;
                 self.dispatch();
             }

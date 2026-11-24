@@ -61,6 +61,8 @@ pub(crate) struct Env {
     pub tz: Option<i32>,
     /// `foreign_key_checks = 0`: foreign keys are not checked.
     pub no_fk_checks: bool,
+    /// The session's `LAST_INSERT_ID()`.
+    pub last_insert_id: u64,
 }
 
 impl Env {
@@ -76,6 +78,7 @@ impl Env {
         no_auto_value_on_zero: false,
         tz: Some(0),
         no_fk_checks: false,
+        last_insert_id: 0,
     };
 
     /// The session's rules from its `sql_mode` (as the backend spells it;
@@ -93,6 +96,7 @@ impl Env {
             no_auto_value_on_zero: false,
             tz: time_zone.map_or(Some(0), zone_offset),
             no_fk_checks: false,
+            last_insert_id: 0,
         };
         if let Some(m) = sql_mode {
             let has = |f: &str| m.split(',').any(|x| x.trim().eq_ignore_ascii_case(f));

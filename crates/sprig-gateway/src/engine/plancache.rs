@@ -200,6 +200,7 @@ mod tests {
             ordered: false,
             lock: None,
             check: None,
+            view_check: None,
             fks: None,
         }
     }

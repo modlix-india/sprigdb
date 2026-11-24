@@ -107,6 +107,19 @@ impl Drop for MemBatch {
 impl Batch for MemBatch {
     type Ticket = MemTicket;
 
+    async fn hold(&mut self, keys: Vec<Bytes>) -> StoreResult<()> {
+        for k in keys {
+            let latch = Arc::clone(lock(&self.latches).entry(k.clone()).or_default());
+            // No deadlock detection here: a wait that lasts gives up, and
+            // the script runs again.
+            let g = tokio::time::timeout(std::time::Duration::from_secs(2), latch.lock_owned())
+                .await
+                .map_err(|_| crate::store::StoreError::retry("lock wait timed out"))?;
+            self.held.push((k, g));
+        }
+        Ok(())
+    }
+
     fn get(&mut self, key: &[u8]) -> StoreResult<Option<Bytes>> {
         if let Some(v) = self.writes.get(key) {
             return Ok(v.clone());

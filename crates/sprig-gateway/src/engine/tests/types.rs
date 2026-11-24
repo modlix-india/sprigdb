@@ -2010,7 +2010,6 @@ async fn the_current_date_and_time_are_values() {
         "INSERT INTO nw (id, v) VALUES (30, NOW(3))",
         "INSERT INTO nw (id, dt) VALUES (30, NOW(7))",
         "INSERT INTO nw (id, dt) VALUES (30, SYSDATE())",
-        "INSERT INTO nw (id, dt) VALUES (30, UNIX_TIMESTAMP(1))",
         "SELECT id FROM nw WHERE v <= NOW()",
         "SELECT id FROM nw WHERE id = NOW()",
         "SELECT id FROM nw WHERE t <= NOW()",

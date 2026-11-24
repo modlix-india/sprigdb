@@ -27,7 +27,7 @@
 //! but no table privilege could tell).
 //!
 //! **Column types the expression engine doesn't compute with** (`ENUM`,
-//! `SET`, `BIT`, `JSON`: it would see their stored numbers or bytes): such
+//! `SET`, `BIT`: it would see their stored numbers or bytes): such
 //! a column may only pass through as a plain select-list column of the
 //! outermost `SELECT`, where the result encoders of the single-table path
 //! print it; named anywhere else, the statement is refused with 39960.
@@ -36,6 +36,7 @@ use std::collections::HashSet;
 use std::ops::ControlFlow;
 use std::sync::Arc;
 
+use sprig_common::ids::DbId;
 use sprig_common::{Result, SprigError};
 use sprig_plan::catalog::{
     Catalog, ColumnDef as PlanColumn, IndexDef, IndexPart, TableDef as PlanTable,
@@ -106,15 +107,275 @@ pub(crate) struct Origin {
     /// `NATURAL`): the result column must carry the column's name, or no
     /// column of the result is placed (checked against the planner's).
     pub merged: bool,
+    /// Read through this view (merged): the view's name (the column's
+    /// table) and the view's column name.
+    pub view: Option<(String, String)>,
+}
+
+/// A view a statement reads (expanded into it as a derived table).
+#[derive(Debug, Clone)]
+pub(crate) struct ViewUse {
+    /// The view.
+    pub view: Arc<crate::engine::view::ViewDef>,
+    /// Its database's logical name.
+    pub db_name: String,
+    /// The view whose select names this one; `None`: the statement does.
+    pub under: Option<usize>,
+    /// The tables its select names directly: (database, name as written).
+    pub tables: Vec<(DbId, String)>,
+}
+
+/// The views of a statement, expanded, and the tables it names itself.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Views {
+    pub uses: Vec<ViewUse>,
+    /// The tables the statement names outside any view.
+    pub direct: Vec<(DbId, String)>,
+}
+
+impl Views {
+    /// Whether table `name` of `db` is read with the session's own rights:
+    /// named by the statement, or by a view of `SQL SECURITY INVOKER`
+    /// that the session's rights reach.
+    pub(crate) fn invoker_reads(&self, db: DbId, name: &str) -> bool {
+        let same = |(d, n): &(DbId, String)| *d == db && n.eq_ignore_ascii_case(name);
+        if self.uses.is_empty() || self.direct.iter().any(same) {
+            return true;
+        }
+        self.uses
+            .iter()
+            .enumerate()
+            .any(|(i, _)| self.uses[i].tables.iter().any(same) && self.principal(i).is_none())
+    }
+
+    /// The view (database, name) through which alone the statement reads
+    /// table `name` of `db`, when it doesn't name the table itself.
+    pub(crate) fn only_through(&self, db: DbId, name: &str) -> Option<(String, String)> {
+        let same = |(d, n): &(DbId, String)| *d == db && n.eq_ignore_ascii_case(name);
+        if self.direct.iter().any(same) {
+            return None;
+        }
+        let mut i = self.uses.iter().position(|u| u.tables.iter().any(same))?;
+        while let Some(up) = self.uses[i].under {
+            i = up;
+        }
+        let u = &self.uses[i];
+        Some((u.db_name.clone(), u.view.name.clone()))
+    }
+
+    /// Whose rights the select of view use `i` runs with: `None` for the
+    /// session's, else the index of the view use whose definer it is.
+    pub(crate) fn principal(&self, mut i: usize) -> Option<usize> {
+        loop {
+            let u = &self.uses[i];
+            if !u.view.invoker {
+                return Some(i);
+            }
+            i = u.under?;
+        }
+    }
+}
+
+/// Replaces each view a statement names with a derived table of its
+/// select (nested views too).
+struct Expand<'a, 'b> {
+    cx: &'a BindCtx<'b>,
+    ctes: HashSet<String>,
+    out: Views,
+    /// The expansions being walked: the factor's address, its use.
+    stack: Vec<(*const TableFactor, usize)>,
+    err: Option<SprigError>,
+}
+
+impl Expand<'_, '_> {
+    fn resolve(&self, name: &ObjectName) -> Option<(DbId, String)> {
+        let parts: Option<Vec<&Ident>> = name.0.iter().map(ident_of).collect();
+        match parts.as_deref()? {
+            [t] => {
+                if self.ctes.contains(&t.value.to_lowercase()) {
+                    return None;
+                }
+                Some((self.cx.current?, t.value.clone()))
+            }
+            [s, t] => Some((
+                physical_db(self.cx.tenant, &s.value)
+                    .or_else(|| self.cx.names.db_by_name(&s.value))?,
+                t.value.clone(),
+            )),
+            _ => None,
+        }
+    }
+}
+
+impl VisitorMut for Expand<'_, '_> {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, q: &mut Query) -> ControlFlow<()> {
+        if let Some(w) = &q.with {
+            for c in &w.cte_tables {
+                self.ctes.insert(c.alias.name.value.to_lowercase());
+            }
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_table_factor(&mut self, f: &mut TableFactor) -> ControlFlow<()> {
+        let TableFactor::Table { name, alias, .. } = f else {
+            return ControlFlow::Continue(());
+        };
+        let Some((db, table)) = self.resolve(name) else {
+            return ControlFlow::Continue(());
+        };
+        let under = self.stack.last().map(|(_, i)| *i);
+        if self.cx.names.view(db, &table).is_none()
+            && self.cx.names.table(db, &table).is_none()
+            && let Some(e) = self.cx.names.sequence(db, &table)
+        {
+            let db_name = self.cx.names.db_name(db);
+            let derived = match &e.def {
+                Ok(def) => seq_derived(&db_name, &table, def, alias.as_ref())
+                    .ok_or_else(|| not_on_engine("this read of a sequence")),
+                Err(why) => Err(not_on_engine(why)),
+            };
+            match derived {
+                Ok(d) => *f = d,
+                Err(err) => {
+                    self.err = Some(err);
+                    return ControlFlow::Break(());
+                }
+            }
+            return ControlFlow::Continue(());
+        }
+        let Some(v) = self.cx.names.view(db, &table) else {
+            match under {
+                Some(i) => self.out.uses[i].tables.push((db, table)),
+                None => self.out.direct.push((db, table)),
+            }
+            return ControlFlow::Continue(());
+        };
+        match under {
+            Some(i) => self.out.uses[i].tables.push((db, table.clone())),
+            None => self.out.direct.push((db, table.clone())),
+        }
+        let db_name = self.cx.names.db_name(db);
+        let Ok(v) = &*v else {
+            self.err = Some(crate::engine::view::errors::invalid(&db_name, &table));
+            return ControlFlow::Break(());
+        };
+        let v = Arc::new(v.clone());
+        if self.stack.len() >= 32
+            || self.stack.iter().any(|(_, i)| {
+                let u = &self.out.uses[*i].view;
+                u.db == v.db && u.name.eq_ignore_ascii_case(&v.name)
+            })
+        {
+            self.err = Some(crate::engine::view::errors::recursive(&db_name, &v.name));
+            return ControlFlow::Break(());
+        }
+        // Every table the select names must still exist.
+        for (d, t) in crate::engine::view::relations(&v.query) {
+            let Some(d) = d.and_then(|d| self.cx.names.db_by_name(&d)) else {
+                continue;
+            };
+            if self.cx.names.table(d, &t).is_none()
+                && self.cx.names.view(d, &t).is_none()
+                && !self.ctes.contains(&t.to_lowercase())
+            {
+                self.err = Some(crate::engine::view::errors::invalid(&db_name, &v.name));
+                return ControlFlow::Break(());
+            }
+        }
+        let alias = alias.clone();
+        *f = crate::engine::view::as_derived(&v, alias.as_ref());
+        self.out.uses.push(ViewUse {
+            view: v,
+            db_name,
+            under,
+            tables: Vec::new(),
+        });
+        self.stack
+            .push((std::ptr::from_ref(f), self.out.uses.len() - 1));
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_table_factor(&mut self, f: &mut TableFactor) -> ControlFlow<()> {
+        if self
+            .stack
+            .last()
+            .is_some_and(|(p, _)| std::ptr::eq(*p, std::ptr::from_ref(f)))
+        {
+            self.stack.pop();
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+/// The derived table standing for a read of sequence `db`.`name`.
+fn seq_derived(
+    db: &str,
+    name: &str,
+    def: &crate::engine::sequence::SeqDef,
+    alias: Option<&sqlparser::ast::TableAlias>,
+) -> Option<TableFactor> {
+    let sql = crate::engine::sequence::as_select(db, name, def);
+    let mut v =
+        sqlparser::parser::Parser::parse_sql(&sprig_plan::dialect::SprigMySql, &sql).ok()?;
+    let Some(Statement::Query(q)) = v.pop() else {
+        return None;
+    };
+    let name = alias.map_or_else(|| Ident::with_quote('`', name), |a| a.name.clone());
+    Some(TableFactor::Derived {
+        lateral: false,
+        subquery: q,
+        alias: Some(sqlparser::ast::TableAlias {
+            explicit: true,
+            at: None,
+            name,
+            columns: Vec::new(),
+        }),
+        sample: None,
+    })
+}
+
+/// Expands the views `stmt` names (see [`Expand`]).
+///
+/// # Errors
+/// 1356 for a view whose tables are gone, 1462 for one that reads itself.
+pub(crate) fn expand_views(cx: &BindCtx<'_>, stmt: &mut Statement) -> Result<Views> {
+    let mut e = Expand {
+        cx,
+        ctes: HashSet::new(),
+        out: Views::default(),
+        stack: Vec::new(),
+        err: None,
+    };
+    let _ = VisitMut::visit(stmt, &mut e);
+    match e.err {
+        Some(err) => Err(err),
+        None => Ok(e.out),
+    }
 }
 
 /// What [`analyze`] found.
 pub(super) struct Analysis {
+    pub(super) views: Views,
     pub(super) stmt: Statement,
     pub(super) tables: Vec<TableUse>,
     pub(super) origins: Vec<Option<Origin>>,
     pub(super) written: Vec<Option<String>>,
     pub(super) params: usize,
+    pub(super) view_named: Vec<Option<(String, String)>>,
+    pub(super) sequences: Vec<SeqUse>,
+}
+
+/// A sequence a statement's sequence functions name: the database and
+/// name as written (the database's logical name), and its identity.
+#[derive(Debug, Clone)]
+pub(crate) struct SeqUse {
+    pub db_name: String,
+    pub name: String,
+    /// Its identity, or the error a use of the name gets (code, message).
+    pub id: std::result::Result<String, (u16, String)>,
 }
 
 fn ident_of(p: &ObjectNamePart) -> Option<&Ident> {
@@ -223,12 +484,64 @@ struct Walk<'a, 'b> {
     /// Its plain column items.
     plain: HashSet<*const Expr>,
     params: usize,
+    /// The sequences named by sequence functions.
+    sequences: Vec<SeqUse>,
+    /// A sequence function was seen.
+    seq_calls: bool,
 }
 
 impl Walk<'_, '_> {
     fn fail(&mut self, e: SprigError) {
         if self.err.is_none() {
             self.err = Some(e);
+        }
+    }
+
+    /// A sequence function's sequence (`args`: the call's arguments).
+    fn sequence_of(&mut self, args: &[FunctionArg]) {
+        self.seq_calls = true;
+        let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(e))) = args.first() else {
+            return;
+        };
+        let (db, name, written) = match e {
+            Expr::Identifier(i) => (self.cx.current, &i.value, i.value.clone()),
+            Expr::CompoundIdentifier(p) if p.len() == 2 => (
+                physical_db(self.cx.tenant, &p[0].value)
+                    .or_else(|| self.cx.names.db_by_name(&p[0].value)),
+                &p[1].value,
+                format!("{}.{}", p[0].value, p[1].value),
+            ),
+            _ => return,
+        };
+        let Some(db) = db else {
+            self.fail(SprigError::standard(
+                1046,
+                *b"3D000",
+                "No database selected",
+            ));
+            return;
+        };
+        let db_name = self.cx.names.db_name(db);
+        // Errors are the planner's to give (MariaDB's port only).
+        let id = match self.cx.names.sequence(db, name) {
+            Some(e) => Ok(e.object.0.to_string()),
+            None if self.cx.names.table(db, name).is_some()
+                || self.cx.names.view(db, name).is_some() =>
+            {
+                Err((4089, format!("'{db_name}.{name}' is not a SEQUENCE")))
+            }
+            None => Err((4091, format!("Unknown SEQUENCE: '{written}'"))),
+        };
+        if !self
+            .sequences
+            .iter()
+            .any(|s| s.db_name == db_name && s.name == *name)
+        {
+            self.sequences.push(SeqUse {
+                db_name,
+                name: name.clone(),
+                id,
+            });
         }
     }
 
@@ -516,6 +829,14 @@ impl Visitor for Walk<'_, '_> {
                 }
             }
             Expr::Function(f) => {
+                if let FunctionArguments::List(l) = &f.args
+                    && let [ObjectNamePart::Identifier(n)] = f.name.0.as_slice()
+                    && ["NEXTVAL", "LASTVAL", "SETVAL", "SPRIG_SEQUENCE_STATE"]
+                        .iter()
+                        .any(|s| n.value.eq_ignore_ascii_case(s))
+                {
+                    self.sequence_of(&l.args);
+                }
                 if let FunctionArguments::List(l) = &f.args {
                     for a in &l.args {
                         let (FunctionArg::Unnamed(x)
@@ -548,7 +869,6 @@ pub(crate) fn opaque(ty: ColType) -> Option<&'static str> {
         ColType::Enum { .. } => Some("ENUM"),
         ColType::Set { .. } => Some("SET"),
         ColType::Bit { .. } => Some("BIT"),
-        ColType::Json => Some("JSON"),
         _ => None,
     }
 }
@@ -657,6 +977,8 @@ pub(super) fn analyze(
     let source = stmt;
     let mut stmt = stmt.clone();
     let _ = VisitMut::visit(&mut stmt, &mut Logical { cx });
+    let views = expand_views(cx, &mut stmt)?;
+    let tableless = tableless || !views.uses.is_empty();
     let Some(query) = query_of(&stmt) else {
         return Ok(None);
     };
@@ -674,8 +996,12 @@ pub(super) fn analyze(
         top,
         plain: HashSet::new(),
         params: 0,
+        sequences: Vec::new(),
+        seq_calls: false,
     };
     let _ = Visit::visit(&stmt, &mut w);
+    // Sequence functions are the engine's: such a statement needs no table.
+    let tableless = tableless || w.seq_calls;
     // The outermost SELECT's own tables, for where its columns come from
     // (read again after the walk, which registered every table).
     let top_from = match &*query.body {
@@ -742,6 +1068,10 @@ pub(super) fn analyze(
         Some(SetExpr::Select(s)) => Some(&**s),
         _ => None,
     };
+    let simple_view = match &*query.body {
+        SetExpr::Select(s) => view_origins(&views, &w.tables, s),
+        _ => None,
+    };
     let (origins, written) = top_from.map_or_else(
         || (Vec::new(), Vec::new()),
         |((factors, mixed), s)| {
@@ -776,13 +1106,145 @@ pub(super) fn analyze(
     }
     let params = w.params;
     let tables = w.tables;
+    let (origins, view_named) = match simple_view {
+        Some((o, n)) if o.len() == origins.len() || origins.is_empty() => (o, n),
+        _ => (origins, Vec::new()),
+    };
     Ok(Some(Analysis {
+        views,
         stmt,
         tables,
         origins,
         written,
         params,
+        view_named,
+        sequences: w.sequences,
     }))
+}
+
+/// The outermost select reads one view and nothing else, a view of one
+/// table merged into it: its columns are described as the servers describe
+/// a merged view's (the view's name as the table; a plain column keeps its
+/// column's definition, a computed one is named after the view).
+#[allow(
+    clippy::type_complexity,
+    clippy::too_many_lines,
+    clippy::manual_let_else,
+    clippy::single_match_else,
+    clippy::match_wildcard_for_single_variants
+)] // per result column: origin, or (`table`, `org_table`); one case after another
+fn view_origins(
+    views: &Views,
+    tables: &[TableUse],
+    s: &Select,
+) -> Option<(Vec<Option<Origin>>, Vec<Option<(String, String)>>)> {
+    let [t] = s.from.as_slice() else {
+        return None;
+    };
+    if !t.joins.is_empty() {
+        return None;
+    }
+    let TableFactor::Derived {
+        alias: Some(a),
+        subquery,
+        ..
+    } = &t.relation
+    else {
+        return None;
+    };
+    let alias = a.name.value.clone();
+    let mut top = views.uses.iter().filter(|u| u.under.is_none());
+    let u = top.next()?;
+    if top.next().is_some() || u.view.algorithm == crate::engine::view::Algorithm::Temptable {
+        return None;
+    }
+    let SetExpr::Select(vs) = &*subquery.body else {
+        return None;
+    };
+    if !crate::engine::view::updatable(subquery, u.view.algorithm, false) {
+        return None;
+    }
+    let [vt] = vs.from.as_slice() else {
+        return None;
+    };
+    if !vt.joins.is_empty() {
+        return None;
+    }
+    let TableFactor::Table { name, .. } = &vt.relation else {
+        return None;
+    };
+    let base = last_name(name)?;
+    let ti = tables
+        .iter()
+        .position(|x| x.def.name.eq_ignore_ascii_case(&base))?;
+    // Per view column: the base column it is, if a plain one.
+    let cols: Vec<Option<usize>> = vs
+        .projection
+        .iter()
+        .map(|it| {
+            let e = match it {
+                SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => e,
+                _ => return None,
+            };
+            let c = match e {
+                Expr::Identifier(i) => i.value.clone(),
+                Expr::CompoundIdentifier(p) => p.last()?.value.clone(),
+                _ => return None,
+            };
+            tables[ti].def.column(&c)
+        })
+        .collect();
+    if cols.len() != u.view.columns.len() {
+        return None;
+    }
+    let mut origins = Vec::new();
+    let mut named = Vec::new();
+    let mut push = |j: Option<usize>| {
+        let Some(j) = j else {
+            origins.push(None);
+            named.push(None);
+            return;
+        };
+        match cols[j] {
+            Some(c) => {
+                origins.push(Some(Origin {
+                    table: ti,
+                    column: c,
+                    alias: alias.clone(),
+                    outer: false,
+                    merged: false,
+                    view: Some((u.view.name.clone(), u.view.columns[j].clone())),
+                }));
+                named.push(None);
+            }
+            None => {
+                origins.push(None);
+                named.push(Some((alias.clone(), u.view.name.clone())));
+            }
+        }
+    };
+    for it in &s.projection {
+        match it {
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..) => {
+                (0..cols.len()).for_each(|j| push(Some(j)));
+            }
+            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+                let c = match e {
+                    Expr::Identifier(i) => Some(i.value.clone()),
+                    Expr::CompoundIdentifier(p) if p.len() == 2 => Some(p[1].value.clone()),
+                    _ => None,
+                };
+                push(c.and_then(|c| {
+                    u.view
+                        .columns
+                        .iter()
+                        .position(|x| x.eq_ignore_ascii_case(&c))
+                }));
+            }
+            _ => return None,
+        }
+    }
+    Some((origins, named))
 }
 
 /// Where each column of the outermost SELECT's result comes from: one
@@ -802,6 +1264,7 @@ fn origins(
         alias: f.alias.clone(),
         outer: f.outer,
         merged: false,
+        view: None,
     };
     // A `*` over joins that merge columns, worked out from the text.
     let merged_star = if mixed {
@@ -915,6 +1378,7 @@ fn merged_columns(tables: &[TableUse], factors: &[Factor], s: &Select) -> Option
                     alias: f.alias.clone(),
                     outer,
                     merged: true,
+                    view: None,
                 })
                 .collect(),
         )
@@ -1010,12 +1474,12 @@ fn written_name(cx: &BindCtx<'_>, tables: &[TableUse], e: &Expr, text: &str) -> 
     }
     let span = e.span();
     let from = offset(text, span.start.line, span.start.column)?;
-    let mut to = offset(text, span.end.line, span.end.column)?;
+    let to = offset(text, span.end.line, span.end.column)?;
     // The cut must read back as the same expression. The parser's place
     // for a call can stop before its closing parenthesis: the cut then
     // grows to the next one, a few times at most.
     let same = |t: &str| {
-        sqlparser::parser::Parser::new(&sqlparser::dialect::MySqlDialect {})
+        sqlparser::parser::Parser::new(&sprig_plan::dialect::SprigMySql)
             .try_with_sql(t)
             .ok()
             .is_some_and(|mut p| {
@@ -1023,14 +1487,27 @@ fn written_name(cx: &BindCtx<'_>, tables: &[TableUse], e: &Expr, text: &str) -> 
                     && p.peek_token().token == sqlparser::tokenizer::Token::EOF
             })
     };
+    // A row value's place starts after its opening parenthesis: the cut
+    // then also grows back to the previous one, a few times at most.
     let mut cut = None;
-    for _ in 0..8 {
-        let t = text.get(from..to)?.trim();
-        if same(t) {
-            cut = Some(t);
-            break;
+    let mut start = from;
+    'grow: for _ in 0..4 {
+        let mut end = to;
+        for _ in 0..8 {
+            let t = text.get(start..end)?.trim();
+            if same(t) {
+                cut = Some(t);
+                break 'grow;
+            }
+            match text.get(end..).and_then(|r| r.find(')')) {
+                Some(i) => end += i + 1,
+                None => break,
+            }
         }
-        to += text.get(to..)?.find(')')? + 1;
+        match text.get(..start).and_then(|l| l.rfind('(')) {
+            Some(i) => start = i,
+            None => break,
+        }
     }
     let cut = cut?;
     // A database name in its physical form reads as the logical one.
@@ -1080,5 +1557,33 @@ impl Catalog for PlanCatalog<'_> {
 
     fn default_schema(&self) -> Option<String> {
         self.g.current.clone()
+    }
+
+    fn sequence(
+        &self,
+        schema: &str,
+        name: &str,
+    ) -> std::result::Result<String, sprig_exec::SqlError> {
+        self.g
+            .sequences
+            .iter()
+            .find(|s| s.db_name.eq_ignore_ascii_case(schema) && s.name.eq_ignore_ascii_case(name))
+            .map_or_else(
+                || Err((4091, format!("Unknown SEQUENCE: '{name}'"))),
+                |s| s.id.clone(),
+            )
+            .map_err(|(code, m)| sprig_exec::SqlError::new(code, "42S02", m))
+    }
+
+    fn shared(&self) -> Option<Arc<dyn Catalog>> {
+        Some(Arc::new(sprig_plan::catalog::Snapshot {
+            tables: self
+                .g
+                .tables
+                .iter()
+                .map(|t| (t.db_name.clone(), t.def.name.clone(), Arc::clone(&t.plan)))
+                .collect(),
+            default: self.g.current.clone(),
+        }))
     }
 }

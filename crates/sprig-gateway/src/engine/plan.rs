@@ -53,6 +53,18 @@ pub(crate) trait Names {
     fn db_by_name(&self, name: &str) -> Option<DbId>;
     /// The catalog version.
     fn version(&self) -> u64;
+    /// The view `name` of `db`, if any (`Err`: one the engine can't read).
+    fn view(
+        &self,
+        _db: DbId,
+        _name: &str,
+    ) -> Option<Arc<std::result::Result<super::view::ViewDef, String>>> {
+        None
+    }
+    /// The sequence `name` of `db`, if any.
+    fn sequence(&self, _db: DbId, _name: &str) -> Option<Arc<super::sequence::SeqEntry>> {
+        None
+    }
     /// The foreign keys whose parent is table `name` of `db`: each child
     /// table's definition and the key's position among its foreign keys.
     fn referencing(&self, _db: DbId, _name: &str) -> Vec<(Arc<TableDef>, usize)> {
@@ -101,6 +113,16 @@ impl Names for CatalogNames<'_> {
     }
     fn version(&self) -> u64 {
         self.cat.version
+    }
+    fn view(
+        &self,
+        db: DbId,
+        name: &str,
+    ) -> Option<Arc<std::result::Result<super::view::ViewDef, String>>> {
+        self.eng.view(db, name, self.lower_case).cloned()
+    }
+    fn sequence(&self, db: DbId, name: &str) -> Option<Arc<super::sequence::SeqEntry>> {
+        self.eng.sequence(db, name, self.lower_case).cloned()
     }
     fn referencing(&self, db: DbId, name: &str) -> Vec<(Arc<TableDef>, usize)> {
         if self.eng.refs.is_empty() {
@@ -175,6 +197,23 @@ pub(crate) enum Access {
     Full,
 }
 
+/// What an `INSERT` does with a row whose primary or unique key another
+/// row has.
+#[derive(Debug, Clone)]
+pub(crate) enum OnDup {
+    /// 1062 (a plain `INSERT`).
+    Error,
+    /// `INSERT IGNORE`: the row is skipped with a warning.
+    Ignore,
+    /// `REPLACE`: the rows in the way are deleted first.
+    Replace,
+    /// `ON DUPLICATE KEY UPDATE`: these columns of the row in the way are
+    /// set, from expressions over that row's columns and then the new
+    /// row's (`VALUES(c)`: position `columns + c`); with how many times
+    /// the statement wrote `VALUES(c)` (MySQL warns of each: 1287).
+    Update(Vec<(usize, CExpr)>, usize),
+}
+
 /// What a statement does.
 #[derive(Debug, Clone)]
 pub(crate) enum Op {
@@ -186,6 +225,8 @@ pub(crate) enum Op {
         cols: Vec<usize>,
         /// The rows' expressions (`None`: `DEFAULT`).
         rows: Vec<Vec<Option<CExpr>>>,
+        /// What happens to a row whose key is taken.
+        on_dup: OnDup,
     },
     /// An `UPDATE`.
     Update { sets: Vec<(usize, CExpr)> },
@@ -248,6 +289,10 @@ pub(crate) struct Plan {
     /// or `UPDATE` writes (the policies' `WITH CHECK`, bound to the
     /// session): a row that doesn't meet it fails the statement.
     pub check: Option<CExpr>,
+    /// A write through a view `WITH CHECK OPTION`: the condition each new
+    /// row version must meet, and (database, view, MySQL's wording) for
+    /// the error.
+    pub view_check: Option<(CExpr, String, String, bool)>,
     /// The foreign keys an `INSERT`, `UPDATE` or `DELETE` must keep (none
     /// when the table has none either way).
     pub fks: Option<Arc<super::fk::Graph>>,
@@ -414,6 +459,7 @@ fn conjuncts(e: CExpr, out: &mut Vec<CExpr>) {
 fn constant(e: &CExpr) -> bool {
     match e {
         CExpr::Param(_) | CExpr::Lit(_) | CExpr::Now { .. } => true,
+        CExpr::Exec(x) => x.session_clock,
         CExpr::Neg(a) => constant(a),
         CExpr::Arith(_, a, b) => constant(a) && constant(b),
         _ => false,
@@ -564,7 +610,7 @@ fn number(e: &Expr) -> Result<u64> {
 pub(crate) fn bind(cx: &BindCtx<'_>, stmt: &Statement) -> Result<Option<Plan>> {
     match stmt {
         Statement::Query(q) => bind_query(cx, q),
-        Statement::Insert(ins) => bind_insert(cx, ins),
+        Statement::Insert(ins) => bind_insert(cx, ins, None),
         Statement::Update(u) => {
             let Some((def, db, name, alias)) = single_table(cx, std::slice::from_ref(&u.table))?
             else {
@@ -785,6 +831,7 @@ fn finish(
         ordered: false,
         lock: None,
         check: None,
+        view_check: None,
         fks,
         table: def,
     }))
@@ -972,8 +1019,114 @@ fn mentions_engine(cx: &BindCtx<'_>, e: &SetExpr) -> Result<bool> {
     })
 }
 
+/// `ON DUPLICATE KEY UPDATE`'s assignments, the statement's parameter
+/// count after them, and how many times it wrote `VALUES(c)`.
+type DupSets = (Vec<(usize, CExpr)>, usize, usize);
+
+/// The assignments of `ON DUPLICATE KEY UPDATE` compiled over the row in
+/// the way and then the new row: `VALUES(c)` reads the new row's `c`.
+/// `params`: the statement's parameters before them; gives the count after.
+fn dup_key_sets(
+    cx: &BindCtx<'_>,
+    def: &TableDef,
+    name: &ObjectName,
+    sets: &[sqlparser::ast::Assignment],
+    params: usize,
+) -> Result<DupSets> {
+    use sqlparser::ast::visit_expressions_mut;
+    let mut uses = 0;
+    // The new row's columns follow the table's, under names no column has.
+    let mut wide = def.clone();
+    for col in &def.columns {
+        let mut c = col.clone();
+        c.name = format!("\u{1}{}", col.name);
+        wide.columns.push(c);
+    }
+    let mut c = compiler(cx, &wide, name, None);
+    c.params = params;
+    let mut out = Vec::with_capacity(sets.len());
+    for a in sets {
+        let sqlparser::ast::AssignmentTarget::ColumnName(n) = &a.target else {
+            return Err(not_on_engine("a tuple assignment"));
+        };
+        let parts = ident_parts(n).ok_or_else(|| not_on_engine("a column"))?;
+        let Some(last) = parts.last() else {
+            return Err(not_on_engine("a column"));
+        };
+        let ci = def
+            .column(&last.value)
+            .ok_or_else(|| super::expr::unknown_column(&last.value, "field list"))?;
+        let mut e = a.value.clone();
+        let mut bad = false;
+        let _ = visit_expressions_mut(&mut e, |x| {
+            if let Expr::Function(f) = x
+                && f.name.to_string().eq_ignore_ascii_case("VALUES")
+            {
+                let arg = match &f.args {
+                    sqlparser::ast::FunctionArguments::List(l) if l.args.len() == 1 => {
+                        match &l.args[0] {
+                            sqlparser::ast::FunctionArg::Unnamed(
+                                sqlparser::ast::FunctionArgExpr::Expr(Expr::Identifier(i)),
+                            ) => Some(i.value.clone()),
+                            sqlparser::ast::FunctionArg::Unnamed(
+                                sqlparser::ast::FunctionArgExpr::Expr(Expr::CompoundIdentifier(v)),
+                            ) => v.last().map(|i| i.value.clone()),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                match arg {
+                    Some(col) => {
+                        uses += 1;
+                        *x = Expr::Identifier(Ident::new(format!("\u{1}{col}")));
+                    }
+                    None => bad = true,
+                }
+            }
+            std::ops::ControlFlow::<()>::Continue(())
+        });
+        if bad {
+            return Err(not_on_engine("this use of VALUES()"));
+        }
+        let x = c.compile(&e)?;
+        super::expr::now_into(&x, &def.columns[ci])?;
+        out.push((ci, x));
+    }
+    Ok((out, c.params, uses))
+}
+
+/// Whether `ins` is `INSERT ... SELECT` (a query as its rows).
+pub(crate) fn insert_select(ins: &sqlparser::ast::Insert) -> bool {
+    ins.assignments.is_empty()
+        && ins
+            .source
+            .as_ref()
+            .is_some_and(|q| !matches!(&*q.body, SetExpr::Values(_)))
+}
+
+/// `INSERT ... SELECT` into an engine table: the insert of `rows`, the
+/// rows the query (of `width` columns) gave. `None` when the table isn't
+/// an engine table.
+///
+/// # Errors
+/// As for an `INSERT ... VALUES`; 1136 when the query's columns don't
+/// match the insert's.
+pub(crate) fn bind_insert_rows(
+    cx: &BindCtx<'_>,
+    ins: &sqlparser::ast::Insert,
+    rows: &[Vec<super::row::Datum>],
+    width: usize,
+) -> Result<Option<Plan>> {
+    bind_insert(cx, ins, Some((rows, width)))
+}
+
 #[allow(clippy::too_many_lines)] // the forms, the columns, the rows
-fn bind_insert(cx: &BindCtx<'_>, ins: &sqlparser::ast::Insert) -> Result<Option<Plan>> {
+fn bind_insert(
+    cx: &BindCtx<'_>,
+    ins: &sqlparser::ast::Insert,
+    supplied: Option<(&[Vec<super::row::Datum>], usize)>,
+) -> Result<Option<Plan>> {
     let TableObject::TableName(name) = &ins.table else {
         return Ok(None);
     };
@@ -989,15 +1142,18 @@ fn bind_insert(cx: &BindCtx<'_>, ins: &sqlparser::ast::Insert) -> Result<Option<
         }
         Resolved::Engine(def, db) => (def, db),
     };
-    if ins.ignore
-        || ins.replace_into
-        || ins.on.is_some()
-        || ins.returning.is_some()
+    if ins.returning.is_some()
         || ins.partitioned.is_some()
         || ins.insert_alias.is_some()
+        || (ins.ignore && ins.on.is_some())
     {
         return Err(not_on_engine("this INSERT form"));
     }
+    let dup_sets = match &ins.on {
+        None => None,
+        Some(sqlparser::ast::OnInsert::DuplicateKeyUpdate(sets)) => Some(sets),
+        Some(_) => return Err(not_on_engine("this INSERT form")),
+    };
     // `INSERT ... SET c = v, ...`: one row of those columns.
     let set_form: Option<(Vec<ObjectName>, Vec<Expr>)> = if ins.assignments.is_empty() {
         None
@@ -1014,6 +1170,7 @@ fn bind_insert(cx: &BindCtx<'_>, ins: &sqlparser::ast::Insert) -> Result<Option<
         Some((names, row))
     };
     let rows_in: Vec<&[Expr]> = match (&set_form, &ins.source) {
+        _ if supplied.is_some() => Vec::new(),
         (Some((_, row)), None) => vec![row.as_slice()],
         (None, Some(src)) => {
             let SetExpr::Values(values) = &*src.body else {
@@ -1048,6 +1205,21 @@ fn bind_insert(cx: &BindCtx<'_>, ins: &sqlparser::ast::Insert) -> Result<Option<
     };
     let mut c = compiler(cx, &def, name, None);
     let mut rows = Vec::with_capacity(rows_in.len());
+    // The query's rows, as constants assigned like VALUES' (the servers
+    // check the column count before any row).
+    if let Some((given, width)) = supplied {
+        if width != cols.len() {
+            return Err(SprigError::standard(
+                1136,
+                *b"21S01",
+                "Column count doesn't match value count at row 1",
+            ));
+        }
+        rows = given
+            .iter()
+            .map(|r| r.iter().map(|d| Some(CExpr::Lit(d.clone()))).collect())
+            .collect();
+    }
     for (ri, r) in rows_in.iter().enumerate() {
         if r.len() != cols.len() {
             return Err(SprigError::standard(
@@ -1065,7 +1237,17 @@ fn bind_insert(cx: &BindCtx<'_>, ins: &sqlparser::ast::Insert) -> Result<Option<
                 row.push(None);
                 continue;
             }
-            let x = c.compile(e)?;
+            let x = match c.compile(e) {
+                Ok(x) => x,
+                // A value the single-table compiler doesn't have (date
+                // arithmetic, a function call): the expression engine's,
+                // when it reads no column.
+                Err(err) if err.code() == Some(sprig_common::SprigCode::NotOnEngine) => {
+                    super::table::value_expr(&def, e, &|s, n| super::sequence::resolve(cx, s, n))
+                        .map_err(|_| err)?
+                }
+                Err(err) => return Err(err),
+            };
             if !constant(&x) {
                 return Err(not_on_engine("a column reference in VALUES"));
             }
@@ -1079,6 +1261,19 @@ fn bind_insert(cx: &BindCtx<'_>, ins: &sqlparser::ast::Insert) -> Result<Option<
     for &ci in &cols {
         written[ci] = true;
     }
+    let on_dup = match dup_sets {
+        Some(sets) => {
+            let (sets, params, uses) = dup_key_sets(cx, &def, name, sets, c.params)?;
+            c.params = params;
+            for (ci, _) in &sets {
+                written[*ci] = true;
+            }
+            OnDup::Update(sets, uses)
+        }
+        None if ins.replace_into => OnDup::Replace,
+        None if ins.ignore => OnDup::Ignore,
+        None => OnDup::Error,
+    };
     finish(
         cx,
         c,
@@ -1086,7 +1281,7 @@ fn bind_insert(cx: &BindCtx<'_>, ins: &sqlparser::ast::Insert) -> Result<Option<
         db,
         name,
         None,
-        Op::Insert { cols, rows },
+        Op::Insert { cols, rows, on_dup },
         None,
         false,
         None,

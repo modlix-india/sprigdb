@@ -994,6 +994,15 @@ fn format_chars(p: &[u8]) -> u32 {
 }
 
 pub(crate) fn date_format(d: Node, f: Node, env: Env<'_>) -> Node {
+    format_node(d, f, env, false)
+}
+
+/// `TIME_FORMAT(t, f)`: `DATE_FORMAT` of a time (hours past 23, a sign).
+pub(crate) fn time_format(d: Node, f: Node, env: Env<'_>) -> Node {
+    format_node(d, f, env, true)
+}
+
+fn format_node(d: Node, f: Node, env: Env<'_>, as_time: bool) -> Node {
     let f = string_node(f, env);
     let chars = match &f.lit {
         Some(Value::Str(p) | Value::Bytes(p)) => format_chars(p),
@@ -1011,9 +1020,14 @@ pub(crate) fn date_format(d: Node, f: Node, env: Env<'_>) -> Node {
     }
     // MariaDB formats a TIME by its own fields: the date fields are
     // zero, the hours can pass 23, and a negative time shows its sign.
-    let time_only = env.maria() && d.ty.kind == Kind::Time;
+    let time_only = as_time || (env.maria() && d.ty.kind == Kind::Time);
     let maria = env.maria();
-    Node::new(ty, "date_format", move |ctx, row| {
+    let name = if as_time {
+        "time_format"
+    } else {
+        "date_format"
+    };
+    Node::new(ty, name, move |ctx, row| {
         let v = d.temporal(ctx, row)?;
         let t = if time_only {
             to_time(ctx, &v)

@@ -61,7 +61,8 @@ pub fn lock_table_full() -> SprigError {
     SprigError::standard(
         ER_LOCK_TABLE_FULL,
         *b"HY000",
-        "The total number of locks exceeds the lock table size",
+        "The total number of locks exceeds the lock table size (one transaction may hold \
+         about a million row locks; split it into smaller transactions)",
     )
 }
 

@@ -149,6 +149,18 @@ pub trait Batch: Send {
     /// The engine's.
     fn delete(&mut self, key: Bytes) -> StoreResult<()>;
 
+    /// Takes `keys` too (sorted, none held yet), waiting for other batches
+    /// as [`Unit::begin`] does: a script's batch takes each key when one of
+    /// its commands first names it.
+    ///
+    /// # Errors
+    /// The engine's; a deadlock or a lock wait that ran out is retryable.
+    fn hold(&mut self, keys: Vec<Bytes>) -> impl Future<Output = StoreResult<()>> + Send;
+
+    /// From now on, every read sees each key's latest version (a script's
+    /// batch, which holds every key its commands name before they run).
+    fn read_latest(&mut self) {}
+
     /// Queues the batch's writes as one commit and releases its keys. The
     /// ticket says when the writes, and every version the batch read, are
     /// durable: only then may a reply go out.

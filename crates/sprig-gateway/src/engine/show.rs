@@ -97,6 +97,47 @@ pub(crate) fn create_table(name: &str, text: &str) -> Answer {
     }
 }
 
+/// `SHOW CREATE VIEW` (and `SHOW CREATE TABLE` of a view): `text` is the
+/// view's stored text; `cs`, `coll`: the session's
+/// `character_set_client` and `collation_connection`.
+pub(crate) fn create_view(name: &str, text: &str, cs: &str, coll: &str) -> Answer {
+    Answer {
+        defs: vec![
+            coldef("", "", "View", "", 224, 256, VARSTR, 0x0001, 0x27),
+            coldef("", "", "Create View", "", 224, 4096, VARSTR, 0x0001, 0x27),
+            coldef(
+                "",
+                "",
+                "character_set_client",
+                "",
+                224,
+                128,
+                VARSTR,
+                0x0001,
+                0x27,
+            ),
+            coldef(
+                "",
+                "",
+                "collation_connection",
+                "",
+                224,
+                256,
+                VARSTR,
+                0x0001,
+                0x27,
+            ),
+        ],
+        rows: vec![encode_text_row([
+            Some(name.as_bytes()),
+            Some(text.as_bytes()),
+            Some(cs.as_bytes()),
+            Some(coll.as_bytes()),
+        ])],
+        no_index: false,
+    }
+}
+
 /// `SHOW CREATE DATABASE` of database `name` (the schema name the
 /// statement used): `text` is its `Create Database`, as MariaDB 11.8
 /// writes it.
@@ -472,7 +513,20 @@ pub(crate) fn index(def: &Def, rows_estimate: u64) -> Answer {
 
 /// `SHOW [FULL] TABLES [LIKE 'p']` of physical schema `schema`: `names`
 /// sorted. The column is named after the pattern too, as written.
+#[cfg(test)]
 pub(crate) fn tables(schema: &str, names: &[String], full: bool, like: Option<&str>) -> Answer {
+    let typed: Vec<(String, &'static str)> =
+        names.iter().map(|n| (n.clone(), "BASE TABLE")).collect();
+    tables_typed(schema, &typed, full, like)
+}
+
+/// [`tables`] with views and sequences: each name, and its type.
+pub(crate) fn tables_typed(
+    schema: &str,
+    names: &[(String, &'static str)],
+    full: bool,
+    like: Option<&str>,
+) -> Answer {
     let t = "TABLE_NAMES";
     let mut defs = vec![coldef(
         IS,
@@ -503,9 +557,9 @@ pub(crate) fn tables(schema: &str, names: &[String], full: bool, like: Option<&s
     }
     let rows = names
         .iter()
-        .map(|n| {
+        .map(|(n, kind)| {
             if full {
-                encode_text_row([Some(n.as_bytes()), Some(b"BASE TABLE".as_slice())])
+                encode_text_row([Some(n.as_bytes()), Some(kind.as_bytes())])
             } else {
                 encode_text_row([Some(n.as_bytes())])
             }

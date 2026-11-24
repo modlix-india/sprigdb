@@ -568,7 +568,7 @@ impl MqCatalog for GatewayMq {
             self.svc.settings.get(k, &ctx, Some(&cat.settings))
         };
         QueueSettings {
-            batch_rows: usize::try_from(n(&qs::WRITE_BATCH_MAX_ROWS)).unwrap_or(500),
+            batch_rows: usize::try_from(n(&qs::WRITE_BATCH_MAX_ROWS)).unwrap_or(4000),
             cache_bytes: n(&qs::OWNER_CACHE_MB) << 20,
             confirm_replica: t(&qs::CONFIRM_MODE) == "replica",
             delivery_limit_default: i64::try_from(n(&qs::DELIVERY_LIMIT_DEFAULT)).unwrap_or(20),
@@ -836,13 +836,20 @@ impl Leases for EtcdLeases {
         };
         let holder = serde_json::from_slice::<LeaseValue>(&kv.value)
             .map_or_else(|_| "another gateway".to_owned(), |v| v.gateway_id);
-        if holder != self.me {
+        let takeover = holder != self.me;
+        if takeover && !self.may_take_over(tenant) {
             return Ok(Acquired::Held(holder));
         }
         // An earlier process of this gateway (the id is stable across
         // restarts) left the key on a lease that hasn't expired yet: that
-        // process is gone, so take the key over. The owner epoch in MariaDB
-        // fences anything it might still write.
+        // process is gone, so take the key over. The owner epoch in the
+        // queue store fences anything it might still write. Likewise on a
+        // replicated engine when this gateway leads the tenant's unit: only
+        // it can commit the queue's writes, so the holder is dead (killed,
+        // its lease still running) or fenced.
+        if takeover {
+            tracing::info!(tenant, object, from = %holder, "queue owner lease taken over: this gateway leads the tenant's unit");
+        }
         let value = serde_json::to_vec(&LeaseValue {
             v: 1,
             gateway_id: self.me.clone(),
@@ -877,6 +884,10 @@ impl Leases for EtcdLeases {
             .unwrap_or(kv.create_revision);
         h.keys.insert((tenant, object), rev);
         Ok(Acquired::Mine(h.lost.clone()))
+    }
+
+    fn may_take_over(&self, tenant: u64) -> bool {
+        crate::node_engine::tenant_leader(tenant) == crate::node_engine::UnitLeader::Here
     }
 
     async fn holder(&self, tenant: u64, object: u64) -> Result<Option<String>, MqError> {

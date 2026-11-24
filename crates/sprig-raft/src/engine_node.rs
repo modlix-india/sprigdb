@@ -386,4 +386,58 @@ impl EngineNode {
     pub fn close(&self) {
         self.node.close();
     }
+
+    /// Moves units to their preferred leaders: every `every`, each unit
+    /// held here whose `preferred` leader is this node, and that another
+    /// replica leads while this one is caught up, asks for its leadership
+    /// (a transfer through the current leader, at most once per
+    /// `3 * every` per unit). Nothing is asked during the first `settle`
+    /// (a restarted node catches up first). Units `preferred` names no
+    /// node for are left wherever their elections put them. Runs on a
+    /// thread of its own until the node closes.
+    ///
+    /// # Errors
+    /// The thread could not be started.
+    pub fn prefer_leaders(
+        &self,
+        preferred: Arc<dyn Fn(UnitId) -> Option<NodeId> + Send + Sync>,
+        every: Duration,
+        settle: Duration,
+    ) -> std::io::Result<std::thread::JoinHandle<()>> {
+        let node = self.node.clone();
+        std::thread::Builder::new()
+            .name(format!("sprig-raft-prefer-{}", node.id()))
+            .spawn(move || {
+                let started = Instant::now();
+                let mut asked: HashMap<GroupId, Instant> = HashMap::new();
+                while !node.is_closed() {
+                    std::thread::sleep(every);
+                    if started.elapsed() < settle {
+                        continue;
+                    }
+                    let me = node.id();
+                    for g in node.groups() {
+                        if preferred(UnitId(g)) != Some(me) {
+                            continue;
+                        }
+                        let Some(st) = node.status(g) else { continue };
+                        let caught_up = st.applied >= st.committed;
+                        if st.is_leader
+                            || st.leader.is_none_or(|l| l == me)
+                            || !caught_up
+                            || !st.voters.contains(&me)
+                            || asked.get(&g).is_some_and(|t| t.elapsed() < every * 3)
+                        {
+                            continue;
+                        }
+                        asked.insert(g, Instant::now());
+                        if let Err(e) = node.request_leadership(g) {
+                            tracing::debug!(group = g, error = %e, "raft: asking for a preferred unit's leadership failed");
+                        } else {
+                            tracing::debug!(group = g, from = ?st.leader, "raft: asking for a preferred unit's leadership");
+                        }
+                    }
+                }
+            })
+    }
 }

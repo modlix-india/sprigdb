@@ -206,6 +206,9 @@ pub enum Expr {
     /// A keyword argument of a function, printed bare: an interval unit, a
     /// `TRIM` side.
     Keyword(String),
+    /// A value the planner bound, with its static type: an outer query's
+    /// column value in a subquery planned for each outer row.
+    Typed(Box<(Value, ExprType)>),
 }
 
 impl Expr {
@@ -399,6 +402,7 @@ impl Expr {
             }
             Expr::Func(name, args) => crate::func::write_sql(out, name, args),
             Expr::Keyword(k) => out.push_str(k),
+            Expr::Typed(_) => out.push('?'),
         }
     }
 }
@@ -834,7 +838,17 @@ pub fn value_text(v: &Value, ty: &ExprType, persona: Persona) -> Option<Bytes> {
 static NEXT_CONST: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Functions whose value differs from call to call.
-const VOLATILE: &[&str] = &["RAND", "UUID", "UUID_SHORT", "SYSDATE", "RANDOM_BYTES"];
+const VOLATILE: &[&str] = &[
+    "RAND",
+    "UUID",
+    "UUID_SHORT",
+    "SYSDATE",
+    "RANDOM_BYTES",
+    "NEXTVAL",
+    "LASTVAL",
+    "SETVAL",
+    "SPRIG_SEQUENCE_STATE",
+];
 
 /// Whether an expression reads no row: its value is the same for every row
 /// of one statement.
@@ -849,6 +863,7 @@ pub(crate) fn is_const(e: &Expr) -> bool {
         | Expr::Str(_)
         | Expr::Hex(_)
         | Expr::Param(_)
+        | Expr::Typed(_)
         | Expr::Keyword(_) => true,
         Expr::Neg(a)
         | Expr::Not(a)
@@ -1291,6 +1306,7 @@ fn build_inner(expr: &Expr, env: Env<'_>) -> Result<Node> {
             "42000",
             format!("You have an error in your SQL syntax near '{k}'"),
         )),
+        Expr::Typed(b) => Ok(Node::literal(b.1, "?", b.0.clone())),
     }
 }
 

@@ -20,7 +20,8 @@ use std::sync::Arc;
 use sprig_engine::row::Value;
 use sprig_exec::ops::{
     AggKind, Aggregate, Aggregation, Distinct, Filter, HashJoin, InnerSource, JoinKind, Limit,
-    Memory, NestedLoopJoin, Project, RowSource, SetKind, SetOp, Sort, SortKey, Union,
+    Memory, NestedLoopJoin, Project, RowSource, SetKind, SetOp, Sort, SortKey, Union, WinFunc,
+    WinKind, Window,
 };
 use sprig_exec::{
     BinOp, Compiled, Ctx, Expr, ExprType, Persona, Result, Session, SqlError, compile,
@@ -35,7 +36,7 @@ use crate::keyval::{key_usable, lookup_exact};
 use crate::range::{KeyCtx, RangeSet};
 use crate::resolve::{
     AGG_BASE, AggSpec, Apply, Block, Clause, Derived, ExprCx, Rel, RelCol, RelKind, SUBQ_BASE,
-    Scope, SemiJoin, StarCol, derived_cols, unknown_column, unsupported,
+    Scope, SemiJoin, StarCol, WIN_BASE, derived_cols, unknown_column, unsupported,
 };
 use crate::sources::{
     ApplyAgg, ApplyOp, CachedInner, DerivedSource, Fixed, LookupInner, LookupPart, ScanSource,
@@ -229,6 +230,8 @@ impl<'a> Planner<'a> {
             ids: 0,
             outer_refs: 0,
             ctes: Vec::new(),
+            bound_outer: None,
+            recording: Vec::new(),
         };
         let (query, explain) = match &statement {
             ast::Statement::Query(q) => (q, false),
@@ -317,6 +320,8 @@ impl Planner<'_> {
             ids: 0,
             outer_refs: 0,
             ctes: Vec::new(),
+            bound_outer: None,
+            recording: Vec::new(),
         };
         let cols = table
             .columns
@@ -380,7 +385,41 @@ pub(crate) struct Cx<'a> {
     ids: usize,
     /// How many names resolved into an enclosing block so far.
     pub(crate) outer_refs: usize,
-    ctes: Vec<Rc<ast::Cte>>,
+    pub(crate) ctes: Vec<Rc<ast::Cte>>,
+    /// Outer names bound to values: this is a dependent subquery planned
+    /// for one outer row.
+    pub(crate) bound_outer: Option<Rc<crate::dependent::BoundOuter>>,
+    /// Dependent subqueries being resolved, innermost last.
+    pub(crate) recording: Vec<crate::dependent::Recording>,
+}
+
+impl<'a> Cx<'a> {
+    /// The state for planning a dependent subquery for one outer row.
+    pub(crate) fn runtime(
+        catalog: &'a dyn Catalog,
+        storage: Arc<dyn Storage>,
+        session: Session,
+        options: PlanOptions,
+        memory: Arc<Memory>,
+        ctes: Vec<Rc<ast::Cte>>,
+        bound: Rc<crate::dependent::BoundOuter>,
+    ) -> Self {
+        Self {
+            catalog,
+            storage,
+            session,
+            params: &[],
+            options,
+            memory,
+            explain: Vec::new(),
+            accesses: Vec::new(),
+            ids: 0,
+            outer_refs: 0,
+            ctes,
+            bound_outer: Some(bound),
+            recording: Vec::new(),
+        }
+    }
 }
 
 /// One way to read a table by itself.
@@ -1238,6 +1277,12 @@ impl<'a> Cx<'a> {
                 .chain(block.items.iter().map(|i| &i.expr))
                 .chain(block.group_by.iter())
                 .chain(block.aggs.iter().filter_map(|a| a.arg.as_ref()))
+                .chain(
+                    block
+                        .aggs
+                        .iter()
+                        .flat_map(|a| a.order.iter().map(|(e, _)| e)),
+                )
                 .chain(block.having.iter())
                 .chain(block.order_by.iter().map(|(e, _)| e))
                 .chain(
@@ -1304,6 +1349,12 @@ impl<'a> Cx<'a> {
             .chain(block.items.iter().map(|i| &i.expr))
             .chain(block.group_by.iter())
             .chain(block.aggs.iter().filter_map(|a| a.arg.as_ref()))
+            .chain(
+                block
+                    .aggs
+                    .iter()
+                    .flat_map(|a| a.order.iter().map(|(e, _)| e)),
+            )
             .chain(block.having.iter())
             .chain(block.order_by.iter().map(|(e, _)| e))
             .chain(
@@ -1451,7 +1502,11 @@ impl<'a> Cx<'a> {
                     })
                     .collect();
                 let later = steps.last().map_or(1.0, |s| s.rows).max(1.0);
-                if block.grouped && !block.group_by.is_empty() && self.options.order_by_index {
+                if block.grouped
+                    && !block.rollup
+                    && !block.group_by.is_empty()
+                    && self.options.order_by_index
+                {
                     let list: Vec<(Expr, bool)> =
                         block.group_by.iter().map(|g| (g.clone(), false)).collect();
                     if let Some((wr, want)) = want_order(&list) {
@@ -1972,14 +2027,31 @@ impl<'a> Cx<'a> {
         let mut items: Vec<Expr> = block.items.iter().map(|i| i.expr.clone()).collect();
         let mut order: Vec<(Expr, bool)> = block.order_by.clone();
         let mut exact_types: Vec<Option<ExprType>> = vec![None; items.len()];
+        // A per-row subquery's value shows its own type, not its slot's.
+        for (i, it) in block.items.iter().enumerate() {
+            if let Expr::Column(c) = &it.expr {
+                if (SUBQ_BASE..AGG_BASE).contains(&c.slot) {
+                    exact_types[i] = block.applies.get(c.slot - SUBQ_BASE).map(|a| a.ty);
+                }
+                if (WIN_BASE..SUBQ_BASE).contains(&c.slot) {
+                    exact_types[i] = block.windows.get(c.slot - WIN_BASE).map(|w| w.ty);
+                }
+            }
+        }
+        let mut wins: Vec<crate::resolve::WinSpec> = block.windows.clone();
         let mut layout_map: Box<dyn Fn(usize) -> usize + '_> = Box::new(final_map);
         let mut temporary = false;
+        let mut filesort = false;
         if block.grouped {
             let groups = block.group_by.clone();
             let mut aggs: Vec<AggSpec> = block.aggs.clone();
+            // A rollup's total rows hold `NULL` in the rolled-up columns.
             let group_types: Vec<ExprType> = groups
                 .iter()
-                .map(|g| self.type_of(g))
+                .map(|g| {
+                    self.type_of(g)
+                        .map(|t| if block.rollup { t.nullable() } else { t })
+                })
                 .collect::<Result<_>>()?;
             // A column that is neither grouped nor aggregated shows one of
             // its group's values.
@@ -1992,6 +2064,9 @@ impl<'a> Cx<'a> {
                             return;
                         }
                         if let Expr::Column(c) = e {
+                            if (WIN_BASE..SUBQ_BASE).contains(&c.slot) {
+                                return;
+                            }
                             if c.slot < AGG_BASE && !out.iter().any(|o| o == e) {
                                 out.push(e.clone());
                             }
@@ -2002,6 +2077,7 @@ impl<'a> Cx<'a> {
                     walk(e, &groups, &mut loose);
                 };
                 items.iter().for_each(&mut find);
+                wins.iter().flat_map(|w| w.exprs()).for_each(&mut find);
                 having.iter().for_each(&mut find);
                 order.iter().for_each(|(e, _)| find(e));
             }
@@ -2017,6 +2093,8 @@ impl<'a> Cx<'a> {
                     arg: Some(e.clone()),
                     distinct: false,
                     separator: None,
+                    order: Vec::new(),
+                    limit: None,
                     ty,
                 });
             }
@@ -2057,18 +2135,27 @@ impl<'a> Cx<'a> {
                 if let Some(sep) = &a.separator {
                     agg = agg.separator(sep);
                 }
+                if !a.order.is_empty() {
+                    let mut keys = Vec::with_capacity(a.order.len());
+                    for (e, desc) in &a.order {
+                        keys.push(sprig_exec::ops::SortKey {
+                            expr: self.compile_at(e, &*layout_map)?,
+                            desc: *desc,
+                        });
+                    }
+                    agg = agg.order_by(keys);
+                }
+                if let Some((offset, count)) = a.limit {
+                    agg = agg.limit(offset, count);
+                }
                 agg_c.push(agg);
             }
             source = if streaming {
                 Box::new(Aggregation::streaming(source, group_c, agg_c))
             } else {
                 temporary = k > 0;
-                Box::new(Aggregation::hash(
-                    source,
-                    group_c,
-                    agg_c,
-                    self.memory.clone(),
-                ))
+                let a = Aggregation::hash(source, group_c, agg_c, self.memory.clone());
+                Box::new(if block.rollup { a.with_rollup() } else { a })
             };
             let out_types = source.types();
             for (i, item) in items.iter_mut().enumerate() {
@@ -2080,6 +2167,7 @@ impl<'a> Cx<'a> {
             for (e, _) in &mut order {
                 *e = post(e);
             }
+            wins = wins.iter().map(|w| w.map(&post)).collect();
             if let Some(h) = &having {
                 source = Box::new(Filter::new(source, compile(&post(h), &self.session)?));
             }
@@ -2091,13 +2179,74 @@ impl<'a> Cx<'a> {
             };
         }
 
+        // Window functions: per distinct partition and order, a sort and a
+        // window operator, each adding its functions' columns.
+        if !wins.is_empty() {
+            let mut win_pos = vec![0usize; wins.len()];
+            let mut done = vec![false; wins.len()];
+            for i in 0..wins.len() {
+                if done[i] {
+                    continue;
+                }
+                let same: Vec<usize> = (i..wins.len())
+                    .filter(|&j| {
+                        !done[j]
+                            && wins[j].partition == wins[i].partition
+                            && wins[j].order == wins[i].order
+                    })
+                    .collect();
+                let width = source.types().len();
+                let mut keys = Vec::new();
+                let mut part = Vec::new();
+                for p in &wins[i].partition {
+                    let c = self.compile_at(p, &*layout_map)?;
+                    keys.push(SortKey {
+                        expr: c.clone(),
+                        desc: false,
+                    });
+                    part.push(c);
+                }
+                let mut ord = Vec::new();
+                for (o, desc) in &wins[i].order {
+                    let c = self.compile_at(o, &*layout_map)?;
+                    keys.push(SortKey {
+                        expr: c.clone(),
+                        desc: *desc,
+                    });
+                    ord.push(SortKey {
+                        expr: c,
+                        desc: *desc,
+                    });
+                }
+                if !keys.is_empty() {
+                    source = Box::new(Sort::new(source, keys, self.memory.clone()));
+                    filesort = true;
+                }
+                let mut funcs = Vec::with_capacity(same.len());
+                for (k, &j) in same.iter().enumerate() {
+                    funcs.push(self.win_func(&wins[j], &*layout_map)?);
+                    win_pos[j] = width + k;
+                    done[j] = true;
+                }
+                source = Box::new(Window::new(source, part, ord, funcs));
+                temporary = true;
+            }
+            let prev = layout_map;
+            layout_map = Box::new(move |s| {
+                if (WIN_BASE..SUBQ_BASE).contains(&s) {
+                    win_pos[s - WIN_BASE]
+                } else {
+                    prev(s)
+                }
+            });
+        }
+
         // Ordering, DISTINCT, LIMIT and the select list.
         order.retain(|(e, _)| !exprs::is_const(e));
         let names: Vec<String> = block.items.iter().map(|i| i.name.clone()).collect();
         let top = block
             .limit
             .map(|l| usize::try_from(l.saturating_add(block.offset)).unwrap_or(usize::MAX));
-        let mut filesort = false;
         if block.distinct {
             let mut proj = Vec::with_capacity(items.len());
             for e in &items {
@@ -2136,7 +2285,7 @@ impl<'a> Cx<'a> {
                 ));
             }
         } else {
-            if !order.is_empty() && !(sorted_by_index && !block.grouped) {
+            if !order.is_empty() && !(sorted_by_index && !block.grouped && wins.is_empty()) {
                 let mut keys = Vec::new();
                 for (e, desc) in &order {
                     keys.push(SortKey {
@@ -2423,6 +2572,77 @@ impl<'a> Cx<'a> {
     }
 
     /// Adds the value of a per-row scalar subquery as a column.
+    /// One window function, compiled over the rows `map` lays out.
+    fn win_func(
+        &self,
+        w: &crate::resolve::WinSpec,
+        map: &dyn Fn(usize) -> usize,
+    ) -> Result<WinFunc> {
+        use crate::resolve::WinFn as F;
+        let arg = |k: usize| -> Result<Compiled> {
+            match w.args.get(k) {
+                Some(e) => self.compile_at(e, map),
+                None => Err(SqlError::param_count("window function")),
+            }
+        };
+        let count = |k: usize, default: u64| -> Result<u64> {
+            match w.args.get(k) {
+                None => Ok(default),
+                Some(e) => match self.eval_const(e) {
+                    Some((Value::Int(v), _)) if v >= 0 => Ok(v as u64),
+                    Some((Value::UInt(v), _)) => Ok(v),
+                    _ => Err(SqlError::new(
+                        1210,
+                        "HY000",
+                        "Incorrect arguments to window function",
+                    )),
+                },
+            }
+        };
+        let kind = match w.func {
+            F::RowNumber => WinKind::RowNumber,
+            F::Rank => WinKind::Rank,
+            F::DenseRank => WinKind::DenseRank,
+            F::PercentRank => WinKind::PercentRank,
+            F::CumeDist => WinKind::CumeDist,
+            F::Ntile => WinKind::Ntile(arg(0)?),
+            F::Lag | F::Lead => WinKind::Shift {
+                arg: arg(0)?,
+                offset: count(1, 1)?,
+                default: match w.args.get(2) {
+                    Some(e) => Some(self.compile_at(e, map)?),
+                    None => None,
+                },
+                lead: w.func == F::Lead,
+            },
+            F::FirstValue => WinKind::FirstValue(arg(0)?),
+            F::LastValue => WinKind::LastValue(arg(0)?),
+            F::NthValue => {
+                let n = count(1, 1)?;
+                if n == 0 {
+                    return Err(SqlError::new(
+                        1210,
+                        "HY000",
+                        "Incorrect arguments to nth_value",
+                    ));
+                }
+                WinKind::NthValue(arg(0)?, n)
+            }
+            F::Agg(k) => {
+                let a = match w.args.first() {
+                    Some(e) => Some(self.compile_at(e, map)?),
+                    None => None,
+                };
+                WinKind::Agg(Aggregate::new(k, a, false, &self.session)?)
+            }
+        };
+        Ok(WinFunc {
+            kind,
+            frame: w.frame,
+            ty: w.ty,
+        })
+    }
+
     fn apply_source(
         &mut self,
         source: Box<dyn RowSource>,
@@ -2431,11 +2651,26 @@ impl<'a> Cx<'a> {
         width: usize,
         explain_rows: &mut Vec<ExplainRow>,
     ) -> Result<Box<dyn RowSource>> {
-        let RelKind::Table(table) = &apply.rel.kind else {
+        if let Some(spec) = &apply.dep {
+            let mut keys = Vec::with_capacity(apply.keys.len());
+            for (outer_e, _) in &apply.keys {
+                keys.push(self.compile_at(outer_e, map)?);
+            }
+            return Ok(Box::new(crate::dependent::DependentOp {
+                outer: source,
+                keys,
+                spec: spec.clone(),
+                cache: std::collections::HashMap::new(),
+            }));
+        }
+        let Some(rel) = &apply.rel else {
+            return Err(unsupported("a per-row subquery without its table"));
+        };
+        let RelKind::Table(table) = &rel.kind else {
             return Err(unsupported("a per-row subquery over a derived table"));
         };
         let inner_map = move |s: usize| width + s;
-        let mut row = ExplainRow::new(apply.id, "DEPENDENT SUBQUERY", &apply.rel.alias);
+        let mut row = ExplainRow::new(apply.id, "DEPENDENT SUBQUERY", &rel.alias);
         let inner: Box<dyn InnerSource> = match self.bind_key(table, &apply.keys) {
             Some((kid, bound, unique, rows)) => {
                 let outer_exprs: Vec<&Expr> = bound.iter().map(|i| &apply.keys[*i].0).collect();
@@ -2447,13 +2682,13 @@ impl<'a> Cx<'a> {
                 }
                 row.r#ref = Some(vec!["func"; bound.len()].join(","));
                 row.rows = Some(rows.max(1.0).round() as u64);
-                self.lookup_inner(table, &apply.rel.alias, apply.id, kid, &outer_exprs, map)?
+                self.lookup_inner(table, &rel.alias, apply.id, kid, &outer_exprs, map)?
             }
             None => {
                 let counters = Counters::new();
                 self.accesses.push(AccessStat {
                     id: apply.id,
-                    table: apply.rel.alias.clone(),
+                    table: rel.alias.clone(),
                     counters: counters.clone(),
                 });
                 row.access = Some("ALL".into());
@@ -2492,6 +2727,11 @@ impl<'a> Cx<'a> {
         };
         let mut aggs = Vec::with_capacity(apply.aggs.len());
         for a in &apply.aggs {
+            if !a.order.is_empty() || a.limit.is_some() {
+                return Err(unsupported(
+                    "GROUP_CONCAT with ORDER BY or LIMIT in a subquery that reads its outer query",
+                ));
+            }
             aggs.push(ApplyAgg {
                 kind: a.kind,
                 arg: match &a.arg {

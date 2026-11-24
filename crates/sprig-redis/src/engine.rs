@@ -43,6 +43,41 @@ pub struct Watched {
     pub exp: Option<i64>,
 }
 
+/// Why a script's transaction failed: the script's reply, and whether
+/// running it again may succeed (a deadlock, a lock wait that ran out).
+/// Nothing of the transaction is kept.
+#[derive(Debug, Clone)]
+pub struct ScriptFailed {
+    /// The reply when it isn't run again.
+    pub reply: Frame,
+    /// Running the script again may succeed.
+    pub retry: bool,
+}
+
+/// A Lua script's transaction on the engine (`EVAL`, `FCALL`, or an `EXEC`
+/// holding scripts): every command the script calls runs in it, each key
+/// locked when a command first names it, and it commits once, when the
+/// script ends. Dropped without [`EngineScript::commit`], it changes
+/// nothing.
+#[async_trait]
+pub trait EngineScript: Send {
+    /// Runs one command (one [`EngineDatabase::runs`], or `SELECT`, which
+    /// changes the database of the commands after it).
+    async fn call(&mut self, cmd: &[Bytes], resp3: bool) -> Result<Frame, ScriptFailed>;
+
+    /// Commits; returns once the writes are durable.
+    async fn commit(self: Box<Self>) -> Result<(), ScriptFailed>;
+}
+
+/// Where the tenant's Lua code is kept on the engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LuaStore {
+    /// The script cache, by SHA1 (`EVAL`, `SCRIPT LOAD`).
+    Scripts,
+    /// The function libraries: one entry, named `""`, holding them all.
+    Functions,
+}
+
 /// One Redis database on the engine.
 #[async_trait]
 pub trait EngineDatabase: Send + Sync + std::fmt::Debug {
@@ -75,6 +110,50 @@ pub trait EngineDatabase: Send + Sync + std::fmt::Debug {
     ) -> Option<Vec<Frame>> {
         let _ = watched;
         Some(self.run(cmds, resp3).await)
+    }
+
+    /// Opens a script's transaction, after checking that no key of
+    /// `watched` changed since its `WATCH` (`Ok(None)`: one did).
+    ///
+    /// # Errors
+    /// The reply when no transaction can be opened.
+    async fn script(&self, watched: &[Watched]) -> Result<Option<Box<dyn EngineScript>>, Frame> {
+        let _ = watched;
+        Err(not_on_engine("eval"))
+    }
+
+    /// The tenant's stored Lua entry `name` of `store`.
+    ///
+    /// # Errors
+    /// The engine's, as a reply.
+    async fn lua_get(&self, store: LuaStore, name: &[u8]) -> Result<Option<Bytes>, Frame> {
+        let _ = (store, name);
+        Err(not_on_engine("script"))
+    }
+
+    /// Replaces entry `name` of `store` with `new` (`None` deletes it) when
+    /// it still holds `expect` (`None`: whatever it holds); whether it did.
+    ///
+    /// # Errors
+    /// The engine's, as a reply.
+    async fn lua_swap(
+        &self,
+        store: LuaStore,
+        name: &[u8],
+        expect: Option<Option<Bytes>>,
+        new: Option<Bytes>,
+    ) -> Result<bool, Frame> {
+        let _ = (store, name, expect, new);
+        Err(not_on_engine("script"))
+    }
+
+    /// Deletes every entry of `store`.
+    ///
+    /// # Errors
+    /// The engine's, as a reply.
+    async fn lua_clear(&self, store: LuaStore) -> Result<(), Frame> {
+        let _ = store;
+        Err(not_on_engine("script"))
     }
 }
 

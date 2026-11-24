@@ -87,7 +87,11 @@ pub fn streams() -> Option<Arc<EngineStreams>> {
             let dir = crate::node_engine::config_from_env()?
                 .data_dir
                 .join("streams");
-            EngineStreams::open(&e, dir, SegConfig::default(), TopicDefaults::default())
+            let cfg = SegConfig {
+                groups: crate::node_engine::stream_groups(),
+                ..SegConfig::default()
+            };
+            EngineStreams::open(&e, dir, cfg, TopicDefaults::default())
         });
         match opened {
             Ok(s) => {

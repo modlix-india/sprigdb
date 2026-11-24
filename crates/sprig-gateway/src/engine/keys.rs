@@ -138,6 +138,11 @@ fn meta_key(tenant: u64, object: u32, name: &[u8]) -> Vec<u8> {
     k
 }
 
+/// The key of sequence `object`'s stored state.
+pub(crate) fn sequence_key(tenant: u64, object: u32) -> Vec<u8> {
+    meta_key(tenant, object, b"sequence")
+}
+
 /// The prefix of the rows of generation `row_gen` of a table.
 pub(crate) fn rows_prefix(tenant: u64, object: u32, row_gen: u16) -> Vec<u8> {
     let mut k = Vec::with_capacity(64);

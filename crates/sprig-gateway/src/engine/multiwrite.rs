@@ -36,7 +36,6 @@ use sprig_common::ids::DbId;
 use sprig_common::{Result, SprigError};
 use sprig_sql::lex::{LexOptions, Token, TokenKind, ident_value, lex};
 use sqlparser::ast::{SetExpr, Statement, TableFactor};
-use sqlparser::dialect::MySqlDialect;
 use sqlparser::parser::Parser;
 
 use super::exec::Outcome;
@@ -334,7 +333,7 @@ struct Factor {
 /// The tables `refs` names at its top level.
 fn factors(cx: &BindCtx<'_>, refs: &str) -> Result<Option<Vec<Factor>>> {
     let probe = format!("SELECT 1 FROM {refs}");
-    let Ok(mut v) = Parser::parse_sql(&MySqlDialect {}, &probe) else {
+    let Ok(mut v) = Parser::parse_sql(&sprig_plan::dialect::SprigMySql, &probe) else {
         return Ok(None);
     };
     let Some(Statement::Query(q)) = v.pop() else {
@@ -724,7 +723,7 @@ pub(crate) fn bind(
                 current: Some(*db),
                 backslash: cx.backslash,
             };
-            let stmt = Parser::parse_sql(&MySqlDialect {}, &sql)
+            let stmt = Parser::parse_sql(&sprig_plan::dialect::SprigMySql, &sql)
                 .ok()
                 .and_then(|mut v| v.pop())
                 .ok_or_else(|| not_on_engine("an assignment the engine can't parse"))?;
@@ -770,7 +769,7 @@ pub(crate) fn bind(
         }
         r => r?,
     };
-    let stmt = Parser::parse_sql(&MySqlDialect {}, &select)
+    let stmt = Parser::parse_sql(&sprig_plan::dialect::SprigMySql, &select)
         .ok()
         .and_then(|mut v| v.pop())
         .ok_or_else(|| not_on_engine("a write's tables or conditions the planner can't parse"))?;
@@ -867,6 +866,7 @@ impl Engine {
                 changed
             },
             last_insert_id: 0,
+            reported_id: 0,
             info: w.update.then(|| {
                 format!("Rows matched: {matched}  Changed: {changed}  Warnings: {warnings}")
             }),

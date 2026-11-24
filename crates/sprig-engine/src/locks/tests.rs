@@ -661,3 +661,22 @@ fn a_gap_in_one_index_blocks_no_other_index_and_a_wide_gap_blocks_all_it_spans()
     assert_eq!(t.key_count() + t.gap_count(), 0);
     assert!(!t.has_gaps());
 }
+
+#[test]
+fn a_million_row_locks_fit_the_default_lock_memory() {
+    // One transaction locking a million rows of a table keyed by a BIGINT
+    // (the key's head and eight bytes) stays under the default cap.
+    let t = Arc::new(LockTable::new(LockConfig::default()));
+    let w = w();
+    for i in 0..1_000_000u64 {
+        let mut k = in_index(0, "").to_vec();
+        k.extend_from_slice(&i.to_be_bytes());
+        let k = Bytes::from(k);
+        assert!(
+            granted(&t.acquire(1, &w, &k, LockMode::Exclusive, false, false)),
+            "row {i} refused at {} bytes",
+            t.bytes_held_by(1)
+        );
+    }
+    t.release_all(1);
+}

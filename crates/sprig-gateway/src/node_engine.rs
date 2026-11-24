@@ -16,6 +16,12 @@
 //!   this one included: `1=10.0.0.11:26171,2=10.0.0.12:26171,...`.
 //!   `SPRIGDB_ENGINE_RAFT_LISTEN` is the address the Raft listener binds
 //!   (default: this node's own entry). Unset: one node, as before.
+//! - `SPRIGDB_ENGINE_STREAM_GROUPS`: on a replicated node, the partition
+//!   groups per tenant (default: one per replica; `0` keeps every
+//!   partition in its tenant's unit). Partition `p` of a stream commits
+//!   through its tenant's group unit `p % n`, each group's leader
+//!   preferably on a different replica, so Kafka writes spread over the
+//!   nodes. Every replica must use the same value.
 //! - `SPRIGDB_ENGINE_RAFT_JOIN=true`: this node replaces a lost replica.
 //!   It starts with no units of its own and takes each unit only from the
 //!   unit's leader, once an operator runs `sprigctl engine replace-replica`
@@ -47,6 +53,9 @@ pub const RAFT_PEERS_VAR: &str = "SPRIGDB_ENGINE_RAFT_PEERS";
 pub const RAFT_LISTEN_VAR: &str = "SPRIGDB_ENGINE_RAFT_LISTEN";
 /// The variable saying this node joins as a replacement replica.
 pub const RAFT_JOIN_VAR: &str = "SPRIGDB_ENGINE_RAFT_JOIN";
+/// The variable giving the partition groups per tenant on a replicated
+/// node.
+pub const STREAM_GROUPS_VAR: &str = "SPRIGDB_ENGINE_STREAM_GROUPS";
 /// The node-local Admin API route that replaces a lost replica.
 pub const REPLACE_PATH: &str = "/admin/v1/engine/replicas:replace";
 
@@ -97,6 +106,15 @@ pub enum UnitLeader {
 /// queues), from this node's Raft state.
 #[must_use]
 pub fn tenant_leader(tenant: u64) -> UnitLeader {
+    unit_leader(tenant)
+}
+
+/// Who leads engine unit `unit` (a tenant's, or a partition group's: see
+/// [`stream_groups`]), from this node's Raft state. A partition group no
+/// replica has started yet is named by its preferred leader, where its
+/// first write starts it.
+#[must_use]
+pub fn unit_leader(unit: u64) -> UnitLeader {
     let Some(raft) = RAFT.get() else {
         return if replicated_from_env() {
             UnitLeader::Unknown
@@ -104,10 +122,48 @@ pub fn tenant_leader(tenant: u64) -> UnitLeader {
             UnitLeader::Any
         };
     };
-    match raft.node.node().status(tenant) {
-        None => UnitLeader::Any,
+    match raft.node.node().status(unit) {
+        None => match preferred_leader(&raft.voters, unit) {
+            Some(p) if p == raft.node.node().id() => UnitLeader::Here,
+            Some(p) => UnitLeader::Node(p),
+            None => UnitLeader::Any,
+        },
         Some(st) if st.is_leader => UnitLeader::Here,
         Some(st) => st.leader.map_or(UnitLeader::Unknown, UnitLeader::Node),
+    }
+}
+
+/// The replica that should lead `unit`: for a tenant's partition group
+/// `g`, the voters in id order, starting at the tenant's own offset, so
+/// the groups of one tenant (and of tenants side by side) sit on
+/// different replicas. `None` for other units (wherever elections put
+/// them).
+fn preferred_leader(voters: &[u64], unit: u64) -> Option<u64> {
+    let (tenant, g) = sprig_streams::seg::group_of_unit(unit)?;
+    let n = u64::try_from(voters.len()).ok().filter(|n| *n > 0)?;
+    let at = (tenant % n + u64::from(g)) % n;
+    voters.get(usize::try_from(at).ok()?).copied()
+}
+
+/// The partition groups per tenant for this node's stream log: 0 on one
+/// node; on a replicated node [`STREAM_GROUPS_VAR`], else the number of
+/// replicas.
+#[must_use]
+pub fn stream_groups() -> u32 {
+    groups_from(|k| std::env::var(k).ok())
+}
+
+fn groups_from(lookup: impl Fn(&str) -> Option<String>) -> u32 {
+    let Ok(Some(r)) = raft_from(&lookup) else {
+        return 0;
+    };
+    match lookup(STREAM_GROUPS_VAR).map(|v| v.trim().parse::<u32>()) {
+        Some(Ok(n)) => n.min(255),
+        Some(Err(_)) => {
+            tracing::warn!("{STREAM_GROUPS_VAR} isn't a number; one group per replica");
+            u32::try_from(r.peers.len()).unwrap_or(0)
+        }
+        None => u32::try_from(r.peers.len()).unwrap_or(0),
     }
 }
 
@@ -233,6 +289,7 @@ pub fn engine() -> Result<Engine> {
                 Ok(e) => {
                     tracing::info!(dir = %dir, replicated = raft.is_some(), "storage engine open");
                     crate::changelog::open_on(&e);
+                    crate::backup::open_on(&e);
                     Ok(e)
                 }
                 Err(e) => {
@@ -299,8 +356,21 @@ fn start_raft(engine: &Engine, r: &RaftSetup, dir: PathBuf) -> Result<()> {
     })?
     .map_err(|e| raft_err(format!("raft listener on {listen}: {e}")))?;
     node.spawn().map_err(|e| raft_err(e.to_string()))?;
-    tracing::info!(id = r.id, raft = %bound, voters = r.peers.len(), join = r.join, "engine units replicate through raft");
-    let _ = RAFT.set(Raft { node, transport });
+    let mut voters: Vec<u64> = r.peers.iter().map(|(p, _)| *p).collect();
+    voters.sort_unstable();
+    let prefer = voters.clone();
+    node.prefer_leaders(
+        Arc::new(move |u: sprig_engine::UnitId| preferred_leader(&prefer, u.0)),
+        std::time::Duration::from_millis(500),
+        std::time::Duration::from_secs(10),
+    )
+    .map_err(|e| raft_err(e.to_string()))?;
+    tracing::info!(id = r.id, raft = %bound, voters = r.peers.len(), join = r.join, stream_groups = groups_from(|k| std::env::var(k).ok()), "engine units replicate through raft");
+    let _ = RAFT.set(Raft {
+        node,
+        transport,
+        voters,
+    });
     Ok(())
 }
 
@@ -308,6 +378,8 @@ fn start_raft(engine: &Engine, r: &RaftSetup, dir: PathBuf) -> Result<()> {
 struct Raft {
     node: sprig_raft::EngineNode,
     transport: Arc<sprig_raft::tcp::TcpTransport>,
+    /// Every member's id, in order.
+    voters: Vec<u64>,
 }
 
 static RAFT: OnceLock<Raft> = OnceLock::new();
@@ -427,7 +499,8 @@ struct FollowCatalogs {
 
 impl sprig_engine::ApplyObserver for FollowCatalogs {
     fn applied(&self, unit: sprig_engine::UnitId, _entries: &[sprig_engine::log::LogEntry]) {
-        if unit == sprig_engine::NODE_UNIT {
+        // Partition groups carry stream appends only, no catalog rows.
+        if unit == sprig_engine::NODE_UNIT || sprig_streams::seg::group_of_unit(unit.0).is_some() {
             return;
         }
         let Some(e) = self.engine.upgrade() else {
@@ -523,5 +596,34 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn partition_groups_and_their_preferred_leaders() {
+        let peers = "1=127.0.0.1:26171,2=127.0.0.1:26172,3=127.0.0.1:26173";
+        let groups = |vars: &[(&str, &str)]| {
+            let vars: Vec<(String, String)> = vars
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect();
+            groups_from(|k| vars.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()))
+        };
+        assert_eq!(groups(&[]), 0, "one node: no groups");
+        let repl = [(RAFT_ID_VAR, "1"), (RAFT_PEERS_VAR, peers)];
+        assert_eq!(groups(&repl), 3, "one group per replica");
+        let mut set = repl.to_vec();
+        set.push((STREAM_GROUPS_VAR, "0"));
+        assert_eq!(groups(&set), 0);
+        set.pop();
+        set.push((STREAM_GROUPS_VAR, "6"));
+        assert_eq!(groups(&set), 6);
+        // A tenant's groups land on different replicas; tenant units have
+        // no preference.
+        let voters = [1, 2, 3];
+        let leads: Vec<Option<u64>> = (0..3)
+            .map(|g| preferred_leader(&voters, sprig_streams::seg::group_unit(7, g)))
+            .collect();
+        assert_eq!(leads, vec![Some(2), Some(3), Some(1)]);
+        assert_eq!(preferred_leader(&voters, 7), None);
     }
 }

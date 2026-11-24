@@ -23,7 +23,6 @@ use sprig_common::ids::{DbId, TenantId};
 use sprig_common::{Result, SprigError};
 use sprig_engine::txn::TxnOptions;
 use sprig_proto_mysql::resultset::Value;
-use sqlparser::dialect::MySqlDialect;
 use sqlparser::parser::Parser;
 
 use super::assign::Env;
@@ -119,7 +118,7 @@ fn client_value(v: Value) -> MyValue {
 impl sprig_graph::mapped::SqlRunner for EngineSql<'_> {
     async fn rows(&mut self, sql: &str, params: Vec<MyValue>) -> Result<Vec<Row>> {
         let eng = super::engine()?;
-        let mut stmts = Parser::parse_sql(&MySqlDialect {}, sql).map_err(|e| {
+        let mut stmts = Parser::parse_sql(&sprig_plan::dialect::SprigMySql, sql).map_err(|e| {
             SprigError::internal(format!(
                 "engine: a mapped graph's statement doesn't parse: {e}"
             ))

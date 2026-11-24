@@ -10,7 +10,7 @@ use crate::exprs;
 use crate::plan::Cx;
 use crate::resolve::{
     AGG_BASE, AggSpec, Apply, Block, Clause, Derived, ExprCx, Item, OUTER_BASE, Rel, RelCol,
-    RelKind, Scope, SemiJoin, SimpleInner, StarCol, derived_cols, object_name, table_col,
+    RelKind, Scope, SemiJoin, SimpleInner, StarCol, WinSpec, derived_cols, object_name, table_col,
     unknown_column, unsupported,
 };
 
@@ -512,7 +512,7 @@ impl Cx<'_> {
         Ok(from)
     }
 
-    fn const_u64(&mut self, e: &ast::Expr, scope: &Scope<'_>) -> Result<u64> {
+    pub(crate) fn const_u64(&mut self, e: &ast::Expr, scope: &Scope<'_>) -> Result<u64> {
         let mut x = ExprCx::new(scope, Clause::Where);
         let e = self.expr(e, &mut x)?;
         let bad = || {
@@ -645,7 +645,6 @@ impl Cx<'_> {
             || select.into.is_some()
             || !select.lateral_views.is_empty()
             || select.qualify.is_some()
-            || !select.named_window.is_empty()
             || !select.cluster_by.is_empty()
             || !select.distribute_by.is_empty()
             || !select.sort_by.is_empty()
@@ -662,6 +661,7 @@ impl Cx<'_> {
         let mut semis = Vec::new();
         let mut correlated = Vec::new();
         let mut applies: Vec<Apply> = Vec::new();
+        let mut windows: Vec<WinSpec> = Vec::new();
 
         // WHERE.
         if let Some(selection) = &select.selection {
@@ -674,9 +674,17 @@ impl Cx<'_> {
                     visible: 0..rels.len(),
                     outer,
                 };
-                if let Some(semi) = self.semi_join(part, &scope)? {
-                    semis.push(semi);
-                    continue;
+                // A shape the semi-join doesn't take is left to the
+                // expression path (a dependent subquery there).
+                let refs = self.outer_refs;
+                match self.semi_join(part, &scope) {
+                    Ok(Some(semi)) => {
+                        semis.push(semi);
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(e) if e.code == 1235 => self.outer_refs = refs,
+                    Err(e) => return Err(e),
                 }
                 let before = self.outer_refs;
                 let mut x = ExprCx::new(&scope, Clause::Where);
@@ -791,6 +799,8 @@ impl Cx<'_> {
                     let mut x = ExprCx::new(&scope, Clause::Select);
                     x.aggs = Some(&mut aggs);
                     x.applies = Some(&mut applies);
+                    x.windows = Some(&mut windows);
+                    x.named = &select.named_window;
                     let expr = self.expr(e, &mut x)?;
                     let (name, alias) = match e {
                         ast::Expr::Identifier(i) => (i.value.clone(), Some(i.value.clone())),
@@ -806,6 +816,8 @@ impl Cx<'_> {
                     let mut x = ExprCx::new(&scope, Clause::Select);
                     x.aggs = Some(&mut aggs);
                     x.applies = Some(&mut applies);
+                    x.windows = Some(&mut windows);
+                    x.named = &select.named_window;
                     let expr = self.expr(expr, &mut x)?;
                     items.push(Item {
                         name: alias.value.clone(),
@@ -834,10 +846,13 @@ impl Cx<'_> {
 
         // GROUP BY.
         let mut group_by = Vec::new();
+        let mut rollup = false;
         match &select.group_by {
             ast::GroupByExpr::Expressions(list, modifiers) => {
-                if !modifiers.is_empty() {
-                    return Err(unsupported("GROUP BY modifiers"));
+                match modifiers.as_slice() {
+                    [] => {}
+                    [ast::GroupByWithModifier::Rollup] if !list.is_empty() => rollup = true,
+                    _ => return Err(unsupported("GROUP BY modifiers")),
                 }
                 for e in list {
                     if let Some(p) = position(e, Clause::GroupBy)? {
@@ -900,6 +915,8 @@ impl Cx<'_> {
                 x.aggs = Some(&mut aggs);
                 x.items = Some(&items);
                 x.alias_first = true;
+                x.windows = Some(&mut windows);
+                x.named = &select.named_window;
                 order.push((self.expr(&o.expr, &mut x)?, desc));
             }
         }
@@ -954,11 +971,20 @@ impl Cx<'_> {
             self.outer_refs = refs_before;
             return Err(unsupported("a subquery that reads its outer query here"));
         }
+        // MariaDB doesn't order a rollup.
+        if rollup && maria && !order.is_empty() {
+            return Err(SqlError::new(
+                1221,
+                "HY000",
+                "Incorrect usage of CUBE/ROLLUP and ORDER BY",
+            ));
+        }
         Ok(Block {
             rels,
             filters,
             semis,
             applies,
+            windows,
             items,
             group_by,
             aggs,
@@ -968,6 +994,7 @@ impl Cx<'_> {
             limit: lim,
             offset: off,
             grouped,
+            rollup,
             id,
             correlated,
         })

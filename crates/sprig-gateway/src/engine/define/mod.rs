@@ -34,7 +34,7 @@
 mod alter;
 pub(crate) mod expr;
 pub(crate) mod fkcheck;
-mod lex;
+pub(crate) mod lex;
 mod types;
 
 #[cfg(test)]
@@ -466,9 +466,8 @@ fn create_in(toks: &[Tok], cx: &Ctx) -> Result<Created, Fail> {
     if p.eat("OR") {
         p.want("REPLACE")?;
     }
-    if p.is("TEMPORARY") {
-        return Err(refuse("temporary tables"));
-    }
+    // A temporary table's definition is a table's (the session keeps it).
+    p.eat("TEMPORARY");
     p.want("TABLE")?;
     if p.eat("IF") {
         p.want("NOT")?;

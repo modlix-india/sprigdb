@@ -266,6 +266,9 @@ impl RowSource for Limit {
     }
 }
 
+mod window;
+pub use window::{Frame, FrameBound, WinFunc, WinKind, Window};
+
 /// A value normalized so that plain comparison gives its type's SQL order:
 /// `NULL` first, numbers by value, strings by their collation's key.
 #[derive(Debug, Clone, PartialEq)]
@@ -756,7 +759,7 @@ impl Aggregate {
 }
 
 /// The running state of one aggregate in one group.
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct AggState {
     count: u64,
     sum_dec: Option<Dec>,
@@ -1019,6 +1022,9 @@ pub struct Aggregation {
     out: std::collections::VecDeque<Row>,
     current: Option<(Vec<u8>, Group)>,
     groups_seen: u64,
+    /// `WITH ROLLUP`: also the totals of each group of the leading
+    /// columns, and the grand total.
+    rollup: bool,
 }
 
 impl Aggregation {
@@ -1040,6 +1046,7 @@ impl Aggregation {
             out: std::collections::VecDeque::new(),
             current: None,
             groups_seen: 0,
+            rollup: false,
         }
     }
 
@@ -1055,6 +1062,87 @@ impl Aggregation {
             streaming: true,
             ..Self::hash(input, group_by, aggs, Memory::unlimited())
         }
+    }
+
+    /// `GROUP BY ... WITH ROLLUP`: after each group, the totals of the
+    /// groups of its leading columns that end with it (the other columns
+    /// `NULL`), and the grand total last; groups in the order of their
+    /// values, `NULL` first, as both servers give them.
+    #[must_use]
+    pub fn with_rollup(mut self) -> Self {
+        self.rollup = true;
+        self
+    }
+
+    fn fresh(&self) -> Vec<AggState> {
+        self.aggs.iter().map(|_| AggState::default()).collect()
+    }
+
+    fn emit_level(&mut self, ctx: &mut Ctx<'_>, values: &[Value], l: usize, states: Vec<AggState>) {
+        let mut row: Row = values
+            .iter()
+            .enumerate()
+            .map(|(c, v)| if c < l { v.clone() } else { Value::Null })
+            .collect();
+        for (a, st) in self.aggs.iter().zip(states) {
+            row.push(a.finish(ctx, st));
+        }
+        self.out.push_back(row);
+    }
+
+    fn run_rollup(&mut self, ctx: &mut Ctx<'_>) -> Result<()> {
+        let k = self.group_by.len();
+        let mut rows: Vec<(Vec<OrdKey>, Row, Row)> = Vec::new();
+        while let Some(row) = self.input.next(ctx)? {
+            let mut keys = Vec::with_capacity(k);
+            let mut values = Vec::with_capacity(k);
+            for g in &self.group_by {
+                let v = g.eval(ctx, &row)?;
+                keys.push(OrdKey::of(&v, g.ty()));
+                values.push(v);
+            }
+            self.memory
+                .charge(row_bytes(&row) + row_bytes(&values) + 64)?;
+            rows.push((keys, values, row));
+        }
+        rows.sort_by(|a, b| {
+            a.0.iter()
+                .zip(&b.0)
+                .map(|(x, y)| x.cmp(y))
+                .find(|o| o.is_ne())
+                .unwrap_or(Ordering::Equal)
+        });
+        // states[l]: the current group of the first `l` columns.
+        let mut states: Vec<Vec<AggState>> = (0..=k).map(|_| self.fresh()).collect();
+        let mut numbers: Vec<u64> = (1..=k as u64 + 1).collect();
+        let mut next_number = k as u64 + 2;
+        for i in 0..rows.len() {
+            if i > 0 {
+                let (before, now) = (&rows[i - 1].0, &rows[i].0);
+                if let Some(c) = (0..k).find(|&c| before[c].cmp(&now[c]).is_ne()) {
+                    for l in (c + 1..=k).rev() {
+                        let st = std::mem::replace(&mut states[l], self.fresh());
+                        let values = rows[i - 1].1.clone();
+                        self.emit_level(ctx, &values, l, st);
+                        numbers[l] = next_number;
+                        next_number += 1;
+                    }
+                }
+            }
+            for (l, level) in states.iter_mut().enumerate() {
+                for (a, st) in self.aggs.iter().zip(level.iter_mut()) {
+                    a.update(st, ctx, &rows[i].2, numbers[l])?;
+                }
+            }
+        }
+        if let Some(last) = rows.last() {
+            let values = last.1.clone();
+            for l in (0..=k).rev() {
+                let st = std::mem::take(&mut states[l]);
+                self.emit_level(ctx, &values, l, st);
+            }
+        }
+        Ok(())
     }
 
     fn new_group(&self, values: Row) -> Group {
@@ -1115,6 +1203,13 @@ impl Aggregation {
 
 impl RowSource for Aggregation {
     fn next(&mut self, ctx: &mut Ctx<'_>) -> Result<Option<Row>> {
+        if self.rollup {
+            if !self.done {
+                self.done = true;
+                self.run_rollup(ctx)?;
+            }
+            return Ok(self.out.pop_front());
+        }
         if !self.streaming {
             if !self.done {
                 self.done = true;
@@ -1165,7 +1260,13 @@ impl RowSource for Aggregation {
     fn types(&self) -> Vec<ExprType> {
         self.group_by
             .iter()
-            .map(|g| *g.ty())
+            .map(|g| {
+                if self.rollup {
+                    g.ty().nullable()
+                } else {
+                    *g.ty()
+                }
+            })
             .chain(self.aggs.iter().map(|a| a.ty))
             .collect()
     }

@@ -68,5 +68,7 @@ mod tz;
 
 pub use error::{Level, Result, SqlError, Warning};
 pub use expr::{BinOp, CastTarget, ColumnRef, Compiled, Expr, Truth, compile, value_text};
+pub use func::misc::SessionInfo;
+pub use func::sequence::Sequences;
 pub use session::{Ctx, Persona, Session, SqlMode};
 pub use types::{ExprType, FieldType, Kind, Meta};

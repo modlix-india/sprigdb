@@ -23,6 +23,7 @@ fn sess() -> Session {
         wait: Duration::from_millis(200),
         db: "sbtest".into(),
         conn: 7,
+        account: ("root".into(), "%".into()),
     }
 }
 

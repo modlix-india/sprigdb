@@ -55,7 +55,6 @@ use sprig_proto_mysql::command::{ExecuteParams, ParamValue, StmtExecute};
 use sprig_proto_mysql::packets::OkPacket;
 use sprig_proto_mysql::{Caps, ColumnDef, StatusFlags};
 use sqlparser::ast::Statement;
-use sqlparser::dialect::MySqlDialect;
 use sqlparser::parser::Parser;
 
 use super::PassSession;
@@ -82,6 +81,8 @@ mod general;
 // `SET` of session variables kept in the gateway.
 mod setvars;
 mod show;
+// DDL on the session's temporary tables.
+mod temp;
 // Multi-table and subquery UPDATE and DELETE.
 mod write;
 
@@ -126,6 +127,8 @@ pub(super) struct EngineState {
     pub(super) txn: SessionTxn,
     /// The session's variables as last read; `None`: read them again.
     vars: Option<SessVars>,
+    /// The session's `LAST_INSERT_ID()` from the engine's inserts.
+    last_insert_id: u64,
     /// `innodb_lock_wait_timeout` as the session last set it, in seconds
     /// (`None`: the default).
     lock_wait: Option<u64>,
@@ -161,6 +164,13 @@ pub(super) struct EngineState {
     pub(super) entry: Option<Bytes>,
     /// 3306: the table a 1062 of the running statement names (`'t.key'`).
     pub(super) dup_table: Option<String>,
+    /// The session's last value of each sequence (`LASTVAL`), by object.
+    seq_last: Arc<std::sync::Mutex<std::collections::HashMap<u64, i64>>>,
+    /// The session's temporary tables on engine databases.
+    pub(super) temps: crate::engine::temp::TempTables,
+    /// MySQL: the open transaction created (bit 1) or dropped (bit 2)
+    /// temporary tables, which its rollback can't undo (1751, 1752).
+    pub(super) temp_txn: u8,
 }
 
 impl EngineState {
@@ -183,6 +193,9 @@ enum Bound {
     Elsewhere { tables: bool },
     /// An `UPDATE` or `DELETE` through a join or a subquery.
     Write(Box<crate::engine::multiwrite::MultiWrite>),
+    /// `INSERT ... SELECT` into an engine table: the query (the planner's)
+    /// runs first, then its rows are inserted.
+    InsertSelect(Box<(crate::engine::general::General, sqlparser::ast::Insert)>),
 }
 
 /// A prepared statement on an engine table.
@@ -200,6 +213,53 @@ pub(crate) struct EnginePrepared {
     /// A general `SELECT` (the planner's): `plan` then only stands in,
     /// and the statement is planned at each execute.
     pub general: Option<Arc<crate::engine::general::General>>,
+    /// The session's temporary tables when it was bound (their
+    /// generation): a change binds it again.
+    pub temp_gen: u64,
+}
+
+/// The `AUTO_INCREMENT` value of the last row insert `plan` gives (0 when
+/// it gives none): what an `INSERT ... SELECT` that generated no value
+/// reports.
+fn last_row_id(plan: &Plan) -> u64 {
+    let Op::Insert { cols, rows, .. } = &plan.op else {
+        return 0;
+    };
+    let Some(ai) = plan.table.columns.iter().position(|c| c.auto_inc) else {
+        return 0;
+    };
+    let Some(at) = cols.iter().position(|&c| c == ai) else {
+        return 0;
+    };
+    match rows.last().and_then(|r| r.get(at)) {
+        Some(Some(crate::engine::expr::CExpr::Lit(Datum::Int(i)))) => {
+            u64::try_from(*i).unwrap_or(0)
+        }
+        Some(Some(crate::engine::expr::CExpr::Lit(Datum::UInt(u)))) => *u,
+        _ => 0,
+    }
+}
+
+/// MySQL's warnings for a rollback of a transaction that created (bit 1)
+/// or dropped (bit 2) temporary tables.
+fn temp_rollback_notes(bits: u8) -> Vec<crate::tenant::session::LocalWarning> {
+    let mut v = Vec::new();
+    if bits & 1 != 0 {
+        v.push(diag::warning(
+            "Warning",
+            1751,
+            "The creation of some temporary tables could not be rolled back.".into(),
+        ));
+    }
+    if bits & 2 != 0 {
+        v.push(diag::warning(
+            "Warning",
+            1752,
+            "Some temporary tables were dropped, but these operations could not be rolled back."
+                .into(),
+        ));
+    }
+    v
 }
 
 /// Statements that run SQL elsewhere (routines, file loads): refused when
@@ -341,6 +401,62 @@ impl PassSession {
     /// The session's snapshot and current database when its tenant has
     /// engine databases; `None` otherwise (nothing here applies).
     fn engine_scope(&self) -> Option<(Arc<TenantCatalog>, Option<DbId>)> {
+        let (cat, current) = self.engine_scope_base()?;
+        Some((self.eng.temps.overlay(&cat), current))
+    }
+
+    /// `INSERT ... SELECT`: runs the query `x.0` (checked as a `SELECT`)
+    /// and gives the insert of its rows into `x.1`'s table.
+    async fn insert_select_rows(
+        &mut self,
+        cx: &mut ExecCtx<'_>,
+        cat: &Arc<TenantCatalog>,
+        current: Option<DbId>,
+        x: (crate::engine::general::General, sqlparser::ast::Insert),
+    ) -> Result<(Box<Plan>, bool)> {
+        let (g, ins) = x;
+        self.general_checks(cat, &g)?;
+        let sv = self.engine_vars(cx);
+        let rows = self
+            .general_run(cat.tenant.0, &g, &[], &sv, Arc::clone(cx.session.handle()))
+            .await?;
+        let Some(eng) = catalog::of(cat) else {
+            return Err(not_on_engine("INSERT ... SELECT"));
+        };
+        let names = CatalogNames {
+            cat,
+            eng,
+            lower_case: self
+                .tenant
+                .as_deref()
+                .is_some_and(crate::tenant::session::TenantSession::lower_case_table_names),
+        };
+        let bcx = BindCtx {
+            tenant: cat.tenant,
+            names: &names,
+            current,
+            backslash: !self.lex_opts().0.no_backslash_escapes,
+        };
+        match plan::bind_insert_rows(&bcx, &ins, &rows.rows, rows.columns.len())? {
+            Some(p) => Ok((Box::new(p), rows.no_index)),
+            None => Err(not_on_engine("INSERT ... SELECT")),
+        }
+    }
+
+    /// The temporary tables' generation prepared statement `stmt` was
+    /// bound at.
+    fn engine_temp_gen_of(&mut self, stmt: StmtRef) -> Option<u64> {
+        self.stmts
+            .get_mut(stmt)
+            .ok()?
+            .engine
+            .as_ref()
+            .map(|e| e.temp_gen)
+    }
+
+    /// [`Self::engine_scope`] without the session's temporary tables: the
+    /// catalog's own definitions, for DDL the catalog runs.
+    fn engine_scope_base(&self) -> Option<(Arc<TenantCatalog>, Option<DbId>)> {
         let ts = self.tenant.as_deref()?;
         let cat = Arc::clone(ts.catalog()?);
         catalog::of(&cat)?;
@@ -356,7 +472,7 @@ impl PassSession {
     fn engine_cat(&self) -> Option<Arc<TenantCatalog>> {
         let cat = self.tenant.as_deref()?.catalog()?;
         catalog::of(cat)?;
-        Some(Arc::clone(cat))
+        Some(self.eng.temps.overlay(cat))
     }
 
     /// Whether MariaDB holds a transaction of this session (its own
@@ -368,6 +484,35 @@ impl PassSession {
     /// The session's variables as the engine path needs them, read again
     /// only after a statement that could have changed them.
     fn engine_vars(&mut self, cx: &ExecCtx<'_>) -> SessVars {
+        let mut v = self.engine_vars_read(cx);
+        // The session's own values, as of this statement.
+        v.env.last_insert_id = self.eng.last_insert_id;
+        let info = &mut v.general.session.info;
+        info.last_insert_id = self.eng.last_insert_id;
+        info.database = self.current_logical();
+        info.connection_id = u64::from(cx.session.id.0);
+        if let Some(ts) = self.tenant.as_deref() {
+            info.user = format!("{}@{}", ts.principal.user, ts.principal.client_ip);
+            info.current_user = format!("{}@{}", ts.principal.user, ts.principal.host);
+        }
+        info.version = self.settings.persona_version(self.persona);
+        // MariaDB's sequences, read through the session's catalog.
+        info.sequences = None;
+        if self.persona != sprig_proto_mysql::Persona::MySql84
+            && let Some(cat) = self.engine_cat()
+            && catalog::of(&cat).is_some_and(|c| !c.seq_by_object.is_empty())
+            && let Ok(eng) = engine::engine()
+        {
+            info.sequences = Some(Arc::new(crate::engine::sequence::SessionSequences {
+                eng,
+                cat,
+                last: Arc::clone(&self.eng.seq_last),
+            }));
+        }
+        v
+    }
+
+    fn engine_vars_read(&mut self, cx: &ExecCtx<'_>) -> SessVars {
         let handshake = cx.proto.collation;
         if let Some(v) = &self.eng.vars
             && v.handshake == handshake
@@ -553,7 +698,7 @@ impl PassSession {
             None => (whole, None),
         };
         let parsed = plain
-            .and_then(|t| Parser::parse_sql(&MySqlDialect {}, t).ok())
+            .and_then(|t| Parser::parse_sql(&sprig_plan::dialect::SprigMySql, t).ok())
             .filter(|v| v.len() == 1);
         let names = CatalogNames {
             cat,
@@ -598,6 +743,12 @@ impl PassSession {
                 })
             };
         };
+        // A write through a view: the same write on its table.
+        let (stmt, view_check) = crate::engine::view::rewrite_write(
+            &cx,
+            stmt,
+            self.persona == sprig_proto_mysql::Persona::MySql84,
+        )?;
         if self.persona == sprig_proto_mysql::Persona::MySql84
             && matches!(stmt, Statement::Query(_))
             && let Some(e) = whole.and_then(bare_values)
@@ -615,6 +766,25 @@ impl PassSession {
         }
         match plan::bind(&cx, &stmt) {
             Ok(Some(mut bound)) => {
+                if let Some(vc) = &view_check {
+                    let mut c = expr::Compiler {
+                        def: &bound.table,
+                        quals: vec![vc.qual.clone()],
+                        params: 0,
+                        read: vec![false; bound.table.columns.len()],
+                        backslash: cx.backslash,
+                        hints: Vec::new(),
+                    };
+                    let compiled = c.compile(&vc.cond).map_err(|_| {
+                        not_on_engine("a view's CHECK OPTION condition the engine can't evaluate")
+                    })?;
+                    bound.view_check = Some((
+                        compiled,
+                        vc.db.clone(),
+                        vc.view.clone(),
+                        self.persona == sprig_proto_mysql::Persona::MySql84,
+                    ));
+                }
                 if let Some(clause) = locking {
                     bound.lock = Some(self.engine_locking(&bound, &clause, whole.unwrap_or(""))?);
                 }
@@ -624,6 +794,23 @@ impl PassSession {
             // A SELECT outside the single-table binder's shapes: the
             // planner's, below.
             Err(e) if crate::engine::general::takes(&stmt, &e) => {}
+            // `INSERT ... SELECT`: the query is the planner's.
+            Err(e)
+                if matches!(&stmt, Statement::Insert(ins) if plan::insert_select(ins))
+                    && e.code() == Some(sprig_common::SprigCode::NotOnEngine) =>
+            {
+                let Statement::Insert(ins) = stmt else {
+                    return Err(e);
+                };
+                let Some(src) = ins.source.clone() else {
+                    return Err(e);
+                };
+                let query = Statement::Query(src);
+                return match crate::engine::general::bind_view(&cx, &query, None)? {
+                    Some(g) => Ok(Bound::InsertSelect(Box::new((g, ins)))),
+                    None => Err(e),
+                };
+            }
             // An UPDATE or DELETE outside them: a join, a subquery, ORDER BY.
             Err(e)
                 if matches!(stmt, Statement::Update(_) | Statement::Delete(_))
@@ -679,7 +866,9 @@ impl PassSession {
             return None;
         }
         let eng = catalog::of(cat)?;
-        let stmt = Parser::parse_sql(&MySqlDialect {}, t).ok()?.pop()?;
+        let stmt = Parser::parse_sql(&sprig_plan::dialect::SprigMySql, t)
+            .ok()?
+            .pop()?;
         let names = CatalogNames {
             cat,
             eng,
@@ -759,7 +948,7 @@ impl PassSession {
             };
             r.new_row_check(k, bit, &sprig_sql::rls::quote(&alias))?
         };
-        let parsed = Parser::new(&MySqlDialect {})
+        let parsed = Parser::new(&sprig_plan::dialect::SprigMySql)
             .try_with_sql(&text)
             .and_then(|mut p| p.parse_expr())
             .map_err(|_| {
@@ -1022,6 +1211,24 @@ impl PassSession {
         found_rows: bool,
         sv: &SessVars,
     ) -> Result<engine::exec::Outcome> {
+        // The session's sequences, for `NEXTVAL(s)` among the values.
+        let seqs = sv.general.session.info.sequences.clone();
+        crate::engine::sequence::CURRENT
+            .scope(
+                seqs,
+                self.engine_run_in(tenant, plan, params, found_rows, sv),
+            )
+            .await
+    }
+
+    async fn engine_run_in(
+        &mut self,
+        tenant: u64,
+        plan: &Plan,
+        params: &[Datum],
+        found_rows: bool,
+        sv: &SessVars,
+    ) -> Result<engine::exec::Outcome> {
         // MariaDB holds the session's transaction: an engine statement
         // can't join it.
         if self.backend_in_txn() {
@@ -1132,6 +1339,7 @@ impl PassSession {
     /// # Errors
     /// The commit's: the transaction is gone either way.
     pub(super) async fn engine_implicit_commit(&mut self) -> Result<()> {
+        self.eng.temp_txn = 0;
         // An XA branch can't be committed on the side: 1399, as the servers
         // answer DDL, `BEGIN` and `LOCK TABLES` inside one.
         if let Some(ph) = self.eng.txn.xa_phase() {
@@ -1175,7 +1383,7 @@ impl PassSession {
         }
         let parsed = std::str::from_utf8(sql)
             .ok()
-            .and_then(|t| Parser::parse_sql(&MySqlDialect {}, t).ok())
+            .and_then(|t| Parser::parse_sql(&sprig_plan::dialect::SprigMySql, t).ok())
             .filter(|v| v.len() == 1)
             .and_then(|mut v| v.pop());
         let tables = match parsed {
@@ -1200,6 +1408,12 @@ impl PassSession {
     /// released, and the next-transaction characteristics forgotten.
     pub(super) fn engine_end(&mut self) {
         self.eng.txn.rollback();
+        self.eng.temp_txn = 0;
+        // The session's temporary tables go with it.
+        if !self.eng.temps.is_empty() {
+            self.eng.temps.clear();
+            self.eng.text_plans = crate::engine::plancache::TextPlans::default();
+        }
         self.eng.txn.xa_leave();
         self.eng.txn.clear_next();
         self.eng.lock_wait = None;
@@ -1250,6 +1464,7 @@ impl PassSession {
         let open = self.eng.txn.is_open();
         let backend_txn = self.backend_in_txn();
         let commit = matches!(ctl, Control::Commit { .. });
+        let mut rollback_notes = Vec::new();
         // Outside any transaction, the current database's side answers.
         let here = open
             || (!backend_txn
@@ -1311,6 +1526,10 @@ impl PassSession {
             Control::Commit { chain, release } | Control::Rollback { chain, release } => {
                 if !here {
                     return Ok(None);
+                }
+                let temp_txn = std::mem::take(&mut self.eng.temp_txn);
+                if !commit && temp_txn != 0 {
+                    rollback_notes = temp_rollback_notes(temp_txn);
                 }
                 let ended = if commit {
                     match self.eng.txn.commit().await {
@@ -1546,6 +1765,21 @@ impl PassSession {
                 return Ok(None);
             }
         }
+        if !rollback_notes.is_empty() {
+            let sv = self.engine_vars(cx);
+            let mut status = self.engine_status(&sv);
+            if more {
+                status |= StatusFlags::MORE_RESULTS_EXISTS;
+            }
+            let mut ok = OkPacket::new(status);
+            ok.warnings = u16::try_from(rollback_notes.len()).unwrap_or(u16::MAX);
+            self.diag_set(rollback_notes, 0);
+            out.ok(ok).await?;
+            return Ok(Some(Step {
+                errored: false,
+                status: Some(status),
+            }));
+        }
         self.engine_ok(cx, more, out).await.map(Some)
     }
 
@@ -1694,7 +1928,14 @@ impl PassSession {
                 status
             });
             ok.affected_rows = o.affected;
-            ok.last_insert_id = o.last_insert_id;
+            ok.last_insert_id = if o.last_insert_id == 0 {
+                o.reported_id
+            } else {
+                o.last_insert_id
+            };
+            if o.last_insert_id != 0 {
+                self.eng.last_insert_id = o.last_insert_id;
+            }
             ok.warnings = o.warnings();
             if let Some(i) = &o.info {
                 ok.info = Bytes::from(i.clone());
@@ -1837,6 +2078,8 @@ impl PassSession {
         }
         // A text sent before in the same context reuses its plan.
         let lex = self.lex_opts().0;
+        // `INSERT ... SELECT`: whether its query read a table without a key.
+        let mut from_select: Option<bool> = None;
         let bound = if let Some(p) = self.eng.text_plans.get(cat.version, sql, current, lex) {
             Ok(Bound::Engine(Box::new((*p).clone())))
         } else {
@@ -1869,6 +2112,15 @@ impl PassSession {
                 return Box::pin(self.write_text(cx, cat, *w, logical, more, out))
                     .await
                     .map(Some);
+            }
+            Ok(Bound::InsertSelect(x)) => {
+                match Box::pin(self.insert_select_rows(cx, cat, current, *x)).await {
+                    Ok((p, no_index)) => {
+                        from_select = Some(no_index);
+                        p
+                    }
+                    Err(e) => return self.fail(out, &e).await.map(Some),
+                }
             }
             Ok(Bound::Elsewhere { tables }) => {
                 if !self.eng.txn.is_open() {
@@ -1930,7 +2182,42 @@ impl PassSession {
         let pending = logical.and_then(|l| self.wl_start(l));
         let tenant = cat.tenant.0;
         let found_rows = cx.proto.has(Caps::FOUND_ROWS);
-        let r = self.engine_run(tenant, &plan, &[], found_rows, &sv).await;
+        let mut r = self.engine_run(tenant, &plan, &[], found_rows, &sv).await;
+        // `INSERT ... SELECT` reports its rows however many there were,
+        // and the last row's id when it generated none.
+        if let Some(no_index) = from_select {
+            match &mut r {
+                Ok(o) => {
+                    if o.info.is_none() {
+                        o.info = Some(format!(
+                            "Records: {}  Duplicates: 0  Warnings: {}",
+                            o.affected,
+                            crate::engine::exec::warning_count(&o.conds)
+                        ));
+                    }
+                    o.no_index |= no_index;
+                    if o.last_insert_id == 0 {
+                        o.reported_id = last_row_id(&plan);
+                    }
+                }
+                // MySQL reports a string too long for its column as
+                // truncated when the rows come from a query.
+                Err(e)
+                    if sv.mysql
+                        && matches!(
+                            e.kind,
+                            sprig_common::ErrorKind::Standard { errno: 1406, .. }
+                        ) =>
+                {
+                    *e = SprigError::standard(
+                        1265,
+                        *b"01000",
+                        e.message.replacen("Data too long", "Data truncated", 1),
+                    );
+                }
+                Err(_) => {}
+            }
+        }
         let mut status = self.engine_status(&sv);
         if more {
             status |= StatusFlags::MORE_RESULTS_EXISTS;
@@ -2077,6 +2364,9 @@ impl PassSession {
                 .map(Some);
             }
             Bound::Elsewhere { .. } => return Ok(None),
+            Bound::InsertSelect(_) => {
+                return Err(not_on_engine("INSERT ... SELECT as a prepared statement"));
+            }
             Bound::Write(w) => {
                 let results = self.engine_vars(cx).results;
                 let types = write_param_types(self.persona, &w, rewritten);
@@ -2112,6 +2402,7 @@ impl PassSession {
             results,
             checked,
             general: None,
+            temp_gen: self.eng.temps.generation(),
         }));
         let stmt = self.stmts.insert(st);
         metrics::gauge!("sprig_mysql_prepared_statements", "persona" => self.persona.as_str())
@@ -2205,13 +2496,14 @@ impl PassSession {
         // The table changed (a new index, a dropped table): bound again.
         // (The table's current definition is looked at, not cloned, and
         // only when the catalog moved on.)
-        let same = cat.version == plan.catalog_version
-            || catalog::of(&cat)
-                .and_then(|e| e.tables.get(&plan.table.object))
-                .is_some_and(|p| {
-                    matches!(&**p, Ok(d) if d.version == plan.table.version
+        let same = self.engine_temp_gen_of(stmt) == Some(self.eng.temps.generation())
+            && (cat.version == plan.catalog_version
+                || catalog::of(&cat)
+                    .and_then(|e| e.tables.get(&plan.table.object))
+                    .is_some_and(|p| {
+                        matches!(&**p, Ok(d) if d.version == plan.table.version
                         && d.indexes.len() == plan.table.indexes.len())
-                });
+                    }));
         let plan = if same {
             plan
         } else {
@@ -2441,6 +2733,24 @@ fn outcome_of(
     })
 }
 
+/// MySQL's answer to sequence DDL: a syntax error at `SEQUENCE`.
+fn no_sequences(text: &[u8]) -> SprigError {
+    let t = String::from_utf8_lossy(text);
+    let near = t
+        .to_ascii_uppercase()
+        .find("SEQUENCE")
+        .and_then(|i| t.get(i..))
+        .unwrap_or("SEQUENCE")
+        .to_owned();
+    SprigError::standard(
+        1064,
+        *b"42000",
+        format!(
+            "You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near '{near}' at line 1"
+        ),
+    )
+}
+
 impl PassSession {
     /// DDL on an engine database that the engine can't follow is refused
     /// before the catalog runs it: an `ALTER TABLE` that also renames the
@@ -2460,7 +2770,7 @@ impl PassSession {
         text: &[u8],
     ) -> Result<()> {
         use sprig_sql::names::{AlterOp, DdlKind, DdlName, DdlTarget};
-        let Some((cat, _)) = self.engine_scope() else {
+        let Some((cat, _)) = self.engine_scope_base() else {
             return Ok(());
         };
         let Some(eng) = catalog::of(&cat) else {
@@ -2491,6 +2801,10 @@ impl PassSession {
                 if *temporary {
                     return refuse("a temporary table in an engine database");
                 }
+                if *kind == DdlKind::Sequence && self.persona == sprig_proto_mysql::Persona::MySql84
+                {
+                    return Err(no_sequences(text));
+                }
                 match kind {
                     DdlKind::Table if *as_select => refuse("CREATE TABLE ... SELECT"),
                     DdlKind::Table if on_engine(name) => {
@@ -2499,11 +2813,37 @@ impl PassSession {
                             Err(why) => refuse(&why),
                         }
                     }
-                    DdlKind::Table => Ok(()),
-                    // Views, stored code, triggers, events and sequences
-                    // aren't the engine's yet.
-                    _ => refuse("views, stored routines, triggers, events and sequences"),
+                    DdlKind::Table | DdlKind::View | DdlKind::Sequence => Ok(()),
+                    // Stored code, triggers, events and sequences aren't
+                    // the engine's yet.
+                    _ => refuse("stored routines, triggers, events and sequences"),
                 }
+            }
+            DdlTarget::AlterObject {
+                kind: DdlKind::Sequence,
+                ..
+            }
+            | DdlTarget::DropObjects {
+                kind: DdlKind::Sequence,
+                ..
+            } if self.persona == sprig_proto_mysql::Persona::MySql84 => Err(no_sequences(text)),
+            // `ALTER SEQUENCE` of a name that is none: MariaDB's 4091.
+            DdlTarget::AlterObject {
+                kind: DdlKind::Sequence,
+                name,
+                if_exists: false,
+                ..
+            } if on_engine(name)
+                && name.db.as_deref().is_some_and(|d| {
+                    cat.database(&database_key(d, lctn))
+                        .is_some_and(|row| eng.sequence(row.db_id, &name.name, lctn).is_none())
+                }) =>
+            {
+                Err(SprigError::standard(
+                    4091,
+                    *b"42S02",
+                    format!("Unknown SEQUENCE: '{}'", name.name),
+                ))
             }
             DdlTarget::AlterObject {
                 kind: DdlKind::Table,
@@ -2533,16 +2873,18 @@ impl PassSession {
     /// empties or drops tables of an engine database: the executor the
     /// catalog's DDL path runs the statement through
     /// (`crate::engine::ddlexec`).
+    #[allow(clippy::match_same_arms)] // tables and views, each kind its own arm
     pub(super) fn engine_ddl_hook(
         &mut self,
         cx: &ExecCtx<'_>,
         target: &sprig_sql::names::DdlTarget,
     ) -> Option<crate::engine::ddlexec::Hook> {
         use sprig_sql::names::{DdlKind, DdlName, DdlTarget};
-        let (cat, _) = self.engine_scope()?;
+        let (cat, _) = self.engine_scope_base()?;
         let ts = self.tenant.as_deref()?;
         let tenant = ts.tenant;
         let lctn = ts.lower_case_table_names();
+        let account = (ts.principal.user.clone(), ts.principal.host.clone());
         let db_of = |d: &str| {
             let eng = catalog::of(&cat)?;
             cat.database(&database_key(d, lctn))
@@ -2561,6 +2903,31 @@ impl PassSession {
                 kind: DdlKind::Table,
                 name,
                 temporary: false,
+                ..
+            } => of_name(name),
+            DdlTarget::CreateObject {
+                kind: DdlKind::View,
+                name,
+                ..
+            }
+            | DdlTarget::AlterObject {
+                kind: DdlKind::View,
+                name,
+                ..
+            } => of_name(name),
+            DdlTarget::DropObjects {
+                kind: DdlKind::View | DdlKind::Sequence,
+                names,
+                ..
+            } => names.iter().find_map(of_name),
+            DdlTarget::CreateObject {
+                kind: DdlKind::Sequence,
+                name,
+                ..
+            }
+            | DdlTarget::AlterObject {
+                kind: DdlKind::Sequence,
+                name,
                 ..
             } => of_name(name),
             DdlTarget::RenameTables { pairs, .. } => pairs.iter().find_map(|(a, _)| of_name(a)),
@@ -2596,6 +2963,7 @@ impl PassSession {
                 wait: std::time::Duration::from_secs(wait),
                 db,
                 conn: cx.session.id.0,
+                account,
             },
             creates,
         ))
@@ -2723,14 +3091,13 @@ fn write_param_types(
     w: &crate::engine::multiwrite::MultiWrite,
     rewritten: &Bytes,
 ) -> Vec<Option<crate::engine::table::ColType>> {
-    use sqlparser::dialect::MySqlDialect;
     if persona != sprig_proto_mysql::Persona::MySql84 {
         return Vec::new();
     }
     let Ok(text) = std::str::from_utf8(rewritten) else {
         return Vec::new();
     };
-    let Some(stmt) = sqlparser::parser::Parser::parse_sql(&MySqlDialect {}, text)
+    let Some(stmt) = sqlparser::parser::Parser::parse_sql(&sprig_plan::dialect::SprigMySql, text)
         .ok()
         .and_then(|mut v| v.pop())
     else {

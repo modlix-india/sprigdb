@@ -63,6 +63,9 @@ pub(crate) struct Session {
     /// The session's connection id (the servers' temporary table names in
     /// messages carry it).
     pub conn: u32,
+    /// The session's account (`user`, `host`): a view's definer when the
+    /// statement names none.
+    pub account: (String, String),
 }
 
 /// A staged change: the engine holds the table until it is applied or
@@ -1010,6 +1013,9 @@ impl Engine {
             let rows = tx.scan(&prefix, &keys::prefix_end(&prefix), false, 1 << 20)?;
             tx.rollback();
             rows.iter()
+                // A session's temporary table is marked with its owner:
+                // only a later process of the same node deletes it.
+                .filter(|(_, v)| v.is_empty() || super::temp::orphaned(v))
                 .filter_map(|(k, _)| {
                     let b = k.get(prefix.len()..prefix.len() + 4)?;
                     Some(u32::from_be_bytes(b.try_into().ok()?))
@@ -1034,8 +1040,24 @@ impl Engine {
         Ok(swept)
     }
 
+    /// Marks table `object` of `tenant` as one to delete when found by a
+    /// later sweep, with `owner` as the mark's value (a session's
+    /// temporary table: its node and process).
+    ///
+    /// # Errors
+    /// The store's.
+    pub(crate) async fn mark_owned(&self, tenant: u64, object: u32, owner: Vec<u8>) -> Result<()> {
+        let mut tx = self.begin(TxnOptions::default())?;
+        tx.put(
+            Bytes::from(keys::drop_mark(tenant, object)),
+            Bytes::from(owner),
+        )
+        .await?;
+        tx.finish().await
+    }
+
     /// Whether table `object` of `tenant` has any key left.
-    fn has_keys(&self, tenant: u64, object: u32) -> Result<bool> {
+    pub(crate) fn has_keys(&self, tenant: u64, object: u32) -> Result<bool> {
         let p = keys::object_prefix(tenant, object);
         let mut tx = self.begin(TxnOptions::default())?;
         let any = !tx.scan(&p, &keys::prefix_end(&p), false, 1)?.is_empty();

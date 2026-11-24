@@ -267,6 +267,10 @@ impl Catalog for MemDb {
     fn default_schema(&self) -> Option<String> {
         Some(self.schema.clone())
     }
+
+    fn shared(&self) -> Option<Arc<dyn Catalog>> {
+        Some(Arc::new(self.clone()))
+    }
 }
 
 impl Storage for MemDb {

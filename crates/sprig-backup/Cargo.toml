@@ -1,0 +1,26 @@
+[package]
+name = "sprig-backup"
+description = "SprigDB: tenant backups and point-in-time restore on the storage engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+flate2.workspace = true
+ring.workspace = true
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sprig-common.workspace = true
+sprig-engine = { path = "../sprig-engine" }
+sprig-settings.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+bytes.workspace = true
+
+[lints]
+workspace = true

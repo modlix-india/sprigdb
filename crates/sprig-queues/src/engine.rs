@@ -170,6 +170,14 @@ pub trait Leases: Send + Sync + 'static {
     async fn release(&self, tenant: u64, object: u64);
     /// Who holds the lease of `object` now, if anyone.
     async fn holder(&self, tenant: u64, object: u64) -> Result<Option<String>, MqError>;
+    /// Whether this gateway may take the leases of `tenant`'s queues from
+    /// another holder before their time runs out: only it can commit the
+    /// queues' writes now (it leads the tenant's replicated unit), so a
+    /// holder elsewhere is dead or fenced. Default: never.
+    fn may_take_over(&self, tenant: u64) -> bool {
+        let _ = tenant;
+        false
+    }
 }
 
 /// Temporary queues of other gateways (and publishing this gateway's).
@@ -632,13 +640,16 @@ impl VShared {
                         Ok(l) => l,
                         Err(err) => {
                             // A chosen owner that can't be reached: if no
-                            // one holds the lease, own the queue here.
+                            // one holds the lease (or only this gateway can
+                            // commit the queue's writes, so the holder is
+                            // gone), own the queue here.
                             if q.temp_on.is_none()
                                 && self.may_own_here(&e).await
-                                && matches!(
-                                    e.deps.leases.holder(self.r.tenant, q.id).await,
-                                    Ok(None)
-                                )
+                                && (e.deps.leases.may_take_over(self.r.tenant)
+                                    || matches!(
+                                        e.deps.leases.holder(self.r.tenant, q.id).await,
+                                        Ok(None)
+                                    ))
                                 && let Ok(p @ Plan::Local { .. }) =
                                     self.take_lease(&e, &q, true).await
                             {

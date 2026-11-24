@@ -162,6 +162,39 @@ fn set_operation(stmt: &sqlparser::ast::Statement) -> Option<bool> {
     }
 }
 
+/// Whether the top query of `stmt` computes a window function.
+fn has_window(stmt: &sqlparser::ast::Statement) -> bool {
+    use sqlparser::ast::{Expr, SelectItem, SetExpr, Statement};
+    let Statement::Query(q) = stmt else {
+        return false;
+    };
+    let SetExpr::Select(s) = &*q.body else {
+        return false;
+    };
+    let mut found = false;
+    let mut look = |e: &Expr| {
+        let _ = sqlparser::ast::visit_expressions(e, |x: &Expr| {
+            if matches!(x, Expr::Function(f) if f.over.is_some()) {
+                found = true;
+            }
+            std::ops::ControlFlow::<()>::Continue(())
+        });
+    };
+    for i in &s.projection {
+        if let SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } = i {
+            look(e);
+        }
+    }
+    if let Some(ob) = &q.order_by
+        && let sqlparser::ast::OrderByKind::Expressions(list) = &ob.kind
+    {
+        for o in list {
+            look(&o.expr);
+        }
+    }
+    found
+}
+
 /// Whether `stmt` is a set operation the servers gather in a temporary
 /// table and then read whole: one that removes duplicates, uses
 /// `INTERSECT` or `EXCEPT`, or orders its whole result. Its answer says
@@ -305,6 +338,10 @@ pub(crate) fn layout(g: &General, cols: &[sprig_plan::Column], results: Results)
     } else {
         vec![None; cols.len()]
     };
+    // Window functions: both servers compute them over a temporary table,
+    // whose columns are described (no key flags on table columns; on
+    // MySQL, computed columns named as the result's and not binary).
+    let windowed = has_window(&g.stmt);
     let mut shapes = Vec::with_capacity(cols.len());
     let mut defs = Vec::with_capacity(cols.len());
     for (i, c) in cols.iter().enumerate() {
@@ -316,14 +353,29 @@ pub(crate) fn layout(g: &General, cols: &[sprig_plan::Column], results: Results)
                 &Bytes::from(t.db_name.clone()),
                 &Bytes::from(o.alias.clone()),
                 &t.def,
-                &Bytes::from(t.def.name.clone()),
+                &Bytes::from(
+                    o.view
+                        .as_ref()
+                        .map_or_else(|| t.def.name.clone(), |v| v.0.clone()),
+                ),
                 o.column,
                 &Bytes::from(c.name.clone()),
-                &Bytes::from(col.name.clone()),
+                &Bytes::from(
+                    o.view
+                        .as_ref()
+                        .map_or_else(|| col.name.clone(), |v| v.1.clone()),
+                ),
                 results,
             );
             if o.outer {
                 d.flags &= !ColumnFlags::NOT_NULL.bits();
+            }
+            if windowed {
+                // PRI_KEY, UNIQUE_KEY, MULTIPLE_KEY, PART_KEY.
+                d.flags &= !(0x2 | 0x4 | 0x8 | 0x4000);
+                if !results.mysql {
+                    d.flags &= !ColumnFlags::NOT_NULL.bits();
+                }
             }
             defs.push(d);
             shapes.push(Shape::Column {
@@ -338,8 +390,19 @@ pub(crate) fn layout(g: &General, cols: &[sprig_plan::Column], results: Results)
                 None
             };
             let mut d = value_def(name.unwrap_or(&c.name), &c.ty, results);
+            if windowed && setop.is_none() && derived[i].is_none() {
+                if results.mysql {
+                    set_result_def(&mut d, &c.ty, false, results);
+                } else if c.ty.kind == Kind::Str {
+                    d.decimals = 39;
+                }
+            }
             if let Some(dedup) = setop {
                 set_result_def(&mut d, &c.ty, dedup, results);
+            } else if let Some(Some((table, org))) = g.view_named.get(i).filter(|_| placed) {
+                d.table = Bytes::from(table.clone());
+                d.org_table = Bytes::from(org.clone());
+                d.org_name = d.name.clone();
             } else if let Some((alias, dedup)) = &derived[i] {
                 set_result_def(&mut d, &c.ty, *dedup, results);
                 d.table = Bytes::from(alias.clone());

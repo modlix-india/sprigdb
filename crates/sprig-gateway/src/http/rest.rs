@@ -131,6 +131,11 @@ pub async fn handle(core: &Arc<Core>, info: &ConnInfo, req: Request<Incoming>) -
             .await
             .unwrap_or_else(|e| error_response(&e));
     }
+    if method == Method::POST && path.starts_with(crate::backup::ROUTE) {
+        return backups(core, req, path)
+            .await
+            .unwrap_or_else(|e| error_response(&e));
+    }
     let Some(m) = routes::find(method.as_str(), &path) else {
         let (status_code, msg) = if routes::path_known(&path) {
             (405, format!("{method} is not allowed on {path}"))
@@ -197,6 +202,22 @@ async fn replace_replica(
         200,
         &serde_json::to_value(report).unwrap_or_default(),
     ))
+}
+
+/// `POST /admin/v1/engine/backups:<action>` (this gateway's own engine,
+/// not a controller route): see [`crate::backup`].
+async fn backups(
+    core: &Arc<Core>,
+    req: Request<Incoming>,
+    path: String,
+) -> Result<Response<Body>, SprigError> {
+    let auth = header(&req, "authorization");
+    core.admin.authorized(auth.as_deref()).await?;
+    let body = read_body(req, 64 << 10).await?;
+    let v = tokio::task::spawn_blocking(move || crate::backup::handle(&path, &body))
+        .await
+        .map_err(|e| SprigError::internal(format!("backups: {e}")))??;
+    Ok(json_response(200, &v))
 }
 
 async fn admin(

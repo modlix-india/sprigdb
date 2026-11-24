@@ -221,13 +221,38 @@ impl Cluster for GatewayCluster {
             Lead::Any | Lead::Unknown => None,
         }
     }
+
+    async fn partition_leader(&self, p: &Principal, stream_id: u64, partition: i32) -> Option<i32> {
+        // With partition groups a partition commits through its group's
+        // unit, whose leader may be another gateway than the tenant's.
+        let unit = super::engine::streams()
+            .filter(|s| s.log().groups() > 0)
+            .map_or(p.tenant_id, |s| {
+                s.log().unit_of_part(sprig_streams::seg::part::PartKey {
+                    tenant: p.tenant_id,
+                    stream: stream_id,
+                    partition: u32::try_from(partition).unwrap_or(0),
+                })
+            });
+        match self.lead_of_unit(unit).await {
+            Lead::Here => Some(self.node_id()),
+            Lead::Broker(b) => Some(b),
+            Lead::Any | Lead::Unknown => None,
+        }
+    }
 }
 
 impl GatewayCluster {
     /// Where `tenant`'s unit is led: on replicated engines a tenant's
     /// streams and consumer groups commit only on its unit's leader.
     async fn lead_of(&self, tenant: u64) -> Lead {
-        match crate::node_engine::tenant_leader(tenant) {
+        self.lead_of_unit(tenant).await
+    }
+
+    /// Where engine unit `unit` is led (a tenant's, or a partition
+    /// group's).
+    async fn lead_of_unit(&self, unit: u64) -> Lead {
+        match crate::node_engine::unit_leader(unit) {
             crate::node_engine::UnitLeader::Any => Lead::Any,
             crate::node_engine::UnitLeader::Here => Lead::Here,
             crate::node_engine::UnitLeader::Unknown => Lead::Unknown,

@@ -47,6 +47,6 @@ pub mod store;
 pub mod sweep;
 
 pub use backend::{Backend, Tenants};
-pub use db::{EngineDb, Uids, Versions, Waiters};
+pub use db::{EngineDb, ScriptTxn, Uids, Versions, Waiters};
 pub use engine_unit::EngineUnit;
 pub use store::{Batch, StoreError, StoreResult, Unit};

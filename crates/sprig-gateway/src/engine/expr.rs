@@ -213,6 +213,10 @@ pub(crate) enum CExpr {
 pub(crate) struct ExecExpr {
     pub maria: (sprig_exec::Session, sprig_exec::Compiled),
     pub mysql: (sprig_exec::Session, sprig_exec::Compiled),
+    /// Evaluated with the statement's time and the session's time zone and
+    /// strictness (a value of `VALUES`); else as compiled (a table's own
+    /// expressions, which read neither).
+    pub session_clock: bool,
 }
 
 impl std::fmt::Debug for ExecExpr {
@@ -1448,8 +1452,57 @@ pub(crate) fn eval(e: &CExpr, row: &[Datum], a: &Args<'_>) -> Result<Datum> {
         CExpr::Col(i) => row.get(*i).cloned().unwrap_or(Datum::Null),
         CExpr::Exec(x) => {
             let (session, c) = if a.env.mysql { &x.mysql } else { &x.maria };
-            let mut ctx = sprig_exec::Ctx::new(session);
-            c.eval(&mut ctx, row).map_err(super::general::sql_error)?
+            if x.session_clock {
+                let mut s = session.clone();
+                let (secs, micros) = *a.now.get_or_init(temporal::now);
+                s.now_seconds = secs;
+                s.now_micros = micros;
+                s.time_zone_offset = assign::zone(a.env)?;
+                s.info.last_insert_id = a.env.last_insert_id;
+                s.info.sequences = super::sequence::current();
+                let strict = sprig_exec::SqlMode::STRICT;
+                s.sql_mode = sprig_exec::SqlMode(if a.env.strict {
+                    s.sql_mode.0 | strict
+                } else {
+                    s.sql_mode.0 & !strict
+                });
+                let mut ctx = sprig_exec::Ctx::new(&s);
+                let v = c.eval(&mut ctx, row).map_err(super::general::sql_error)?;
+                // The expression's conditions are the statement's: errors in
+                // strict mode, as the servers raise them while storing.
+                let raised = ctx.take_warnings();
+                if a.env.strict
+                    && let Some(w) = raised.iter().find(|w| w.level != sprig_exec::Level::Note)
+                {
+                    let state = match w.code {
+                        1292 => *b"22007",
+                        1441 => *b"22008",
+                        1365 => *b"22012",
+                        1690 | 1264 => *b"22003",
+                        _ => *b"HY000",
+                    };
+                    return Err(SprigError::standard(w.code, state, w.message.clone()));
+                }
+                if !raised.is_empty()
+                    && let Ok(mut r) = a.conds.lock()
+                {
+                    for w in raised {
+                        r.conds.push(assign::Condition {
+                            level: if w.level == sprig_exec::Level::Note {
+                                assign::Level::Note
+                            } else {
+                                assign::Level::Warning
+                            },
+                            code: w.code,
+                            message: w.message,
+                        });
+                    }
+                }
+                v
+            } else {
+                let mut ctx = sprig_exec::Ctx::new(session);
+                c.eval(&mut ctx, row).map_err(super::general::sql_error)?
+            }
         }
         CExpr::Param(i) => a.params.get(*i).cloned().unwrap_or(Datum::Null),
         CExpr::Lit(d) => d.clone(),
@@ -1778,10 +1831,9 @@ mod tests {
 
     #[test]
     fn literals_keep_their_kind() {
-        use sqlparser::dialect::MySqlDialect;
         use sqlparser::parser::Parser;
         let lit = |t: &str| {
-            let e = Parser::new(&MySqlDialect {})
+            let e = Parser::new(&sprig_plan::dialect::SprigMySql)
                 .try_with_sql(t)
                 .unwrap()
                 .parse_expr()

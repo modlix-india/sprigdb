@@ -161,6 +161,8 @@ impl TenantServices {
         clock: Arc<dyn Clock>,
     ) -> Result<Arc<Self>> {
         let registry: &'static Registry = live.registry();
+        // Tenants' `backup.*` settings for the node's backup service.
+        crate::backup::set_settings(live);
         let stores = live.stores();
         let dc = stores.dc_id().clone();
         let global = Arc::clone(&stores.global);

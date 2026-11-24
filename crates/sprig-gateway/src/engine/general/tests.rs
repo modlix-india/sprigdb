@@ -16,7 +16,6 @@ use sprig_engine::{EngineConfig, StoreKind};
 use sprig_exec::Ctx;
 use sprig_plan::Planner;
 use sprig_plan::mem::MemDb;
-use sqlparser::dialect::MySqlDialect;
 use sqlparser::parser::Parser;
 
 use super::results::{self, Shape};
@@ -120,6 +119,30 @@ impl Names for Fake {
     fn version(&self) -> u64 {
         1
     }
+    fn view(
+        &self,
+        _db: DbId,
+        name: &str,
+    ) -> Option<Arc<std::result::Result<crate::engine::view::ViewDef, String>>> {
+        let text = match name {
+            "big_orders" => {
+                "CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`%` SQL SECURITY DEFINER VIEW `big_orders` AS select `orders`.`id` AS `id`,`orders`.`customer_id` AS `cust`,`orders`.`amount` * 2 AS `twice` from `orders` where `orders`.`amount` > 50 WITH CASCADED CHECK OPTION"
+            }
+            "per_customer" => {
+                "CREATE ALGORITHM=TEMPTABLE DEFINER=`root`@`%` SQL SECURITY INVOKER VIEW `per_customer` (`cust`,`n`) AS select `big_orders`.`cust` AS `cust`,count(0) AS `n` from `big_orders` group by `big_orders`.`cust`"
+            }
+            "loop_a" => {
+                "CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`%` SQL SECURITY DEFINER VIEW `loop_a` AS select `loop_b`.`x` AS `x` from `loop_b`"
+            }
+            "loop_b" => {
+                "CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`%` SQL SECURITY DEFINER VIEW `loop_b` AS select `loop_a`.`x` AS `x` from `loop_a`"
+            }
+            _ => return None,
+        };
+        Some(Arc::new(
+            crate::engine::view::load(ObjectId(90), DB, "shop", text).map_err(|e| e.message),
+        ))
+    }
 }
 
 fn cx(f: &Fake) -> BindCtx<'_> {
@@ -132,7 +155,9 @@ fn cx(f: &Fake) -> BindCtx<'_> {
 }
 
 fn parse(sql: &str) -> sqlparser::ast::Statement {
-    Parser::parse_sql(&MySqlDialect {}, sql).unwrap().remove(0)
+    Parser::parse_sql(&sprig_plan::dialect::SprigMySql, sql)
+        .unwrap()
+        .remove(0)
 }
 
 fn general(f: &Fake, sql: &str) -> sprig_common::Result<Option<General>> {
@@ -703,9 +728,7 @@ async fn what_the_planner_does_not_run_is_refused() {
     // too, with the planner's words.
     let (e, f2, _d) = shop().await;
     for sql in [
-        "SELECT order_id, GROUP_CONCAT(sku ORDER BY line) FROM items GROUP BY order_id",
-        "SELECT id, DATE_ADD(placed, INTERVAL 3 DAY) FROM orders WHERE id < 15 ORDER BY placed",
-        "SELECT id, ROW_NUMBER() OVER (ORDER BY amount) FROM orders",
+        "SELECT order_id, VARIANCE(line) OVER () FROM items",
         "SELECT id, NO_SUCH_FUNCTION(amount) FROM orders ORDER BY amount",
     ] {
         let err = select(&e, &f2, sql, &[]).await.unwrap_err();
@@ -734,6 +757,210 @@ async fn what_the_planner_does_not_run_is_refused() {
     let stmt = parse("SELECT nope FROM orders");
     let e = plan::bind(&cx(&f), &stmt).unwrap_err();
     assert!(!takes(&stmt, &e));
+}
+
+#[tokio::test]
+async fn subqueries_that_read_the_outer_query_run_per_outer_row() {
+    let (e, f, _d) = shop().await;
+    let db = in_memory(&e, &f).await;
+    for sql in [
+        // A condition other than an equality.
+        "SELECT id FROM orders o WHERE NOT EXISTS (SELECT 1 FROM orders p \
+         WHERE p.customer_id = o.customer_id AND p.amount > o.amount) ORDER BY id",
+        // Correlated IN, in WHERE and in the select list.
+        "SELECT id FROM customers c WHERE id IN (SELECT customer_id FROM orders o \
+         WHERE o.amount > c.id * 10) ORDER BY id",
+        "SELECT id, id IN (SELECT customer_id FROM orders o WHERE o.status = c.city OR o.amount > c.id * 30) FROM customers c ORDER BY id",
+        // A scalar subquery over a join, and a grouped one with HAVING.
+        "SELECT id, (SELECT COUNT(*) FROM orders o JOIN items i ON i.order_id = o.id \
+         WHERE o.customer_id = c.id) FROM customers c ORDER BY id",
+        "SELECT id, (SELECT MAX(n) FROM (SELECT 1 AS n) d WHERE c.id > 3) FROM customers c ORDER BY id",
+        "SELECT id, (SELECT SUM(amount) FROM orders o WHERE o.customer_id <= c.id GROUP BY o.customer_id \
+         HAVING SUM(amount) > 0 ORDER BY o.customer_id DESC LIMIT 1) FROM customers c ORDER BY id",
+        // EXISTS with a non-equality in the select list.
+        "SELECT id, EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.id AND o.placed > c.joined) \
+         FROM customers c ORDER BY id",
+        // Nested: the inner subquery reads both outer queries.
+        "SELECT id FROM customers c WHERE EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.id \
+         AND EXISTS (SELECT 1 FROM items i WHERE i.order_id = o.id AND i.qty > c.id)) ORDER BY id",
+    ] {
+        let want = reference(&db, sql, &[]).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        let got = select(&e, &f, sql, &[])
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {}", e.message));
+        assert_eq!(got, want, "{sql}");
+        assert!(!got.is_empty(), "{sql}");
+    }
+    // More than one row for a scalar subquery is the servers' 1242.
+    let err = select(
+        &e,
+        &f,
+        "SELECT id, (SELECT id FROM orders o WHERE o.customer_id > c.id) FROM customers c",
+        &[],
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.protocol().mysql_errno, 1242);
+}
+
+#[tokio::test]
+async fn window_functions_run_on_the_engine() {
+    let (e, f, _d) = shop().await;
+    let got = select(
+        &e,
+        &f,
+        "SELECT id, ROW_NUMBER() OVER w, RANK() OVER w, DENSE_RANK() OVER w, \
+         SUM(amount) OVER w, LAG(id) OVER w, LEAD(id, 2) OVER w, COUNT(*) OVER (PARTITION BY customer_id), \
+         FIRST_VALUE(id) OVER (PARTITION BY customer_id ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) \
+         FROM orders WHERE customer_id = 3 WINDOW w AS (PARTITION BY customer_id ORDER BY id) ORDER BY id",
+        &[],
+    )
+    .await
+    .unwrap();
+    assert!(!got.is_empty());
+    let first: Vec<&str> = got[0].split('|').collect();
+    assert_eq!(&first[1..4], ["1", "1", "1"], "{got:?}");
+    assert_eq!(first[5], "NULL", "{got:?}");
+    let db = in_memory(&e, &f).await;
+    for sql in [
+        "SELECT customer_id, COUNT(*), RANK() OVER (ORDER BY COUNT(*) DESC) FROM orders GROUP BY customer_id ORDER BY customer_id",
+        "SELECT id, NTILE(4) OVER (ORDER BY amount, id), PERCENT_RANK() OVER (ORDER BY amount), CUME_DIST() OVER (ORDER BY amount) FROM orders ORDER BY id",
+        "SELECT id, AVG(amount) OVER (PARTITION BY status ORDER BY id ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) FROM orders ORDER BY id",
+        "SELECT id, LAST_VALUE(id) OVER (ORDER BY placed RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING), NTH_VALUE(id, 2) OVER (ORDER BY id) FROM orders ORDER BY id",
+    ] {
+        let want = reference(&db, sql, &[]).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        let got = select(&e, &f, sql, &[])
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {}", e.message));
+        assert_eq!(got, want, "{sql}");
+    }
+    // Not in WHERE.
+    let err = select(
+        &e,
+        &f,
+        "SELECT id FROM orders WHERE ROW_NUMBER() OVER () > 1",
+        &[],
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.protocol().mysql_errno, 4015);
+}
+
+#[tokio::test]
+async fn date_arithmetic_runs_on_the_engine() {
+    let (e, f, _d) = shop().await;
+    let got = select(
+        &e,
+        &f,
+        "SELECT id, DATE_ADD(placed, INTERVAL 3 DAY), placed - INTERVAL 1 MONTH, \
+         INTERVAL 2 DAY + placed, EXTRACT(YEAR_MONTH FROM placed), \
+         TIMESTAMPDIFF(DAY, placed, '2025-01-01'), TIMESTAMPADD(HOUR, 5, placed), \
+         placed + INTERVAL '1:30' HOUR_MINUTE, ADDDATE(placed, 1) \
+         FROM orders WHERE id IN (1, 11) ORDER BY id",
+        &[],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        got,
+        [
+            "1|2024-02-05|2024-01-02|2024-02-04|202402|334|2024-02-02 05:00:00|2024-02-02 01:30:00|2024-02-03",
+            "11|NULL|NULL|NULL|NULL|NULL|NULL|NULL|NULL",
+        ]
+    );
+    // In WHERE, against the statement's clock.
+    let got = select(
+        &e,
+        &f,
+        "SELECT COUNT(*) FROM orders WHERE placed > NOW() - INTERVAL 100 YEAR",
+        &[],
+    )
+    .await
+    .unwrap();
+    assert_eq!(got, ["110"]);
+    // A unit neither server has is a syntax error.
+    let err = select(&e, &f, "SELECT placed + INTERVAL 1 DAYS FROM orders", &[])
+        .await
+        .unwrap_err();
+    assert_eq!(err.protocol().mysql_errno, 1064);
+}
+
+#[tokio::test]
+async fn row_comparisons_run_on_the_engine() {
+    let (e, f, _d) = shop().await;
+    let got = select(
+        &e,
+        &f,
+        "SELECT (1, 2) < (1, 3), (1, NULL) < (2, 0), (NULL, 1) < (1, 2), (1, 2) <=> (1, 2), \
+         (1, 2) IN ((1, 2), (3, 4)), (1, NULL) IN ((1, 2)), ((1, 2), 3) < ((1, 3), 0), \
+         (id, 2) >= (1, 2) FROM orders WHERE id = 1",
+        &[],
+    )
+    .await
+    .unwrap();
+    assert_eq!(got, ["1|1|NULL|1|1|NULL|1|1"]);
+    // Keyset pagination: `(a, b) < (x, y)` is `a < x OR (a = x AND b < y)`.
+    let rows = |sql: &'static str| {
+        let (e, f) = (&e, &f);
+        async move { select(e, f, sql, &[]).await.unwrap() }
+    };
+    assert_eq!(
+        rows("SELECT id FROM orders WHERE (customer_id, id) < (3, 20) ORDER BY id").await,
+        rows("SELECT id FROM orders WHERE customer_id < 3 OR (customer_id = 3 AND id < 20) ORDER BY id")
+            .await
+    );
+    // A row where one value belongs is 1241 on both servers.
+    let err = select(&e, &f, "SELECT (1, 2) FROM orders", &[])
+        .await
+        .unwrap_err();
+    assert_eq!(err.protocol().mysql_errno, 1241);
+}
+
+#[tokio::test]
+async fn ordered_group_concat_and_bit_aggregates_run_on_the_engine() {
+    let (e, f, _d) = shop().await;
+    let got = select(
+        &e,
+        &f,
+        "SELECT GROUP_CONCAT(id ORDER BY id DESC), GROUP_CONCAT(id, '-', id ORDER BY id SEPARATOR ';'), \
+         BIT_OR(id), BIT_AND(id), BIT_XOR(id) FROM orders WHERE id IN (1, 2, 3)",
+        &[],
+    )
+    .await
+    .unwrap();
+    assert_eq!(got, ["3,2,1|1-1;2-2;3-3|3|0|0"]);
+}
+
+#[tokio::test]
+async fn group_by_with_rollup_runs_on_the_engine() {
+    let (e, f, _d) = shop().await;
+    let got = select(
+        &e,
+        &f,
+        "SELECT customer_id, id, COUNT(*) FROM orders WHERE id <= 4 GROUP BY customer_id, id WITH ROLLUP",
+        &[],
+    )
+    .await
+    .unwrap();
+    // Four orders, a total per customer after its orders, the grand total
+    // last.
+    assert_eq!(got.last().map(String::as_str), Some("NULL|NULL|4"));
+    let totals: usize = got
+        .iter()
+        .filter(|r| r.contains("|NULL|") && !r.starts_with("NULL"))
+        .map(|r| r.rsplit('|').next().unwrap().parse::<usize>().unwrap())
+        .sum();
+    assert_eq!(totals, 4);
+    // MariaDB doesn't order a rollup.
+    let err = select(
+        &e,
+        &f,
+        "SELECT customer_id, COUNT(*) FROM orders GROUP BY customer_id WITH ROLLUP ORDER BY customer_id",
+        &[],
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.protocol().mysql_errno, 1221);
 }
 
 #[tokio::test]
@@ -979,4 +1206,43 @@ async fn physical_database_names_read_as_the_logical_ones() {
         "SELECT `{p}`.`orders`.`id`, c.name FROM `{p}`.`orders` JOIN `{p}`.`customers` c ON c.id = `{p}`.`orders`.customer_id WHERE `{p}`.`orders`.id = 3"
     );
     assert_eq!(select(&e, &f, &sql, &[]).await.unwrap(), ["3|name22"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn views_read_as_their_select() {
+    let (e, f, _d) = shop().await;
+    for (through, direct) in [
+        (
+            "SELECT * FROM big_orders ORDER BY id",
+            "SELECT id, customer_id, amount * 2 FROM orders WHERE amount > 50 ORDER BY id",
+        ),
+        (
+            "SELECT b.cust, c.name FROM big_orders b JOIN customers c ON c.id = b.cust WHERE b.twice > 300 ORDER BY b.id",
+            "SELECT o.customer_id, c.name FROM orders o JOIN customers c ON c.id = o.customer_id WHERE o.amount > 50 AND o.amount * 2 > 300 ORDER BY o.id",
+        ),
+        (
+            "SELECT * FROM per_customer ORDER BY cust",
+            "SELECT customer_id, COUNT(*) FROM orders WHERE amount > 50 GROUP BY customer_id ORDER BY customer_id",
+        ),
+        (
+            "SELECT id FROM customers WHERE id IN (SELECT cust FROM big_orders) ORDER BY id",
+            "SELECT id FROM customers WHERE id IN (SELECT customer_id FROM orders WHERE amount > 50) ORDER BY id",
+        ),
+    ] {
+        let got = select(&e, &f, through, &[])
+            .await
+            .unwrap_or_else(|e| panic!("{through}: {}", e.message));
+        let want = select(&e, &f, direct, &[])
+            .await
+            .unwrap_or_else(|e| panic!("{direct}: {}", e.message));
+        assert_eq!(
+            got.iter().skip(1).collect::<Vec<_>>(),
+            want.iter().skip(1).collect::<Vec<_>>(),
+            "{through}"
+        );
+    }
+    let err = select(&e, &f, "SELECT * FROM loop_a", &[])
+        .await
+        .unwrap_err();
+    assert_eq!(err.protocol().mysql_errno, 1462);
 }

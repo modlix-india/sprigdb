@@ -18,9 +18,12 @@ use sprig_exec::{BinOp, CastTarget, ColumnRef, Expr, ExprType, Result, SqlError,
 use sqlparser::ast::{self, BinaryOperator, UnaryOperator, Value as SqlValue};
 
 use crate::catalog::TableDef;
+use crate::dependent::{DepKind, DepSpec, Recording};
 use crate::exprs::{self, slot_ref, slot_type};
 use crate::plan::Cx;
 
+/// The first slot number of window function results.
+pub(crate) const WIN_BASE: usize = 1 << 21;
 /// The first slot number of scalar subqueries computed per row.
 pub(crate) const SUBQ_BASE: usize = 1 << 22;
 /// The first slot number of aggregate results.
@@ -214,6 +217,10 @@ pub(crate) struct AggSpec {
     pub(crate) arg: Option<Expr>,
     pub(crate) distinct: bool,
     pub(crate) separator: Option<Vec<u8>>,
+    /// `GROUP_CONCAT(... ORDER BY ...)`: the keys and whether each descends.
+    pub(crate) order: Vec<(Expr, bool)>,
+    /// `GROUP_CONCAT(... LIMIT [offset,] count)` (MariaDB).
+    pub(crate) limit: Option<(u64, u64)>,
     pub(crate) ty: ExprType,
 }
 
@@ -258,8 +265,8 @@ pub(crate) struct SimpleInner {
 /// each outer row, the value of one expression over the matching rows of
 /// one table.
 pub(crate) struct Apply {
-    /// The subquery's table.
-    pub(crate) rel: Rel,
+    /// The subquery's table (`None` for a dependent subquery).
+    pub(crate) rel: Option<Rel>,
     /// Pairs of an outer expression and an expression over the table
     /// that must be equal.
     pub(crate) keys: Vec<(Expr, Expr)>,
@@ -276,6 +283,58 @@ pub(crate) struct Apply {
     pub(crate) ty: ExprType,
     /// The query block number shown by `EXPLAIN`.
     pub(crate) id: usize,
+    /// A subquery planned again for each combination of the outer values
+    /// in `keys` (their inner sides unused).
+    pub(crate) dep: Option<Rc<crate::dependent::DepSpec>>,
+}
+
+/// What a window function computes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum WinFn {
+    RowNumber,
+    Rank,
+    DenseRank,
+    PercentRank,
+    CumeDist,
+    Ntile,
+    Lag,
+    Lead,
+    FirstValue,
+    LastValue,
+    NthValue,
+    Agg(AggKind),
+}
+
+/// One window function of a block, over the block's rows (after grouping
+/// when the block groups).
+#[derive(Debug, Clone)]
+pub(crate) struct WinSpec {
+    pub(crate) func: WinFn,
+    pub(crate) args: Vec<Expr>,
+    pub(crate) partition: Vec<Expr>,
+    pub(crate) order: Vec<(Expr, bool)>,
+    pub(crate) frame: sprig_exec::ops::Frame,
+    pub(crate) ty: ExprType,
+}
+
+impl WinSpec {
+    /// Every expression the function reads.
+    pub(crate) fn exprs(&self) -> impl Iterator<Item = &Expr> {
+        self.args
+            .iter()
+            .chain(self.partition.iter())
+            .chain(self.order.iter().map(|(e, _)| e))
+    }
+
+    /// The same function with `f` applied to each expression.
+    pub(crate) fn map(&self, f: &dyn Fn(&Expr) -> Expr) -> Self {
+        Self {
+            args: self.args.iter().map(f).collect(),
+            partition: self.partition.iter().map(f).collect(),
+            order: self.order.iter().map(|(e, d)| (f(e), *d)).collect(),
+            ..self.clone()
+        }
+    }
 }
 
 /// A resolved query block.
@@ -287,6 +346,8 @@ pub(crate) struct Block {
     /// Scalar subqueries tied to this block: each is computed per row
     /// and read through a slot numbered from [`SUBQ_BASE`].
     pub(crate) applies: Vec<Apply>,
+    /// Window functions, read through slots numbered from [`WIN_BASE`].
+    pub(crate) windows: Vec<WinSpec>,
     pub(crate) items: Vec<Item>,
     pub(crate) group_by: Vec<Expr>,
     pub(crate) aggs: Vec<AggSpec>,
@@ -298,6 +359,8 @@ pub(crate) struct Block {
     /// Whether the block groups its rows (it has `GROUP BY` or an
     /// aggregate).
     pub(crate) grouped: bool,
+    /// `GROUP BY ... WITH ROLLUP`.
+    pub(crate) rollup: bool,
     /// The block's number in `EXPLAIN`.
     pub(crate) id: usize,
     /// Pairs (outer expression, inner expression) taken out of the
@@ -357,6 +420,93 @@ impl Scope<'_> {
     }
 }
 
+/// The partition, order and frame of an `OVER` clause, with a named
+/// window's parts filled in.
+fn window_of(
+    over: &ast::WindowType,
+    named: &[ast::NamedWindowDefinition],
+) -> Result<(
+    Vec<ast::Expr>,
+    Vec<ast::OrderByExpr>,
+    Option<ast::WindowFrame>,
+)> {
+    fn lookup(
+        name: &ast::Ident,
+        named: &[ast::NamedWindowDefinition],
+        depth: usize,
+    ) -> Result<(
+        Vec<ast::Expr>,
+        Vec<ast::OrderByExpr>,
+        Option<ast::WindowFrame>,
+    )> {
+        let Some(def) = named
+            .iter()
+            .find(|d| d.0.value.eq_ignore_ascii_case(&name.value))
+        else {
+            return Err(SqlError::new(
+                3579,
+                "HY000",
+                format!("Window name '{}' is not defined.", name.value),
+            ));
+        };
+        if depth > named.len() {
+            return Err(SqlError::new(
+                3580,
+                "HY000",
+                "There is a circularity in the window dependency graph.",
+            ));
+        }
+        match &def.1 {
+            ast::NamedWindowExpr::NamedWindow(other) => lookup(other, named, depth + 1),
+            ast::NamedWindowExpr::WindowSpec(spec) => spec_of(spec, named, depth + 1),
+        }
+    }
+    fn spec_of(
+        spec: &ast::WindowSpec,
+        named: &[ast::NamedWindowDefinition],
+        depth: usize,
+    ) -> Result<(
+        Vec<ast::Expr>,
+        Vec<ast::OrderByExpr>,
+        Option<ast::WindowFrame>,
+    )> {
+        let (mut p, mut o, mut f) = match &spec.window_name {
+            Some(n) => lookup(n, named, depth)?,
+            None => (Vec::new(), Vec::new(), None),
+        };
+        if !spec.partition_by.is_empty() {
+            p.clone_from(&spec.partition_by);
+        }
+        if !spec.order_by.is_empty() {
+            o.clone_from(&spec.order_by);
+        }
+        if spec.window_frame.is_some() {
+            f.clone_from(&spec.window_frame);
+        }
+        Ok((p, o, f))
+    }
+    match over {
+        ast::WindowType::NamedWindow(n) => lookup(n, named, 0),
+        ast::WindowType::WindowSpec(spec) => spec_of(spec, named, 0),
+    }
+}
+
+/// The type of a subquery predicate's value: MariaDB's 32-bit integer,
+/// MySQL's 64-bit one, `len` characters wide.
+fn truth_type(maria: bool, len: u32, nullable: bool) -> ExprType {
+    let t = ExprType {
+        prec: 1,
+        width: if maria { 4 } else { 0 },
+        ..ExprType::int(len, false)
+    };
+    if nullable { t.nullable() } else { t }
+}
+
+/// A scope's identity, for telling the blocks of a statement apart.
+fn scope_id(s: &Scope<'_>) -> *const () {
+    std::ptr::from_ref(s).cast()
+}
+
 /// Shifts an expression of an enclosing block into a subquery's slots.
 fn to_outer(e: &Expr) -> Expr {
     exprs::remap(e, &|s| s + OUTER_BASE)
@@ -375,6 +525,11 @@ pub(crate) struct ExprCx<'a, 'b> {
     /// Where scalar subqueries tied to the block are collected; `None`
     /// where the clause can't hold one.
     pub(crate) applies: Option<&'b mut Vec<Apply>>,
+    /// Where window functions are collected; `None` where they aren't
+    /// allowed.
+    pub(crate) windows: Option<&'b mut Vec<WinSpec>>,
+    /// The block's named windows (`WINDOW w AS (...)`).
+    pub(crate) named: &'a [ast::NamedWindowDefinition],
     in_agg: bool,
 }
 
@@ -387,6 +542,8 @@ impl<'a, 'b> ExprCx<'a, 'b> {
             items: None,
             alias_first: false,
             applies: None,
+            windows: None,
+            named: &[],
             in_agg: false,
         }
     }
@@ -524,24 +681,16 @@ fn agg_kind(name: &str) -> Option<AggKind> {
         "MIN" => AggKind::Min,
         "MAX" => AggKind::Max,
         "GROUP_CONCAT" => AggKind::GroupConcat,
+        "STD" | "STDDEV" | "STDDEV_POP" => AggKind::StdPop,
+        "STDDEV_SAMP" => AggKind::StdSamp,
+        "VARIANCE" | "VAR_POP" => AggKind::VarPop,
+        "VAR_SAMP" => AggKind::VarSamp,
+        "BIT_AND" => AggKind::BitAnd,
+        "BIT_OR" => AggKind::BitOr,
+        "BIT_XOR" => AggKind::BitXor,
         _ => return None,
     })
 }
-
-const OTHER_AGGREGATES: &[&str] = &[
-    "STD",
-    "STDDEV",
-    "STDDEV_POP",
-    "STDDEV_SAMP",
-    "VARIANCE",
-    "VAR_POP",
-    "VAR_SAMP",
-    "BIT_AND",
-    "BIT_OR",
-    "BIT_XOR",
-    "JSON_ARRAYAGG",
-    "JSON_OBJECTAGG",
-];
 
 impl Cx<'_> {
     fn maria(&self) -> bool {
@@ -608,12 +757,20 @@ impl Cx<'_> {
                     }
                 }
                 let mut outer = x.scope.outer;
+                let mut seen: Vec<*const ()> = Vec::new();
                 while let Some(o) = outer {
+                    seen.push(scope_id(o));
                     if let Some(e) = o.unqualified(name, x.clause, maria)? {
+                        if let Some(r) = self.recorded(&[name], &e, &seen)? {
+                            return Ok(r);
+                        }
                         self.outer_refs += 1;
                         return Ok(to_outer(&e));
                     }
                     outer = o.outer;
+                }
+                if let Some(e) = self.bound_outer.as_ref().and_then(|b| b.find(&[name])) {
+                    return Ok(e);
                 }
                 Err(not_found())
             }
@@ -636,13 +793,24 @@ impl Cx<'_> {
         if let Some(e) = x.scope.qualified(schema, table, name) {
             return Ok(e);
         }
+        let mut parts: Vec<&str> = schema.into_iter().collect();
+        parts.push(table);
+        parts.push(name);
         let mut outer = x.scope.outer;
+        let mut seen: Vec<*const ()> = Vec::new();
         while let Some(o) = outer {
+            seen.push(scope_id(o));
             if let Some(e) = o.qualified(schema, table, name) {
+                if let Some(r) = self.recorded(&parts, &e, &seen)? {
+                    return Ok(r);
+                }
                 self.outer_refs += 1;
                 return Ok(to_outer(&e));
             }
             outer = o.outer;
+        }
+        if let Some(e) = self.bound_outer.as_ref().and_then(|b| b.find(&parts)) {
+            return Ok(e);
         }
         Err(unknown_column(text, x.clause, self.maria()))
     }
@@ -704,8 +872,13 @@ impl Cx<'_> {
                 left,
                 op: op @ (BinaryOperator::Eq | BinaryOperator::NotEq),
                 right,
-            } if matches!((&**left, &**right), (A::Tuple(_), A::Tuple(_))) => {
-                // A row comparison, column by column.
+            } if matches!((&**left, &**right), (A::Tuple(l), A::Tuple(r))
+                if l.len() != r.len()
+                    || !l.iter().chain(r.iter()).any(|e| matches!(e, A::Tuple(_)))) =>
+            {
+                // A row equality of single values, column by column (so the
+                // key lookups see each column); nested rows go to the
+                // expression engine's row comparison below.
                 let (A::Tuple(l), A::Tuple(r)) = (&**left, &**right) else {
                     return Err(unsupported("this row comparison"));
                 };
@@ -726,6 +899,125 @@ impl Cx<'_> {
                     all
                 } else {
                     Expr::Not(Box::new(all))
+                }
+            }
+            // Any other comparison with a row operand, such as keyset
+            // pagination's `(created, id) < (?, ?)`: the expression engine's
+            // row comparison (`ROW`), with each server's shape errors. In a
+            // filter, `(a, ...) < (x, ...)` also gets the implied `a <= x`
+            // (true, false or unknown exactly when needed, so the answer is
+            // unchanged) for the range analysis of the first column.
+            A::BinaryOp {
+                left,
+                op:
+                    op @ (BinaryOperator::Eq
+                    | BinaryOperator::NotEq
+                    | BinaryOperator::Lt
+                    | BinaryOperator::LtEq
+                    | BinaryOperator::Gt
+                    | BinaryOperator::GtEq
+                    | BinaryOperator::Spaceship),
+                right,
+            } if matches!(&**left, A::Tuple(_)) || matches!(&**right, A::Tuple(_)) => {
+                let bop = match op {
+                    BinaryOperator::Eq => BinOp::Eq,
+                    BinaryOperator::NotEq => BinOp::Ne,
+                    BinaryOperator::Lt => BinOp::Lt,
+                    BinaryOperator::LtEq => BinOp::Le,
+                    BinaryOperator::Gt => BinOp::Gt,
+                    BinaryOperator::GtEq => BinOp::Ge,
+                    _ => BinOp::NullSafeEq,
+                };
+                let implied = match (&**left, &**right, bop) {
+                    (A::Tuple(l), A::Tuple(r), BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge)
+                        if matches!(x.clause, Clause::Where | Clause::On)
+                            && l.len() == r.len()
+                            && l.len() > 1
+                            && matches!(l[0], A::Identifier(_) | A::CompoundIdentifier(_))
+                            && matches!(
+                                r[0],
+                                A::Value(_) | A::Identifier(_) | A::CompoundIdentifier(_)
+                            ) =>
+                    {
+                        let first = match bop {
+                            BinOp::Lt | BinOp::Le => BinOp::Le,
+                            _ => BinOp::Ge,
+                        };
+                        Some((first, &l[0], &r[0]))
+                    }
+                    _ => None,
+                };
+                let row = Expr::Binary(bop, self.boxed(left, x)?, self.boxed(right, x)?);
+                match implied {
+                    Some((first, a, b)) => {
+                        let a = self.boxed(a, x)?;
+                        let first = Expr::Binary(first, a, self.boxed(b, x)?);
+                        Expr::Binary(BinOp::And, Box::new(first), Box::new(row))
+                    }
+                    None => row,
+                }
+            }
+            // A row value: the expression engine's `ROW`, which is only
+            // valid as an operand of a comparison or `IN` (1241 elsewhere).
+            A::Tuple(items) => {
+                let mut row = Vec::with_capacity(items.len());
+                for item in items {
+                    row.push(self.expr_in(item, x, false)?);
+                }
+                Expr::Func("ROW".into(), row)
+            }
+            // `d + INTERVAL n unit`, `INTERVAL n unit + d`, `d - INTERVAL n unit`.
+            A::BinaryOp {
+                left,
+                op: op @ (BinaryOperator::Plus | BinaryOperator::Minus),
+                right,
+            } if matches!(&**right, A::Interval(_))
+                || (*op == BinaryOperator::Plus && matches!(&**left, A::Interval(_))) =>
+            {
+                let (d, iv) = match (&**left, &**right) {
+                    (_, A::Interval(iv)) => (&**left, iv),
+                    (A::Interval(iv), _) => (&**right, iv),
+                    _ => return Err(syntax_error()),
+                };
+                let d = self.expr_in(d, x, false)?;
+                let (n, unit) = self.interval(iv, x)?;
+                let name = if *op == BinaryOperator::Plus {
+                    "DATE_ADD"
+                } else {
+                    "DATE_SUB"
+                };
+                Expr::Func(name.into(), vec![d, n, unit])
+            }
+            A::Interval(_) => return Err(syntax_error()),
+            A::Extract { field, expr, .. } => {
+                let unit = unit_keyword(field)?;
+                Expr::Func("EXTRACT".into(), vec![unit, self.expr_in(expr, x, false)?])
+            }
+            A::MemberOf(m) => Expr::Func(
+                "MEMBER OF".into(),
+                vec![
+                    self.expr_in(&m.value, x, false)?,
+                    self.expr_in(&m.array, x, false)?,
+                ],
+            ),
+            // `doc->'$.path'` is `JSON_EXTRACT(doc, '$.path')`; `->>` also
+            // unquotes.
+            A::BinaryOp {
+                left,
+                op: op @ (BinaryOperator::Arrow | BinaryOperator::LongArrow),
+                right,
+            } => {
+                let e = Expr::Func(
+                    "JSON_EXTRACT".into(),
+                    vec![
+                        self.expr_in(left, x, false)?,
+                        self.expr_in(right, x, false)?,
+                    ],
+                );
+                if matches!(op, BinaryOperator::LongArrow) {
+                    Expr::Func("JSON_UNQUOTE".into(), vec![e])
+                } else {
+                    e
                 }
             }
             A::BinaryOp { left, op, right } => {
@@ -935,9 +1227,6 @@ impl Cx<'_> {
 
     fn function(&mut self, f: &ast::Function, x: &mut ExprCx<'_, '_>) -> Result<Expr> {
         let name = object_name(&f.name)?.join(".").to_ascii_uppercase();
-        if f.over.is_some() {
-            return Err(unsupported("window functions"));
-        }
         if f.filter.is_some() || !f.within_group.is_empty() {
             return Err(unsupported(&format!("{name} with FILTER or WITHIN GROUP")));
         }
@@ -953,14 +1242,37 @@ impl Cx<'_> {
                     return Err(unsupported(&format!("{name} of a subquery")));
                 }
             };
-        if OTHER_AGGREGATES.contains(&name.as_str()) {
-            return Err(unsupported(&name));
+        if let Some(over) = &f.over {
+            return self.window_fn(&name, args, distinct, clauses, over, x);
+        }
+        if matches!(name.as_str(), "JSON_ARRAYAGG" | "JSON_OBJECTAGG") {
+            let e = self.json_agg(&name, args, distinct, clauses)?;
+            return self.expr_in(&e, x, false);
         }
         if let Some(kind) = agg_kind(&name) {
             return self.aggregate(&name, kind, args, distinct, clauses, x);
         }
         if distinct || !clauses.is_empty() {
             return Err(unsupported(&format!("{name} with these arguments")));
+        }
+        if matches!(
+            name.as_str(),
+            "NEXTVAL" | "LASTVAL" | "SETVAL" | "SPRIG_SEQUENCE_STATE"
+        ) {
+            if self.maria() {
+                return self.sequence_call(&name, args, x);
+            }
+            // MySQL has no sequences: a stored function of that name.
+            let written = object_name(&f.name)?.join(".");
+            let db = self.catalog.default_schema().unwrap_or_default();
+            return Err(SqlError::new(
+                1305,
+                "42000",
+                format!("FUNCTION {db}.{written} does not exist"),
+            ));
+        }
+        if let Some(e) = self.unit_call(&name, args, x)? {
+            return Ok(e);
         }
         let mut out = Vec::with_capacity(args.len());
         for a in args {
@@ -972,6 +1284,593 @@ impl Cx<'_> {
             }
         }
         Ok(Expr::Func(name, out))
+    }
+
+    /// A sequence function (MariaDB): its first argument names the
+    /// sequence, passed on as the sequence's identity.
+    fn sequence_call(
+        &mut self,
+        name: &str,
+        args: &[ast::FunctionArg],
+        x: &mut ExprCx<'_, '_>,
+    ) -> Result<Expr> {
+        let lower = name.to_ascii_lowercase();
+        let (first, rest) = args
+            .split_first()
+            .ok_or_else(|| SqlError::param_count(&lower))?;
+        let named = match first {
+            ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) => match e {
+                ast::Expr::Identifier(i) => Some((None, i.value.clone())),
+                ast::Expr::CompoundIdentifier(p) if p.len() == 2 => {
+                    Some((Some(p[0].value.clone()), p[1].value.clone()))
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        let Some((schema, seq)) = named else {
+            return Err(SqlError::new(
+                1064,
+                "42000",
+                format!("You have an error in your SQL syntax; {lower} takes a sequence name"),
+            ));
+        };
+        let schema = match schema {
+            Some(s) => s,
+            None => self
+                .catalog
+                .default_schema()
+                .ok_or_else(|| SqlError::new(1046, "3D000", "No database selected"))?,
+        };
+        let id = self.catalog.sequence(&schema, &seq)?;
+        let mut out = vec![Expr::Keyword(id)];
+        for a in rest {
+            match a {
+                ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) => {
+                    if name == "SPRIG_SEQUENCE_STATE" {
+                        if let ast::Expr::Value(v) = e
+                            && let ast::Value::Number(n, _) = &v.value
+                        {
+                            out.push(Expr::Int(n.clone()));
+                            continue;
+                        }
+                        return Err(unsupported("a sequence field"));
+                    }
+                    out.push(self.expr_in(e, x, false)?);
+                }
+                _ => return Err(unsupported(&format!("{name} with these arguments"))),
+            }
+        }
+        Ok(Expr::Func(name.to_owned(), out))
+    }
+
+    /// A window function call: resolved into the block's window list and
+    /// read back through its slot.
+    fn window_fn(
+        &mut self,
+        name: &str,
+        args: &[ast::FunctionArg],
+        distinct: bool,
+        clauses: &[ast::FunctionArgumentClause],
+        over: &ast::WindowType,
+        x: &mut ExprCx<'_, '_>,
+    ) -> Result<Expr> {
+        let maria = self.maria();
+        let lower = name.to_ascii_lowercase();
+        if x.windows.is_none() || x.in_agg {
+            return Err(if maria {
+                SqlError::new(
+                    4015,
+                    "HY000",
+                    "Window function is allowed only in SELECT list and ORDER BY clause",
+                )
+            } else {
+                SqlError::new(
+                    3593,
+                    "HY000",
+                    format!("You cannot use the window function '{lower}' in this context.'"),
+                )
+            });
+        }
+        if distinct || !clauses.is_empty() {
+            return Err(unsupported(&format!(
+                "{name} with DISTINCT or a clause in a window"
+            )));
+        }
+        let func = match name {
+            "ROW_NUMBER" => WinFn::RowNumber,
+            "RANK" => WinFn::Rank,
+            "DENSE_RANK" => WinFn::DenseRank,
+            "PERCENT_RANK" => WinFn::PercentRank,
+            "CUME_DIST" => WinFn::CumeDist,
+            "NTILE" => WinFn::Ntile,
+            "LAG" => WinFn::Lag,
+            "LEAD" => WinFn::Lead,
+            "FIRST_VALUE" => WinFn::FirstValue,
+            "LAST_VALUE" => WinFn::LastValue,
+            "NTH_VALUE" => WinFn::NthValue,
+            other => match agg_kind(other) {
+                Some(
+                    k
+                    @ (AggKind::Count | AggKind::Sum | AggKind::Avg | AggKind::Min | AggKind::Max),
+                ) => WinFn::Agg(k),
+                _ => return Err(unsupported(&format!("{name} as a window function"))),
+            },
+        };
+        let (lo, hi) = match func {
+            WinFn::RowNumber
+            | WinFn::Rank
+            | WinFn::DenseRank
+            | WinFn::PercentRank
+            | WinFn::CumeDist => (0, 0),
+            WinFn::Ntile | WinFn::FirstValue | WinFn::LastValue | WinFn::Agg(_) => (1, 1),
+            WinFn::Lag | WinFn::Lead => (1, if maria { 2 } else { 3 }),
+            WinFn::NthValue => (2, 2),
+        };
+        // `COUNT(*)`.
+        let star = matches!(
+            args,
+            [ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Wildcard)]
+        );
+        if star && func != WinFn::Agg(AggKind::Count) {
+            return Err(unsupported(&format!("{name}(*)")));
+        }
+        if !star && (args.len() < lo || args.len() > hi) {
+            return Err(SqlError::param_count(name));
+        }
+        // The window: a named one, possibly extended.
+        let (partition_ast, order_ast, frame_ast) = window_of(over, x.named).map_err(|e| {
+            if maria && e.code == 3579 {
+                let n = e.message.split('\'').nth(1).unwrap_or_default();
+                SqlError::new(
+                    4009,
+                    "HY000",
+                    format!("Window specification with name '{n}' is not defined"),
+                )
+            } else {
+                e
+            }
+        })?;
+        let saved = x.windows.take();
+        let resolved = self.window_parts(args, star, &partition_ast, &order_ast, x);
+        x.windows = saved;
+        let (mut wargs, partition, order) = resolved?;
+        let ordered = !order.is_empty();
+        if maria
+            && !ordered
+            && matches!(
+                func,
+                WinFn::Rank
+                    | WinFn::DenseRank
+                    | WinFn::PercentRank
+                    | WinFn::CumeDist
+                    | WinFn::Ntile
+                    | WinFn::Lag
+                    | WinFn::Lead
+            )
+        {
+            return Err(SqlError::new(
+                4018,
+                "HY000",
+                format!("No order list in window specification for '{lower}'"),
+            ));
+        }
+        let frame = match &frame_ast {
+            None => sprig_exec::ops::Frame::default_for(ordered),
+            Some(f) => self.frame_of(f)?,
+        };
+        let count_ty = ExprType::int(21, !maria);
+        let ty = match func {
+            WinFn::RowNumber | WinFn::Rank | WinFn::DenseRank | WinFn::Ntile => count_ty,
+            WinFn::PercentRank | WinFn::CumeDist => {
+                if maria {
+                    ExprType {
+                        dec: 10,
+                        len: 17,
+                        ..ExprType::double()
+                    }
+                    .nullable()
+                } else {
+                    ExprType::double()
+                }
+            }
+            WinFn::Lag | WinFn::Lead | WinFn::FirstValue | WinFn::LastValue | WinFn::NthValue => {
+                self.type_of(&wargs[0])?.nullable()
+            }
+            WinFn::Agg(k) => {
+                let arg = match wargs.first() {
+                    Some(a) => Some(compile(a, &self.session)?),
+                    None => None,
+                };
+                let kind = if star { AggKind::CountStar } else { k };
+                *Aggregate::new(kind, arg, false, &self.session)?.ty()
+            }
+        };
+        let func = if star {
+            WinFn::Agg(AggKind::CountStar)
+        } else {
+            func
+        };
+        if star {
+            wargs.clear();
+        }
+        let Some(list) = x.windows.as_deref_mut() else {
+            return Err(unsupported("a window function here"));
+        };
+        list.push(WinSpec {
+            func,
+            args: wargs,
+            partition,
+            order,
+            frame,
+            ty,
+        });
+        Ok(slot_ref(WIN_BASE + list.len() - 1, &lower, &ty))
+    }
+
+    /// The arguments, partition and order of a window function.
+    fn window_parts(
+        &mut self,
+        args: &[ast::FunctionArg],
+        star: bool,
+        partition: &[ast::Expr],
+        order: &[ast::OrderByExpr],
+        x: &mut ExprCx<'_, '_>,
+    ) -> Result<(Vec<Expr>, Vec<Expr>, Vec<(Expr, bool)>)> {
+        let mut wargs = Vec::new();
+        if !star {
+            for a in args {
+                match a {
+                    ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) => {
+                        wargs.push(self.expr_in(e, x, false)?);
+                    }
+                    _ => return Err(unsupported("these window function arguments")),
+                }
+            }
+        }
+        let mut parts = Vec::with_capacity(partition.len());
+        for p in partition {
+            parts.push(self.expr_in(p, x, false)?);
+        }
+        let mut ord = Vec::with_capacity(order.len());
+        for o in order {
+            if o.with_fill.is_some() || o.options.nulls_first.is_some() {
+                return Err(unsupported("this window ORDER BY option"));
+            }
+            let desc = o.options.sort == Some(ast::OrderBySort::Desc);
+            ord.push((self.expr_in(&o.expr, x, false)?, desc));
+        }
+        Ok((wargs, parts, ord))
+    }
+
+    /// A frame clause: `ROWS` with row counts, or `RANGE` with
+    /// `UNBOUNDED` and `CURRENT ROW` bounds.
+    fn frame_of(&mut self, f: &ast::WindowFrame) -> Result<sprig_exec::ops::Frame> {
+        use sprig_exec::ops::FrameBound as B;
+        let rows = match f.units {
+            ast::WindowFrameUnits::Rows => true,
+            ast::WindowFrameUnits::Range => false,
+            ast::WindowFrameUnits::Groups => return Err(unsupported("GROUPS frames")),
+        };
+        let mut bound = |b: &ast::WindowFrameBound| -> Result<B> {
+            Ok(match b {
+                ast::WindowFrameBound::CurrentRow => B::CurrentRow,
+                ast::WindowFrameBound::Preceding(None) => B::UnboundedPreceding,
+                ast::WindowFrameBound::Following(None) => B::UnboundedFollowing,
+                ast::WindowFrameBound::Preceding(Some(e))
+                | ast::WindowFrameBound::Following(Some(e)) => {
+                    if !rows {
+                        return Err(unsupported("RANGE frames with an offset"));
+                    }
+                    let scope = Scope {
+                        rels: &[],
+                        star: &[],
+                        visible: 0..0,
+                        outer: None,
+                    };
+                    let n = self.const_u64(e, &scope)?;
+                    if matches!(b, ast::WindowFrameBound::Preceding(_)) {
+                        B::Preceding(n)
+                    } else {
+                        B::Following(n)
+                    }
+                }
+            })
+        };
+        let start = bound(&f.start_bound)?;
+        let end = match &f.end_bound {
+            Some(e) => bound(e)?,
+            None => B::CurrentRow,
+        };
+        Ok(sprig_exec::ops::Frame { rows, start, end })
+    }
+
+    /// `INTERVAL n unit`: the amount and the unit as a keyword.
+    fn interval(&mut self, iv: &ast::Interval, x: &mut ExprCx<'_, '_>) -> Result<(Expr, Expr)> {
+        if iv.last_field.is_some()
+            || iv.leading_precision.is_some()
+            || iv.fractional_seconds_precision.is_some()
+        {
+            return Err(syntax_error());
+        }
+        let unit = unit_keyword(iv.leading_field.as_ref().ok_or_else(syntax_error)?)?;
+        Ok((self.expr_in(&iv.value, x, false)?, unit))
+    }
+
+    /// The date and time functions that take an interval or a unit:
+    /// `DATE_ADD(d, INTERVAL n unit)` (and `DATE_SUB`, `ADDDATE`, `SUBDATE`),
+    /// `TIMESTAMPADD(unit, n, d)`, `TIMESTAMPDIFF(unit, a, b)`. `None` for
+    /// any other call.
+    fn unit_call(
+        &mut self,
+        name: &str,
+        args: &[ast::FunctionArg],
+        x: &mut ExprCx<'_, '_>,
+    ) -> Result<Option<Expr>> {
+        let plain = |a: &'_ ast::FunctionArg| match a {
+            ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) => Some(e.clone()),
+            _ => None,
+        };
+        let args: Vec<ast::Expr> = match args.iter().map(plain).collect::<Option<Vec<_>>>() {
+            Some(a) => a,
+            None => return Ok(None),
+        };
+        Ok(Some(match name {
+            "DATE_ADD" | "DATE_SUB" | "ADDDATE" | "SUBDATE" => match args.as_slice() {
+                [d, ast::Expr::Interval(iv)] => {
+                    let d = self.expr_in(d, x, false)?;
+                    let (n, unit) = self.interval(iv, x)?;
+                    Expr::Func(name.into(), vec![d, n, unit])
+                }
+                // `ADDDATE(d, n)`: days.
+                [d, n] if matches!(name, "ADDDATE" | "SUBDATE") => {
+                    let d = self.expr_in(d, x, false)?;
+                    let n = self.expr_in(n, x, false)?;
+                    Expr::Func(name.into(), vec![d, n, Expr::Keyword("DAY".into())])
+                }
+                _ => return Err(syntax_error()),
+            },
+            "TIMESTAMPADD" | "TIMESTAMPDIFF" => match args.as_slice() {
+                [u, a, b] => {
+                    let unit = match u {
+                        ast::Expr::Identifier(i) if i.quote_style.is_none() => {
+                            let up = i.value.to_ascii_uppercase();
+                            let up = up.strip_prefix("SQL_TSI_").unwrap_or(&up).to_owned();
+                            if !TIMESTAMP_UNITS.contains(&up.as_str()) {
+                                return Err(syntax_error());
+                            }
+                            Expr::Keyword(up)
+                        }
+                        _ => return Err(syntax_error()),
+                    };
+                    let a = self.expr_in(a, x, false)?;
+                    let b = self.expr_in(b, x, false)?;
+                    Expr::Func(name.into(), vec![unit, a, b])
+                }
+                _ => return Err(SqlError::param_count(name)),
+            },
+            _ => return Ok(None),
+        }))
+    }
+
+    /// A name an enclosing block answered, while a dependent subquery is
+    /// resolved: recorded for the subquery whose block it is, and read as
+    /// a typed `NULL` meanwhile. `None` when no dependent subquery is
+    /// being resolved across that block. `seen`: the enclosing scopes
+    /// walked, the answering one last.
+    fn recorded(&mut self, parts: &[&str], e: &Expr, seen: &[*const ()]) -> Result<Option<Expr>> {
+        if self.recording.is_empty() {
+            return Ok(None);
+        }
+        let at = seen.last().copied();
+        let mut crossed = false;
+        let mut owned = false;
+        for r in &mut self.recording {
+            if !seen.contains(&r.boundary) {
+                continue;
+            }
+            crossed = true;
+            if Some(r.boundary) == at {
+                owned = true;
+                let key: Vec<String> = parts.iter().map(|p| p.to_ascii_lowercase()).collect();
+                if !r.uses.iter().any(|(k, _)| *k == key) {
+                    r.uses.push((key, e.clone()));
+                }
+            }
+        }
+        if !crossed {
+            return Ok(None);
+        }
+        if !owned {
+            return Err(unsupported("a subquery that reads a query two levels out"));
+        }
+        let ty = self.type_of(e)?.nullable();
+        Ok(Some(Expr::Typed(Box::new((Value::Null, ty)))))
+    }
+
+    /// A subquery that reads its outer block in a way no other path
+    /// covers: planned again for each combination of the outer values it
+    /// reads (see [`crate::dependent`]).
+    fn dependent(
+        &mut self,
+        q: &ast::Query,
+        kind: DepKind,
+        lhs: Option<Expr>,
+        x: &mut ExprCx<'_, '_>,
+    ) -> Result<Expr> {
+        let Some(catalog) = self.catalog.shared() else {
+            return Err(unsupported("a subquery that reads its outer query here"));
+        };
+        self.recording.push(Recording {
+            boundary: scope_id(x.scope),
+            uses: Vec::new(),
+        });
+        let planned = self.query(q, Some(x.scope), "DEPENDENT SUBQUERY");
+        let rec = self.recording.pop();
+        let planned = planned?;
+        let uses = rec.map(|r| r.uses).unwrap_or_default();
+        let one_column = |n: usize| {
+            SqlError::new(
+                1241,
+                "21000",
+                format!("Operand should contain {n} column(s)"),
+            )
+        };
+        let width = planned.types.len();
+        if width != 1 && !matches!(kind, DepKind::Exists { .. }) {
+            return Err(one_column(1));
+        }
+        let inner_ty = planned.types.first().copied();
+        let mut keys: Vec<(Expr, Expr)> = Vec::with_capacity(uses.len() + 1);
+        let mut key_types = Vec::with_capacity(uses.len() + 1);
+        let mut names = Vec::with_capacity(uses.len());
+        for (n, e) in uses {
+            key_types.push(self.type_of(&e)?);
+            keys.push((e, Expr::Null));
+            names.push(n);
+        }
+        let maria = self.maria();
+        let ty = match kind {
+            DepKind::Scalar => inner_ty.map_or_else(ExprType::boolean, |t| {
+                let mut t = t.nullable();
+                // A subquery's string is shown without a fixed scale.
+                if t.kind == sprig_exec::Kind::Str {
+                    t.dec = self.session.persona.not_fixed_dec();
+                }
+                t
+            }),
+            DepKind::Exists { .. } => truth_type(maria, 1, false),
+            DepKind::In { negated } => {
+                let Some(l) = lhs else {
+                    return Err(unsupported("IN without its left side"));
+                };
+                let lt = self.type_of(&l)?;
+                let probe = Expr::In(
+                    Box::new(Expr::Typed(Box::new((Value::Null, lt)))),
+                    vec![Expr::Typed(Box::new((Value::Null, inner_ty.unwrap_or(lt))))],
+                    negated,
+                );
+                key_types.push(lt);
+                keys.push((l, Expr::Null));
+                self.type_of(&probe)?;
+                truth_type(maria, if maria { 21 } else { 1 }, true)
+            }
+        };
+        let spec = DepSpec {
+            query: Rc::new(q.clone()),
+            names,
+            key_types,
+            kind,
+            ty,
+            inner_ty,
+            catalog,
+            storage: self.storage.clone(),
+            session: self.session.clone(),
+            options: self.options.clone(),
+            memory: self.memory.clone(),
+            ctes: self.ctes.clone(),
+            parent: self.bound_outer.clone(),
+        };
+        let Some(applies) = x.applies.as_deref_mut() else {
+            return Err(unsupported("a subquery that reads its outer query here"));
+        };
+        applies.push(Apply {
+            rel: None,
+            keys,
+            filters: Vec::new(),
+            aggs: Vec::new(),
+            grouped: false,
+            item: Expr::Null,
+            first_by: Vec::new(),
+            ty,
+            id: planned.id,
+            dep: Some(Rc::new(spec)),
+        });
+        Ok(slot_ref(SUBQ_BASE + applies.len() - 1, "subquery", &ty))
+    }
+
+    /// `JSON_ARRAYAGG(x)` and `JSON_OBJECTAGG(k, v)` as a `GROUP_CONCAT`
+    /// of each row's JSON text: MariaDB's text as it builds it (`[1,null]`,
+    /// `{"a":1, "a":2}`, rows with a `NULL` key left out, `DISTINCT` and
+    /// `ORDER BY` allowed); on MySQL the document read back, so it prints
+    /// and keeps duplicate keys as MySQL does (`[1, null]`, last key wins,
+    /// 3158 for a `NULL` key). Like MariaDB's own, the text is bounded by
+    /// `group_concat_max_len`.
+    fn json_agg(
+        &mut self,
+        name: &str,
+        args: &[ast::FunctionArg],
+        distinct: bool,
+        clauses: &[ast::FunctionArgumentClause],
+    ) -> Result<ast::Expr> {
+        let maria = self.maria();
+        let mut texts = Vec::with_capacity(args.len());
+        for a in args {
+            match a {
+                ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) => {
+                    texts.push(e.to_string());
+                }
+                _ => return Err(unsupported(&format!("{name} with these arguments"))),
+            }
+        }
+        let object = name == "JSON_OBJECTAGG";
+        if texts.len() != if object { 2 } else { 1 } {
+            return Err(SqlError::new(
+                1582,
+                "42000",
+                format!(
+                    "Incorrect parameter count in the call to native function '{}'",
+                    name.to_ascii_lowercase()
+                ),
+            ));
+        }
+        let mut order = String::new();
+        for c in clauses {
+            match c {
+                ast::FunctionArgumentClause::OrderBy(keys) if maria && !object => {
+                    let keys: Vec<String> = keys.iter().map(ToString::to_string).collect();
+                    order = format!(" ORDER BY {}", keys.join(", "));
+                }
+                ast::FunctionArgumentClause::Limit(_) | ast::FunctionArgumentClause::OrderBy(_)
+                    if !maria =>
+                {
+                    return Err(syntax_error());
+                }
+                _ => return Err(unsupported(&format!("{name} with this clause"))),
+            }
+        }
+        if (distinct && (!maria || object)) || texts.iter().any(|t| t.contains('?')) {
+            return Err(if distinct && !maria {
+                syntax_error()
+            } else {
+                unsupported(&format!("{name} with these arguments"))
+            });
+        }
+        let inner = |j: &str| format!("SUBSTRING({j}, 2, CHAR_LENGTH({j}) - 2)");
+        let d = if distinct { "DISTINCT " } else { "" };
+        let sql = match (object, maria) {
+            (false, true) => format!(
+                "CONCAT('[', GROUP_CONCAT({d}{}{order} SEPARATOR ','), ']')",
+                inner(&format!("JSON_ARRAY({})", texts[0]))
+            ),
+            (false, false) => format!(
+                "JSON_EXTRACT(CONCAT('[', GROUP_CONCAT({} SEPARATOR ','), ']'), '$')",
+                inner(&format!("JSON_ARRAY({})", texts[0]))
+            ),
+            (true, true) => format!(
+                "CONCAT('{{', GROUP_CONCAT(IF(({k}) IS NULL, NULL, CONCAT(JSON_QUOTE(CONCAT({k})), ':', {v})) SEPARATOR ', '), '}}')",
+                k = texts[0],
+                v = inner(&format!("JSON_ARRAY({})", texts[1]))
+            ),
+            (true, false) => format!(
+                "JSON_EXTRACT(CONCAT('{{', GROUP_CONCAT({} SEPARATOR ','), '}}'), '$')",
+                inner(&format!("JSON_OBJECT({}, {})", texts[0], texts[1]))
+            ),
+        };
+        sqlparser::parser::Parser::new(&crate::dialect::SprigMySql)
+            .try_with_sql(&sql)
+            .and_then(|mut p| p.parse_expr())
+            .map_err(|_| unsupported(name))
     }
 
     fn aggregate(
@@ -988,6 +1887,8 @@ impl Cx<'_> {
             return Err(invalid());
         }
         let mut separator = None;
+        let mut order = Vec::new();
+        let mut limit = None;
         for c in clauses {
             match c {
                 ast::FunctionArgumentClause::Separator(v) if kind == AggKind::GroupConcat => {
@@ -998,10 +1899,63 @@ impl Cx<'_> {
                         _ => return Err(unsupported("this SEPARATOR")),
                     }
                 }
+                ast::FunctionArgumentClause::OrderBy(keys) if kind == AggKind::GroupConcat => {
+                    x.in_agg = true;
+                    let r = keys
+                        .iter()
+                        .map(|k| {
+                            let desc = k.options.sort == Some(ast::OrderBySort::Desc);
+                            self.expr_in(&k.expr, x, false).map(|e| (e, desc))
+                        })
+                        .collect::<Result<Vec<_>>>();
+                    x.in_agg = false;
+                    order = r?;
+                }
+                // MariaDB's `LIMIT [offset,] count`; MySQL has none.
+                ast::FunctionArgumentClause::Limit(e)
+                    if kind == AggKind::GroupConcat && self.maria() =>
+                {
+                    let n = |e: &ast::Expr| match e {
+                        ast::Expr::Value(v) => match &v.value {
+                            SqlValue::Number(n, _) => n.parse::<u64>().ok(),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    limit = Some(
+                        n(e).map(|c| (0, c))
+                            .ok_or_else(|| unsupported("this GROUP_CONCAT LIMIT"))?,
+                    );
+                }
+                ast::FunctionArgumentClause::Limit(_) if kind == AggKind::GroupConcat => {
+                    return Err(syntax_error());
+                }
                 _ => return Err(unsupported(&format!("{name} with this clause"))),
             }
         }
         let (kind, arg) = match args {
+            // `GROUP_CONCAT(a, b, ...)` concatenates its arguments.
+            [_, _, ..] if kind == AggKind::GroupConcat => {
+                let mut parts = Vec::with_capacity(args.len());
+                x.in_agg = true;
+                for a in args {
+                    let r = match a {
+                        ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) => {
+                            self.expr_in(e, x, false)
+                        }
+                        _ => Err(unsupported(&format!("{name} with these arguments"))),
+                    };
+                    match r {
+                        Ok(e) => parts.push(e),
+                        Err(e) => {
+                            x.in_agg = false;
+                            return Err(e);
+                        }
+                    }
+                }
+                x.in_agg = false;
+                (kind, Some(Expr::Func("CONCAT".into(), parts)))
+            }
             [ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Wildcard)]
                 if kind == AggKind::Count =>
             {
@@ -1025,6 +1979,8 @@ impl Cx<'_> {
             arg,
             distinct,
             separator,
+            order,
+            limit,
             ty,
         };
         let Some(aggs) = x.aggs.as_deref_mut() else {
@@ -1037,6 +1993,8 @@ impl Cx<'_> {
                     && a.arg == spec.arg
                     && a.distinct == spec.distinct
                     && a.separator == spec.separator
+                    && a.order == spec.order
+                    && a.limit == spec.limit
             })
             .unwrap_or_else(|| {
                 aggs.push(spec);
@@ -1072,6 +2030,22 @@ impl Cx<'_> {
     /// select list): one truth value when the subquery doesn't read the
     /// outer block, else a count of the matching rows per outer row.
     fn exists(&mut self, q: &ast::Query, negated: bool, x: &mut ExprCx<'_, '_>) -> Result<Expr> {
+        let refs = self.outer_refs;
+        match self.exists_shapes(q, negated, x) {
+            Err(e) if e.code == 1235 && x.applies.is_some() && !x.in_agg => {
+                self.outer_refs = refs;
+                self.dependent(q, DepKind::Exists { negated }, None, x)
+            }
+            r => r,
+        }
+    }
+
+    fn exists_shapes(
+        &mut self,
+        q: &ast::Query,
+        negated: bool,
+        x: &mut ExprCx<'_, '_>,
+    ) -> Result<Expr> {
         if let ast::SetExpr::Select(select) = &*q.body {
             if q.with.is_none() && q.fetch.is_none() && x.applies.is_some() && !x.in_agg {
                 let id = self.next_id();
@@ -1106,7 +2080,7 @@ impl Cx<'_> {
                 };
                 let count = ExprType::bigint(false);
                 applies.push(Apply {
-                    rel: block.rels.remove(0),
+                    rel: Some(block.rels.remove(0)),
                     keys: block.correlated,
                     filters: block.filters,
                     aggs: vec![AggSpec {
@@ -1114,6 +2088,8 @@ impl Cx<'_> {
                         arg: None,
                         distinct: false,
                         separator: None,
+                        order: Vec::new(),
+                        limit: None,
                         ty: count,
                     }],
                     grouped: true,
@@ -1125,6 +2101,7 @@ impl Cx<'_> {
                     first_by: Vec::new(),
                     ty: ExprType::boolean(),
                     id,
+                    dep: None,
                 });
                 return Ok(slot_ref(
                     SUBQ_BASE + applies.len() - 1,
@@ -1138,6 +2115,17 @@ impl Cx<'_> {
     }
 
     fn scalar_subquery(&mut self, q: &ast::Query, x: &mut ExprCx<'_, '_>) -> Result<Expr> {
+        let refs = self.outer_refs;
+        match self.scalar_shapes(q, x) {
+            Err(e) if e.code == 1235 && x.applies.is_some() && !x.in_agg => {
+                self.outer_refs = refs;
+                self.dependent(q, DepKind::Scalar, None, x)
+            }
+            r => r,
+        }
+    }
+
+    fn scalar_shapes(&mut self, q: &ast::Query, x: &mut ExprCx<'_, '_>) -> Result<Expr> {
         let one_column = || SqlError::new(1241, "21000", "Operand should contain 1 column(s)");
         let (rows, types) = match &*q.body {
             // One SELECT may be tied to this block by equalities: it is
@@ -1185,7 +2173,7 @@ impl Cx<'_> {
                         return Err(unsupported("a subquery that reads its outer query here"));
                     };
                     applies.push(Apply {
-                        rel: block.rels.remove(0),
+                        rel: Some(block.rels.remove(0)),
                         keys: block.correlated,
                         filters: block.filters,
                         aggs: block.aggs,
@@ -1200,6 +2188,7 @@ impl Cx<'_> {
                         },
                         ty,
                         id,
+                        dep: None,
                     });
                     return Ok(slot_ref(SUBQ_BASE + applies.len() - 1, "subquery", &ty));
                 }
@@ -1236,9 +2225,27 @@ impl Cx<'_> {
         a: Box<Expr>,
         q: &ast::Query,
         negated: bool,
-        x: &ExprCx<'_, '_>,
+        x: &mut ExprCx<'_, '_>,
     ) -> Result<Expr> {
-        let (rows, types) = self.run_subquery(q, x, None)?;
+        if q.limit_clause.is_some() || q.fetch.is_some() {
+            let server = if self.maria() { "MariaDB" } else { "MySQL" };
+            return Err(SqlError::new(
+                1235,
+                "42000",
+                format!(
+                    "This version of {server} doesn't yet support 'LIMIT & IN/ALL/ANY/SOME subquery'"
+                ),
+            ));
+        }
+        let refs = self.outer_refs;
+        let (rows, types) = match self.run_subquery(q, x, None) {
+            Ok(r) => r,
+            Err(e) if e.code == 1235 && x.applies.is_some() && !x.in_agg => {
+                self.outer_refs = refs;
+                return self.dependent(q, DepKind::In { negated }, Some(*a), x);
+            }
+            Err(e) => return Err(e),
+        };
         if types.len() != 1 {
             return Err(SqlError::new(
                 1241,
@@ -1255,6 +2262,51 @@ impl Cx<'_> {
 }
 
 /// A reference to column `i` of a relation whose row starts at `base`.
+/// MySQL's syntax error, for an interval or a unit where the grammar has
+/// none.
+fn syntax_error() -> SqlError {
+    SqlError::new(
+        1064,
+        "42000",
+        "You have an error in your SQL syntax; check the manual that corresponds to your server version for the right syntax to use",
+    )
+}
+
+/// The units `TIMESTAMPADD` and `TIMESTAMPDIFF` take.
+const TIMESTAMP_UNITS: &[&str] = &[
+    "MICROSECOND",
+    "SECOND",
+    "MINUTE",
+    "HOUR",
+    "DAY",
+    "WEEK",
+    "MONTH",
+    "QUARTER",
+    "YEAR",
+];
+
+/// The interval unit `f` names, as the keyword argument the date and time
+/// functions take; 1064 for a field neither server has.
+fn unit_keyword(f: &ast::DateTimeField) -> Result<Expr> {
+    use ast::DateTimeField as F;
+    let name = match f {
+        F::Year => "YEAR",
+        F::Month => "MONTH",
+        F::Week(None) => "WEEK",
+        F::Day => "DAY",
+        F::Hour => "HOUR",
+        F::Minute => "MINUTE",
+        F::Second => "SECOND",
+        F::Microsecond => "MICROSECOND",
+        F::Quarter => "QUARTER",
+        F::Custom(i) if i.quote_style.is_none() && crate::dialect::compound_unit(&i.value) => {
+            return Ok(Expr::Keyword(i.value.to_ascii_uppercase()));
+        }
+        _ => return Err(syntax_error()),
+    };
+    Ok(Expr::Keyword(name.into()))
+}
+
 pub(crate) fn table_col(base: usize, i: usize, name: &str, ty: ColumnType, nullable: bool) -> Expr {
     Expr::Column(ColumnRef {
         slot: base + i,

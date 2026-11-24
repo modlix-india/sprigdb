@@ -107,6 +107,8 @@ pub struct Session {
     /// sub-expression once and reuses it for every row; without tables,
     /// and on MariaDB, it is computed in place each time.
     pub fold_constants: bool,
+    /// The session's own values (`DATABASE()`, `LAST_INSERT_ID()`, ...).
+    pub info: crate::func::misc::SessionInfo,
 }
 
 impl Session {
@@ -140,6 +142,7 @@ impl Session {
             group_concat_max_len: if maria { 1 << 20 } else { 1024 },
             default_week_format: 0,
             fold_constants: false,
+            info: crate::func::misc::SessionInfo::default(),
         }
     }
 }

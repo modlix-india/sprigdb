@@ -29,7 +29,7 @@ macro_rules! key {
 
 key!(
     /// `queue.write_batch_max_rows`.
-    WRITE_BATCH_MAX_ROWS: u64 = "queue.write_batch_max_rows", 500, Scopes::PROCESS,
+    WRITE_BATCH_MAX_ROWS: u64 = "queue.write_batch_max_rows", 4000, Scopes::PROCESS,
     HardBounds::range(1, 100_000), "Rows per queue owner write batch"
 );
 key!(
@@ -166,7 +166,7 @@ pub struct QueueSettings {
 impl Default for QueueSettings {
     fn default() -> Self {
         Self {
-            batch_rows: 500,
+            batch_rows: 4000,
             cache_bytes: 64 << 20,
             confirm_replica: false,
             delivery_limit_default: 20,

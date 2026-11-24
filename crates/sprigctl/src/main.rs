@@ -48,6 +48,7 @@
 
 // AI providers.
 mod ai;
+mod backup;
 mod catalog;
 mod check;
 mod client;
@@ -199,6 +200,8 @@ fn tenant_group() -> Command {
         );
     g = placement::add_pin_cmds(g);
     g = suspend::add_cmds(g);
+    // Backups and point-in-time restore (crate::backup).
+    g = backup::add_cmds(g);
     g = issuer::add_cmds(g);
     // Moves between DCs and traffic (crate::dcmove).
     g = g
@@ -1059,6 +1062,10 @@ async fn run_tenant(
         }
         "suspend" | "resume" => {
             suspend::run(c, cmd, sub, m.get_flag("dry-run"), out).await?;
+            Ok(ExitCode::SUCCESS)
+        }
+        "backup" | "backups" | "restore" | "backup-check" => {
+            backup::run(c, cmd, sub, out).await?;
             Ok(ExitCode::SUCCESS)
         }
         "issuer" => {

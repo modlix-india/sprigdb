@@ -1,0 +1,253 @@
+# Lua scripts and functions on the engine (diff_lua.rs): one command per
+# line, arguments separated by " | ", "\n" for a newline inside an
+# argument, '' for an empty one. Both servers are flushed first, and their
+# script caches and function libraries emptied.
+
+# return values and conversions
+EVAL | return 1 | 0
+EVAL | return 'str' | 0
+EVAL | return {1,2,{3,'x'}} | 0
+EVAL | return {1,2,nil,4} | 0
+EVAL | return true | 0
+EVAL | return false | 0
+EVAL | return nil | 0
+EVAL | return 3.99 | 0
+EVAL | return -3.99 | 0
+EVAL | return 2^53 | 0
+EVAL | return {err='custom error'} | 0
+EVAL | return {err='MYCODE with a code'} | 0
+EVAL | return {ok='fine'} | 0
+EVAL | return redis.error_reply('MY err') | 0
+EVAL | return redis.error_reply('plain') | 0
+EVAL | return redis.status_reply('FINE') | 0
+EVAL | return {1, {err='inner'}, {ok='x'}} | 0
+EVAL | return {double=3.5} | 0
+EVAL | return KEYS[1]..ARGV[1] | 1 | a | b
+EVAL | return #KEYS + #ARGV | 2 | a | b | c
+EVAL | return {KEYS[1], KEYS[2], ARGV[1]} | 2 | k1 | k2 | v1
+EVAL | return redis.sha1hex('') | 0
+EVAL | return redis.sha1hex('hello world') | 0
+EVAL | return tostring(12.5) | 0
+EVAL | return string.format('%d-%s', 7, 'x') | 0
+EVAL | return cjson.encode({1,2,3}) | 0
+EVAL | return cjson.decode('[1,2,3]')[2] | 0
+EVAL | return cjson.decode('{"a":5}').a | 0
+EVAL | return bit.band(12, 10) | 0
+EVAL | local r = math.random(1000); return r >= 1 and r <= 1000 and r == math.floor(r) | 0
+EVAL | local r = math.random(); return r >= 0 and r < 1 | 0
+EVAL | local r = math.random(5, 7); return r >= 5 and r <= 7 | 0
+EVAL | math.randomseed(42); local a = math.random(1000000); math.randomseed(42); return a == math.random(1000000) | 0
+EVAL | return type(redis.log) | 0
+EVAL | redis.log(redis.LOG_WARNING, 'from a script') return 'logged' | 0
+EVAL | return {redis.LOG_DEBUG, redis.LOG_VERBOSE, redis.LOG_NOTICE, redis.LOG_WARNING} | 0
+EVAL | return redis.REPL_ALL | 0
+EVAL | return redis.replicate_commands() | 0
+EVAL | redis.set_repl(redis.REPL_ALL) return 'ok' | 0
+
+# argument errors
+EVAL | return 1 | -1
+EVAL | return 1 | 5 | a
+EVAL | return 1 | x
+EVAL | return '1 | 0
+EVAL | return 1 +  | 0
+EVALSHA | e0e1f9fabfc9d4800c877a703b823ac0578ff8db | 0
+EVALSHA | ffffffffffffffffffffffffffffffffffffffff | 0
+EVALSHA | short | 0
+EVAL | error('boom') | 0
+EVAL | \n\nerror('line three') | 0
+EVAL | error({err='TABLE err'}) | 0
+EVAL | local t = nil; return t.x | 0
+EVAL | return undefined_global | 0
+EVAL | x = 1 | 0
+
+# redis.call and redis.pcall
+EVAL | return redis.call('SET', KEYS[1], ARGV[1]) | 1 | k | v1
+EVAL | return redis.call('GET', KEYS[1]) | 1 | k
+EVAL | return redis.call('GET', KEYS[1]) | 1 | nokey
+EVAL | return redis.call('INCR', KEYS[1]) | 1 | cnt
+EVAL | return redis.call('INCR', KEYS[1]) | 1 | k
+EVAL | return redis.pcall('INCR', KEYS[1]) | 1 | k
+EVAL | local r = redis.pcall('INCR', KEYS[1]); return type(r) | 1 | k
+EVAL | local r = redis.pcall('INCR', KEYS[1]); return r['err'] | 1 | k
+EVAL | return redis.call('HSET', KEYS[1], 'a', 1, 'b', 2) | 1 | h
+EVAL | return redis.call('HGET', KEYS[1], 'b') | 1 | h
+EVAL | return redis.call('HMGET', KEYS[1], 'a', 'zz', 'b') | 1 | h
+EVAL | return redis.call('RPUSH', KEYS[1], 'x', 'y', 'z') | 1 | l
+EVAL | return redis.call('LRANGE', KEYS[1], 0, -1) | 1 | l
+EVAL | return redis.call('ZADD', KEYS[1], 1.5, 'a', 2, 'b') | 1 | z
+EVAL | return redis.call('ZRANGE', KEYS[1], 0, -1, 'WITHSCORES') | 1 | z
+EVAL | return redis.call('ZSCORE', KEYS[1], 'a') | 1 | z
+EVAL | return redis.call('SADD', KEYS[1], 'm') | 1 | s
+EVAL | return redis.call('SISMEMBER', KEYS[1], 'm') | 1 | s
+EVAL | return redis.call('TYPE', KEYS[1]) | 1 | h
+EVAL | return redis.call('TYPE', KEYS[1])['ok'] | 1 | h
+EVAL | return redis.call('EXISTS', KEYS[1], KEYS[2]) | 2 | k | nokey
+EVAL | return redis.call('DEL', KEYS[1]) | 1 | cnt
+EVAL | return redis.call('GET', KEYS[1]) == false | 1 | nokey
+EVAL | return redis.call('SET', KEYS[1], 'x', 'NX') | 1 | k
+EVAL | return redis.call('PING') | 0
+EVAL | return redis.call('ECHO', 'hi') | 0
+EVAL | return redis.call('NOSUCH') | 0
+EVAL | return redis.pcall('NOSUCH') | 0
+EVAL | return redis.call('GET') | 0
+EVAL | return redis.call() | 0
+EVAL | return redis.call('MULTI') | 0
+EVAL | return redis.call('SUBSCRIBE', 'c') | 0
+EVAL | return redis.call('EVAL', 'return 1', 0) | 0
+EVAL | return redis.call('LPUSH', KEYS[1], 'x') | 1 | h
+EVAL | return redis.pcall('LPUSH', KEYS[1], 'x') | 1 | h
+EVAL | return redis.call('SET', KEYS[1], {}) | 1 | k
+EVAL | return redis.call('SET', KEYS[1], 1.5) | 1 | num
+EVAL | return redis.call('GET', KEYS[1]) | 1 | num
+EVAL | return redis.call('SET', KEYS[1], 100000000000000) | 1 | num
+EVAL | return redis.call('GET', KEYS[1]) | 1 | num
+
+# keys not declared in KEYS (allowed outside a cluster)
+EVAL | return redis.call('SET', 'undeclared', 'u') | 0
+EVAL | return redis.call('GET', 'undeclared') | 0
+EVAL | local v = redis.call('GET', KEYS[1]); redis.call('SET', 'copy:' .. KEYS[1], v); return redis.call('GET', 'copy:' .. KEYS[1]) | 1 | k
+
+# writes before an error are kept; a pcall'ed error doesn't stop the script
+EVAL | redis.call('SET', KEYS[1], 'before'); error('after the write') | 1 | kept
+GET | kept
+EVAL | redis.call('SET', KEYS[1], 'p1'); redis.pcall('INCR', KEYS[1]); redis.call('APPEND', KEYS[1], '2'); return redis.call('GET', KEYS[1]) | 1 | kept
+EVAL | redis.call('SET', KEYS[1], 'v'); return redis.call('INCR', KEYS[1]) | 1 | kept
+GET | kept
+
+# SELECT inside a script changes only the script's database
+EVAL | redis.call('SELECT', 3); redis.call('SET', KEYS[1], 'in3'); return redis.call('GET', KEYS[1]) | 1 | sel
+GET | sel
+SELECT | 3
+GET | sel
+DEL | sel
+SELECT | 0
+EVAL | return redis.call('SELECT', 99) | 0
+
+# RESP3 inside a script
+EVAL | redis.setresp(3); return redis.call('HGETALL', KEYS[1]) | 1 | h
+EVAL | redis.setresp(3); local m = redis.call('HGETALL', KEYS[1]); return m['map']['a'] | 1 | h
+EVAL | redis.setresp(3); return redis.call('SMEMBERS', KEYS[1]) | 1 | s
+EVAL | redis.setresp(3); local s = redis.call('SMEMBERS', KEYS[1]); return type(s['set']) | 1 | s
+EVAL | redis.setresp(3); return redis.call('ZSCORE', KEYS[1], 'a') | 1 | z
+EVAL | redis.setresp(3); local d = redis.call('ZSCORE', KEYS[1], 'a'); return tostring(d['double']) | 1 | z
+EVAL | redis.setresp(3); return redis.call('GET', KEYS[1]) | 1 | nokey
+EVAL | redis.setresp(3); return redis.call('GET', KEYS[1]) == nil | 1 | nokey
+EVAL | redis.setresp(4) | 0
+EVAL | redis.setresp(2); return redis.call('HGETALL', KEYS[1]) | 1 | h
+
+# read-only scripts
+EVAL_RO | return redis.call('GET', KEYS[1]) | 1 | k
+EVAL_RO | return redis.call('SET', KEYS[1], 'x') | 1 | k
+EVAL_RO | return redis.pcall('SET', KEYS[1], 'x') | 1 | k
+EVAL | #!lua flags=no-writes\nreturn redis.call('SET', KEYS[1], 'x') | 1 | k
+EVAL | #!lua flags=no-writes\nreturn redis.call('GET', KEYS[1]) | 1 | k
+EVAL | #!lua\nreturn redis.call('GET', KEYS[1]) | 1 | k
+EVAL | #!lua flags=bogus\nreturn 1 | 0
+EVAL | #!python\nreturn 1 | 0
+EVAL | #!lua name=x\nreturn 1 | 0
+
+# the script cache
+EVAL | return 'cached' | 0
+EVALSHA | 952f49ffc8f7b098d8ab5da45d3164ca36ed18b1 | 0
+EVALSHA | 952F49FFC8F7B098D8AB5DA45D3164CA36ED18B1 | 0
+SCRIPT | EXISTS | 952f49ffc8f7b098d8ab5da45d3164ca36ed18b1 | b534286061d4b9e4026607613b95c06c06015ae8
+SCRIPT | EXISTS | e0e1f9fabfc9d4800c877a703b823ac0578ff8db | ffff
+SCRIPT | LOAD | return 'loaded'
+EVALSHA | b534286061d4b9e4026607613b95c06c06015ae8 | 0
+SCRIPT | LOAD | return 'x
+SCRIPT | LOAD | #!lua flags=no-writes\nreturn redis.call('GET', KEYS[1])
+EVALSHA_RO | d623bfea8e37744c1ffa709b62269c5db88a6bc0 | 1 | k
+EVALSHA_RO | b534286061d4b9e4026607613b95c06c06015ae8 | 0
+SCRIPT | FLUSH | BOGUS
+SCRIPT | FLUSH | ASYNC
+SCRIPT | FLUSH
+SCRIPT | KILL
+SCRIPT | NOSUCH
+SCRIPT | LOAD
+FLUSHALL
+
+# MULTI with scripts
+MULTI
+SET | m1 | 1
+EVAL | return redis.call('INCR', KEYS[1]) | 1 | m1
+EVAL | return redis.call('NOSUCH') | 0
+GET | m1
+EXEC
+MULTI
+EVAL | redis.call('SELECT', 2); return redis.call('SET', KEYS[1], 'x') | 1 | m2
+GET | m2
+EXEC
+GET | m2
+
+# functions
+FUNCTION | LOAD | #!lua name=mylib\nredis.register_function('echo1', function(keys, args) return args[1] end)\nredis.register_function{function_name='getk', callback=function(keys, args) return redis.call('GET', keys[1]) end, flags={'no-writes'}}\nredis.register_function('setk', function(keys, args) return redis.call('SET', keys[1], args[1]) end)
+FUNCTION | LOAD | #!lua name=mylib\nredis.register_function('echo1', function(keys, args) return args[1] end)
+FUNCTION | LOAD | #!lua name=other\nredis.register_function('echo1', function(keys, args) return args[1] end)
+FCALL | echo1 | 0 | hello
+FCALL | setk | 1 | fk | fv
+FCALL | getk | 1 | fk
+FCALL_RO | getk | 1 | fk
+FCALL_RO | setk | 1 | fk | x
+FCALL | nosuch | 0
+FCALL | echo1 | -1
+FCALL | echo1 | 3 | a
+FCALL | echo1
+FUNCTION | LIST
+FUNCTION | LIST | WITHCODE
+FUNCTION | LIST | LIBRARYNAME | my*
+FUNCTION | LIST | LIBRARYNAME | nomatch*
+FUNCTION | LIST | BOGUS
+FUNCTION | STATS
+FUNCTION | LOAD | REPLACE | #!lua name=mylib\nredis.register_function('echo2', function(keys, args) return 'two:' .. args[1] end)
+FCALL | echo1 | 0 | hello
+FCALL | echo2 | 0 | hello
+FUNCTION | LOAD | return 1
+FUNCTION | LOAD | #!lua\nredis.register_function('f', function() return 1 end)
+FUNCTION | LOAD | #!lua name=bad-name\nreturn 1
+FUNCTION | LOAD | #!lua name=empty\nlocal x = 1
+FUNCTION | LOAD | #!lua name=callsatload\nredis.call('SET', 'x', 1)
+FUNCTION | LOAD | #!lua name=badfn\nredis.register_function('f-x', function() return 1 end)
+FUNCTION | LOAD | #!lua name=dup\nredis.register_function('a', function() return 1 end)\nredis.register_function('a', function() return 2 end)
+FUNCTION | LOAD | #!lua name=syntax\nreturn (
+FUNCTION | LOAD | #!lua name=flags\nredis.register_function{function_name='f', callback=function() return 1 end, flags={'bogus'}}
+FUNCTION | LOAD | BOGUS | #!lua name=x\nredis.register_function('x1', function() return 1 end)
+FUNCTION | LOAD | #!lua name=errs\nredis.register_function('raise', function(keys, args) error('raised') end)\nredis.register_function('stat', function(keys, args) return redis.status_reply('STAT') end)
+FCALL | raise | 0
+FCALL | stat | 0
+FUNCTION | DELETE | nolib
+FUNCTION | DELETE | errs
+FCALL | raise | 0
+FUNCTION | KILL
+FUNCTION | FLUSH | BOGUS
+FUNCTION | RESTORE | notapayload
+FUNCTION | NOSUCH
+FUNCTION | DELETE | mylib
+FCALL | echo1 | 0 | hello
+FUNCTION | FLUSH
+FUNCTION | LIST
+FUNCTION | STATS
+
+# cmsgpack (BullMQ packs job options with it)
+EVAL | return type(cmsgpack) | 0
+EVAL | return cmsgpack.pack(1, -1, 127, 128, -32, -33, 255, 256, 65535, 65536, -129, -32769, 4294967296, -2147483649) | 0
+EVAL | return cmsgpack.pack(1.5, 0.1, -2.25, 1e300, true, false, nil) | 0
+EVAL | return cmsgpack.pack('', 'short', string.rep('x', 40), string.rep('y', 300), string.rep('z', 70000)) | 0
+EVAL | return cmsgpack.pack({}, {1, 2, 3}, {a = 1}, {1, {2, {3}}}, {[1] = 'a', [3] = 'c'}) | 0
+EVAL | return cmsgpack.pack({name = 'job', opts = {attempts = 3, delay = 0}}) | 0
+EVAL | local t = cmsgpack.unpack(cmsgpack.pack({attempts = 3, list = {1, 'two', 3.5}})); return {t.attempts, t.list[2], tostring(t.list[3])} | 0
+EVAL | return {cmsgpack.unpack(cmsgpack.pack(1, 'b', 300, -5))} | 0
+EVAL | local a = cmsgpack.unpack(ARGV[1]); return a | 0 | \x93
+EVAL | return cmsgpack.unpack('') | 0
+EVAL | return cmsgpack.unpack(string.char(0x92, 1)) | 0
+EVAL | return cmsgpack.unpack(string.char(0xc1)) | 0
+EVAL | return {cmsgpack.unpack(string.char(0xc4, 3, 65, 66, 67, 0xcb, 64, 9, 33, 251, 84, 68, 45, 24))} | 0
+EVAL | local t = cmsgpack.unpack(string.char(0x82, 0xa1, 0x61, 1, 0xa1, 0x62, 0xc0)); return {t.a, t.b == nil} | 0
+
+# commands with keys after a count, and HyperLogLog, inside scripts
+EVAL | redis.call('ZADD', KEYS[1], 1, 'a', 2, 'b'); redis.call('ZADD', KEYS[2], 3, 'b', 4, 'c'); return redis.call('ZUNION', 2, KEYS[1], KEYS[2], 'WITHSCORES') | 2 | za | zb
+EVAL | return redis.call('ZINTERSTORE', KEYS[3], 2, KEYS[1], KEYS[2]) | 3 | za | zb | zc
+EVAL | return redis.call('ZRANGE', KEYS[1], 0, -1, 'WITHSCORES') | 1 | zc
+EVAL | return redis.call('PFADD', KEYS[1], 'a', 'b', 'c') | 1 | hll
+EVAL | return redis.call('PFCOUNT', KEYS[1]) | 1 | hll
+EVAL_RO | return redis.call('PFCOUNT', KEYS[1]) | 1 | hll
+EVAL | return redis.call('PUBLISH', 'nobody-listens', 'm') | 0

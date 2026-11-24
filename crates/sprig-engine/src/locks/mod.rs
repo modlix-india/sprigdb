@@ -112,7 +112,7 @@ pub struct LockConfig {
 impl Default for LockConfig {
     fn default() -> Self {
         Self {
-            max_lock_bytes_per_txn: 64 << 20,
+            max_lock_bytes_per_txn: 128 << 20,
         }
     }
 }

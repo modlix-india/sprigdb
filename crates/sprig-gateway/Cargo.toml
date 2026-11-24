@@ -86,6 +86,8 @@ sprig-proto-redis = { path = "../sprig-proto-redis" }
 sprig-kv = { path = "../sprig-kv" }
 # SprigDB's storage engine (one per node), and the Redis databases on it.
 sprig-engine = { path = "../sprig-engine" }
+# Tenant backups and point-in-time restore on the engine.
+sprig-backup = { path = "../sprig-backup" }
 # Replicated engine units: the node joins its tenant units' Raft groups at start.
 sprig-raft = { path = "../sprig-raft" }
 # The SQL planner and executor that general SELECTs on engine tables run on.

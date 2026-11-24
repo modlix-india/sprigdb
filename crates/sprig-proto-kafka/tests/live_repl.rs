@@ -82,6 +82,12 @@ struct View {
     brokers: BTreeMap<i32, String>,
     controller: i32,
     leaders: BTreeMap<i32, i32>,
+    /// Each partition's leader epoch as last accepted.
+    epochs: BTreeMap<i32, i32>,
+    /// Metadata answers that named a partition with an older leader epoch
+    /// than one already seen: like Kafka's clients, the view keeps the
+    /// leader it had for that partition.
+    stale: usize,
     conns: HashMap<i32, Conn>,
 }
 
@@ -121,12 +127,29 @@ impl View {
                 .map(|b| (b.node_id, format!("{}:{}", b.host, b.port)))
                 .collect();
             self.controller = m.controller_id;
-            self.leaders = m
+            // Leaders of the one topic asked for (all topics: as listed),
+            // keeping a partition's leader when the answer shows an older
+            // epoch than one already seen.
+            let mut leaders = BTreeMap::new();
+            let wanted = m
                 .topics
                 .iter()
-                .flat_map(|t| t.partitions.iter())
-                .map(|p| (p.partition_index, p.leader_id))
-                .collect();
+                .filter(|t| topic.is_none_or(|n| t.name.as_deref() == Some(n)));
+            for p in wanted.flat_map(|t| t.partitions.iter()) {
+                let i = p.partition_index;
+                if topic.is_some() && self.epochs.get(&i).is_some_and(|e| p.leader_epoch < *e) {
+                    self.stale += 1;
+                    if let Some(l) = self.leaders.get(&i) {
+                        leaders.insert(i, *l);
+                    }
+                    continue;
+                }
+                if topic.is_some() {
+                    self.epochs.insert(i, p.leader_epoch);
+                }
+                leaders.insert(i, p.leader_id);
+            }
+            self.leaders = leaders;
             self.conns
                 .retain(|n, _| m.brokers.iter().any(|b| b.node_id == *n));
             return;
@@ -516,14 +539,49 @@ async fn live_writes_follow_the_tenants_leader() {
     println!("leaders {:?}", v.leaders);
     assert_eq!(v.leaders.len(), parts as usize);
     assert!(
-        v.leaders.values().all(|l| *l == v.controller),
-        "every partition led by the controller: {:?} vs {}",
-        v.leaders,
-        v.controller
+        v.leaders.values().all(|l| v.brokers.contains_key(l)),
+        "every partition led by a broker: {:?}",
+        v.leaders
     );
+    if env("SPRIG_KAFKA_SPREAD").is_some() {
+        // Partition groups: the partitions' leaders are spread over the
+        // gateways (after the first writes start the groups and they move
+        // to their preferred gateways).
+        for p in 0..parts {
+            let _ = produce(
+                &mut v,
+                &topic,
+                p,
+                &batch("w", 0, 1),
+                Duration::from_secs(10),
+            )
+            .await;
+        }
+        let t0 = Instant::now();
+        let mut distinct = 0;
+        while t0.elapsed() < Duration::from_secs(30) {
+            v.refresh(Some(&topic)).await;
+            let mut l: Vec<i32> = v.leaders.values().copied().collect();
+            l.sort_unstable();
+            l.dedup();
+            distinct = l.len();
+            if distinct == parts as usize {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        println!("spread leaders after {:?}: {:?}", t0.elapsed(), v.leaders);
+        assert_eq!(
+            distinct, parts as usize,
+            "partition leaders spread: {:?}",
+            v.leaders
+        );
+    }
 
-    // A produce at a follower: NOT_LEADER_OR_FOLLOWER, so the client asks
-    // Metadata again.
+    // A produce at a gateway that doesn't lead the partition:
+    // NOT_LEADER_OR_FOLLOWER, so the client asks Metadata again.
+    let l0 = v.leaders[&0];
+    let other = *v.brokers.keys().find(|b| **b != l0).unwrap();
     let r: ProduceResponse = v
         .conn(other)
         .await
@@ -538,6 +596,11 @@ async fn live_writes_follow_the_tenants_leader() {
 
     // Produce through Metadata: every batch acknowledged at once.
     let mut acked: BTreeMap<i32, Vec<String>> = BTreeMap::new();
+    if env("SPRIG_KAFKA_SPREAD").is_some() {
+        for p in 0..parts {
+            acked.entry(p).or_default().push("w-0".into());
+        }
+    }
     let mut sent = 0;
     for round in 0..20 {
         for p in 0..parts {
@@ -637,4 +700,115 @@ async fn live_writes_follow_the_tenants_leader() {
         "after the failover: {sent} records acknowledged in all, every one read back; RTO {:?}",
         first_ack.unwrap()
     );
+}
+
+/// Kill loop: one writer produces to six partitions round-robin through
+/// Metadata (keeping a partition's leader when Metadata shows an older
+/// leader epoch, as Kafka's clients do) while the tenant's leading gateway
+/// is killed `SPRIG_KAFKA_KILLS` times, every `SPRIG_KAFKA_KILL_EVERY_S`
+/// seconds, with `SPRIG_KAFKA_FAILOVER`. Reports the gaps between
+/// acknowledgements and checks every acknowledged record is read back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a three-gateway cluster and a kill command"]
+async fn live_kill_loop() {
+    let db = env("SPRIG_KAFKA_DB").unwrap();
+    let cmd = env("SPRIG_KAFKA_FAILOVER").expect("SPRIG_KAFKA_FAILOVER");
+    let kills: usize = env("SPRIG_KAFKA_KILLS").map_or(10, |v| v.parse().unwrap());
+    let every =
+        Duration::from_secs(env("SPRIG_KAFKA_KILL_EVERY_S").map_or(7, |v| v.parse().unwrap()));
+    let topic = format!("{db}.kill_{}", std::process::id());
+    let parts = 6;
+    let mut v = View::default();
+    v.refresh(None).await;
+    let create = CreateTopicsRequest {
+        topics: vec![create_topics_request::CreatableTopic {
+            name: topic.clone(),
+            num_partitions: parts,
+            replication_factor: -1,
+            ..Default::default()
+        }],
+        timeout_ms: 30_000,
+        ..Default::default()
+    };
+    let r: CreateTopicsResponse = v
+        .conn(v.controller)
+        .await
+        .unwrap()
+        .call(7, &create)
+        .await
+        .unwrap();
+    assert_eq!(r.topics[0].error_code, 0, "{:?}", r.topics[0].error_message);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    v.refresh(Some(&topic)).await;
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let killer = {
+        let stop = Arc::clone(&stop);
+        tokio::spawn(async move {
+            let mut k = View::default();
+            for round in 0..kills {
+                tokio::time::sleep(every).await;
+                k.refresh(None).await;
+                let addr = k.brokers[&k.controller].clone();
+                let line = format!("{cmd} {addr}");
+                let st = tokio::task::spawn_blocking(move || {
+                    std::process::Command::new("sh")
+                        .arg("-c")
+                        .arg(line)
+                        .status()
+                        .unwrap()
+                })
+                .await
+                .unwrap();
+                println!("round {round}: killed {addr} ({st})");
+            }
+            tokio::time::sleep(every).await;
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        })
+    };
+    let started = Instant::now();
+    let mut acks: Vec<Duration> = Vec::new();
+    let mut acked: BTreeMap<i32, Vec<String>> = BTreeMap::new();
+    let mut retried = 0usize;
+    let mut sent = 0;
+    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+        let p = i32::try_from(sent % 6).unwrap();
+        let (_, seen) = produce(
+            &mut v,
+            &topic,
+            p,
+            &batch("k", sent, 1),
+            Duration::from_secs(120),
+        )
+        .await;
+        retried += seen.len();
+        acks.push(started.elapsed());
+        acked.entry(p).or_default().push(format!("k-{sent}"));
+        sent += 1;
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    killer.await.unwrap();
+    let mut gaps: Vec<f64> = acks
+        .windows(2)
+        .map(|w| w[1].saturating_sub(w[0]).as_secs_f64())
+        .collect();
+    gaps.sort_by(|a, b| b.total_cmp(a));
+    v.refresh(Some(&topic)).await;
+    let mut missing = 0;
+    for p in 0..parts {
+        let got: std::collections::BTreeSet<String> = fetch_all(&mut v, &topic, p)
+            .await
+            .into_iter()
+            .map(|(_, s)| s)
+            .collect();
+        missing += acked[&p].iter().filter(|r| !got.contains(*r)).count();
+    }
+    println!(
+        "kill loop: {kills} kills, {sent} acknowledged, {retried} errors on the way, {} stale Metadata answers, \
+         lost {missing}; gaps > 1 s: {}, > 5 s: {}, longest {:?}",
+        v.stale,
+        gaps.iter().filter(|g| **g > 1.0).count(),
+        gaps.iter().filter(|g| **g > 5.0).count(),
+        &gaps[..gaps.len().min(5)]
+    );
+    assert_eq!(missing, 0, "acknowledged records lost");
 }

@@ -101,6 +101,14 @@ pub(crate) struct General {
     /// locked exclusively (a target of the write) or in shared mode;
     /// every table read is locked, subqueries' too.
     pub lock_each: Option<Vec<bool>>,
+    /// The views it reads (expanded into `stmt`), and the tables it
+    /// names itself: whose rights each table is read with.
+    pub views: names::Views,
+    /// Per result column computed by a view read alone: (`table`, `org_table`)
+    /// as the servers name a merged view's column.
+    pub view_named: Vec<Option<(String, String)>>,
+    /// The sequences its sequence functions name.
+    pub sequences: Vec<names::SeqUse>,
 }
 
 impl General {
@@ -129,6 +137,7 @@ impl General {
             ordered: false,
             lock: None,
             check: None,
+            view_check: None,
             fks: None,
         })
     }
@@ -166,6 +175,19 @@ pub(crate) fn bind(
 ///
 /// # Errors
 /// As for [`bind`].
+/// [`bind`] for the select of a view being defined: also when it reads no
+/// table.
+///
+/// # Errors
+/// As for [`bind`].
+pub(crate) fn bind_view(
+    cx: &BindCtx<'_>,
+    stmt: &Statement,
+    text: Option<&str>,
+) -> Result<Option<General>> {
+    bind_in(cx, stmt, text, None, true)
+}
+
 pub(crate) fn bind_tableless(
     cx: &BindCtx<'_>,
     stmt: &Statement,
@@ -249,6 +271,9 @@ fn bind_in(
         top,
         lock,
         lock_each: None,
+        views: a.views,
+        view_named: a.view_named,
+        sequences: a.sequences,
     }))
 }
 
@@ -455,7 +480,7 @@ pub(crate) fn sql_error(e: SqlError) -> SprigError {
         // statement is refused, as every statement outside the engine's
         // reach is. (1305 here is a built-in function it doesn't have;
         // stored functions don't run on the engine.)
-        1235 => not_on_engine(
+        1235 if e.message.starts_with("This version of SprigDB") => not_on_engine(
             e.message
                 .strip_prefix("This version of SprigDB doesn't yet support '")
                 .and_then(|m| m.strip_suffix('\''))
