@@ -478,8 +478,6 @@ pub async fn ensure_database(
     {
         return Ok(cat);
     }
-    let cluster = svc.locator.cluster(t).await?;
-    let pool = svc.locator.ctl_pool(&cluster).await?;
     let logical = format!(
         "CREATE DATABASE IF NOT EXISTS {}",
         sprig_common::names::quote(db)
@@ -499,9 +497,11 @@ pub async fn ensure_database(
         lower_case_table_names: lc,
         wait: None,
     };
+    // Every database is the engine's: it exists in the catalog alone, as a
+    // session's `CREATE DATABASE` makes it (nothing on MariaDB).
     let out = svc
         .ddl
-        .execute(&req, &sprig_catalog::ddl::MariaExecutor::new(pool))
+        .execute(&req, &crate::exec::inherit_tree::NoMaria::default())
         .await?;
     let cat = match out.version {
         Some(v) => {

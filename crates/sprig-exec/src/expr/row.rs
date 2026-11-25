@@ -132,6 +132,7 @@ fn key_value(k: Option<&Key>) -> Option<Value> {
         Some(Key::Int(i)) => i.value(),
         Some(Key::Dec(d)) => Value::Decimal(d.to_decimal()?),
         Some(Key::Real(x)) => Value::Double(*x),
+        Some(Key::Json(j)) => Value::Json(crate::func::json::key_text(j)),
     })
 }
 
@@ -142,6 +143,7 @@ fn value_key(v: &Value) -> Option<Key> {
         Value::UInt(u) => Some(Key::Int(IntVal::unsigned(*u))),
         Value::Decimal(d) => Some(Key::Dec(Dec::from_decimal(d))),
         Value::Double(x) => Some(Key::Real(*x)),
+        Value::Json(b) => crate::func::json::parse(b).map(Key::Json),
         _ => None,
     }
 }

@@ -146,15 +146,26 @@ pub fn indexable(f: &FpWindowStats) -> bool {
         )
 }
 
+/// Whether a pattern counts toward the triggers: statements run from
+/// Studio are recorded as their own patterns and count only with
+/// `auto_index.include_studio`.
+fn counted(f: &FpWindowStats, s: &AutoIndexSettings) -> bool {
+    s.include_studio || !f.caller.is_some_and(|c| c.is_studio())
+}
+
 /// The window's patterns that qualify, with why: positions in `window`.
+/// Patterns from Studio take no part, not even in the top-N ranking,
+/// unless `auto_index.include_studio` is set.
 #[must_use]
 pub fn qualify(window: &[FpWindowStats], s: &AutoIndexSettings) -> Vec<(usize, Reason)> {
-    let mut by_total: Vec<usize> = (0..window.len()).collect();
+    let mut by_total: Vec<usize> = (0..window.len())
+        .filter(|&i| counted(&window[i], s))
+        .collect();
     by_total.sort_by(|&a, &b| window[b].total_ms().total_cmp(&window[a].total_ms()));
     let top: BTreeSet<usize> = by_total.into_iter().take(s.top_n as usize).collect();
     let mut out = Vec::new();
     for (i, f) in window.iter().enumerate() {
-        if !indexable(f) || f.runs() == 0 {
+        if !counted(f, s) || !indexable(f) || f.runs() == 0 {
             continue;
         }
         let slow = f.runs() >= u64::from(s.min_runs) && f.p95_ms() > s.p95_threshold_ms;
@@ -360,7 +371,7 @@ mod tests {
     use std::sync::Arc;
 
     use sprig_common::ids::{Fingerprint, TenantId};
-    use sprig_workload::fingerprint::FpKind;
+    use sprig_workload::fingerprint::{Caller, FpKind};
     use sprig_workload::recorder::Stats;
     use sprig_workload::shape::{OrderItem, Predicate};
 
@@ -583,5 +594,34 @@ mod tests {
                 (4, "top_total_time")
             ]
         );
+    }
+
+    #[test]
+    fn studio_patterns_count_only_when_included() {
+        let studio = |mut f: FpWindowStats| {
+            f.caller = Some(Caller::studio());
+            f
+        };
+        let w = vec![
+            studio(window_fp(1, 100, 200_000, 1000, 1)), // slow, from Studio
+            window_fp(2, 100, 200_000, 1000, 1),         // slow, from the application
+            studio(window_fp(3, 10, 900_000, 50_000, 2)), // heavy, from Studio
+            window_fp(4, 10, 50_000, 50_000, 2),         // heavy, from the application
+        ];
+        let ids = |s: &AutoIndexSettings| -> Vec<u64> {
+            qualify(&w, s).iter().map(|(i, _)| w[*i].id.0).collect()
+        };
+        // Studio's patterns neither qualify nor push the application's
+        // out of the top N.
+        let one = AutoIndexSettings {
+            top_n: 2,
+            ..AutoIndexSettings::default()
+        };
+        assert_eq!(ids(&one), vec![2, 4]);
+        let all = AutoIndexSettings {
+            include_studio: true,
+            ..AutoIndexSettings::default()
+        };
+        assert_eq!(ids(&all), vec![1, 2, 3, 4]);
     }
 }

@@ -15,7 +15,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use sprig_advisor::autoindex::candidates::{ColumnInfo, ExistingIndex, TableInfo};
-use sprig_advisor::autoindex::model::{BuildReport, IndexRecord, IndexSpec, KeyCol, State};
+use sprig_advisor::autoindex::model::{
+    Action, BuildReport, IndexRecord, IndexSpec, KeyCol, OperatorRequest, State,
+};
 use sprig_advisor::autoindex::pass::{self, Approval, Env};
 use sprig_advisor::autoindex::policy::{DAY_US, HOUR_US, Replay};
 use sprig_advisor::autoindex::settings::{AutoIndexSettings, Mode};
@@ -50,6 +52,7 @@ struct Sim {
     log: Mutex<Vec<Bucket>>,
     indexes: Mutex<Vec<ExistingIndex>>,
     reads: Mutex<HashMap<String, u64>>,
+    last_read: Mutex<HashMap<String, u64>>,
     approvals: Mutex<HashMap<String, Approval>>,
     records: MemRecords,
     builds: Mutex<Vec<(u64, String)>>,
@@ -99,6 +102,7 @@ impl Sim {
             log: Mutex::new(Vec::new()),
             indexes: Mutex::new(Vec::new()),
             reads: Mutex::new(HashMap::new()),
+            last_read: Mutex::new(HashMap::new()),
             approvals: Mutex::new(HashMap::new()),
             records: MemRecords::new(),
             builds: Mutex::new(Vec::new()),
@@ -127,6 +131,9 @@ impl Sim {
                 None => (SLOW_US, ROWS),
             };
             if let Some(name) = idx {
+                if runs > 0 {
+                    self.last_read.lock().unwrap().insert(name.clone(), at);
+                }
                 *self.reads.lock().unwrap().entry(name).or_default() += runs;
             }
             self.log.lock().unwrap().push(Bucket {
@@ -306,6 +313,31 @@ impl Env for SimEnv {
 
     fn reads(&self, _spec: &IndexSpec, name: &str) -> u64 {
         self.0.reads.lock().unwrap().get(name).copied().unwrap_or(0)
+    }
+
+    fn last_read_us(&self, _spec: &IndexSpec, name: &str) -> Option<u64> {
+        self.0.last_read.lock().unwrap().get(name).copied()
+    }
+
+    async fn auto_indexes(&self) -> Result<Vec<(IndexSpec, String)>> {
+        Ok(self
+            .0
+            .indexes
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|x| x.name.starts_with("sprig_auto_"))
+            .map(|x| {
+                (
+                    IndexSpec {
+                        db: "app".into(),
+                        table: "t".into(),
+                        cols: x.cols.clone(),
+                    },
+                    x.name.clone(),
+                )
+            })
+            .collect())
     }
 
     async fn propose(&self, rec: &IndexRecord) -> Result<String> {
@@ -525,4 +557,158 @@ async fn recommend_mode_waits_for_approval() {
         let r = tick(&sim, &[2], 100).await;
         assert!(r.recommended.is_empty(), "{r:?}");
     }
+}
+
+async fn request(sim: &Arc<Sim>, col: &str, action: Action) {
+    let mut tx = sim.records.begin(TenantId(1)).await.unwrap();
+    AutoIndexStore::put_request(
+        &mut *tx,
+        &OperatorRequest {
+            index: spec(col).name().to_uppercase(),
+            action,
+            actor: "op:test".into(),
+            reason: "testing".into(),
+            at_us: sim.now.load(Ordering::SeqCst),
+        },
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+}
+
+#[tokio::test]
+async fn usage_reaches_the_records_between_passes_and_survives_a_restart() {
+    let sim = Sim::new();
+    tick(&sim, &[1], 100).await;
+    let name = spec("a").name();
+    // Half an hour of reads, then the minute's flush: in the record, with
+    // the time of the last read, before any pass.
+    sim.advance(HOUR_US / 2);
+    sim.hour(&[1], 40);
+    let read_at = sim.now.load(Ordering::SeqCst);
+    sim.advance(60_000_000);
+    assert_eq!(
+        pass::note_usage(&SimEnv(Arc::clone(&sim))).await.unwrap(),
+        1
+    );
+    let r = sim.record("a").await.unwrap();
+    assert_eq!(r.reads_total, 40);
+    assert_eq!(r.last_used_us, Some(read_at));
+    // Nothing new: nothing written.
+    assert_eq!(
+        pass::note_usage(&SimEnv(Arc::clone(&sim))).await.unwrap(),
+        0
+    );
+    // The node restarts: its in-memory counts start again from zero, and
+    // what was flushed stays.
+    sim.reads.lock().unwrap().clear();
+    sim.hour(&[1], 5);
+    pass::note_usage(&SimEnv(Arc::clone(&sim))).await.unwrap();
+    let r = sim.record("a").await.unwrap();
+    assert_eq!(r.reads_total, 45);
+    assert_eq!(sim.reads.lock().unwrap().get(&name).copied(), Some(5));
+}
+
+#[tokio::test]
+async fn operators_drop_pin_and_restore() {
+    let sim = Sim::new();
+    tick(&sim, &[1, 2], 100).await;
+    assert!(sim.index_on("a").is_some() && sim.index_on("b").is_some());
+    let env = SimEnv(Arc::clone(&sim));
+    // Drop `a`: gone at once, and blocked like a refused definition.
+    request(&sim, "a", Action::Drop).await;
+    let done = pass::apply_requests(&env).await.unwrap();
+    assert_eq!(done[0].outcome, "done", "{done:?}");
+    assert!(sim.index_on("a").is_none());
+    let a = sim.record("a").await.unwrap();
+    assert_eq!(a.state, State::Dropped);
+    assert_eq!(a.end_reason.as_deref(), Some("operator"));
+    assert!(pass::apply_requests(&env).await.unwrap().is_empty());
+    for _ in 0..30 {
+        let r = tick(&sim, &[1, 2], 100).await;
+        assert!(r.built.is_empty(), "{r:?}");
+    }
+    // A second drop is refused by the state; the request still goes.
+    request(&sim, "a", Action::Drop).await;
+    let done = pass::apply_requests(&env).await.unwrap();
+    assert!(done[0].outcome.contains("dropped"), "{done:?}");
+    // Restore `a`: built again at once, pinned, kept while unread.
+    request(&sim, "a", Action::Restore).await;
+    let done = pass::apply_requests(&env).await.unwrap();
+    assert_eq!(done[0].outcome, "done", "{done:?}");
+    assert!(sim.index_on("a").is_some());
+    let a = sim.record("a").await.unwrap();
+    assert!(a.pinned);
+    assert_eq!(a.state, State::Observing);
+    // Pin `b` too; nothing runs for 20 days: both are kept.
+    request(&sim, "b", Action::Pin).await;
+    pass::apply_requests(&env).await.unwrap();
+    for _ in 0..24 * 20 {
+        let r = tick(&sim, &[], 0).await;
+        assert!(r.dropped.is_empty(), "{r:?}");
+    }
+    assert_eq!(sim.record("a").await.unwrap().state, State::Active);
+    // Unpinned, `b` is judged again: unread for 7 days, dropped.
+    request(&sim, "b", Action::Unpin).await;
+    pass::apply_requests(&env).await.unwrap();
+    let r = tick(&sim, &[], 0).await;
+    assert_eq!(r.dropped, vec![(spec("b").name(), "unused".to_owned())]);
+    // A restore waits while builds must wait.
+    request(&sim, "b", Action::Restore).await;
+    *sim.paused.lock().unwrap() = Some("failover".into());
+    assert_eq!(
+        pass::apply_requests(&env).await.unwrap()[0].outcome,
+        "waiting"
+    );
+    *sim.paused.lock().unwrap() = None;
+    assert_eq!(pass::apply_requests(&env).await.unwrap()[0].outcome, "done");
+    assert!(sim.index_on("b").is_some());
+    // Unknown names are refused.
+    let mut tx = sim.records.begin(TenantId(1)).await.unwrap();
+    AutoIndexStore::put_request(
+        &mut *tx,
+        &OperatorRequest {
+            index: "sprig_auto_ffffffff".into(),
+            action: Action::Pin,
+            actor: String::new(),
+            reason: String::new(),
+            at_us: 0,
+        },
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(
+        pass::apply_requests(&env).await.unwrap()[0].outcome,
+        "no_such_index"
+    );
+}
+
+#[tokio::test]
+async fn an_automatic_index_no_record_explains_is_dropped() {
+    let sim = Sim::new();
+    tick(&sim, &[1], 100).await;
+    sim.indexes.lock().unwrap().push(ExistingIndex {
+        name: "sprig_auto_deadbeef".into(),
+        cols: vec![KeyCol::asc("g")],
+        ignored: false,
+    });
+    sim.indexes.lock().unwrap().push(ExistingIndex {
+        name: "k_user".into(),
+        cols: vec![KeyCol::asc("f")],
+        ignored: false,
+    });
+    let r = tick(&sim, &[1], 100).await;
+    assert_eq!(
+        r.dropped,
+        vec![("sprig_auto_deadbeef".to_owned(), "unexplained".to_owned())]
+    );
+    let names: Vec<String> = sim
+        .indexes
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|x| x.name.clone())
+        .collect();
+    assert_eq!(names, vec![spec("a").name(), "k_user".to_owned()]);
 }

@@ -1734,12 +1734,15 @@ where
                 // The key-value element tables (`__sprig_ke_`, `__sprig_kz_`)
                 // and the Redis scripts table, from the key-value engine's
                 // internal-mode statements likewise; the model table
-                // (`__sprig_dim_models`) too.
+                // (`__sprig_dim_models`) too; and the copies of inherited
+                // tables (`__sprig_ih_`) the gateway's copy pass makes on
+                // engine databases.
                 let kv_engine = [
                     "__sprig_ke_",
                     "__sprig_kz_",
                     "__sprig_redis_",
                     "__sprig_dim_",
+                    "__sprig_ih_",
                 ]
                 .iter()
                 .any(|p| {

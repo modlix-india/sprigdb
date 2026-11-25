@@ -122,6 +122,8 @@ pub enum CastTarget {
     Time(u8),
     /// `DATETIME(fsp)`
     DateTime(u8),
+    /// `JSON` (MySQL)
+    Json,
 }
 
 /// The truth value an `IS` test asks for.
@@ -392,6 +394,7 @@ impl Expr {
                     CastTarget::DateTime(f) => {
                         let _ = write!(out, "DATETIME({f})");
                     }
+                    CastTarget::Json => out.push_str("JSON"),
                 }
                 out.push(')');
             }

@@ -325,3 +325,43 @@ fn a_restart_applies_nothing_twice_and_checkpoints_trim() {
     assert_eq!(units[&2].1.last().unwrap(), b"last");
     assert_eq!(units[&2].1.len(), 21);
 }
+
+/// A node writes and syncs once per pass for every group with new entries,
+/// whichever node leads each group: a burst over many groups costs each
+/// node a few syncs, not one per group.
+#[test]
+fn groups_share_one_sync_per_pass() {
+    let c = Cluster::new("shared-sync");
+    let units: Vec<u64> = (1..=32).collect();
+    create(&c, &units);
+    let leaders: Vec<u64> = units.iter().map(|u| c.leader(*u)).collect();
+    // Settle: every group's first entries are in.
+    for u in &units {
+        c.propose(*u, b"warm");
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    let before: Vec<u64> = (1..=3).map(|id| c.c(id).node().stats().syncs).collect();
+    let tickets: Vec<_> = units
+        .iter()
+        .zip(&leaders)
+        .filter_map(|(u, l)| {
+            c.c(*l)
+                .propose(UnitId(*u), b"burst".to_vec(), Durability::Strict)
+                .ok()
+        })
+        .collect();
+    assert!(tickets.len() >= 24, "most leaders kept their groups");
+    for t in &tickets {
+        t.wait().unwrap();
+        t.wait_applied().unwrap();
+    }
+    for id in 1..=3u64 {
+        let i = usize::try_from(id - 1).unwrap();
+        let syncs = c.c(id).node().stats().syncs - before[i];
+        assert!(
+            syncs < 12,
+            "node {id}: {syncs} syncs for {} entries over 32 groups",
+            tickets.len()
+        );
+    }
+}

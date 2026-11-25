@@ -110,20 +110,34 @@ impl Cx<'_> {
                 let parts = object_name(name)?;
                 let alias_name = alias.as_ref().map(|a| a.name.value.clone());
                 if let [single] = parts.as_slice() {
-                    if let Some(cte) = self.find_cte(single) {
-                        let columns: Vec<String> = cte
+                    let shown = alias_name.clone().unwrap_or_else(|| single.clone());
+                    if let Some(rel) = self.working_rel(single, shown.clone()) {
+                        return Ok(rel);
+                    }
+                    if let Some(def) = self.find_cte(single) {
+                        if def.recursive {
+                            return self.recursive_rel(&def, shown);
+                        }
+                        let columns: Vec<String> = def
+                            .cte
                             .alias
                             .columns
                             .iter()
                             .map(|c| c.name.value.clone())
                             .collect();
-                        return self.derived_rel(
-                            &cte.query,
-                            &columns,
-                            alias_name.unwrap_or_else(|| single.clone()),
-                            merge,
-                            inner,
-                        );
+                        // Its query sees only the expressions defined
+                        // before it.
+                        let later = self.ctes.split_off(def.sees.min(self.ctes.len()));
+                        let maria = self.session.persona.is_maria();
+                        let rel = self
+                            .derived_rel(&def.cte.query, &columns, shown, merge, inner)
+                            .and_then(|rel| {
+                                let width = rel.cols.len();
+                                crate::recursive::check_column_list(maria, columns.len(), width)
+                                    .map(|()| rel)
+                            });
+                        self.ctes.extend(later);
+                        return rel;
                     }
                 }
                 let (schema, table) = match parts.as_slice() {

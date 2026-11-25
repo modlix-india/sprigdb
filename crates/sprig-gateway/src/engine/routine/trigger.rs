@@ -42,6 +42,19 @@ impl Trigger {
         self.def.as_ref().ok().map(|d| (d.before, d.event))
     }
 
+    /// Whether an `UPDATE` assigning the columns `assigned` fires it: a
+    /// trigger `UPDATE OF c, ...` only when one of its columns is assigned
+    /// (names compared as column names are).
+    pub(crate) fn fires_on(&self, assigned: &[&str]) -> bool {
+        match &self.def {
+            Ok(d) if !d.of.is_empty() => {
+                d.of.iter()
+                    .any(|c| assigned.iter().any(|a| a.eq_ignore_ascii_case(c)))
+            }
+            _ => true,
+        }
+    }
+
     /// The body compiled against the table's columns.
     ///
     /// # Errors
@@ -88,6 +101,17 @@ pub(crate) fn create(
         .filter(|e| parse::parse_trigger(e).is_ok())
         .unwrap_or(sql);
     let t = parse::parse_trigger(text)?;
+    // `UPDATE OF` is MariaDB's; MySQL's parser stops at `OF`.
+    if mysql && let Some(near) = &t.of_text {
+        return Err(SprigError::standard(
+            1064,
+            *b"42000",
+            format!(
+                "You have an error in your SQL syntax; check the manual that corresponds to your \
+                 MySQL server version for the right syntax to use near '{near}' at line 1"
+            ),
+        ));
+    }
     code::compile_trigger(&t, cols)?;
     let mut same: Vec<(&str, i64)> = others
         .iter()

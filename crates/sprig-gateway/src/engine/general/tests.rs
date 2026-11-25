@@ -715,7 +715,8 @@ async fn what_the_planner_does_not_run_is_refused() {
     );
     for sql in [
         "SELECT tier, COUNT(*) FROM customers GROUP BY tier",
-        "SELECT id FROM customers WHERE tier = 'gold' ORDER BY name",
+        // (`tier = 'gold'` runs: a member-number comparison.)
+        "SELECT id FROM customers WHERE tier > 'gold' ORDER BY name",
         "SELECT CONCAT(tier, '!') FROM customers",
         "SELECT d.tier FROM (SELECT tier FROM customers) d",
         "SELECT tier FROM customers UNION SELECT status FROM orders",
@@ -914,6 +915,48 @@ async fn row_comparisons_run_on_the_engine() {
         .await
         .unwrap_err();
     assert_eq!(err.protocol().mysql_errno, 1241);
+}
+
+#[tokio::test]
+async fn enum_columns_compare_with_their_members_on_the_engine() {
+    let (e, f, _d) = shop().await;
+    let ids = |rows: Vec<String>| rows.join(",");
+    // `tier` is ENUM('gold', 'silver', 'none'): gold for every third id.
+    let got = select(
+        &e,
+        &f,
+        "SELECT c.id, c.tier FROM customers c JOIN customers d ON d.id = c.id \
+         WHERE c.tier IN ('GOLD', 'nope') AND d.tier <> 'silver' AND c.tier IS NOT NULL \
+         ORDER BY c.id",
+        &[],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        ids(got),
+        "3|gold,6|gold,9|gold,12|gold,15|gold,18|gold,21|gold,24|gold"
+    );
+    let none = select(
+        &e,
+        &f,
+        "SELECT c.id FROM customers c JOIN customers d ON d.id = c.id WHERE c.tier = 'nope' \
+         OR 'x' = d.tier",
+        &[],
+    )
+    .await
+    .unwrap();
+    assert!(none.is_empty(), "{none:?}");
+    // Computing with the member text is still refused.
+    let (code, msg) = refused(
+        &f,
+        "SELECT CONCAT(c.tier, 'x') FROM customers c JOIN customers d ON d.id = c.id",
+    );
+    assert_eq!(code, NOT_ON_ENGINE, "{msg}");
+    let (code, msg) = refused(
+        &f,
+        "SELECT c.id FROM customers c JOIN customers d ON d.id = c.id WHERE c.tier < 'none'",
+    );
+    assert_eq!(code, NOT_ON_ENGINE, "{msg}");
 }
 
 #[tokio::test]
@@ -1245,4 +1288,140 @@ async fn views_read_as_their_select() {
         .await
         .unwrap_err();
     assert_eq!(err.protocol().mysql_errno, 1462);
+}
+
+/// Runs `sql` under `seed`, giving the rows as text and the
+/// `SQL_CALC_FOUND_ROWS` count.
+async fn select_with(
+    e: &Engine,
+    f: &Fake,
+    s: &Seed,
+    sql: &str,
+) -> sprig_common::Result<(Vec<String>, Option<u64>)> {
+    // A query of common table expressions alone names no stored table.
+    let stmt = parse(sql);
+    let g = match general(f, sql)? {
+        Some(g) => g,
+        None => super::bind_no_tables(&cx(f), &stmt, Some(sql))?.expect("a general statement"),
+    };
+    let a = RunArgs {
+        tenant: TENANT.0,
+        params: &[],
+        seed: s,
+        deadline: None,
+        stop: None,
+    };
+    let rows = e
+        .general_run(&g, &a, TxnOptions::default(), Env::STRICT)
+        .await?;
+    Ok((show(&g, &rows.columns, &rows.rows), rows.found))
+}
+
+#[tokio::test]
+async fn recursive_common_table_expressions_run_on_the_engine() {
+    let (e, f, _d) = shop().await;
+    let maria = seed();
+    let one = |sql: &'static str| {
+        let (e, f, s) = (&e, &f, &maria);
+        async move { select_with(e, f, s, sql).await.map(|(rows, _)| rows) }
+    };
+    let got = one("WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 5) SELECT SUM(n), COUNT(*) FROM c").await.unwrap();
+    assert_eq!(got, ["15|5"]);
+    // A chain through a table, by key.
+    let got = one("WITH RECURSIVE c(id, d) AS (SELECT id, 0 FROM customers WHERE id = 1 UNION ALL SELECT x.id, c.d + 1 FROM c JOIN customers x ON x.id = c.id * 2) SELECT GROUP_CONCAT(id ORDER BY id), MAX(d) FROM c").await.unwrap();
+    assert_eq!(got, ["1,2,4,8,16|4"]);
+    // UNION DISTINCT ends a cycle; MariaDB stops after 1000 passes.
+    let got = one(
+        "WITH RECURSIVE c(n) AS (SELECT 1 UNION SELECT n % 3 + 1 FROM c) SELECT COUNT(*) FROM c",
+    )
+    .await
+    .unwrap();
+    assert_eq!(got, ["3"]);
+    let got = one("WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c) SELECT COUNT(*), MAX(n) FROM c").await.unwrap();
+    assert_eq!(got, ["1001|1001"]);
+    // Two references, and a reference in a subquery of the main query.
+    let got = one("WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 3) SELECT a.n FROM c a JOIN c b ON a.n = b.n WHERE a.n > (SELECT MIN(n) FROM c) ORDER BY a.n").await.unwrap();
+    assert_eq!(got, ["2", "3"]);
+    // Strings are stored into the anchor's column type.
+    let err = one("WITH RECURSIVE c(s) AS (SELECT 'a' UNION ALL SELECT CONCAT(s, 'a') FROM c WHERE LENGTH(s) < 3) SELECT * FROM c").await.unwrap_err();
+    assert_eq!(err.protocol().mysql_errno, 1406);
+    for (sql, code) in [
+        (
+            "WITH RECURSIVE c(n) AS (SELECT n FROM c) SELECT * FROM c",
+            4005,
+        ),
+        (
+            "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT COUNT(*) FROM c) SELECT * FROM c",
+            4008,
+        ),
+        (
+            "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT a.n FROM c a JOIN c b) SELECT * FROM c",
+            4008,
+        ),
+        (
+            "WITH RECURSIVE c(n, m) AS (SELECT 1 UNION ALL SELECT n FROM c) SELECT * FROM c",
+            4002,
+        ),
+        (
+            "WITH c AS (SELECT 1), c AS (SELECT 2) SELECT * FROM c",
+            4004,
+        ),
+    ] {
+        let err = one(sql).await.unwrap_err();
+        assert_eq!(err.protocol().mysql_errno, code, "{sql}");
+    }
+    // Without RECURSIVE, an expression's own name is the stored table.
+    let got = one("WITH customers AS (SELECT id, name FROM customers WHERE id < 3) SELECT COUNT(*) FROM customers").await.unwrap();
+    assert_eq!(got, ["2"]);
+    // MySQL: pass 1001 fails; a LIMIT on the whole stops the passes.
+    let my = Seed::of(true);
+    let err = select_with(
+        &e,
+        &f,
+        &my,
+        "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c) SELECT COUNT(*) FROM c",
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.protocol().mysql_errno, 3636);
+    let (got, _) = select_with(&e, &f, &my, "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c LIMIT 2, 3) SELECT * FROM c").await.unwrap();
+    assert_eq!(got, ["3", "4", "5"]);
+    let err = select_with(
+        &e,
+        &f,
+        &my,
+        "WITH RECURSIVE c(n) AS (SELECT 1 FROM c UNION ALL SELECT 1) SELECT * FROM c",
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.protocol().mysql_errno, 3574);
+}
+
+#[tokio::test]
+async fn sql_calc_found_rows_counts_past_the_limit() {
+    let (e, f, _d) = shop().await;
+    let s = seed();
+    let (got, found) = select_with(
+        &e,
+        &f,
+        &s,
+        "SELECT SQL_CALC_FOUND_ROWS id FROM customers ORDER BY id LIMIT 1, 2",
+    )
+    .await
+    .unwrap();
+    assert_eq!(got, ["2", "3"]);
+    assert_eq!(found, Some(24));
+    let (_, found) = select_with(&e, &f, &s, "SELECT id FROM customers LIMIT 2")
+        .await
+        .unwrap();
+    assert_eq!(found, None);
+    let err = select_with(
+        &e,
+        &f,
+        &s,
+        "SELECT id FROM customers WHERE id IN (SELECT SQL_CALC_FOUND_ROWS id FROM customers)",
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.protocol().mysql_errno, 1234);
 }

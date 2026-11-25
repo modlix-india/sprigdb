@@ -5,6 +5,15 @@
 //! the segment's first batch and then at least every `index_interval`
 //! bytes, rebuilt from the batch heads when the file is opened. A lookup
 //! starts at the floor entry and reads heads forward from there.
+//!
+//! **Write-behind.** An append keeps the batch in memory and returns; the
+//! stream log's writer moves pending batches into the file in one write
+//! per segment, off the apply path (which runs on the replication loop).
+//! Readers see pending batches as if they were in the file. Whoever syncs
+//! the file or reads it directly writes the pending bytes out first
+//! ([`Segment::write_out`]). A pending batch lost in a crash is no worse
+//! than an unsynced one: the commit log keeps every entry above the
+//! durable floor and the log replays them.
 
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -13,6 +22,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::batch::{HEAD, Head};
+
+/// Pending bytes past which an append writes them out itself (bounds the
+/// memory a slow or failing writer can pin).
+pub const PENDING_MAX: u64 = 4 << 20;
+
+/// Batches not in the file yet: (position, bytes), back to back.
+type Chunks = Vec<(u64, Arc<[u8]>)>;
 
 /// One sparse index entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,10 +49,13 @@ pub struct Segment {
     /// Its file.
     pub path: PathBuf,
     file: Arc<File>,
-    /// Bytes written.
+    /// Bytes appended (in the file or pending).
     pub len: u64,
     /// Bytes known synced.
     pub synced: u64,
+    /// Bytes in the file; `pending` holds the rest up to `len`.
+    written: u64,
+    pending: Chunks,
     /// The offset after its last batch (`base` while empty).
     pub next: i64,
     /// The largest batch timestamp (-1 while empty).
@@ -56,6 +75,82 @@ pub struct View {
     pub len: u64,
     /// Where to start (a batch head).
     pub pos: u64,
+    /// Bytes in the file when the view was taken; the rest is in `tail`.
+    written: u64,
+    tail: Chunks,
+}
+
+/// A segment's pending batches, to write outside the partition lock
+/// ([`Segment::pending_write`], then [`Segment::written_through`]).
+#[derive(Debug)]
+pub struct PendingWrite {
+    file: Arc<File>,
+    /// The segment's base offset.
+    pub base: i64,
+    /// Where the bytes go.
+    pub at: u64,
+    chunks: Chunks,
+}
+
+impl PendingWrite {
+    /// The position after the last pending byte.
+    #[must_use]
+    pub fn end(&self) -> u64 {
+        self.chunks
+            .last()
+            .map_or(self.at, |(p, b)| p + b.len() as u64)
+    }
+
+    /// Writes the bytes into the file (one write).
+    ///
+    /// # Errors
+    /// The file system's.
+    pub fn write(&self) -> io::Result<()> {
+        write_chunks(&self.file, self.at, &self.chunks)
+    }
+}
+
+fn write_chunks(file: &File, at: u64, chunks: &[(u64, Arc<[u8]>)]) -> io::Result<()> {
+    match chunks {
+        [] => Ok(()),
+        [(_, b)] => file.write_all_at(b, at),
+        _ => {
+            let n: usize = chunks.iter().map(|(_, b)| b.len()).sum();
+            let mut buf = Vec::with_capacity(n);
+            for (_, b) in chunks {
+                buf.extend_from_slice(b);
+            }
+            file.write_all_at(&buf, at)
+        }
+    }
+}
+
+/// Fills `buf` from position `pos`: from the file below `written`, from
+/// `tail` (pending batches) from there on.
+fn fill(file: &File, written: u64, tail: &[(u64, Arc<[u8]>)], buf: &mut [u8], pos: u64) -> io::Result<()> {
+    let mut at = pos;
+    let mut done = 0usize;
+    if at < written {
+        let n = usize::try_from((written - at).min(buf.len() as u64)).unwrap_or(buf.len());
+        file.read_exact_at(&mut buf[..n], at)?;
+        done = n;
+        at += n as u64;
+    }
+    while done < buf.len() {
+        let i = tail.partition_point(|(p, b)| p + b.len() as u64 <= at);
+        let Some((p, b)) = tail.get(i).filter(|(p, _)| *p <= at) else {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "read past a segment's end",
+            ));
+        };
+        let off = usize::try_from(at - p).unwrap_or(usize::MAX);
+        let n = (b.len() - off).min(buf.len() - done);
+        buf[done..done + n].copy_from_slice(&b[off..off + n]);
+        done += n;
+        at += n as u64;
+    }
+    Ok(())
 }
 
 /// The name of the segment starting at `base`.
@@ -103,6 +198,8 @@ impl Segment {
             file: Arc::new(file),
             len: 0,
             synced: 0,
+            written: 0,
+            pending: Vec::new(),
             next: base,
             max_ts: -1,
             created_ms: now_ms,
@@ -166,6 +263,8 @@ impl Segment {
             file: Arc::new(file),
             len: 0,
             synced: 0,
+            written: 0,
+            pending: Vec::new(),
             next: base,
             max_ts: -1,
             created_ms,
@@ -186,6 +285,7 @@ impl Segment {
         }
         s.len = pos;
         s.synced = pos;
+        s.written = pos;
         Ok(s)
     }
 
@@ -203,32 +303,106 @@ impl Segment {
         self.max_ts = self.max_ts.max(h.max_ts);
     }
 
-    /// Appends one batch whose head is `h` (already patched).
+    /// Appends one batch whose head is `h` (already patched). It stays
+    /// pending (in memory) until a writer moves it into the file; past
+    /// [`PENDING_MAX`] pending bytes the append writes them out first.
     ///
     /// # Errors
-    /// The file system's.
+    /// The file system's (the batch is then not appended).
     pub fn append(&mut self, bytes: &[u8], h: &Head) -> io::Result<()> {
-        self.file.write_all_at(bytes, self.len)?;
+        if self.len - self.written + bytes.len() as u64 > PENDING_MAX {
+            self.write_out()?;
+        }
         let pos = self.len;
+        self.pending.push((pos, Arc::from(bytes)));
         self.note(pos, h);
         self.len += bytes.len() as u64;
         Ok(())
     }
 
-    /// Syncs the file; returns the length synced.
+    /// Writes every pending batch into the file.
+    ///
+    /// # Errors
+    /// The file system's (the batches stay pending).
+    pub fn write_out(&mut self) -> io::Result<()> {
+        write_chunks(&self.file, self.written, &self.pending)?;
+        self.written = self.len;
+        self.pending.clear();
+        Ok(())
+    }
+
+    /// Pending bytes (appended, not in the file yet).
+    #[must_use]
+    pub fn pending_bytes(&self) -> u64 {
+        self.len - self.written
+    }
+
+    /// The pending batches, to write outside the partition lock; `None`
+    /// when there are none.
+    #[must_use]
+    pub fn pending_write(&self) -> Option<PendingWrite> {
+        (!self.pending.is_empty()).then(|| PendingWrite {
+            file: Arc::clone(&self.file),
+            base: self.base,
+            at: self.written,
+            chunks: self.pending.clone(),
+        })
+    }
+
+    /// Records that a [`PendingWrite`] taken at `at` put everything before
+    /// `end` in the file (ignored when another writer got there first).
+    pub fn written_through(&mut self, at: u64, end: u64) {
+        if self.written != at || end > self.len {
+            return;
+        }
+        let k = self.pending.partition_point(|(p, _)| *p < end);
+        self.pending.drain(..k);
+        self.written = end;
+    }
+
+    /// Writes pending batches out, then syncs the file; returns the length
+    /// synced.
     ///
     /// # Errors
     /// The file system's.
-    pub fn sync(&self) -> io::Result<u64> {
+    pub fn sync(&mut self) -> io::Result<u64> {
+        self.write_out()?;
         let len = self.len;
         self.file.sync_data()?;
         Ok(len)
     }
 
-    /// The file handle (for syncing outside the partition lock).
+    /// The file handle (for syncing or reading outside the partition
+    /// lock). The file holds only what was written: call
+    /// [`Segment::write_out`] first.
     #[must_use]
     pub fn handle(&self) -> Arc<File> {
         Arc::clone(&self.file)
+    }
+
+    /// The batch head at `pos`, from the file or the pending batches.
+    fn head_at(&self, pos: u64) -> io::Result<Option<Head>> {
+        if pos + HEAD as u64 > self.len {
+            return Ok(None);
+        }
+        if pos < self.written {
+            return read_head(&self.file, pos);
+        }
+        let mut h = [0u8; HEAD];
+        fill(&self.file, self.written, &self.pending, &mut h, pos)?;
+        Ok(Head::parse(&h))
+    }
+
+    /// A view from `pos` (a batch head).
+    fn view_from(&self, pos: u64) -> View {
+        let from = self.pending.partition_point(|(p, b)| p + b.len() as u64 <= pos);
+        View {
+            file: Arc::clone(&self.file),
+            len: self.len,
+            pos,
+            written: self.written,
+            tail: self.pending[from..].to_vec(),
+        }
     }
 
     /// Whether it holds no batch.
@@ -255,15 +429,11 @@ impl Segment {
         }
         let mut pos = self.floor(offset);
         while pos < self.len {
-            let Some(h) = read_head(&self.file, pos)? else {
+            let Some(h) = self.head_at(pos)? else {
                 break;
             };
             if h.next_offset() > offset {
-                return Ok(Some(View {
-                    file: Arc::clone(&self.file),
-                    len: self.len,
-                    pos,
-                }));
+                return Ok(Some(self.view_from(pos)));
             }
             pos += h.total as u64;
         }
@@ -281,18 +451,11 @@ impl Segment {
         let i = self.index.partition_point(|e| e.max_ts_before < ts);
         let mut pos = if i == 0 { 0 } else { self.index[i - 1].pos };
         while pos < self.len {
-            let Some(h) = read_head(&self.file, pos)? else {
+            let Some(h) = self.head_at(pos)? else {
                 break;
             };
             if h.max_ts >= ts {
-                return Ok(Some((
-                    View {
-                        file: Arc::clone(&self.file),
-                        len: self.len,
-                        pos,
-                    },
-                    h,
-                )));
+                return Ok(Some((self.view_from(pos), h)));
             }
             pos += h.total as u64;
         }
@@ -308,7 +471,7 @@ impl Segment {
         let mut out = Vec::new();
         let mut pos = 0;
         while pos < self.len {
-            let Some(h) = read_head(&self.file, pos)? else {
+            let Some(h) = self.head_at(pos)? else {
                 break;
             };
             out.push((pos, h));
@@ -323,7 +486,7 @@ impl Segment {
     /// The file system's.
     pub fn batch_at(&self, pos: u64, h: &Head) -> io::Result<Vec<u8>> {
         let mut buf = vec![0u8; h.total];
-        self.file.read_exact_at(&mut buf, pos)?;
+        fill(&self.file, self.written, &self.pending, &mut buf, pos)?;
         Ok(buf)
     }
 }
@@ -338,7 +501,7 @@ impl View {
         let avail = self.len.saturating_sub(self.pos);
         let want = (max_bytes as u64).min(avail).max(HEAD as u64).min(avail);
         let mut buf = vec![0u8; usize::try_from(want).unwrap_or(usize::MAX)];
-        self.file.read_exact_at(&mut buf, self.pos)?;
+        fill(&self.file, self.written, &self.tail, &mut buf, self.pos)?;
         // Keep whole batches; the first one whole whatever its size.
         let mut end = 0usize;
         loop {
@@ -348,7 +511,7 @@ impl View {
             if end + h.total > buf.len() {
                 if end == 0 {
                     let mut first = vec![0u8; h.total];
-                    self.file.read_exact_at(&mut first, self.pos)?;
+                    fill(&self.file, self.written, &self.tail, &mut first, self.pos)?;
                     return Ok(first);
                 }
                 break;
@@ -392,6 +555,8 @@ mod tests {
         let (_, h) = s.view_at_time(1_010).unwrap().unwrap();
         assert_eq!(h.base_offset, 124);
         // Reopen with a torn tail: it is cut at the last whole batch.
+        assert_eq!(s.pending_bytes(), s.len, "appends stay pending until written");
+        s.write_out().unwrap();
         let full = s.len;
         let path = s.path.clone();
         drop(s);
@@ -401,5 +566,67 @@ mod tests {
         assert_eq!(s.next, 157);
         let s = Segment::open(&path, 100, Some(0), 0, 600).unwrap();
         assert_eq!((s.next, s.len), (100, 0));
+    }
+
+    /// Reads see pending batches, across the boundary with written ones,
+    /// and a view keeps reading what it saw after a writer moved it.
+    #[test]
+    fn pending_batches_read_like_written_ones() {
+        let d = TempDir::new("segment-pending");
+        let mut s = Segment::create(d.path(), 0, 0, 100).unwrap();
+        let mut off = 0;
+        let mut all = Vec::new();
+        let mut append = |s: &mut Segment, i: i64| {
+            let mut b = batch_bytes(2, 500 + i, 40);
+            set_offset_and_epoch(&mut b, off, 1);
+            let h = Head::parse(&b).unwrap();
+            s.append(&b, &h).unwrap();
+            off = h.next_offset();
+            all.extend_from_slice(&b);
+        };
+        for i in 0..5 {
+            append(&mut s, i);
+        }
+        // Half written by a background writer, the rest pending.
+        let w = s.pending_write().unwrap();
+        w.write().unwrap();
+        s.written_through(w.at, w.end());
+        assert_eq!(s.pending_bytes(), 0);
+        for i in 5..10 {
+            append(&mut s, i);
+        }
+        assert_eq!(std::fs::metadata(&s.path).unwrap().len(), w.end());
+        let v = s.view_at(0).unwrap().unwrap();
+        assert_eq!(v.read(usize::MAX >> 1).unwrap(), all);
+        let heads = s.heads().unwrap();
+        assert_eq!(heads.len(), 10);
+        for (pos, h) in &heads {
+            let p = usize::try_from(*pos).unwrap();
+            assert_eq!(s.batch_at(*pos, h).unwrap(), all[p..p + h.total]);
+        }
+        let (tv, th) = s.view_at_time(507).unwrap().unwrap();
+        assert_eq!(th.base_offset, 12);
+        // A writer that lost the race to `write_out` changes nothing.
+        let late = s.pending_write().unwrap();
+        s.write_out().unwrap();
+        late.write().unwrap();
+        s.written_through(late.at, late.end());
+        assert_eq!(s.pending_bytes(), 0);
+        assert_eq!(std::fs::read(&s.path).unwrap(), all);
+        // Views taken before the write still read their bytes.
+        assert_eq!(v.read(usize::MAX >> 1).unwrap(), all);
+        let p = usize::try_from(tv.pos).unwrap();
+        assert_eq!(tv.read(usize::MAX >> 1).unwrap(), all[p..]);
+        // Past the cap an append writes what is pending itself.
+        let big = usize::try_from(PENDING_MAX / 3).unwrap();
+        for _ in 0..4 {
+            let mut b = batch_bytes(1, 900, big);
+            set_offset_and_epoch(&mut b, off, 1);
+            let h = Head::parse(&b).unwrap();
+            s.append(&b, &h).unwrap();
+            off = h.next_offset();
+        }
+        assert!(s.pending_bytes() <= PENDING_MAX);
+        assert!(std::fs::metadata(&s.path).unwrap().len() > all.len() as u64);
     }
 }

@@ -51,6 +51,12 @@ pub struct RaftConfig {
     /// unit needs creating on one member only. A node not listed creates
     /// nothing this way.
     pub static_voters: Vec<crate::NodeId>,
+    /// Log writes and syncs run on a thread of their own, started by
+    /// [`crate::Node::spawn`]: the loop keeps stepping groups (and sending
+    /// what doesn't wait for durability) while a sync runs, and writes
+    /// queued meanwhile share the next sync. Off: the loop writes itself
+    /// (a driver run with [`crate::Node::run`] always does).
+    pub log_writer_thread: bool,
 }
 
 impl Default for RaftConfig {
@@ -70,6 +76,7 @@ impl Default for RaftConfig {
             snapshot_retry_ticks: 30,
             auto_create: true,
             static_voters: Vec::new(),
+            log_writer_thread: false,
         }
     }
 }

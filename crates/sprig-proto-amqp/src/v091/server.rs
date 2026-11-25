@@ -16,9 +16,9 @@ use std::time::Duration;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use bytes::{Bytes, BytesMut};
-use futures::StreamExt;
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
+use futures::{FutureExt, StreamExt};
 use sprig_common::CancellationToken;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::sync::mpsc;
@@ -106,6 +106,11 @@ pub(crate) fn random_suffix() -> String {
     let _ = ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut b);
     URL_SAFE_NO_PAD.encode(b)
 }
+
+/// Events (deliveries, confirms) handled at most before one write.
+const COALESCE_MAX: usize = 256;
+/// Output bytes past which the connection writes before taking more.
+const COALESCE_BYTES: usize = 128 << 10;
 
 async fn flush<W: AsyncWrite + Unpin>(w: &mut W, out: &mut BytesMut) -> Result<(), MqError> {
     if !out.is_empty() {
@@ -604,8 +609,30 @@ impl Conn<'_> {
                     last_recv = Instant::now();
                     self.handle_frames(&mut inb).await;
                 }
-                Some(ev) = events.recv() => self.on_event(ev).await,
-                Some(c) = self.confirms.next(), if !self.confirms.is_empty() => self.on_confirm(c),
+                Some(ev) = events.recv() => {
+                    self.on_event(ev).await;
+                    // Deliveries that are already waiting go out in the
+                    // same write: one send per delivery cost the owner's
+                    // gateway most of a core at tens of thousands a second.
+                    for _ in 1..COALESCE_MAX {
+                        if self.out.len() >= COALESCE_BYTES || self.finished {
+                            break;
+                        }
+                        let Ok(ev) = events.try_recv() else { break };
+                        self.on_event(ev).await;
+                    }
+                }
+                Some(c) = self.confirms.next(), if !self.confirms.is_empty() => {
+                    self.on_confirm(c);
+                    // Likewise for confirms already settled.
+                    for _ in 1..COALESCE_MAX {
+                        if self.out.len() >= COALESCE_BYTES {
+                            break;
+                        }
+                        let Some(Some(c)) = self.confirms.next().now_or_never() else { break };
+                        self.on_confirm(c);
+                    }
+                }
                 _ = ticker.tick(), if self.heartbeat > 0 => {
                     if last_recv.elapsed() > hb * 2 {
                         tracing::info!(peer = %self.info.peer, "AMQP heartbeat timeout: no frames for two intervals");

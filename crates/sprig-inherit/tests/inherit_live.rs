@@ -11,6 +11,14 @@
 //! cargo test -p sprig-inherit --test inherit_live -- --nocapture --test-threads 1
 //! ```
 //!
+//! On engine databases the gateway itself orphans overrides across
+//! tenants (from its change log): set `SPRIG_TEST_R6I_ASYNC_ORPHANS=1` and
+//! the read-through model test waits for the orphans as the materialized
+//! one does. It keeps materialized copies there too:
+//! `engine_copies_converge_to_the_model` (with
+//! `SPRIG_TEST_R6I_ENGINE_COPIES=1`) runs the materialized workload with
+//! no worker, waiting for the gateway's copies to serve.
+//!
 //! The two model tests need a deployment without a worker process: the
 //! controller's `inherit` loop would give the tree a copy worker, which
 //! orphans overrides across tenants while the read-through model expects
@@ -405,7 +413,41 @@ async fn merged_views_match_the_model() {
     if Box::pin(worker_copies_the_tree("merged_views_match_the_model")).await {
         return;
     }
-    model_run(&eps, None).await;
+    model_run(&eps, None, false).await;
+}
+
+/// The materialized workload on engine databases: the gateway hosting them
+/// seeds and keeps the copies from its change log, with no worker
+/// (`SPRIG_TEST_R6I_ENGINE_COPIES=1`).
+#[tokio::test]
+async fn engine_copies_converge_to_the_model() {
+    let Some(eps) = endpoints("engine_copies_converge_to_the_model") else {
+        return;
+    };
+    if needs(
+        "engine_copies_converge_to_the_model",
+        "SPRIG_TEST_R6I_ENGINE_COPIES",
+    )
+    .is_none()
+    {
+        return;
+    }
+    model_run(&eps, None, true).await;
+}
+
+/// How many of `db`'s copies serve, as `SHOW SHARES` tells each tenant.
+async fn serving_copies(conns: &mut [Conn], db: &str) -> usize {
+    let mut n = 0;
+    for c in conns.iter_mut() {
+        for r in rows(c, "SHOW SHARES").await {
+            let object = r.get(2).cloned().flatten().unwrap_or_default();
+            let copy = r.get(10).cloned().flatten().unwrap_or_default();
+            if object.starts_with(&format!("{db}.")) && copy == "serving" {
+                n += 1;
+            }
+        }
+    }
+    n
 }
 
 /// The reference-model workload. With a worker, every share is
@@ -413,9 +455,9 @@ async fn merged_views_match_the_model() {
 /// this process, and after each write the test waits until every space's
 /// view equals the model (the copies converged), measuring how long that
 /// took.
-async fn model_run(eps: &[String], mut worker: Option<&mut copyw::Worker>) {
+async fn model_run(eps: &[String], mut worker: Option<&mut copyw::Worker>, engine_copies: bool) {
     let t = tenants();
-    let materialized = worker.is_some();
+    let materialized = worker.is_some() || engine_copies;
     let ops: u64 = std::env::var("SPRIG_TEST_R6I_OPS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -437,7 +479,11 @@ async fn model_run(eps: &[String], mut worker: Option<&mut copyw::Worker>) {
         }
         let spaces = setup(&mut conns, &db, p, &t).await;
         let mut m = model();
-        m.async_orphans = materialized;
+        // Engine databases: the gateway hosting them orphans across tenants
+        // from its change log, with no worker (`SPRIG_TEST_R6I_ASYNC_ORPHANS=1`).
+        let converge =
+            materialized || std::env::var("SPRIG_TEST_R6I_ASYNC_ORPHANS").as_deref() == Ok("1");
+        m.async_orphans = converge;
         let mut lags: Vec<u128> = Vec::new();
         let mut instant = 0u64;
         if let Some(w) = worker.as_deref_mut() {
@@ -449,6 +495,24 @@ async fn model_run(eps: &[String], mut worker: Option<&mut copyw::Worker>) {
                 t0.elapsed()
             );
             // The gateways' copy-state cache.
+            tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        } else if engine_copies {
+            let t0 = Instant::now();
+            loop {
+                let n = serving_copies(&mut conns, &db).await;
+                if n >= 5 {
+                    break;
+                }
+                assert!(
+                    t0.elapsed() < std::time::Duration::from_secs(60),
+                    "{p}: only {n} of 5 copies serve"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            eprintln!(
+                "{p}: 5 copies serving {:.1?} after the shares (the gateway's copy pass)",
+                t0.elapsed()
+            );
             tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
         }
         let mut g = Lcg(0x5eed_0000 + pi as u64);
@@ -549,7 +613,7 @@ async fn model_run(eps: &[String], mut worker: Option<&mut copyw::Worker>) {
             }
             writes += 1;
             *counts.entry(what).or_default() += 1;
-            if materialized {
+            if converge {
                 let t0 = Instant::now();
                 let mut polls = 0;
                 loop {
@@ -624,7 +688,7 @@ async fn model_run(eps: &[String], mut worker: Option<&mut copyw::Worker>) {
                 x.name
             );
         }
-        if materialized {
+        if converge {
             lags.sort_unstable();
             let pct = |q: usize| lags[(lags.len() * q / 100).min(lags.len() - 1)];
             eprintln!(
@@ -636,7 +700,7 @@ async fn model_run(eps: &[String], mut worker: Option<&mut copyw::Worker>) {
                 lags.len()
             );
             assert!(
-                pct(99) <= 1000,
+                !materialized || pct(99) <= 1000,
                 "{p}: p99 convergence {} ms is above inherit.copy_max_lag_ms",
                 pct(99)
             );
@@ -688,7 +752,7 @@ async fn materialized_views_converge_to_the_model() {
         return;
     }
     let mut w = copyw::Worker::new(&tenants()[0]).await;
-    model_run(&eps, Some(&mut w)).await;
+    model_run(&eps, Some(&mut w), false).await;
     w.stop().await;
 }
 

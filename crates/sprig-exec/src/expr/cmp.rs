@@ -78,6 +78,8 @@ pub(crate) enum CmpKind {
     Date,
     DateTime,
     Time,
+    /// MySQL's comparison of JSON values (an operand of a JSON type).
+    Json,
 }
 
 /// A value converted into its comparison type.
@@ -87,6 +89,13 @@ pub(crate) enum Key {
     Int(IntVal),
     Dec(Dec),
     Real(f64),
+    Json(crate::func::json::J),
+}
+
+/// Whether MySQL compares operands of these types as JSON values: one of
+/// them is a JSON value. (MariaDB's JSON is text.)
+fn json_compare(types: &[&ExprType], env: Env<'_>) -> bool {
+    !env.maria() && types.iter().any(|t| t.json)
 }
 
 /// A comparison chosen at compile time.
@@ -188,6 +197,7 @@ impl Comparator {
             CmpKind::Date | CmpKind::DateTime | CmpKind::Time => {
                 temporal::cmp_key_strict(ctx, self.kind, v, self.strict_dates)?.map(Key::Dec)
             }
+            CmpKind::Json => crate::func::json::compared(v, ty).map(Key::Json),
         })
     }
 
@@ -256,6 +266,7 @@ impl Comparator {
             (Key::Int(x), Key::Int(y)) if self.bits && x.v == y.v => Some(Ordering::Equal),
             (Key::Int(x), Key::Int(y)) => Some(x.wide().cmp(&y.wide())),
             (Key::Dec(x), Key::Dec(y)) => Some(x.cmp(y)),
+            (Key::Json(x), Key::Json(y)) => Some(crate::func::json::mysql_cmp(x, y)),
             (Key::Real(x), Key::Real(y)) => match self.real_precision {
                 Some(p) if x == y || (x - y).abs() < p => Some(Ordering::Equal),
                 _ => x.partial_cmp(y),
@@ -475,6 +486,9 @@ fn loose_int_literal(col: &Node, k: &Node, v: &Value, env: Env<'_>) -> Option<No
 /// The comparator of a two-operand comparison (`=` and its kin,
 /// `NULLIF`).
 pub(crate) fn comparator2(a: &Node, b: &Node, op: &str, env: Env<'_>) -> Result<Comparator> {
+    if json_compare(&[&a.ty, &b.ty], env) {
+        return Ok(Comparator::of(CmpKind::Json));
+    }
     let all_str = [a, b]
         .iter()
         .all(|n| matches!(n.ty.kind, Kind::Str | Kind::Null));
@@ -519,6 +533,9 @@ pub(crate) fn comparator_n(
     null_is_string: bool,
     env: Env<'_>,
 ) -> Result<Comparator> {
+    if json_compare(types, env) {
+        return Ok(Comparator::of(CmpKind::Json));
+    }
     let all_str = types
         .iter()
         .all(|t| matches!(t.kind, Kind::Str | Kind::Null));
@@ -743,9 +760,17 @@ pub(crate) fn pairwise(
     } else {
         None
     };
+    let mysql_json = !env.maria();
     Ok(items
         .iter()
         .map(|n| {
+            if mysql_json && (a.ty.json || n.ty.json) {
+                return Comparator {
+                    rounds,
+                    bits,
+                    ..Comparator::of(CmpKind::Json)
+                };
+            }
             let s = pair(
                 effective_side(&a.ty, all_str),
                 effective_side(&n.ty, all_str),

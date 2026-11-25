@@ -8,7 +8,9 @@
 //!                global ID blocks (one allocator per root tenant
 //!                in this gateway); created at first use above every
 //!                tenant's MAX(id) and AUTO_INCREMENT in the root's subtree
-//! inherit_refs   t<root>_sprig.inherit_refs (created at first use)
+//! inherit_refs   the root's catalog records (m/inherit/refs), or
+//!                t<root>_sprig.inherit_refs (created at first use) for a
+//!                root whose catalog schema is on MariaDB
 //! adopt          before a tenant statement: for each tenant on the
 //!                session's line, top first, what sprig_inherit::adopt::
 //!                wanted says is missing is created or added, as the
@@ -77,19 +79,23 @@ fn bytes_of(v: mysql_async::Value) -> Option<Vec<u8>> {
 /// Runs `sql` as the provisioning account on tenant `t`'s cluster: a
 /// dropped share's clean-up of `t`'s rows, link checks locking them. For
 /// a tenant on Sprig 2PC's relay path, through the relay writer, since
-/// `t`'s own transactions write the same rows.
+/// `t`'s own transactions write the same rows. On a tenant whose
+/// databases are all the engine's, in process instead ([`engine_ctl`]).
 ///
 /// # Errors
 /// The backend's (server errors keep their number).
-pub(crate) async fn ctl_query(svc: &TenantServices, t: TenantId, sql: &str) -> Result<RawRows> {
-    let cluster = svc.locator.cluster(t).await?;
-    let pool = svc.locator.tenant_ctl_pool(t, &cluster).await?;
-    let mut conn = pool.get_conn().await.map_err(server_err)?;
-    let rows: Vec<mysql_async::Row> = conn.query(sql).await.map_err(server_err)?;
-    Ok(rows
-        .into_iter()
-        .map(|r| r.unwrap().into_iter().map(bytes_of).collect())
-        .collect())
+pub(crate) async fn ctl_query(
+    svc: &TenantServices,
+    t: TenantId,
+    sql: &str,
+    lctn: bool,
+) -> Result<RawRows> {
+    // A tenant whose databases are all the engine's has no MariaDB to ask.
+    let cat = svc.cache.get(t, Freshness::Latest).await?;
+    if all_engine(&cat) {
+        return engine_ctl(&cat, sql, lctn).await;
+    }
+    maria_query(svc, t, sql).await
 }
 
 fn refs_ready() -> &'static Mutex<HashSet<u64>> {
@@ -97,29 +103,49 @@ fn refs_ready() -> &'static Mutex<HashSet<u64>> {
     R.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
-/// Runs `sql` on `inherit_refs` in tenant `root`'s catalog, creating the
-/// table when this gateway hasn't seen it yet.
+/// Runs `op` on tree root `root`'s reference index: its catalog records
+/// when its catalog is records only (no catalog schema on MariaDB), else
+/// the `inherit_refs` table of its catalog schema, created when this
+/// gateway hasn't seen it yet.
 ///
 /// # Errors
 /// The catalog's.
-pub(crate) async fn refs(svc: &TenantServices, root: TenantId, sql: &str) -> Result<RawRows> {
-    let table = format!(
-        "{}.`inherit_refs`",
-        q(&SchemaName::catalog(root).to_string())
-    );
+pub(crate) async fn refs(
+    svc: &TenantServices,
+    root: TenantId,
+    op: &sprig_inherit::refs::RefsOp<'_>,
+) -> Result<RawRows> {
+    let schema = SchemaName::catalog(root).to_string();
+    if sprig_catalog::migrate::records_catalog(&schema).await? {
+        let mut tx = svc.records.begin(root).await?;
+        let rows = match sprig_inherit::refs::run(&mut *tx, op).await {
+            Ok(rows) => rows,
+            Err(e) => {
+                let _ = tx.rollback().await;
+                return Err(e);
+            }
+        };
+        if op.reads() {
+            let _ = tx.rollback().await;
+        } else {
+            tx.commit().await?;
+        }
+        return Ok(rows);
+    }
+    let table = format!("{}.`inherit_refs`", q(&schema));
     let ready = refs_ready()
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .contains(&root.0);
     if !ready {
-        ctl_query(
+        maria_query(
             svc,
             root,
             &sprig_inherit::links::DDL_REFS.replace("{refs}", &table),
         )
         .await?;
         // Tables made before handovers lack the index by referencing row.
-        ctl_query(
+        maria_query(
             svc,
             root,
             &sprig_inherit::links::DDL_REFS_BY_FROM.replace("{refs}", &table),
@@ -130,7 +156,408 @@ pub(crate) async fn refs(svc: &TenantServices, root: TenantId, sql: &str) -> Res
             .unwrap_or_else(PoisonError::into_inner)
             .insert(root.0);
     }
-    ctl_query(svc, root, &sql.replace("{refs}", &table)).await
+    maria_query(svc, root, &op.sql().replace("{refs}", &table)).await
+}
+
+/// The record-hierarchy lock of `object` (physical schema `schema`) on a
+/// tenant whose databases are all the engine's: an engine transaction of
+/// its own holding the exclusive lock of the catalog-records key
+/// `lk/inherit/hier/<schema>/<object>/` of tenant `t` (no record is
+/// written there), waiting at most `wait`. The caller keeps the
+/// transaction until the session's transaction ends; dropping it releases
+/// the lock. As the MariaDB lock row, it serializes structural changes of
+/// one hierarchy whatever the user's grants.
+///
+/// # Errors
+/// 1205 after `wait` (another structural change of the hierarchy holds
+/// it); 1213 for a deadlock; 39070 when the engine isn't available.
+pub(crate) async fn engine_hier_lock(
+    t: TenantId,
+    schema: &str,
+    object: u64,
+    wait: std::time::Duration,
+) -> Result<sprig_engine::txn::Txn> {
+    use sprig_engine::txn::{LockMode, LockRequest, TxnOptions, Wait};
+    let eng = crate::node_engine::engine()?;
+    let mut txn = eng.begin(TxnOptions {
+        lock_wait_timeout: Some(wait),
+        ..TxnOptions::default()
+    })?;
+    let mut key = Vec::with_capacity(64);
+    sprig_engine::keys::KeyPrefix {
+        tenant: t.0,
+        shard: 0,
+        object: 0,
+        kind: sprig_engine::keys::kind::META,
+        index: 0,
+    }
+    .encode_into(&mut key);
+    key.extend_from_slice(format!("lk/inherit/hier/{schema}/{object}/").as_bytes());
+    let req = LockRequest {
+        mode: LockMode::Exclusive,
+        wait: Wait::Block,
+        check_snapshot: false,
+    };
+    match txn.lock(&bytes::Bytes::from(key), req).await {
+        Ok(_) => Ok(txn),
+        Err(e)
+            if matches!(
+                e.kind,
+                sprig_common::ErrorKind::Standard { errno: 1205, .. }
+                    | sprig_common::ErrorKind::Backend { errno: 1205, .. }
+            ) =>
+        {
+            Err(SprigError::standard(
+                1205,
+                *b"HY000",
+                "Lock wait timeout exceeded; another structural change of this record \
+             hierarchy is running: try restarting transaction",
+            ))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Runs `sql` as the provisioning account on tenant `t`'s cluster.
+async fn maria_query(svc: &TenantServices, t: TenantId, sql: &str) -> Result<RawRows> {
+    let cluster = svc.locator.cluster(t).await?;
+    let pool = svc.locator.tenant_ctl_pool(t, &cluster).await?;
+    let mut conn = pool.get_conn().await.map_err(server_err)?;
+    let rows: Vec<mysql_async::Row> = conn.query(sql).await.map_err(server_err)?;
+    Ok(rows
+        .into_iter()
+        .map(|r| r.unwrap().into_iter().map(bytes_of).collect())
+        .collect())
+}
+
+/// Whether every database of `cat`'s tenant is the engine's (a tenant
+/// with no database yet counts: each new database is the engine's).
+pub(crate) fn all_engine(cat: &TenantCatalog) -> bool {
+    let engine = crate::engine::catalog::of(cat);
+    cat.databases
+        .iter()
+        .all(|d| engine.is_some_and(|e| e.dbs.contains(&d.db_id)))
+}
+
+/// A trailing locking clause of `sql`, cut off.
+fn strip_lock(sql: &str) -> (&str, Option<crate::engine::plan::RowLock>) {
+    use sprig_engine::txn::Wait;
+    let s = sql.trim_end().trim_end_matches(';').trim_end();
+    let up = s.to_ascii_uppercase();
+    for (suffix, exclusive, wait) in [
+        (" LOCK IN SHARE MODE NOWAIT", false, Wait::NoWait),
+        (" FOR SHARE NOWAIT", false, Wait::NoWait),
+        (" FOR UPDATE NOWAIT", true, Wait::NoWait),
+        (" LOCK IN SHARE MODE", false, Wait::Block),
+        (" FOR SHARE", false, Wait::Block),
+        (" FOR UPDATE", true, Wait::Block),
+    ] {
+        if up.ends_with(suffix) {
+            return (
+                &s[..s.len() - suffix.len()],
+                Some(crate::engine::plan::RowLock { exclusive, wait }),
+            );
+        }
+    }
+    (s, None)
+}
+
+/// [`ctl_query`] on a tenant whose databases are all the engine's: the
+/// statement (physical names, as the inheritance layer writes them) runs
+/// in process on the tenant's catalog snapshot `cat`, in a transaction of
+/// its own, as the system (no privileges checked): a `SELECT` through the
+/// general planner (its rows as text, a trailing locking clause kept, so a
+/// `NOWAIT` read of a row another transaction holds fails with 1205), an
+/// `INSERT` (the copy pass's upserts), `UPDATE` or `DELETE` of one table
+/// through the single-table executor.
+/// What exists only on MariaDB answers nothing: share views and their
+/// definer's grants (`DROP VIEW`, `REVOKE`), copies (`DROP TABLE`, their
+/// `information_schema` lookups) and the catalog schema's tables.
+#[allow(clippy::too_many_lines)] // the statement kinds, in order
+async fn engine_ctl(cat: &TenantCatalog, sql: &str, lctn: bool) -> Result<RawRows> {
+    use sprig_engine::txn::TxnOptions;
+    use sqlparser::ast::Statement;
+
+    use crate::engine::assign::Env;
+    use crate::engine::general::{self, RunArgs, Seed};
+    use crate::engine::meta::{Results, ResultsCs};
+    use crate::engine::plan::{BindCtx, CatalogNames};
+
+    enum Bound {
+        Read(Box<general::General>),
+        Write(Box<crate::engine::plan::Plan>),
+    }
+
+    let s = sql.trim();
+    let lower = s.to_ascii_lowercase();
+    let mut words = lower.split_whitespace();
+    let head = (words.next().unwrap_or(""), words.next().unwrap_or(""));
+    if matches!(
+        head,
+        ("drop", "view" | "table") | ("revoke" | "grant" | "create", _)
+    ) || lower.contains("information_schema.")
+        || lower.contains("_sprig`.")
+    {
+        return Ok(Vec::new());
+    }
+    let (text, lock) = strip_lock(s);
+    // A layer row's state is an `ENUM`, which the planner reads as its
+    // member's text only as a plain result column.
+    let text = text.replace("CAST(`_sprig_state` AS CHAR)", "`_sprig_state`");
+    let mut stmts = sqlparser::parser::Parser::parse_sql(&sprig_plan::dialect::SprigMySql, &text)
+        .map_err(|e| {
+        SprigError::internal(format!(
+            "engine: an inheritance statement doesn't parse: {e}"
+        ))
+    })?;
+    let (Some(stmt), true) = (stmts.pop(), stmts.is_empty()) else {
+        return Err(SprigError::internal(
+            "engine: an inheritance statement isn't one statement",
+        ));
+    };
+    let eng = crate::engine::engine()?;
+    let Some(ecat) = crate::engine::catalog::of(cat) else {
+        // No engine database at all: nothing to read or change.
+        return Ok(Vec::new());
+    };
+    // Bound before any wait: the names aren't `Send`.
+    let bound = {
+        let names = CatalogNames {
+            cat,
+            eng: ecat,
+            lower_case: lctn,
+        };
+        let cx = BindCtx {
+            tenant: cat.tenant,
+            names: &names,
+            current: None,
+            backslash: true,
+        };
+        match &stmt {
+            Statement::Query(_) => {
+                general::bind(&cx, &stmt, Some(&text), lock)?.map(|g| Bound::Read(Box::new(g)))
+            }
+            Statement::Update { .. } | Statement::Delete(_) | Statement::Insert(_) => {
+                Some(Bound::Write(Box::new(
+                    crate::engine::plan::bind(&cx, &stmt)?.ok_or_else(|| {
+                        crate::engine::not_on_engine(
+                            "an inheritance write outside the engine's tables",
+                        )
+                    })?,
+                )))
+            }
+            _ => {
+                return Err(crate::engine::not_on_engine(
+                    "an inheritance statement other than SELECT, INSERT, UPDATE or DELETE",
+                ));
+            }
+        }
+    };
+    match bound {
+        None => Ok(Vec::new()),
+        Some(Bound::Read(g)) => {
+            let seed = Seed::from_vars(false, &Env::STRICT, |_| None);
+            let a = RunArgs {
+                tenant: cat.tenant.0,
+                params: &[],
+                seed: &seed,
+                deadline: None,
+                stop: None,
+            };
+            let ran = eng
+                .general_run(&g, &a, TxnOptions::default(), Env::STRICT)
+                .await?;
+            let results = Results {
+                cs: Some(ResultsCs { id: 224, mbmax: 4 }),
+                mysql: false,
+            };
+            let layout = general::results::layout(&g, &ran.columns, results);
+            Ok(ran
+                .rows
+                .iter()
+                .map(|r| {
+                    r.iter()
+                        .zip(&layout.shapes)
+                        .map(|(v, shape)| {
+                            general::results::text(&g, shape, v, &Env::STRICT, results)
+                                .map(|b| b.to_vec())
+                        })
+                        .collect()
+                })
+                .collect())
+        }
+        Some(Bound::Write(plan)) => {
+            eng.run_env(
+                cat.tenant.0,
+                &plan,
+                &[],
+                false,
+                TxnOptions::default(),
+                Env::STRICT,
+            )
+            .await?;
+            Ok(Vec::new())
+        }
+    }
+}
+
+/// Runs one DDL statement as the system on tenant `t`, whose databases
+/// are all the engine's (the copy pass's copy tables): staged by the DDL
+/// engine with the engine's hook, nothing on MariaDB, then published on
+/// its own and applied by the engine. `sql` names physical schemas,
+/// `logical` the logical database `db`.
+///
+/// # Errors
+/// The DDL engine's and the engine's.
+pub(crate) async fn engine_ddl(
+    svc: &Arc<TenantServices>,
+    t: TenantId,
+    db: &str,
+    statement: DdlStatement,
+    sql: &str,
+    logical: &str,
+    lctn: bool,
+) -> Result<()> {
+    let mut hooks = Vec::new();
+    let staged = match stage(svc, t, statement, sql, logical, lctn, db, &mut hooks).await {
+        Ok(Stage::Staged(s)) => *s,
+        Ok(Stage::Done(_)) => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let none = Records {
+        inherit: InheritChange::default(),
+        types: TypesChange::default(),
+    };
+    let r = svc.ddl.publish(t, vec![staged], &none).await;
+    let fresh = match &r {
+        Ok(v) => svc
+            .cache
+            .get(t, Freshness::Cached { min_version: *v })
+            .await
+            .ok(),
+        Err(_) => None,
+    };
+    for h in hooks {
+        let outcome = match (&fresh, &r) {
+            (Some(c), _) => crate::engine::ddlexec::Outcome::Published(c),
+            (None, Err(_)) => crate::engine::ddlexec::Outcome::Failed,
+            (None, Ok(_)) => crate::engine::ddlexec::Outcome::Unknown,
+        };
+        let _ = h.done(outcome).await;
+    }
+    r.map(|_| ())
+}
+
+/// The states of a tenant's copies on engine databases: unversioned rows
+/// of its catalog records (as the reference index's), one per copy.
+///
+/// ```text
+/// m/inherit/copies/<object u64><share key u64>
+///     {"serving", "object_version", "share_version", "epoch", "seeded_ms", "caught_up_ms", "source_tenant"}
+/// ```
+pub(crate) const COPIES: sprig_catalog::records::RowTable =
+    sprig_catalog::records::RowTable::new("inherit", "copies");
+
+/// A copy's state row in the records ([`COPIES`]).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct CopyRow {
+    pub serving: bool,
+    pub object_version: u64,
+    pub share_version: u64,
+    pub epoch: u64,
+    pub seeded_ms: u64,
+    pub caught_up_ms: u64,
+    pub source_tenant: u64,
+}
+
+fn copy_pk(object: ObjectId, share: u64) -> sprig_catalog::records::Pk {
+    sprig_catalog::records::Pk::new().u64(object.0).u64(share)
+}
+
+/// Tenant `t`'s copy states on engine databases (none when it has none).
+///
+/// # Errors
+/// The records'.
+pub(crate) async fn engine_copy_states(
+    svc: &TenantServices,
+    t: TenantId,
+) -> Result<Vec<(sprig_inherit::copy::CopyKey, CopyRow)>> {
+    let mut tx = svc.records.begin(t).await?;
+    let rows = COPIES
+        .scan::<CopyRow>(&mut *tx, &sprig_catalog::records::Pk::new())
+        .await;
+    let _ = tx.rollback().await;
+    Ok(rows?
+        .into_iter()
+        .filter_map(|(pk, row)| {
+            let b = pk.0.get(..16)?;
+            let object = u64::from_be_bytes(b[..8].try_into().ok()?);
+            let share = u64::from_be_bytes(b[8..16].try_into().ok()?);
+            Some((
+                sprig_inherit::copy::CopyKey {
+                    tenant: t,
+                    object: ObjectId(object),
+                    share,
+                },
+                row,
+            ))
+        })
+        .collect())
+}
+
+/// [`engine_copy_states`] as the read path's [`CopyStates`]: a serving copy
+/// is its subscribers' source from the start (no change streams of copies
+/// on engine databases).
+///
+/// [`CopyStates`]: sprig_inherit::copy::CopyStates
+pub(crate) fn copy_infos(
+    rows: Vec<(sprig_inherit::copy::CopyKey, CopyRow)>,
+) -> sprig_inherit::copy::CopyStates {
+    sprig_inherit::copy::CopyStates(
+        rows.into_iter()
+            .map(|(k, r)| {
+                (
+                    k,
+                    sprig_inherit::copy::CopyInfo {
+                        serving: r.serving,
+                        object_version: r.object_version,
+                        share_version: r.share_version,
+                        caught_up_ms: r.caught_up_ms,
+                        seeded_ms: r.seeded_ms,
+                        handover: if r.serving {
+                            sprig_inherit::handover::Handover::Always
+                        } else {
+                            sprig_inherit::handover::Handover::Pending
+                        },
+                    },
+                )
+            })
+            .collect(),
+    )
+}
+
+/// Writes (`Some`) or removes (`None`) copy `k`'s state row.
+///
+/// # Errors
+/// The records'.
+pub(crate) async fn set_engine_copy_state(
+    svc: &TenantServices,
+    k: sprig_inherit::copy::CopyKey,
+    row: Option<&CopyRow>,
+) -> Result<()> {
+    let mut tx = svc.records.begin(k.tenant).await?;
+    let pk = copy_pk(k.object, k.share);
+    let r = match row {
+        Some(row) => COPIES.put(&mut *tx, &pk, row).await,
+        None => COPIES.delete(&mut *tx, &pk).await,
+    };
+    match r {
+        Ok(()) => tx.commit().await,
+        Err(e) => {
+            let _ = tx.rollback().await;
+            Err(e)
+        }
+    }
 }
 
 /// Every active tenant of the directory, by id.
@@ -287,10 +714,18 @@ async fn first_value(svc: &TenantServices, seq: &TreeSeq, lctn: bool) -> Result<
     let mut next: i128 = 1;
     let mut holders: HashMap<String, usize> = HashMap::new();
     for tt in tree_tables(svc, seq.root, &seq.db, &seq.table, lctn).await? {
-        let rows = ctl_query(
-            svc,
-            tt.tenant,
-            &format!(
+        // An engine table has no `information_schema` counter to read:
+        // above its largest value.
+        let engine = all_engine(&*svc.cache.get(tt.tenant, Freshness::Latest).await?);
+        let sql = if engine {
+            format!(
+                "SELECT CAST(COALESCE(MAX({col}), 0) + 1 AS CHAR) FROM {s}.{t}",
+                col = q(&seq.column),
+                s = q(&tt.schema),
+                t = q(&seq.table),
+            )
+        } else {
+            format!(
                 "SELECT CAST(GREATEST(COALESCE((SELECT MAX({col}) FROM {s}.{t}), 0) + 1, \
                  COALESCE((SELECT AUTO_INCREMENT FROM information_schema.TABLES WHERE \
                  TABLE_SCHEMA = '{sn}' AND TABLE_NAME = '{tn}'), 1)) AS CHAR)",
@@ -299,9 +734,9 @@ async fn first_value(svc: &TenantServices, seq: &TreeSeq, lctn: bool) -> Result<
                 t = q(&seq.table),
                 sn = tt.schema.replace('\'', "''"),
                 tn = seq.table.replace('\'', "''"),
-            ),
-        )
-        .await?;
+            )
+        };
+        let rows = ctl_query(svc, tt.tenant, &sql, lctn).await?;
         let v: i128 = rows
             .first()
             .and_then(|r| r.first().cloned().flatten())
@@ -318,6 +753,7 @@ async fn first_value(svc: &TenantServices, seq: &TreeSeq, lctn: bool) -> Result<
                 s = q(&tt.schema),
                 t = q(&seq.table),
             ),
+            lctn,
         )
         .await
         .unwrap_or_default();
@@ -428,19 +864,86 @@ fn synced() -> &'static Mutex<HashMap<u64, (u64, u64)>> {
     S.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// The executor of a statement whose physical side is the engine's alone
+/// (an engine tenant's adoption): a database exists only in the catalog,
+/// tables are the engine hook's ([`crate::engine::ddlexec::Hook`]), and
+/// nothing runs on MariaDB.
+#[derive(Default)]
+pub(crate) struct NoMaria {
+    databases: Mutex<HashMap<SchemaName, sprig_catalog::ddl::SchemaInfo>>,
+}
+
+#[async_trait::async_trait]
+impl sprig_catalog::ddl::DdlExecutor for NoMaria {
+    async fn execute(&self, stmt: &sprig_catalog::ddl::PhysicalDdl) -> Result<()> {
+        use sprig_catalog::ddl::Effect;
+        if matches!(stmt.effect, Effect::CreateSchema | Effect::AlterSchema) {
+            let info = crate::tenant::ddl::database_charset(&stmt.sql)?;
+            self.databases
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(stmt.schema, info);
+            return Ok(());
+        }
+        // Nor the decision table of transactions on MariaDB a new database
+        // gets (no transaction of an engine database uses it).
+        if matches!(&stmt.effect, Effect::Create { kind: ObjectKind::Table, name }
+            if name == sprig_catalog::ddl::DTX_TABLE)
+        {
+            return Ok(());
+        }
+        Err(SprigError::internal(
+            "inheritance: this statement has no physical side outside the engine",
+        ))
+    }
+    async fn schema(&self, schema: &SchemaName) -> Result<Option<sprig_catalog::ddl::SchemaInfo>> {
+        Ok(self
+            .databases
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(schema)
+            .cloned())
+    }
+    async fn show_create(
+        &self,
+        _schema: &SchemaName,
+        _kind: ObjectKind,
+        _name: &str,
+    ) -> Result<Option<String>> {
+        Ok(None)
+    }
+    async fn objects(
+        &self,
+        _schema: &SchemaName,
+    ) -> Result<Vec<sprig_catalog::ddl::PhysicalObject>> {
+        Ok(Vec::new())
+    }
+    async fn tenant_schemas(&self, _tenant: TenantId) -> Result<Vec<SchemaName>> {
+        Ok(Vec::new())
+    }
+}
+
 /// Runs phases 1 and 2 of one adoption statement on tenant `t`: the
 /// physical change is made, and its catalog change waits for the
 /// adoption's one publish.
+///
+/// On a tenant with engine databases the engine takes part (its tables
+/// are the engine's: nothing of them runs on MariaDB): the statement's
+/// engine state is kept in `hooks` until the adoption's publish.
+#[allow(clippy::too_many_arguments)] // the statement's parts and the hooks kept
 async fn stage(
-    svc: &TenantServices,
+    svc: &Arc<TenantServices>,
     t: TenantId,
     statement: DdlStatement,
     sql: &str,
     logical: &str,
     lctn: bool,
+    db: &str,
+    hooks: &mut Vec<crate::engine::ddlexec::Hook>,
 ) -> Result<Stage> {
     let cluster = svc.locator.cluster(t).await?;
     let pool = svc.locator.ctl_pool(&cluster).await?;
+    let creates = matches!(statement, DdlStatement::CreateObject { .. });
     let req = DdlRequest {
         tenant: t,
         statement,
@@ -451,7 +954,40 @@ async fn stage(
         lower_case_table_names: lctn,
         wait: None,
     };
-    svc.ddl.stage(&req, &MariaExecutor::new(pool)).await
+    let maria = MariaExecutor::new(pool);
+    let cat = svc.cache.get(t, Freshness::Latest).await?;
+    if crate::engine::catalog::of(&cat).is_some()
+        && let Ok(eng) = crate::engine::engine()
+    {
+        let none = NoMaria::default();
+        let hook = crate::engine::ddlexec::Hook::new(
+            eng,
+            t,
+            Arc::clone(&cat),
+            lctn,
+            crate::engine::ddl::Session {
+                env: crate::engine::assign::Env::STRICT,
+                wait: std::time::Duration::from_secs(30),
+                db: db.to_owned(),
+                conn: 0,
+                account: ("sprig_inherit".into(), "localhost".into()),
+            },
+            creates,
+        )
+        .with_services(Arc::clone(svc));
+        let r = svc.ddl.stage(&req, &hook.over(&none)).await;
+        match &r {
+            Ok(Stage::Staged(_)) => hooks.push(hook),
+            Ok(Stage::Done(_)) => {
+                let _ = hook.done(crate::engine::ddlexec::Outcome::Unknown).await;
+            }
+            Err(_) => {
+                let _ = hook.done(crate::engine::ddlexec::Outcome::Failed).await;
+            }
+        }
+        return r;
+    }
+    svc.ddl.stage(&req, &maria).await
 }
 
 async fn show_create(
@@ -460,10 +996,19 @@ async fn show_create(
     schema: &str,
     table: &str,
 ) -> Result<String> {
+    // An engine table: the engine's own text (no MariaDB holds it).
+    if let Ok(sn) = schema.parse::<SchemaName>()
+        && let Some(db) = sn.db()
+        && let Ok(cat) = svc.cache.get(t, Freshness::Latest).await
+        && let Some(text) = crate::engine::show::stored_create(&cat, db, table)
+    {
+        return Ok(text);
+    }
     let rows = ctl_query(
         svc,
         t,
         &format!("SHOW CREATE TABLE {}.{}", q(schema), q(table)),
+        false,
     )
     .await?;
     rows.first()
@@ -531,12 +1076,46 @@ fn table_key(db: &str, table: &str) -> (String, String) {
 /// parent columns). The physical statements run first, each staged by
 /// the DDL engine; the records are then worked out from the newest
 /// snapshot and published with them. The version when anything changed.
-#[allow(clippy::too_many_lines, clippy::many_single_char_names)] // the steps in order
 async fn sync_one(
     svc: &Arc<TenantServices>,
     parent: &TenantCatalog,
     child: &Arc<TenantCatalog>,
     lctn: bool,
+) -> Result<Option<u64>> {
+    let mut hooks = Vec::new();
+    let r = sync_staged(svc, parent, child, lctn, &mut hooks).await;
+    if hooks.is_empty() {
+        return r;
+    }
+    // The engine applies what was published, or gives it up.
+    let fresh = match &r {
+        Ok(Some(v)) => svc
+            .cache
+            .get(child.tenant, Freshness::Cached { min_version: *v })
+            .await
+            .ok(),
+        _ => None,
+    };
+    for h in hooks {
+        let outcome = match (&fresh, &r) {
+            (Some(c), _) => crate::engine::ddlexec::Outcome::Published(c),
+            (None, Err(_)) => crate::engine::ddlexec::Outcome::Failed,
+            (None, Ok(_)) => crate::engine::ddlexec::Outcome::Unknown,
+        };
+        let _ = h.done(outcome).await;
+    }
+    r
+}
+
+/// [`sync_one`]'s steps; `hooks`: the engine's part of each staged
+/// statement, for its outcome.
+#[allow(clippy::too_many_lines, clippy::many_single_char_names)] // the steps in order
+async fn sync_staged(
+    svc: &Arc<TenantServices>,
+    parent: &TenantCatalog,
+    child: &Arc<TenantCatalog>,
+    lctn: bool,
+    hooks: &mut Vec<crate::engine::ddlexec::Hook>,
 ) -> Result<Option<u64>> {
     let t = child.tenant;
     let wants = sprig_inherit::adopt::wanted(parent, child, lctn);
@@ -567,6 +1146,16 @@ async fn sync_one(
             name: w.table.clone(),
         };
         if w.child.is_none() {
+            // A database whose creation stopped half-way (left `creating`
+            // in the catalog, which only a cluster's reconciler clears)
+            // can't take the table: the table waits, and the child's
+            // sessions go on.
+            if let Some(d) = child.database(&sprig_catalog::ddl::database_key(&w.db, lctn))
+                && d.state != sprig_catalog::store::DbState::Active
+            {
+                tracing::warn!(tenant = %t, db = %w.db, table = %w.table, state = ?d.state, "inherited table not created: the child's database isn't active");
+                continue;
+            }
             // A database alone changes nothing anyone reads: it is
             // published on its own.
             let cat = crate::inherited::ensure_database(svc, t, &w.db).await?;
@@ -584,7 +1173,7 @@ async fn sync_one(
                 or_replace: false,
                 parent: None,
             };
-            match stage(svc, t, st, &sql, &logical, lctn).await? {
+            match stage(svc, t, st, &sql, &logical, lctn, &w.db, hooks).await? {
                 Stage::Staged(s) => {
                     if let Some(id) = s.objects().first() {
                         made.insert(table_key(&w.db, &w.table), *id);
@@ -632,7 +1221,7 @@ async fn sync_one(
             if_exists: false,
             rename_to: None,
         };
-        match stage(svc, t, st, &sql, &logical, lctn).await? {
+        match stage(svc, t, st, &sql, &logical, lctn, &w.db, hooks).await? {
             Stage::Staged(s) => staged.push(*s),
             Stage::Done(o) => seen = seen.max(o.seen.or(o.version).unwrap_or(0)),
         }
@@ -911,4 +1500,24 @@ pub(crate) async fn adopt(
     }
     let last = Arc::clone(&line[line.len() - 1]);
     Ok((changed || last.version != cat.version).then_some(last))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_lock;
+
+    #[test]
+    fn a_trailing_locking_clause_is_cut_off() {
+        let (s, l) = strip_lock("SELECT 1 FROM t WHERE a = 1 LIMIT 1 LOCK IN SHARE MODE NOWAIT");
+        assert_eq!(s, "SELECT 1 FROM t WHERE a = 1 LIMIT 1");
+        let l = l.expect("a lock");
+        assert!(!l.exclusive);
+        assert_eq!(l.wait, sprig_engine::txn::Wait::NoWait);
+        let (s, l) = strip_lock("SELECT a FROM t for update;");
+        assert_eq!(s, "SELECT a FROM t");
+        assert!(l.is_some_and(|l| l.exclusive && l.wait == sprig_engine::txn::Wait::Block));
+        let (s, l) = strip_lock("SELECT 'FOR UPDATE x' FROM t");
+        assert_eq!(s, "SELECT 'FOR UPDATE x' FROM t");
+        assert!(l.is_none());
+    }
 }

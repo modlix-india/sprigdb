@@ -666,6 +666,129 @@ fn key_pred(key: &[String], keys: &[KeyLit], alias: &str) -> String {
     )
 }
 
+/// The statement reading copy `e`'s source rows for `keys` (all when
+/// `None`), as the child's columns: the source tenant's merged view of the
+/// source space (up to its nearest serving copy, by `copies`), filtered
+/// by the share and cut to its columns. A share view on the source's
+/// chain must exist (MariaDB) or be known to the engine
+/// ([`crate::upstream::engine_lineage`]) when it runs.
+///
+/// # Errors
+/// 39880, 39892; a source object that is gone.
+pub fn source_select(
+    family: &Family,
+    copies: &CopyStates,
+    e: &CopyEdge,
+    keys: Option<&[KeyLit]>,
+) -> Result<String> {
+    let ctx = family
+        .ctx(e.source_tenant, copies)
+        .ok_or_else(|| SprigError::internal("a source outside the family"))?;
+    let cat = ctx.cat;
+    let src = ctx
+        .state
+        .objects()
+        .find(|o| {
+            o.table.eq_ignore_ascii_case(&e.table)
+                && cat
+                    .databases
+                    .get(o.db)
+                    .is_some_and(|d| d.name.eq_ignore_ascii_case(&e.db_name))
+        })
+        .cloned()
+        .ok_or_else(|| SprigError::internal("the source object is gone"))?;
+    let schema = physical_schema(cat, &e.db_name, false)?;
+    let prefix = format!("{}.", q(&schema));
+    let chain = ctx.chain(&src, e.source_space, &prefix)?;
+    let view = ViewSql {
+        o: &src,
+        layer: format!("{prefix}{}", q(&src.table)),
+        keys: keys.map(|ks| ks.iter().map(KeyLit::tuple).collect()),
+        origin: false,
+        derived: Vec::new(),
+    }
+    .view(&chain);
+    let cols: Vec<String> = e
+        .columns
+        .iter()
+        .map(|(c, shared)| {
+            if *shared && src.column(c).is_some() {
+                format!("`__sprig_v`.{}", q(c))
+            } else {
+                format!("NULL AS {}", q(c))
+            }
+        })
+        .collect();
+    Ok(format!(
+        "SELECT {} FROM ({view}) AS `__sprig_v` WHERE {}",
+        cols.join(", "),
+        e.filter
+            .as_deref()
+            .map_or_else(|| "TRUE".to_owned(), |f| format!("({f})"))
+    ))
+}
+
+/// The upsert of `rows` (each the child's columns as SQL literals) into
+/// copy `e` (`table`, qualified), live, stamped `v`: a row whose stamp is
+/// higher keeps its values (the guard).
+#[must_use]
+pub fn upsert_sql(e: &CopyEdge, table: &str, rows: &[Vec<String>], v: u64) -> String {
+    let names: Vec<String> = e.columns.iter().map(|(n, _)| q(n)).collect();
+    let sets: Vec<String> = e
+        .columns
+        .iter()
+        .filter(|(n, _)| !e.child_key.iter().any(|k| k.eq_ignore_ascii_case(n)))
+        .map(|(n, _)| {
+            format!(
+                "{c} = IF(VALUES(`_sprig_src_v`) >= `_sprig_src_v`, VALUES({c}), {c})",
+                c = q(n)
+            )
+        })
+        .collect();
+    let mut sql = format!(
+        "INSERT INTO {table} ({}, `_sprig_share`, `_sprig_live`, `_sprig_src_v`) VALUES ",
+        names.join(", ")
+    );
+    for (i, r) in rows.iter().enumerate() {
+        if i > 0 {
+            sql.push_str(", ");
+        }
+        let _ = write!(sql, "({}, {}, TRUE, {v})", r.join(", "), e.key.share);
+    }
+    let _ = write!(
+        sql,
+        " ON DUPLICATE KEY UPDATE {}{}`_sprig_live` = IF(VALUES(`_sprig_src_v`) >= \
+         `_sprig_src_v`, TRUE, `_sprig_live`), `_sprig_src_v` = \
+         GREATEST(`_sprig_src_v`, VALUES(`_sprig_src_v`))",
+        sets.join(", "),
+        if sets.is_empty() { "" } else { ", " }
+    );
+    sql
+}
+
+/// The tombstones of `gone` in copy `e` (`table`, qualified), stamped `v`
+/// (guarded as [`upsert_sql`]).
+#[must_use]
+pub fn tombstone_sql(e: &CopyEdge, table: &str, gone: &[KeyLit], v: u64) -> String {
+    let keys: Vec<String> = e.child_key.iter().map(|k| q(k)).collect();
+    let mut sql = format!(
+        "INSERT INTO {table} ({}, `_sprig_share`, `_sprig_live`, `_sprig_src_v`) VALUES ",
+        keys.join(", ")
+    );
+    for (i, k) in gone.iter().enumerate() {
+        if i > 0 {
+            sql.push_str(", ");
+        }
+        let _ = write!(sql, "({}, {}, FALSE, {v})", k.0.join(", "), e.key.share);
+    }
+    sql.push_str(
+        " ON DUPLICATE KEY UPDATE `_sprig_live` = IF(VALUES(`_sprig_src_v`) >= `_sprig_src_v`, \
+         FALSE, `_sprig_live`), `_sprig_src_v` = GREATEST(`_sprig_src_v`, \
+         VALUES(`_sprig_src_v`))",
+    );
+    sql
+}
+
 /// What one maintainer did, for progress and tests.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Counts {
@@ -994,55 +1117,7 @@ impl Maintainer {
     async fn source_sql(&mut self, e: &CopyEdge, keys: Option<&[KeyLit]>) -> Result<String> {
         self.ensure_views(e.source_tenant, &e.db_name, &e.table)
             .await?;
-        let sql = {
-            let ctx = self
-                .family
-                .ctx(e.source_tenant, &self.copies)
-                .ok_or_else(|| SprigError::internal("a source outside the family"))?;
-            let cat = ctx.cat;
-            let src = ctx
-                .state
-                .objects()
-                .find(|o| {
-                    o.table.eq_ignore_ascii_case(&e.table)
-                        && cat
-                            .databases
-                            .get(o.db)
-                            .is_some_and(|d| d.name.eq_ignore_ascii_case(&e.db_name))
-                })
-                .cloned()
-                .ok_or_else(|| SprigError::internal("the source object is gone"))?;
-            let schema = physical_schema(cat, &e.db_name, false)?;
-            let prefix = format!("{}.", q(&schema));
-            let chain = ctx.chain(&src, e.source_space, &prefix)?;
-            let view = ViewSql {
-                o: &src,
-                layer: format!("{prefix}{}", q(&src.table)),
-                keys: keys.map(|ks| ks.iter().map(KeyLit::tuple).collect()),
-                origin: false,
-                derived: Vec::new(),
-            }
-            .view(&chain);
-            let cols: Vec<String> = e
-                .columns
-                .iter()
-                .map(|(c, shared)| {
-                    if *shared && src.column(c).is_some() {
-                        format!("`__sprig_v`.{}", q(c))
-                    } else {
-                        format!("NULL AS {}", q(c))
-                    }
-                })
-                .collect();
-            format!(
-                "SELECT {} FROM ({view}) AS `__sprig_v` WHERE {}",
-                cols.join(", "),
-                e.filter
-                    .as_deref()
-                    .map_or_else(|| "TRUE".to_owned(), |f| format!("({f})"))
-            )
-        };
-        Ok(sql)
+        source_select(&self.family, &self.copies, e, keys)
     }
 
     fn key_of(e: &CopyEdge, row: &[Value]) -> KeyLit {
@@ -1064,63 +1139,20 @@ impl Maintainer {
         let v = self.stamp();
         let mut c = self.env.conn(e.key.tenant).await?;
         let table = format!("{}.{}", q(&e.child_schema), q(&copy_table(e.key.object)));
-        let names: Vec<String> = e.columns.iter().map(|(n, _)| q(n)).collect();
-        let sets: Vec<String> = e
-            .columns
-            .iter()
-            .filter(|(n, _)| !e.child_key.iter().any(|k| k.eq_ignore_ascii_case(n)))
-            .map(|(n, _)| {
-                format!(
-                    "{c} = IF(VALUES(`_sprig_src_v`) >= `_sprig_src_v`, VALUES({c}), {c})",
-                    c = q(n)
-                )
-            })
-            .collect();
         for chunk in rows.chunks(500) {
-            let mut sql = format!(
-                "INSERT INTO {table} ({}, `_sprig_share`, `_sprig_live`, `_sprig_src_v`) VALUES ",
-                names.join(", ")
-            );
-            for (i, r) in chunk.iter().enumerate() {
-                if i > 0 {
-                    sql.push_str(", ");
-                }
-                let _ = write!(
-                    sql,
-                    "({}, {}, TRUE, {v})",
-                    r.iter().map(literal).collect::<Vec<_>>().join(", "),
-                    e.key.share
-                );
-            }
-            let _ = write!(
-                sql,
-                " ON DUPLICATE KEY UPDATE {}{}`_sprig_live` = IF(VALUES(`_sprig_src_v`) >= \
-                 `_sprig_src_v`, TRUE, `_sprig_live`), `_sprig_src_v` = \
-                 GREATEST(`_sprig_src_v`, VALUES(`_sprig_src_v`))",
-                sets.join(", "),
-                if sets.is_empty() { "" } else { ", " }
-            );
-            c.query_drop(sql).await.map_err(exec_err)?;
+            let lits: Vec<Vec<String>> = chunk
+                .iter()
+                .map(|r| r.iter().map(literal).collect())
+                .collect();
+            c.query_drop(upsert_sql(e, &table, &lits, v))
+                .await
+                .map_err(exec_err)?;
             self.counts.upserts += chunk.len() as u64;
         }
-        let keys: Vec<String> = e.child_key.iter().map(|k| q(k)).collect();
         for chunk in gone.chunks(500) {
-            let mut sql = format!(
-                "INSERT INTO {table} ({}, `_sprig_share`, `_sprig_live`, `_sprig_src_v`) VALUES ",
-                keys.join(", ")
-            );
-            for (i, k) in chunk.iter().enumerate() {
-                if i > 0 {
-                    sql.push_str(", ");
-                }
-                let _ = write!(sql, "({}, {}, FALSE, {v})", k.0.join(", "), e.key.share);
-            }
-            sql.push_str(
-                " ON DUPLICATE KEY UPDATE `_sprig_live` = IF(VALUES(`_sprig_src_v`) >= \
-                 `_sprig_src_v`, FALSE, `_sprig_live`), `_sprig_src_v` = \
-                 GREATEST(`_sprig_src_v`, VALUES(`_sprig_src_v`))",
-            );
-            c.query_drop(sql).await.map_err(exec_err)?;
+            c.query_drop(tombstone_sql(e, &table, chunk, v))
+                .await
+                .map_err(exec_err)?;
             self.counts.tombstones += chunk.len() as u64;
         }
         Ok(())

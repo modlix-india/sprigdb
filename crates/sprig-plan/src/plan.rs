@@ -16,11 +16,12 @@ use std::collections::BTreeSet;
 use std::ops::ControlFlow;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use sprig_engine::row::Value;
 use sprig_exec::ops::{
     AggKind, Aggregate, Aggregation, Distinct, Filter, HashJoin, InnerSource, JoinKind, Limit,
-    Memory, NestedLoopJoin, Project, RowSource, SetKind, SetOp, Sort, SortKey, Union, WinFunc,
+    Memory, NestedLoopJoin, Project, Row, RowSource, SetKind, SetOp, Sort, SortKey, Union, WinFunc,
     WinKind, Window,
 };
 use sprig_exec::{
@@ -110,6 +111,11 @@ pub struct PlanOptions {
     pub keep_filters: bool,
     /// The most bytes the statement's sorts and hash tables may hold.
     pub memory_limit: Option<usize>,
+    /// The recursion limit of `WITH RECURSIVE`: MySQL's
+    /// `cte_max_recursion_depth` (a deeper pass fails with 3636),
+    /// MariaDB's `max_recursive_iterations` (the passes stop there, with
+    /// warning 1931).
+    pub max_recursion: u64,
 }
 
 impl PlanOptions {
@@ -122,6 +128,7 @@ impl PlanOptions {
             order_by_index: true,
             keep_filters: false,
             memory_limit: None,
+            max_recursion: 1000,
         }
     }
 }
@@ -156,6 +163,107 @@ pub struct Plan {
     pub explain: Vec<ExplainRow>,
     /// The table accesses, for rows-examined figures after the run.
     pub accesses: Vec<AccessStat>,
+    /// `SELECT SQL_CALC_FOUND_ROWS ...`: the rows the statement found
+    /// without its `LIMIT` (the session's `FOUND_ROWS()` afterwards), set
+    /// once every row has been read.
+    pub found_rows: Option<Arc<AtomicU64>>,
+}
+
+/// `SQL_CALC_FOUND_ROWS`: the statement's `LIMIT` applied while every row
+/// is still counted.
+struct CountingLimit {
+    source: Box<dyn RowSource>,
+    offset: u64,
+    limit: u64,
+    seen: u64,
+    found: Arc<AtomicU64>,
+    done: bool,
+}
+
+impl RowSource for CountingLimit {
+    fn next(&mut self, ctx: &mut Ctx<'_>) -> Result<Option<Row>> {
+        if self.seen == 0 && !self.done && !ctx.maria() {
+            ctx.warn(
+                1287,
+                "SQL_CALC_FOUND_ROWS is deprecated and will be removed in a future release. Consider using two separate queries instead.",
+            );
+        }
+        while !self.done {
+            let Some(row) = self.source.next(ctx)? else {
+                self.done = true;
+                self.found.store(self.seen, AtomicOrdering::Relaxed);
+                break;
+            };
+            self.seen += 1;
+            if self.seen > self.offset && self.seen - self.offset <= self.limit {
+                return Ok(Some(row));
+            }
+        }
+        Ok(None)
+    }
+
+    fn types(&self) -> Vec<ExprType> {
+        self.source.types()
+    }
+}
+
+/// Whether the statement's first `SELECT` has `SQL_CALC_FOUND_ROWS`; the
+/// modifier anywhere else is 1234.
+fn calc_found_rows(q: &ast::Query) -> Result<bool> {
+    fn leftmost(b: &ast::SetExpr) -> Option<&ast::Select> {
+        match b {
+            ast::SetExpr::Select(s) => Some(s),
+            ast::SetExpr::SetOperation { left, .. } => leftmost(left),
+            ast::SetExpr::Query(q) => leftmost(&q.body),
+            _ => None,
+        }
+    }
+    fn calc(s: &ast::Select) -> bool {
+        s.select_modifiers
+            .as_ref()
+            .is_some_and(|m| m.sql_calc_found_rows)
+    }
+    struct Check {
+        top: *const ast::Select,
+        misplaced: bool,
+    }
+    impl Check {
+        fn walk(&mut self, b: &ast::SetExpr) {
+            match b {
+                ast::SetExpr::Select(s) => {
+                    if calc(s) && !std::ptr::eq(&raw const **s, self.top) {
+                        self.misplaced = true;
+                    }
+                }
+                ast::SetExpr::SetOperation { left, right, .. } => {
+                    self.walk(left);
+                    self.walk(right);
+                }
+                _ => {}
+            }
+        }
+    }
+    impl ast::Visitor for Check {
+        type Break = ();
+        fn pre_visit_query(&mut self, q: &ast::Query) -> ControlFlow<()> {
+            self.walk(&q.body);
+            ControlFlow::Continue(())
+        }
+    }
+    let top = leftmost(&q.body);
+    let mut check = Check {
+        top: top.map_or(std::ptr::null(), std::ptr::from_ref::<ast::Select>),
+        misplaced: false,
+    };
+    let _ = ast::Visit::visit(q, &mut check);
+    if check.misplaced {
+        return Err(SqlError::new(
+            1234,
+            "42000",
+            "Incorrect usage/placement of 'SQL_CALC_FOUND_ROWS'",
+        ));
+    }
+    Ok(top.is_some_and(calc))
 }
 
 impl Plan {
@@ -230,20 +338,51 @@ impl<'a> Planner<'a> {
             ids: 0,
             outer_refs: 0,
             ctes: Vec::new(),
+            working: Vec::new(),
             bound_outer: None,
             recording: Vec::new(),
         };
-        let (query, explain) = match &statement {
-            ast::Statement::Query(q) => (q, false),
+        let (query, explain, extended) = match &statement {
+            ast::Statement::Query(q) => (q, false, false),
             ast::Statement::Explain {
-                statement, analyze, ..
+                statement,
+                analyze,
+                verbose,
+                ..
             } => match &**statement {
-                ast::Statement::Query(q) if !analyze => (q, true),
+                ast::Statement::Query(q) if !analyze => (q, true, *verbose),
                 _ => return Err(unsupported("EXPLAIN of this statement")),
             },
             _ => return Err(unsupported("this statement")),
         };
-        let planned = cx.query(query, None, "SIMPLE")?;
+        let calc = calc_found_rows(query)? && !explain;
+        let stripped;
+        let query = if calc && query.limit_clause.is_some() {
+            let mut q = query.clone();
+            q.limit_clause = None;
+            stripped = q;
+            &stripped
+        } else {
+            query
+        };
+        let mut planned = cx.query(query, None, "SIMPLE")?;
+        let mut found_rows = None;
+        if calc {
+            let (limit, offset) = match &stripped_limit(&statement) {
+                Some(l) => cx.limit_clause(l)?,
+                None => (None, 0),
+            };
+            let found = Arc::new(AtomicU64::new(0));
+            planned.source = Box::new(CountingLimit {
+                source: planned.source,
+                offset,
+                limit: limit.unwrap_or(u64::MAX),
+                seen: 0,
+                found: found.clone(),
+                done: false,
+            });
+            found_rows = Some(found);
+        }
         let mut rows = std::mem::take(&mut cx.explain);
         rows.sort_by_key(|r| r.id);
         if rows.iter().any(|r| r.id != 1) {
@@ -254,12 +393,13 @@ impl<'a> Planner<'a> {
             }
         }
         if explain {
-            let (source, columns) = crate::explain::as_rows(&rows, &cx.session);
+            let (source, columns) = crate::explain::as_rows(&rows, &cx.session, extended);
             return Ok(Plan {
                 source,
                 columns,
                 explain: rows,
                 accesses: Vec::new(),
+                found_rows: None,
             });
         }
         let types = planned.types;
@@ -273,6 +413,7 @@ impl<'a> Planner<'a> {
                 .collect(),
             explain: rows,
             accesses: cx.accesses,
+            found_rows,
         })
     }
 }
@@ -320,6 +461,7 @@ impl Planner<'_> {
             ids: 0,
             outer_refs: 0,
             ctes: Vec::new(),
+            working: Vec::new(),
             bound_outer: None,
             recording: Vec::new(),
         };
@@ -363,6 +505,14 @@ impl Planner<'_> {
     }
 }
 
+/// The `LIMIT` of a statement's query.
+fn stripped_limit(statement: &ast::Statement) -> Option<ast::LimitClause> {
+    match statement {
+        ast::Statement::Query(q) => q.limit_clause.clone(),
+        _ => None,
+    }
+}
+
 /// A planned query: its operator tree and what it gives.
 pub(crate) struct Planned {
     pub(crate) source: Box<dyn RowSource>,
@@ -385,7 +535,10 @@ pub(crate) struct Cx<'a> {
     ids: usize,
     /// How many names resolved into an enclosing block so far.
     pub(crate) outer_refs: usize,
-    pub(crate) ctes: Vec<Rc<ast::Cte>>,
+    pub(crate) ctes: Vec<Rc<crate::recursive::CteDef>>,
+    /// The rows of the previous pass of each recursive common table
+    /// expression being made, innermost last.
+    pub(crate) working: Vec<Rc<crate::recursive::Working>>,
     /// Outer names bound to values: this is a dependent subquery planned
     /// for one outer row.
     pub(crate) bound_outer: Option<Rc<crate::dependent::BoundOuter>>,
@@ -401,7 +554,7 @@ impl<'a> Cx<'a> {
         session: Session,
         options: PlanOptions,
         memory: Arc<Memory>,
-        ctes: Vec<Rc<ast::Cte>>,
+        ctes: Vec<Rc<crate::recursive::CteDef>>,
         bound: Rc<crate::dependent::BoundOuter>,
     ) -> Self {
         Self {
@@ -416,7 +569,38 @@ impl<'a> Cx<'a> {
             ids: 0,
             outer_refs: 0,
             ctes,
+            working: Vec::new(),
             bound_outer: Some(bound),
+            recording: Vec::new(),
+        }
+    }
+
+    /// The state for planning a pass of a recursive common table
+    /// expression while the statement runs.
+    pub(crate) fn detached(
+        catalog: &'a dyn Catalog,
+        storage: Arc<dyn Storage>,
+        session: Session,
+        params: &'a [Value],
+        options: PlanOptions,
+        memory: Arc<Memory>,
+        ctes: Vec<Rc<crate::recursive::CteDef>>,
+        bound: Option<Rc<crate::dependent::BoundOuter>>,
+    ) -> Self {
+        Self {
+            catalog,
+            storage,
+            session,
+            params,
+            options,
+            memory,
+            explain: Vec::new(),
+            accesses: Vec::new(),
+            ids: 0,
+            outer_refs: 0,
+            ctes,
+            working: Vec::new(),
+            bound_outer: bound,
             recording: Vec::new(),
         }
     }
@@ -666,12 +850,48 @@ impl<'a> Cx<'a> {
         self.ids
     }
 
-    pub(crate) fn find_cte(&self, name: &str) -> Option<Rc<ast::Cte>> {
+    pub(crate) fn find_cte(&self, name: &str) -> Option<Rc<crate::recursive::CteDef>> {
         self.ctes
             .iter()
             .rev()
-            .find(|c| c.alias.name.value.eq_ignore_ascii_case(name))
+            .find(|c| c.name().eq_ignore_ascii_case(name))
             .cloned()
+    }
+
+    /// A set operation's part planned by itself (no outer query).
+    pub(crate) fn set_expr_pub(
+        &mut self,
+        body: &ast::SetExpr,
+        select_type: &str,
+    ) -> Result<Planned> {
+        self.set_expr(body, None, select_type)
+    }
+
+    /// The values of a `LIMIT` clause: the row count (if any) and the
+    /// offset.
+    pub(crate) fn limit_clause(&mut self, limit: &ast::LimitClause) -> Result<(Option<u64>, u64)> {
+        let empty = Scope {
+            rels: &[],
+            star: &[],
+            visible: 0..0,
+            outer: None,
+        };
+        let (mut lim, mut off) = (None, 0u64);
+        match limit {
+            ast::LimitClause::LimitOffset { limit, offset, .. } => {
+                if let Some(l) = limit {
+                    lim = Some(self.limit_value(l, &empty)?);
+                }
+                if let Some(o) = offset {
+                    off = self.limit_value(&o.value, &empty)?;
+                }
+            }
+            ast::LimitClause::OffsetCommaLimit { offset, limit } => {
+                off = self.limit_value(offset, &empty)?;
+                lim = Some(self.limit_value(limit, &empty)?);
+            }
+        }
+        Ok((lim, off))
     }
 
     pub(crate) fn type_of(&self, e: &Expr) -> Result<ExprType> {
@@ -700,11 +920,30 @@ impl<'a> Cx<'a> {
         }
         let cte_mark = self.ctes.len();
         if let Some(with) = &q.with {
-            if with.recursive {
-                return Err(unsupported("WITH RECURSIVE"));
-            }
-            for cte in &with.cte_tables {
-                self.ctes.push(Rc::new(cte.clone()));
+            let maria = self.session.persona.is_maria();
+            for (i, cte) in with.cte_tables.iter().enumerate() {
+                let name = &cte.alias.name.value;
+                if with.cte_tables[..i]
+                    .iter()
+                    .any(|c| c.alias.name.value.eq_ignore_ascii_case(name))
+                {
+                    self.ctes.truncate(cte_mark);
+                    return Err(if maria {
+                        SqlError::new(
+                            4004,
+                            "HY000",
+                            format!("Duplicate query name `{name}` in WITH clause"),
+                        )
+                    } else {
+                        SqlError::new(1066, "42000", format!("Not unique table/alias: '{name}'"))
+                    });
+                }
+                // An expression sees the ones before it; under `WITH
+                // RECURSIVE`, one that reads itself sees itself too.
+                let recursive = with.recursive && crate::recursive::reads_itself(cte);
+                let sees = self.ctes.len() + usize::from(recursive);
+                self.ctes
+                    .push(crate::recursive::CteDef::new(cte.clone(), sees, recursive));
             }
         }
         let out = self.query_body(q, outer, select_type);
@@ -3149,7 +3388,7 @@ impl<'a> Cx<'a> {
         }
     }
 
-    fn limit_value(&mut self, e: &ast::Expr, scope: &Scope<'_>) -> Result<u64> {
+    pub(crate) fn limit_value(&mut self, e: &ast::Expr, scope: &Scope<'_>) -> Result<u64> {
         let mut x = crate::resolve::ExprCx::new(scope, Clause::Where);
         let e = self.expr(e, &mut x)?;
         let bad = || {

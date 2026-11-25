@@ -580,10 +580,16 @@ mod tests {
     #[test]
     fn intervals_read_as_the_servers_read_them() {
         assert_eq!(interval("2", "HOUR", false).ok(), Some((0, 7_200)));
-        assert_eq!(interval("1:30", "HOUR_MINUTE", false).ok(), Some((0, 5_400)));
+        assert_eq!(
+            interval("1:30", "HOUR_MINUTE", false).ok(),
+            Some((0, 5_400))
+        );
         assert_eq!(interval("1-2", "YEAR_MONTH", false).ok(), Some((14, 0)));
         assert_eq!(interval("3", "QUARTER", false).ok(), Some((9, 0)));
-        assert_eq!(interval("1 2:03:04", "DAY_SECOND", false).ok(), Some((0, 93_784)));
+        assert_eq!(
+            interval("1 2:03:04", "DAY_SECOND", false).ok(),
+            Some((0, 93_784))
+        );
         assert!(interval("0", "DAY", false).is_err_and(|e| e.message.contains("not positive")));
         assert!(interval("1", "MICROSECOND", true).is_err_and(|e| e.message.contains("MySQL")));
         assert_eq!(printed_value("2"), "2");
@@ -604,7 +610,10 @@ mod tests {
         assert_eq!(due(&d, feb, mar), Some(mar));
         // Every hour: after a long gap only the latest run is due.
         let h = every(("x", 1_000), 0, 3_600);
-        assert_eq!(due(&h, 1_000, 1_000 + 5 * 3_600 + 7), Some(1_000 + 5 * 3_600));
+        assert_eq!(
+            due(&h, 1_000, 1_000 + 5 * 3_600 + 7),
+            Some(1_000 + 5 * 3_600)
+        );
         assert_eq!(latest(&h, 999), None);
         let mut e = h.clone();
         e.ends = Some(("y".into(), 1_000 + 2 * 3_600));

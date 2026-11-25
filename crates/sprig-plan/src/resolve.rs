@@ -634,6 +634,8 @@ pub(crate) fn literal(v: &Value, ty: &ExprType) -> Expr {
             let e = Expr::Double(text);
             if neg { Expr::Neg(Box::new(e)) } else { e }
         }
+        // A JSON value (a subquery's, computed once) stays a JSON value.
+        Value::Str(_) | Value::Json(_) if ty.json => Expr::Typed(Box::new((v.clone(), *ty))),
         Value::Str(s) | Value::Json(s) => Expr::Str(String::from_utf8_lossy(s).into_owned()),
         Value::Bytes(b) => Expr::Cast(Box::new(Expr::Hex(b.to_vec())), CastTarget::Binary(None)),
         Value::Date(d) => cast_str(d.to_string(), CastTarget::Date),
@@ -669,6 +671,7 @@ fn cast_target(dt: &ast::DataType) -> Result<CastTarget> {
         D::Date => CastTarget::Date,
         D::Time(f, _) => CastTarget::Time(f.unwrap_or(0).min(6) as u8),
         D::Datetime(f) => CastTarget::DateTime(f.unwrap_or(0).min(6) as u8),
+        D::JSON => CastTarget::Json,
         other => return Err(unsupported(&format!("CAST AS {other}"))),
     })
 }
@@ -1147,6 +1150,30 @@ impl Cx<'_> {
                 charset: None,
                 ..
             } => Expr::Cast(self.boxed(expr, x)?, cast_target(dt)?),
+            // `CONVERT(e USING cs)` to a UTF-8 character set (the
+            // expression engine's strings) or to `binary`; other character
+            // sets stay refused.
+            A::Convert {
+                is_try: false,
+                expr,
+                data_type: None,
+                charset: Some(cs),
+                ..
+            } if {
+                let n = object_name(cs)?.join(".").to_ascii_lowercase();
+                matches!(n.as_str(), "utf8mb4" | "utf8mb3" | "utf8" | "binary")
+            } =>
+            {
+                let binary = object_name(cs)?.join(".").eq_ignore_ascii_case("binary");
+                Expr::Cast(
+                    self.boxed(expr, x)?,
+                    if binary {
+                        CastTarget::Binary(None)
+                    } else {
+                        CastTarget::Char(None)
+                    },
+                )
+            }
             A::Collate { expr, collation } => {
                 let name = object_name(collation)?.join(".");
                 let coll =
@@ -1252,6 +1279,12 @@ impl Cx<'_> {
         if let Some(kind) = agg_kind(&name) {
             return self.aggregate(&name, kind, args, distinct, clauses, x);
         }
+        if name == "JSON_VALUE"
+            && !distinct
+            && let [ast::FunctionArgumentClause::JsonReturningClause(r)] = clauses
+        {
+            return self.json_value_returning(args, &r.data_type, x);
+        }
         if distinct || !clauses.is_empty() {
             return Err(unsupported(&format!("{name} with these arguments")));
         }
@@ -1284,6 +1317,72 @@ impl Cx<'_> {
             }
         }
         Ok(Expr::Func(name, out))
+    }
+
+    /// `JSON_VALUE(doc, path RETURNING type)`: MySQL's, with the type
+    /// passed on as a keyword (`RETURNING SIGNED`, `RETURNING
+    /// DECIMAL(5,2)`, ...). MariaDB has no `RETURNING`: a syntax error.
+    fn json_value_returning(
+        &mut self,
+        args: &[ast::FunctionArg],
+        dt: &ast::DataType,
+        x: &mut ExprCx<'_, '_>,
+    ) -> Result<Expr> {
+        use ast::DataType as D;
+        if self.maria() {
+            return Err(SqlError::new(
+                1064,
+                "42000",
+                format!(
+                    "You have an error in your SQL syntax; check the manual that corresponds to \
+                     your MariaDB server version for the right syntax to use near 'RETURNING {dt})' \
+                     at line 1"
+                ),
+            ));
+        }
+        let len = |l: &Option<ast::CharacterLength>| match l {
+            Some(ast::CharacterLength::IntegerLength { length, .. }) => format!("({length})"),
+            _ => String::new(),
+        };
+        let fsp = |f: &Option<u64>| format!("({})", f.unwrap_or(0).min(6));
+        let kw = match dt {
+            D::Signed | D::SignedInteger | D::Int(_) | D::Integer(_) | D::BigInt(_) => {
+                "SIGNED".to_owned()
+            }
+            D::Unsigned | D::UnsignedInteger => "UNSIGNED".to_owned(),
+            D::Decimal(info) | D::Dec(info) | D::Numeric(info) => match info {
+                ast::ExactNumberInfo::None => "DECIMAL".to_owned(),
+                ast::ExactNumberInfo::Precision(p) => format!("DECIMAL({p})"),
+                ast::ExactNumberInfo::PrecisionAndScale(p, sc) => format!("DECIMAL({p},{sc})"),
+            },
+            D::Double(_) | D::Real => "DOUBLE".to_owned(),
+            D::Float(_) => "FLOAT".to_owned(),
+            D::Char(l) | D::Character(l) | D::Varchar(l) => format!("CHAR{}", len(l)),
+            D::Binary(l) => match l {
+                Some(n) => format!("BINARY({n})"),
+                None => "BINARY".to_owned(),
+            },
+            D::Date => "DATE".to_owned(),
+            D::Time(f, _) => format!("TIME{}", fsp(f)),
+            D::Datetime(f) => format!("DATETIME{}", fsp(f)),
+            D::Custom(n, _) if n.to_string().eq_ignore_ascii_case("YEAR") => "YEAR".to_owned(),
+            D::JSON => "JSON".to_owned(),
+            other => return Err(unsupported(&format!("JSON_VALUE RETURNING {other}"))),
+        };
+        let mut out = Vec::with_capacity(3);
+        for a in args {
+            match a {
+                ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) => {
+                    out.push(self.expr_in(e, x, false)?);
+                }
+                _ => return Err(unsupported("JSON_VALUE with these arguments")),
+            }
+        }
+        if out.len() != 2 {
+            return Err(SqlError::param_count("json_value"));
+        }
+        out.push(Expr::Keyword(format!("RETURNING {kw}")));
+        Ok(Expr::Func("JSON_VALUE".to_owned(), out))
     }
 
     /// A sequence function (MariaDB): its first argument names the

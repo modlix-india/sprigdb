@@ -757,6 +757,35 @@ impl Core {
         Ok(())
     }
 
+    /// How many ready messages the cache aims to hold while the rest of
+    /// the queue waits on disk: twice the consumers' window (their credit
+    /// plus what they hold: deliveries go on during a write, and pages are
+    /// read between writes), at least one page. One page per write capped
+    /// delivery from a backlog at a page per write round trip.
+    fn ready_target(&self) -> usize {
+        let window = self
+            .consumers
+            .iter()
+            .map(|c| usize::try_from(c.credit).unwrap_or(usize::MAX))
+            .fold(self.unacked.len(), usize::saturating_add);
+        window
+            .saturating_mul(2)
+            .clamp(self.p.page, self.p.page.saturating_mul(16))
+    }
+
+    /// Pages in until the cache holds [`Self::ready_target`] messages,
+    /// everything is loaded, or half the cache's bytes are used.
+    async fn refill(&mut self) -> Result<(), StoreError> {
+        let target = self.ready_target();
+        while !self.complete
+            && self.ready.len() < target
+            && self.cache_bytes < self.p.cache_bytes / 2
+        {
+            self.page_in().await?;
+        }
+        Ok(())
+    }
+
     fn cache_put(&mut self, e: Entry) {
         let k = e.key();
         if !self.complete && self.loaded_upto.is_some_and(|u| k > u) {
@@ -796,9 +825,15 @@ impl Core {
     }
 
     /// Whether the next batch is full: [`OwnerParams::batch_rows`] rows,
-    /// or [`BATCH_MAX_BYTES`] of published messages.
+    /// or [`BATCH_MAX_BYTES`] of published messages. Acknowledged
+    /// messages' deletes have an allowance of their own, as many rows
+    /// again: a delete is small (consecutive messages go as one range),
+    /// and with publishes and acknowledgements sharing one allowance a
+    /// backlog drained only as fast as publishers left room.
     fn batch_full(&self) -> bool {
-        self.batch_rows() >= self.p.batch_rows || self.insert_bytes >= BATCH_MAX_BYTES
+        self.batch_rows() - self.deletes.len() >= self.p.batch_rows
+            || self.deletes.len() >= self.p.batch_rows
+            || self.insert_bytes >= BATCH_MAX_BYTES
     }
 
     fn needs_write(&self) -> bool {
@@ -2128,8 +2163,8 @@ impl Core {
             // doesn't wait for them (it reads only past what is loaded,
             // where no delivered message is), or a queue that publishers
             // keep busy would never page in again.
-            if !self.complete && self.ready.len() < self.p.page / 2 {
-                self.page_in().await?;
+            if !self.complete && self.ready.len() < self.ready_target() / 2 {
+                self.refill().await?;
                 self.dispatch();
             }
             if !self.needs_write() {

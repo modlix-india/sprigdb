@@ -39,6 +39,7 @@ use crate::tenant::session::LocalWarning;
 
 mod event;
 mod trigger;
+mod validation;
 
 tokio::task_local! {
     /// The routines running on this task, outermost first (recursion).
@@ -411,6 +412,19 @@ fn approx(t: &str) -> String {
 /// A variable's column, from its declared type (`None` when the engine
 /// can't read the type: the value is kept as computed).
 fn column_of(ty: &str, name: &str, mysql: bool, db_cs: &(String, String)) -> Option<Column> {
+    param_table(ty, name, mysql, db_cs)?
+        .columns
+        .first()
+        .cloned()
+}
+
+/// A one-column table of a variable or parameter `name` of type `ty`.
+fn param_table(
+    ty: &str,
+    name: &str,
+    mysql: bool,
+    db_cs: &(String, String),
+) -> Option<Arc<table::TableDef>> {
     if ty.is_empty() {
         return None;
     }
@@ -423,9 +437,12 @@ fn column_of(ty: &str, name: &str, mysql: bool, db_cs: &(String, String)) -> Opt
         return None;
     };
     let text = define::render(&def);
-    let t = table::parse(ObjectId(0), 0, DbId(0), &text).ok()?;
-    t.columns.first().cloned()
+    table::parse(ObjectId(0), 0, DbId(0), &text).ok()
 }
+
+/// The function a prepared `CALL` wraps around each `?` in an `OUT` or
+/// `INOUT` position (`engine_call_mark_outs`).
+const PS_OUT: &str = "_sprig_ps_out";
 
 /// One running routine.
 struct Frame {
@@ -525,6 +542,91 @@ impl PassSession {
         Some((Arc::clone(r), row.name.clone()))
     }
 
+    /// Whether `text`, a statement being prepared (`?` for parameters), is
+    /// a `CALL` of a procedure of an engine database. Such a statement is
+    /// kept as text and run at each execute with the bound values written
+    /// in; its result sets go to the client as binary rows.
+    pub(in crate::exec) fn engine_call_prepares(&self, text: &[u8]) -> bool {
+        let Ok(t) = std::str::from_utf8(text) else {
+            return false;
+        };
+        if !t
+            .trim_start()
+            .get(..4)
+            .is_some_and(|w| w.eq_ignore_ascii_case("CALL"))
+        {
+            return false;
+        }
+        let nulls = vec!["NULL".to_owned(); sprig_search::sqlscan::placeholders(t).len()];
+        let Some(t) = sprig_search::sqlscan::interpolate(t, &nulls) else {
+            return false;
+        };
+        let Ok(mut p) = parse::P::new(&t) else {
+            return false;
+        };
+        let Ok(Stmt::Call { db, name, .. }) = p.statement(true) else {
+            return false;
+        };
+        self.sp_find(db.as_deref(), Kind::Procedure, &name)
+            .is_some()
+    }
+
+    /// A prepared `CALL`'s text with each `?` in an `OUT` or `INOUT`
+    /// position wrapped in [`PS_OUT`]: at each execute the parameter starts
+    /// from the bound value and its end value goes back to the client in
+    /// the output-parameters result set, as both servers send it.
+    pub(in crate::exec) fn engine_call_mark_outs(&self, text: &Bytes) -> Bytes {
+        let Ok(sql) = std::str::from_utf8(text) else {
+            return text.clone();
+        };
+        let n = sprig_search::sqlscan::placeholders(sql).len();
+        if n == 0 {
+            return text.clone();
+        }
+        let marks: Vec<String> = (0..n).map(|k| format!("@_sprig_q{k}")).collect();
+        let Some(marked) = sprig_search::sqlscan::interpolate(sql, &marks) else {
+            return text.clone();
+        };
+        let Ok(mut parser) = parse::P::new(&marked) else {
+            return text.clone();
+        };
+        let Ok(Stmt::Call { db, name, args }) = parser.statement(true) else {
+            return text.clone();
+        };
+        let Some((r, _)) = self.sp_find(db.as_deref(), Kind::Procedure, &name) else {
+            return text.clone();
+        };
+        let Ok((_, prog)) = &r.def else {
+            return text.clone();
+        };
+        let mut wrap = vec![false; n];
+        for (i, a) in args.iter().enumerate() {
+            if prog.modes.get(i).is_some_and(|m| *m != Mode::In)
+                && let Some(k) = a
+                    .trim()
+                    .strip_prefix("@_sprig_q")
+                    .and_then(|k| k.parse::<usize>().ok())
+                && k < n
+            {
+                wrap[k] = true;
+            }
+        }
+        if !wrap.contains(&true) {
+            return text.clone();
+        }
+        let vals: Vec<String> = wrap
+            .iter()
+            .map(|w| {
+                if *w {
+                    format!("{PS_OUT}(?)")
+                } else {
+                    "?".to_owned()
+                }
+            })
+            .collect();
+        sprig_search::sqlscan::interpolate(sql, &vals).map_or_else(|| text.clone(), Bytes::from)
+    }
+
     /// A client's `CALL` of a procedure of an engine database (`None`: the
     /// text names no such procedure, the logic layer's `CALL` goes on).
     pub(in crate::exec) async fn engine_sql_call(
@@ -574,9 +676,25 @@ impl PassSession {
             );
             return self.fail(out, &e).await;
         }
-        // Arguments: values in the caller's context, `OUT` targets.
+        // Arguments: values in the caller's context, `OUT` targets; a
+        // prepared `CALL`'s `?` in an `OUT`/`INOUT` position goes back in
+        // the output-parameters result set.
+        let mut args = args;
+        let mut back: Vec<usize> = Vec::new();
         let mut outs = Vec::with_capacity(args.len());
-        for a in &args {
+        for (i, a) in args.iter_mut().enumerate() {
+            if let Some(inner) = a
+                .trim()
+                .strip_prefix(PS_OUT)
+                .map(str::trim_start)
+                .and_then(|x| x.strip_prefix('('))
+                .and_then(|x| x.strip_suffix(')'))
+            {
+                *a = inner.to_owned();
+                back.push(i);
+                outs.push(Some(Tgt::Slot(usize::MAX)));
+                continue;
+            }
             let a = a.trim();
             outs.push(
                 a.strip_prefix('@')
@@ -602,6 +720,13 @@ impl PassSession {
                 if let Err(e) = self.sp_copy_out(cx, &frame, &outs, None).await {
                     return self.fail(out, &e).await;
                 }
+                if !back.is_empty()
+                    && let Err(e) = self
+                        .sp_out_params(cx, &r, &db_name, &frame, &back, out)
+                        .await
+                {
+                    return self.fail(out, &e).await;
+                }
                 let mut ok = OkPacket::new(status);
                 ok.affected_rows = if self.persona == sprig_proto_mysql::Persona::MySql84 {
                     frame.last_affected
@@ -616,6 +741,58 @@ impl PassSession {
             }
             Err(e) => self.fail(out, &e).await,
         }
+    }
+
+    /// The output-parameters result set of a prepared `CALL`: one row of
+    /// the end values of parameters `back`, flagged as output parameters.
+    #[allow(clippy::too_many_arguments)]
+    async fn sp_out_params(
+        &mut self,
+        cx: &mut ExecCtx<'_>,
+        r: &Routine,
+        db_name: &str,
+        frame: &Frame,
+        back: &[usize],
+        out: &mut dyn ResultSink,
+    ) -> Result<()> {
+        let results = self.engine_vars(cx).results;
+        let mysql = self.persona == sprig_proto_mysql::Persona::MySql84;
+        let db_cs = self
+            .engine_cat()
+            .and_then(|c| {
+                c.databases
+                    .get(r.db)
+                    .map(|d| (d.default_charset.clone(), d.default_collation.clone()))
+            })
+            .unwrap_or_default();
+        let dbb = Bytes::from(db_name.to_owned());
+        let tb = Bytes::from(r.name.clone());
+        let mut defs = Vec::with_capacity(back.len());
+        let mut texts: Vec<Option<Bytes>> = Vec::with_capacity(back.len());
+        for &i in back {
+            let v = &frame.prog.vars[i];
+            let def = param_table(&v.ty, &v.name, mysql, &db_cs)
+                .ok_or_else(|| not_on_engine("this parameter type as an output parameter"))?;
+            let nb = Bytes::from(v.name.clone());
+            let mut d = crate::engine::meta::column_def(&dbb, &tb, &def, &tb, 0, &nb, &nb, results);
+            // The servers report output parameters with no column flag but
+            // BINARY; MySQL with the binary character set.
+            d.flags &= sprig_proto_mysql::resultset::ColumnFlags::BINARY.bits();
+            if mysql {
+                d.charset = 63;
+            }
+            defs.push(d);
+            texts.push(crate::engine::meta::text(&def.columns[0], &frame.vals[i]));
+        }
+        out.begin_rows(&defs, RowFormat::Text).await?;
+        let row: Vec<Option<&[u8]>> = texts.iter().map(|t| t.as_deref()).collect();
+        out.row(RowValues::Text(&row)).await?;
+        let status = self.status() | StatusFlags::MORE_RESULTS_EXISTS | StatusFlags::PS_OUT_PARAMS;
+        out.end_rows(crate::pipeline::EndOfRows {
+            status,
+            warnings: 0,
+        })
+        .await
     }
 
     /// The frame of a call with argument values `vals` (`OUT` parameters

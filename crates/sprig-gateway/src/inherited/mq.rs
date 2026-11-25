@@ -218,8 +218,28 @@ pub async fn ensure_vhost(
     if done(&sig) {
         return Ok(true);
     }
+    // Another publish or consumer of the member may be making the
+    // instances: wait for it at most `inherit.instance_create_wait_ms`.
+    let wait_ms = match svc
+        .cache
+        .get(t, sprig_catalog::Freshness::Cached { min_version: 0 })
+        .await
+    {
+        Ok(cat) => svc.settings.get(
+            &sprig_inherit::msg::settings::INSTANCE_CREATE_WAIT_MS,
+            &cat.setting_ctx(&svc.dc),
+            Some(&cat.settings),
+        ),
+        Err(_) => sprig_inherit::msg::settings::INSTANCE_CREATE_WAIT_MS.default,
+    };
     let lock = vhost_lock(t, db);
-    let _g = lock.lock().await;
+    let Ok(_g) = tokio::time::timeout(std::time::Duration::from_millis(wait_ms), lock.lock()).await
+    else {
+        return Err(super::unavailable(format!(
+            "tenant {t}'s instances of {db} are still being created after {wait_ms} ms \
+             (inherit.instance_create_wait_ms); retry"
+        )));
+    };
     if done(&sig) {
         return Ok(true);
     }

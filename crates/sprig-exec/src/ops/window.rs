@@ -144,7 +144,7 @@ impl Window {
     fn part_key(&self, ctx: &mut Ctx<'_>, row: &[Value]) -> Result<Vec<OrdKey>> {
         let mut k = Vec::with_capacity(self.partition.len());
         for p in &self.partition {
-            k.push(OrdKey::of(&p.eval(ctx, row)?, p.ty()));
+            k.push(OrdKey::of_in(&p.eval(ctx, row)?, p.ty(), ctx.maria()));
         }
         Ok(k)
     }
@@ -195,7 +195,11 @@ impl Window {
         for r in rows {
             let mut k = Vec::with_capacity(self.order.len());
             for o in &self.order {
-                k.push(OrdKey::of(&o.expr.eval(ctx, r)?, o.expr.ty()));
+                k.push(OrdKey::of_in(
+                    &o.expr.eval(ctx, r)?,
+                    o.expr.ty(),
+                    ctx.maria(),
+                ));
             }
             okeys.push(k);
         }

@@ -25,6 +25,11 @@
 //!   node's one Raft loop then syncs for a group it leads and groups it
 //!   follows in turn, and commits wait on more of those syncs. Every
 //!   replica must use the same value.
+//! - `SPRIGDB_ENGINE_RAFT_LOG_THREAD`: on a replicated node, the Raft
+//!   log's writes and syncs run on a thread of their own, so the Raft loop
+//!   keeps stepping groups (and answering) while a sync runs, and writes
+//!   queued meanwhile share the next sync (default `true`; `false` writes
+//!   on the loop, as before).
 //! - `SPRIGDB_ENGINE_RAFT_JOIN=true`: this node replaces a lost replica.
 //!   It starts with no units of its own and takes each unit only from the
 //!   unit's leader, once an operator runs `sprigctl engine replace-replica`
@@ -59,6 +64,8 @@ pub const RAFT_JOIN_VAR: &str = "SPRIGDB_ENGINE_RAFT_JOIN";
 /// The variable giving the partition groups per tenant on a replicated
 /// node.
 pub const STREAM_GROUPS_VAR: &str = "SPRIGDB_ENGINE_STREAM_GROUPS";
+/// The variable that turns the Raft log writer thread off (`false`).
+pub const RAFT_LOG_THREAD_VAR: &str = "SPRIGDB_ENGINE_RAFT_LOG_THREAD";
 /// The node-local Admin API route that replaces a lost replica.
 pub const REPLACE_PATH: &str = "/admin/v1/engine/replicas:replace";
 
@@ -337,6 +344,8 @@ fn start_raft(engine: &Engine, r: &RaftSetup, dir: PathBuf) -> Result<()> {
                 } else {
                     r.peers.iter().map(|(p, _)| *p).collect()
                 },
+                log_writer_thread: !std::env::var(RAFT_LOG_THREAD_VAR)
+                    .is_ok_and(|v| v.trim().eq_ignore_ascii_case("false")),
                 ..sprig_raft::RaftConfig::default()
             },
             store,

@@ -16,7 +16,7 @@
 use std::sync::Arc;
 
 use sprig_advisor::autoindex::candidates::{ColumnInfo, ExistingIndex, TableInfo};
-use sprig_advisor::autoindex::model::{IndexSpec, KeyCol};
+use sprig_advisor::autoindex::model::{IndexSpec, KeyCol, STATS_MAX_AGE_US, TableStats};
 use sprig_advisor::autoindex::policy::Replay;
 use sprig_catalog::ddl::database_key;
 use sprig_catalog::{Freshness, TenantCatalog};
@@ -68,35 +68,83 @@ fn indexable(ty: ColType) -> bool {
     )
 }
 
-/// The generator's view of `def`: columns with distinct counts from a
-/// sample, the primary key, the indexes.
-pub(crate) async fn table_info(tenant: TenantId, db: &str, def: &TableDef) -> Result<TableInfo> {
-    let rows = first_rows(tenant, def, TABLE_SAMPLE).await?;
-    let complete = rows.len() < TABLE_SAMPLE;
-    let columns = def
-        .columns
-        .iter()
-        .enumerate()
-        .map(|(i, c)| {
-            let mut seen: Vec<&Datum> = rows.iter().filter_map(|r| r.get(i)).collect();
-            seen.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
-            seen.dedup_by(|a, b| a == b);
-            let d = seen.len() as f64;
-            // Mostly distinct in a partial sample: more values beyond it.
-            let distinct = if !complete && d > rows.len() as f64 * 0.9 {
-                d * 10.0
-            } else {
-                d
+/// The generator's view of `def`: columns with distinct counts, the
+/// primary key, the indexes. The counts come from `cached` (the figures
+/// kept in the records) while they are fresh and of this definition, else
+/// from a sample of the table's first rows; the new figures are returned
+/// then, to be kept.
+pub(crate) async fn table_info(
+    tenant: TenantId,
+    db: &str,
+    def: &TableDef,
+    cached: Option<&TableStats>,
+    now_us: u64,
+) -> Result<(TableInfo, Option<TableStats>)> {
+    let fresh = cached.filter(|st| {
+        st.version == def.version
+            && now_us.saturating_sub(st.at_us) < STATS_MAX_AGE_US
+            && def
+                .columns
+                .iter()
+                .all(|c| st.distinct.iter().any(|(n, _)| *n == c.name))
+    });
+    let (columns, count, taken): (Vec<ColumnInfo>, u64, Option<TableStats>) = match fresh {
+        Some(st) => (
+            def.columns
+                .iter()
+                .map(|c| ColumnInfo {
+                    name: c.name.clone(),
+                    indexable: indexable(c.ty),
+                    distinct: st
+                        .distinct
+                        .iter()
+                        .find(|(n, _)| *n == c.name)
+                        .map(|(_, d)| *d),
+                })
+                .collect(),
+            st.rows,
+            None,
+        ),
+        None => {
+            let rows = first_rows(tenant, def, TABLE_SAMPLE).await?;
+            let complete = rows.len() < TABLE_SAMPLE;
+            let columns: Vec<ColumnInfo> = def
+                .columns
+                .iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    let mut seen: Vec<&Datum> = rows.iter().filter_map(|r| r.get(i)).collect();
+                    seen.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+                    seen.dedup_by(|a, b| a == b);
+                    let d = seen.len() as f64;
+                    // Mostly distinct in a partial sample: more values beyond it.
+                    let distinct = if !complete && d > rows.len() as f64 * 0.9 {
+                        d * 10.0
+                    } else {
+                        d
+                    };
+                    ColumnInfo {
+                        name: c.name.clone(),
+                        indexable: indexable(c.ty),
+                        distinct: Some(distinct),
+                    }
+                })
+                .collect();
+            let st = TableStats {
+                table: format!("{db}.{}", def.name).to_lowercase(),
+                version: def.version,
+                rows: rows.len() as u64,
+                distinct: columns
+                    .iter()
+                    .map(|c| (c.name.clone(), c.distinct.unwrap_or(0.0)))
+                    .collect(),
+                at_us: now_us,
             };
-            ColumnInfo {
-                name: c.name.clone(),
-                indexable: indexable(c.ty),
-                distinct: Some(distinct),
-            }
-        })
-        .collect();
+            (columns, rows.len() as u64, Some(st))
+        }
+    };
     let name_of = |i: usize| def.columns.get(i).map(|c| c.name.clone());
-    Ok(TableInfo {
+    let info = TableInfo {
         db: db.to_owned(),
         table: def.name.clone(),
         columns,
@@ -124,8 +172,9 @@ pub(crate) async fn table_info(tenant: TenantId, db: &str, def: &TableDef) -> Re
                 ignored: x.ignored,
             })
             .collect(),
-        rows: rows.len() as u64,
-    })
+        rows: count,
+    };
+    Ok((info, taken))
 }
 
 /// A value as SQL literal text.

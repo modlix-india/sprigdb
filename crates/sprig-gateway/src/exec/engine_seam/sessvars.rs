@@ -248,6 +248,9 @@ const DEFAULTS: &[(&str, Kind, Option<&str>, Option<&str>)] = &[
         Some("OFF"),
         Some("OFF"),
     ),
+    // No local socket to switch to (drivers such as mysql_async read it at
+    // connect and try the path when it names one).
+    ("socket", Kind::Str, Some(""), Some("")),
     (
         "sort_buffer_size",
         Kind::Num,
@@ -666,6 +669,14 @@ impl VarSource for Snapshot {
             return Some(literal(kind, &v, self.nbe));
         }
         if !global {
+            // The MySQL port's `SET cte_max_recursion_depth` is kept under
+            // MariaDB's name for it.
+            if self.persona == Persona::MySql84
+                && name == "cte_max_recursion_depth"
+                && let Some(v) = self.vars.get("max_recursive_iterations")
+            {
+                return Some(literal(kind, v, self.nbe));
+            }
             if let Some(v) = self.gateway_vars.get(name).or_else(|| self.vars.get(name)) {
                 if name == "character_set_results" && v == "NULL" {
                     return Some("NULL".to_owned());

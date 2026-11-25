@@ -1097,6 +1097,10 @@ pub(crate) fn compare(
     op: &str,
 ) -> Result<Option<Ordering>> {
     use Datum as D;
+    // MySQL compares a JSON column's value as JSON (by type, then value).
+    if env.mysql && (matches!(a, D::Json(_)) || matches!(b, D::Json(_))) {
+        return Ok(sprig_exec::json_order(a, b));
+    }
     let sides = (cx.text_left, cx.text_right);
     Ok(Some(match (a, b) {
         (D::Int(x), D::Int(y)) => x.cmp(y),
@@ -1459,6 +1463,7 @@ pub(crate) fn eval(e: &CExpr, row: &[Datum], a: &Args<'_>) -> Result<Datum> {
                 s.now_micros = micros;
                 s.time_zone_offset = assign::zone(a.env)?;
                 s.info.last_insert_id = a.env.last_insert_id;
+                s.info.connection_id = a.env.conn;
                 s.info.sequences = super::sequence::current();
                 let strict = sprig_exec::SqlMode::STRICT;
                 s.sql_mode = sprig_exec::SqlMode(if a.env.strict {

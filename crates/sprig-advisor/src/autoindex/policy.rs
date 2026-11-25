@@ -212,9 +212,24 @@ pub enum Watch {
 }
 
 /// The watch rule for `rec` at `now_us`; `current`: the served patterns'
-/// figures over the latest window (absent: no runs).
+/// figures over the latest window (absent: no runs). A pinned index is
+/// never dropped: its observation ends with it kept.
 #[must_use]
 pub fn watch(
+    rec: &IndexRecord,
+    now_us: u64,
+    current: &[(u64, Baseline)],
+    s: &AutoIndexSettings,
+) -> Watch {
+    let w = judge(rec, now_us, current, s);
+    match w {
+        Watch::Drop(_) if rec.pinned && rec.state == State::Observing => Watch::Activate,
+        Watch::Drop(_) if rec.pinned => Watch::Keep,
+        other => other,
+    }
+}
+
+fn judge(
     rec: &IndexRecord,
     now_us: u64,
     current: &[(u64, Baseline)],
@@ -403,6 +418,23 @@ mod tests {
             ..d
         };
         assert!(!d.blocked(dropped.spec.def_hash(), "d.t", &s));
+    }
+
+    #[test]
+    fn a_pinned_index_is_never_dropped() {
+        let s = s();
+        let built = 10 * DAY_US;
+        let mut x = rec(State::Observing, built, Some(built));
+        x.pinned = true;
+        // Never read in its observation: kept, and active.
+        assert_eq!(watch(&x, built + 7 * DAY_US, &[], &s), Watch::Activate);
+        x.state = State::Active;
+        assert_eq!(watch(&x, built + 30 * DAY_US, &[], &s), Watch::Keep);
+        x.pinned = false;
+        assert_eq!(
+            watch(&x, built + 30 * DAY_US, &[], &s),
+            Watch::Drop("unused")
+        );
     }
 
     #[test]

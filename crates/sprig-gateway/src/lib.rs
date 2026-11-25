@@ -107,8 +107,12 @@ pub(crate) mod table_changes;
 pub mod tenant;
 pub mod tls;
 // Workers' runs of triggers on streams and queues.
-pub mod triggers;
 pub(crate) mod sql_events;
+pub mod triggers;
+// Orphans across tenants and materialized copies on engine databases,
+// from the change log.
+pub(crate) mod inherit_copies;
+pub(crate) mod inherit_orphans;
 pub mod workload;
 
 use std::sync::Arc;
@@ -410,6 +414,8 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
             Arc::clone(&engine),
             stop.clone(),
         );
+        // Overrides in child tenants of records gone above become orphans.
+        let _orphans = inherit_orphans::spawn(Arc::clone(t), stop.clone());
     }
     let drain_lc = lifecycle.clone();
     let core = Arc::new(http::Core {

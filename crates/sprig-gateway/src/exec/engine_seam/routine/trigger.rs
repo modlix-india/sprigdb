@@ -5,6 +5,10 @@
 //! `AFTER` triggers (which see the row as stored). The whole statement
 //! runs inside a transaction or savepoint of its own, so an error in any
 //! row or trigger undoes all of it.
+//!
+//! A table with validations (`super::validation`) for the statement's
+//! event takes the same path, triggers or not: each row's validations run
+//! after its `BEFORE` triggers, on the final `NEW`, before the change.
 
 use sqlparser::ast::{
     AssignmentTarget, Expr, FromTable, ObjectName, ObjectNamePart, SetExpr, Spanned, Statement,
@@ -13,6 +17,7 @@ use sqlparser::ast::{
 
 use std::fmt::Write as _;
 
+use super::validation;
 use super::{
     Arc, Bytes, ColumnDef, Datum, ExecCtx, Frame, ObjectId, OkPacket, PassSession, Ran, Result,
     ResultSink, STACK, SprigError, StatusFlags, Step, catalog, database_key, literal,
@@ -21,6 +26,12 @@ use super::{
 use crate::engine::routine::parse::Event;
 use crate::engine::routine::trigger::{Trigger, firing};
 use crate::engine::table::{ColDefault, TableDef};
+
+tokio::task_local! {
+    /// The (table, definer) pairs whose TRIGGER right the running
+    /// statement has checked.
+    static RIGHTS: std::cell::RefCell<Vec<(ObjectId, String, String)>>;
+}
 
 /// The marker a statement's own one-row changes carry on the routine
 /// stack: they fire no trigger.
@@ -99,6 +110,9 @@ enum Dml {
         query: Option<String>,
         /// `ON DUPLICATE KEY UPDATE`: (column, expression) pairs.
         upsert: Vec<(String, String)>,
+        /// MySQL's row alias (`VALUES (...) AS new`): `upsert` is read
+        /// again once the table is known.
+        aliased: bool,
     },
     /// `UPDATE`: (column, expression) pairs; the `FROM ... WHERE ...
     /// ORDER BY ... LIMIT` tail.
@@ -108,6 +122,13 @@ enum Dml {
     },
     /// `DELETE`: the tail.
     Delete { tail: String },
+    /// A multi-table `UPDATE` or `DELETE`: the rows' `SELECT` and targets,
+    /// each target's `BEFORE` and `AFTER` triggers and its database name.
+    Multi {
+        rs: Box<crate::engine::multiwrite::RowsSelect>,
+        trigs: Vec<[Vec<Arc<Trigger>>; 2]>,
+        dbs: Vec<String>,
+    },
 }
 
 impl Dml {
@@ -116,6 +137,13 @@ impl Dml {
             Dml::Insert { .. } => Event::Insert,
             Dml::Update { .. } => Event::Update,
             Dml::Delete { .. } => Event::Delete,
+            Dml::Multi { rs, .. } => {
+                if rs.update {
+                    Event::Update
+                } else {
+                    Event::Delete
+                }
+            }
         }
     }
 }
@@ -164,9 +192,7 @@ fn read(text: &str) -> Option<std::result::Result<(ObjectName, Dml), String>> {
             let mut upsert = Vec::new();
             match &ins.on {
                 None => {}
-                Some(sqlparser::ast::OnInsert::DuplicateKeyUpdate(sets))
-                    if ins.insert_alias.is_none() =>
-                {
+                Some(sqlparser::ast::OnInsert::DuplicateKeyUpdate(sets)) => {
                     for a in sets {
                         let AssignmentTarget::ColumnName(n) = &a.target else {
                             return refuse("ON DUPLICATE KEY UPDATE with a column tuple");
@@ -175,9 +201,7 @@ fn read(text: &str) -> Option<std::result::Result<(ObjectName, Dml), String>> {
                     }
                 }
                 Some(_) => {
-                    return refuse(
-                        "INSERT ... AS alias ON DUPLICATE KEY UPDATE on a table with triggers",
-                    );
+                    return refuse("this INSERT form on a table with triggers or validations");
                 }
             }
             let mode = if ins.replace_into {
@@ -224,12 +248,14 @@ fn read(text: &str) -> Option<std::result::Result<(ObjectName, Dml), String>> {
                     rows,
                     query,
                     upsert,
+                    aliased: ins.insert_alias.is_some(),
                 },
             )))
         }
         Statement::Update(u) => {
             if !u.table.joins.is_empty() || u.from.is_some() {
-                return refuse("a multi-table UPDATE of a table with triggers");
+                // Multi-table: `trg_multi_hook`'s, or the usual path's error.
+                return None;
             }
             let TableFactor::Table { name, .. } = &u.table.relation else {
                 return None;
@@ -256,11 +282,11 @@ fn read(text: &str) -> Option<std::result::Result<(ObjectName, Dml), String>> {
                 FromTable::WithFromKeyword(f) | FromTable::WithoutKeyword(f) => f,
             };
             if !d.tables.is_empty() || d.using.is_some() || froms.len() != 1 {
-                return refuse("a multi-table DELETE of a table with triggers");
+                return None;
             }
             let f = &froms[0];
             if !f.joins.is_empty() {
-                return refuse("a multi-table DELETE of a table with triggers");
+                return None;
             }
             let TableFactor::Table { name, .. } = &f.relation else {
                 return None;
@@ -277,6 +303,54 @@ fn read(text: &str) -> Option<std::result::Result<(ObjectName, Dml), String>> {
         }
         _ => None,
     }
+}
+
+/// `ON DUPLICATE KEY UPDATE`'s (column, expression) pairs of an `INSERT`
+/// with MySQL's row alias, each reference to the new row made `VALUES(c)`
+/// (`None`: `text` has no row alias).
+fn alias_upsert(
+    text: &str,
+    def: &TableDef,
+    cols: Option<&[String]>,
+) -> Result<Option<Vec<(String, String)>>> {
+    let Ok(mut stmts) =
+        sqlparser::parser::Parser::parse_sql(&sprig_plan::dialect::SprigMySql, text)
+    else {
+        return Ok(None);
+    };
+    let Some(Statement::Insert(ins)) = stmts.pop() else {
+        return Ok(None);
+    };
+    if ins.insert_alias.is_none() {
+        return Ok(None);
+    }
+    let idx: Vec<usize> = match cols {
+        Some(names) => names.iter().filter_map(|n| def.column(n)).collect(),
+        None => (0..def.columns.len())
+            .filter(|&i| !def.columns[i].invisible)
+            .collect(),
+    };
+    let new_row = |ci: usize| {
+        let t = format!("VALUES({})", q(&def.columns[ci].name));
+        sqlparser::parser::Parser::new(&sprig_plan::dialect::SprigMySql)
+            .try_with_sql(&t)
+            .and_then(|mut p| p.parse_expr())
+            .unwrap_or(Expr::Value(sqlparser::ast::Value::Null.into()))
+    };
+    let Some(sets) = crate::engine::plan::row_alias_sets(def, &ins, &idx, &new_row)? else {
+        return Ok(Some(Vec::new()));
+    };
+    let mut out = Vec::with_capacity(sets.len());
+    for a in &sets {
+        let AssignmentTarget::ColumnName(n) = &a.target else {
+            return Err(not_on_engine("ON DUPLICATE KEY UPDATE with a column tuple"));
+        };
+        let Some(c) = last_part(n) else {
+            return Err(not_on_engine("an assignment target"));
+        };
+        out.push((c, a.value.to_string()));
+    }
+    Ok(Some(out))
 }
 
 /// A `VALUES` item's text; `None` for `DEFAULT`.
@@ -320,8 +394,22 @@ fn values_subst(e: &str, def: &TableDef, new: &[Datum]) -> String {
             continue;
         }
         let word_start = i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_');
-        if word_start && e.get(i..i + 6).is_some_and(|w| w.eq_ignore_ascii_case("VALUES")) {
-            let rest = &e[i + 6..];
+        // `VALUES(c)`, or MariaDB's `VALUE(c)`.
+        let word = if e
+            .get(i..i + 6)
+            .is_some_and(|w| w.eq_ignore_ascii_case("VALUES"))
+        {
+            6
+        } else if e
+            .get(i..i + 5)
+            .is_some_and(|w| w.eq_ignore_ascii_case("VALUE"))
+        {
+            5
+        } else {
+            0
+        };
+        if word_start && word > 0 {
+            let rest = &e[i + word..];
             let open = rest.len() - rest.trim_start().len();
             if rest.trim_start().starts_with('(')
                 && let Some(close) = rest.find(')')
@@ -333,7 +421,7 @@ fn values_subst(e: &str, def: &TableDef, new: &[Datum]) -> String {
                     .position(|c| c.name.eq_ignore_ascii_case(name))
                 {
                     out.push_str(&literal(&new[k], Some(&def.columns[k])));
-                    i += 6 + close + 1;
+                    i += word + close + 1;
                     continue;
                 }
             }
@@ -343,6 +431,123 @@ fn values_subst(e: &str, def: &TableDef, new: &[Datum]) -> String {
         i += c.len_utf8();
     }
     out
+}
+
+/// `e` with each column reference (`c`, `` `c` ``, `t.c`) that `repl`
+/// gives a value for replaced by that value; and whether any was.
+/// Function names, user variables and quoted strings stay.
+fn cols_subst(e: &str, repl: &dyn Fn(&str) -> Option<String>) -> (String, bool) {
+    let raw = e.as_bytes();
+    let mut out = String::with_capacity(e.len());
+    let mut hit = false;
+    let mut i = 0;
+    // Where the identifier chain being read started in `out`.
+    let mut chain: Option<usize> = None;
+    let word = |chr: u8| chr.is_ascii_alphanumeric() || chr == b'_' || chr == b'$' || chr >= 0x80;
+    while i < raw.len() {
+        let ch = raw[i];
+        if ch == b'\'' || ch == b'"' {
+            let mut at = i + 1;
+            while at < raw.len() {
+                if raw[at] == b'\\' {
+                    at += 2;
+                    continue;
+                }
+                if raw[at] == ch {
+                    if raw.get(at + 1) == Some(&ch) {
+                        at += 2;
+                        continue;
+                    }
+                    break;
+                }
+                at += 1;
+            }
+            let end = (at + 1).min(raw.len());
+            out.push_str(&e[i..end]);
+            i = end;
+            chain = None;
+            continue;
+        }
+        let prev = if i == 0 { b' ' } else { raw[i - 1] };
+        let starts = ch == b'`' || (word(ch) && !word(prev) && !ch.is_ascii_digit());
+        if !starts || prev == b'@' {
+            if ch == b'.' && chain.is_some() {
+                out.push('.');
+                i += 1;
+                continue;
+            }
+            if !word(ch) {
+                chain = None;
+            }
+            let chr = e[i..].chars().next().unwrap_or(' ');
+            out.push(chr);
+            i += chr.len_utf8();
+            continue;
+        }
+        // One identifier.
+        let (name, end) = if ch == b'`' {
+            let mut at = i + 1;
+            let mut ident = String::new();
+            while at < raw.len() {
+                if raw[at] == b'`' {
+                    if raw.get(at + 1) == Some(&b'`') {
+                        ident.push('`');
+                        at += 2;
+                        continue;
+                    }
+                    break;
+                }
+                let chr = e[at..].chars().next().unwrap_or(' ');
+                ident.push(chr);
+                at += chr.len_utf8();
+            }
+            (ident, (at + 1).min(raw.len()))
+        } else {
+            let mut at = i;
+            while at < raw.len() && word(raw[at]) {
+                at += 1;
+            }
+            (e[i..at].to_owned(), at)
+        };
+        let qualified = prev == b'.' && chain.is_some();
+        let start = if qualified { chain } else { Some(out.len()) };
+        let after = e[end..].trim_start();
+        let is_call = after.starts_with('(');
+        let continues = e[end..].starts_with('.');
+        if !is_call
+            && !continues
+            && let Some(v) = repl(&name)
+        {
+            out.truncate(start.unwrap_or(out.len()));
+            out.push_str(&v);
+            hit = true;
+            chain = None;
+        } else {
+            out.push_str(&e[i..end]);
+            chain = start;
+        }
+        i = end;
+    }
+    (out, hit)
+}
+
+/// For each assignment, whether it reads a column assigned before it in
+/// the same list (the servers read the new value then).
+fn reads_earlier(def: &TableDef, targets: &[usize], exprs: &[&str]) -> Vec<bool> {
+    exprs
+        .iter()
+        .enumerate()
+        .map(|(k, e)| {
+            let earlier = &targets[..k];
+            cols_subst(e, &|n| {
+                earlier
+                    .iter()
+                    .any(|&i| def.columns[i].name.eq_ignore_ascii_case(n))
+                    .then(String::new)
+            })
+            .1
+        })
+        .collect()
 }
 
 /// The table an `INSERT | REPLACE | UPDATE | DELETE` names first.
@@ -387,6 +592,7 @@ impl PassSession {
     /// An `INSERT`, `UPDATE` or `DELETE` on an engine table with triggers
     /// for it: run here, row by row (`None`: no trigger fires, the
     /// statement goes on as usual).
+    #[allow(clippy::too_many_lines)] // the forms, the table, then the firing lists
     pub(in crate::exec) async fn engine_sql_triggers(
         &mut self,
         cx: &mut ExecCtx<'_>,
@@ -399,7 +605,7 @@ impl PassSession {
         let Some(eng) = catalog::of(cat) else {
             return Ok(None);
         };
-        if eng.triggers.is_empty() || top_is_raw() {
+        if top_is_raw() {
             return Ok(None);
         }
         let text = match logical.or(self.eng.entry.as_deref()) {
@@ -407,6 +613,29 @@ impl PassSession {
             None => String::from_utf8_lossy(sql).into_owned(),
         };
         let text = text.as_str();
+        // Validations: a write checks them (and one running writes nothing).
+        let vals = if validation::write_verb(text) {
+            if let Some(name) = validation::running() {
+                let e = validation::writes_refused(&name, text);
+                return Ok(Some(self.fail(out, &e).await?));
+            }
+            match self.validations().await {
+                Ok(v) => v,
+                Err(e) => return Ok(Some(self.fail(out, &e).await?)),
+            }
+        } else {
+            Arc::default()
+        };
+        if eng.triggers.is_empty() && vals.is_empty() {
+            return Ok(None);
+        }
+        // `UPDATE a JOIN b ...`, `DELETE a, b FROM ...`: every target's
+        // triggers.
+        if let Some(step) =
+            Box::pin(self.trg_multi_hook(cx, cat, eng, &vals, text, more, out)).await?
+        {
+            return Ok(Some(step));
+        }
         let Some(read) = read(text) else {
             return Ok(None);
         };
@@ -421,7 +650,9 @@ impl PassSession {
                 let Some(name) = table_of_text(text) else {
                     return Ok(None);
                 };
-                if !self.trg_has(eng, &name, lctn) {
+                // (Validations don't check deletes.)
+                let v = (!validation::deletes(text)).then_some(&*vals);
+                if !self.trg_has(eng, v, &name, lctn) {
                     return Ok(None);
                 }
                 let e = not_on_engine(&why);
@@ -454,6 +685,39 @@ impl PassSession {
             );
             return Ok(Some(self.fail(out, &e).await?));
         }
+        let mut dml = dml;
+        let mysql = self.persona == sprig_proto_mysql::Persona::MySql84;
+        if let Dml::Insert {
+            aliased,
+            cols,
+            upsert,
+            ..
+        } = &mut dml
+        {
+            // MySQL's row alias, read off the client's own text (the
+            // MySQL port hands it on already written as `VALUE(c)`).
+            // MariaDB has none: its syntax error comes from the usual path.
+            if *aliased && !mysql {
+                return Ok(None);
+            }
+            let client = if *aliased {
+                Some(text.to_owned())
+            } else if mysql && !upsert.is_empty() {
+                self.eng
+                    .entry
+                    .as_deref()
+                    .map(|t| String::from_utf8_lossy(t).into_owned())
+            } else {
+                None
+            };
+            if let Some(t) = client {
+                match alias_upsert(&t, &def, cols.as_deref()) {
+                    Ok(Some(u)) => *upsert = u,
+                    Ok(None) => {}
+                    Err(e) => return Ok(Some(self.fail(out, &e).await?)),
+                }
+            }
+        }
         let ev = dml.event();
         let before = firing(eng.triggers.values(), def.object, true, ev);
         let after = firing(eng.triggers.values(), def.object, false, ev);
@@ -474,7 +738,17 @@ impl PassSession {
             ),
             _ => (Vec::new(), Vec::new()),
         };
-        if before.is_empty() && after.is_empty() && del.0.is_empty() && del.1.is_empty() {
+        // Validations: an insert's (an upsert's update too), an update's.
+        let checks = match &dml {
+            Dml::Insert { upsert, .. } => {
+                vals.fires(def.object, false)
+                    || (!upsert.is_empty() && vals.fires(def.object, true))
+            }
+            Dml::Update { .. } => vals.fires(def.object, true),
+            Dml::Delete { .. } | Dml::Multi { .. } => false,
+        };
+        if before.is_empty() && after.is_empty() && del.0.is_empty() && del.1.is_empty() && !checks
+        {
             return Ok(None);
         }
         let db_name = row.name.clone();
@@ -487,12 +761,15 @@ impl PassSession {
             more,
             out,
         );
-        Ok(Some(Box::pin(with_stack(fut)).await?))
+        let fut = RIGHTS.scope(std::cell::RefCell::new(Vec::new()), fut);
+        Ok(Some(
+            Box::pin(validation::with(vals, with_stack(fut))).await?,
+        ))
     }
 
-    /// `text` changes rows of an engine table that has triggers: a
-    /// prepared statement the engine can't run yet.
-    pub(in crate::exec) fn engine_prepared_fires(&self, text: &[u8]) -> bool {
+    /// `text` changes rows of an engine table that has triggers or
+    /// validations: a prepared statement the engine can't run yet.
+    pub(in crate::exec) async fn engine_prepared_fires(&self, text: &[u8]) -> bool {
         let text = String::from_utf8_lossy(text);
         let first = text.trim_start().get(..6).map(str::to_ascii_uppercase);
         if !matches!(
@@ -507,17 +784,36 @@ impl PassSession {
         let Some(eng) = catalog::of(&cat) else {
             return false;
         };
-        if eng.triggers.is_empty() {
+        // A table with validations (read again if they're stale; a failed
+        // read sends the write the text way, which reports it).
+        let vals = self.validations().await.ok();
+        if eng.triggers.is_empty() && vals.as_ref().is_some_and(|v| v.is_empty()) {
             return false;
         }
         let lctn = self
             .tenant
             .as_deref()
             .is_some_and(crate::tenant::session::TenantSession::lower_case_table_names);
-        table_of_text(&text).is_some_and(|n| self.trg_has(eng, &n, lctn))
+        let vals = if validation::deletes(&text) {
+            Some(Arc::default())
+        } else {
+            vals
+        };
+        match (table_of_text(&text), &vals) {
+            (Some(n), Some(v)) => self.trg_has(eng, Some(&**v), &n, lctn),
+            (Some(_), None) => true,
+            (None, _) => false,
+        }
     }
 
-    fn trg_has(&self, eng: &catalog::EngineCatalog, name: &str, lctn: bool) -> bool {
+    /// Whether table `name` has triggers, or validations in `vals`.
+    fn trg_has(
+        &self,
+        eng: &catalog::EngineCatalog,
+        vals: Option<&validation::Validations>,
+        name: &str,
+        lctn: bool,
+    ) -> bool {
         let (db, t) = match name.split_once('.') {
             Some((d, t)) => (Some(d.to_owned()), t),
             None => (self.current_logical(), name),
@@ -533,6 +829,7 @@ impl PassSession {
             return false;
         };
         eng.triggers.values().any(|x| x.table == def.object)
+            || vals.is_some_and(|v| v.has(def.object))
     }
 
     /// A one-row change or read of the statement's own: fires nothing.
@@ -585,6 +882,7 @@ impl PassSession {
                 rows,
                 query,
                 upsert,
+                ..
             } => {
                 Box::pin(self.trg_insert(
                     cx,
@@ -603,6 +901,7 @@ impl PassSession {
             Dml::Delete { tail } => {
                 Box::pin(self.trg_delete(cx, &def, &db, tail, &before, &after)).await
             }
+            Dml::Multi { rs, trigs, dbs } => Box::pin(self.trg_multi(cx, rs, trigs, dbs)).await,
         };
         let _ = STACK.try_with(|s| s.borrow_mut().pop());
         match r {
@@ -621,6 +920,10 @@ impl PassSession {
                 ok.affected_rows = done.affected;
                 ok.last_insert_id = done.first_id;
                 let info = match dml {
+                    Dml::Multi { ref rs, .. } if rs.update => Some(format!(
+                        "Rows matched: {}  Changed: {}  Warnings: 0",
+                        done.matched, done.affected
+                    )),
                     Dml::Update { .. } => Some(format!(
                         "Rows matched: {}  Changed: {}  Warnings: 0",
                         done.matched, done.affected
@@ -657,6 +960,70 @@ impl PassSession {
         }
     }
 
+    /// 1142 unless the definer of `t` has the TRIGGER right on table
+    /// `def` of database `db`: checked when the trigger first fires in a
+    /// statement, as both servers do (a statement that changes no row
+    /// checks nothing).
+    fn trg_rights(&mut self, t: &Trigger, db: &str, def: &TableDef) -> Result<()> {
+        let who = &t.cx.definer;
+        let key = (def.object, who.0.clone(), who.1.clone());
+        if RIGHTS
+            .try_with(|r| r.borrow().contains(&key))
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+        let saved = self.sp_become(Some(who))?;
+        let ok = match (self.tenant.as_deref(), self.engine_cat()) {
+            (Some(ts), Some(cat)) => {
+                let lctn = ts.lower_case_table_names();
+                let grants = crate::tenant::authz::privileges(ts, &cat);
+                let db_key = database_key(db, lctn);
+                let name_key = sprig_catalog::ddl::object_key(
+                    sprig_catalog::store::ObjectKind::Table,
+                    &def.name,
+                    lctn,
+                );
+                let on = |target| grants.allows(sprig_auth::authz::Action::Trigger, target);
+                grants.unrestricted()
+                    || on(sprig_auth::authz::Target::Object {
+                        db_key: &db_key,
+                        db: def.db,
+                        object: def.object,
+                    })
+                    || on(sprig_auth::authz::Target::Named {
+                        db_key: &db_key,
+                        name_key: &name_key,
+                    })
+                    || on(sprig_auth::authz::Target::Database { db_key: &db_key })
+            }
+            _ => true,
+        };
+        if let (Some(w), Some(ts)) = (saved, self.tenant.as_deref_mut()) {
+            ts.principal.user_id = w.0;
+            ts.principal.user = w.1;
+            ts.principal.host = w.2;
+            ts.authz = w.3;
+        }
+        if !ok {
+            let shown = if self.persona == sprig_proto_mysql::Persona::MySql84 {
+                format!("'{}'", def.name)
+            } else {
+                format!("`{db}`.`{}`", def.name)
+            };
+            return Err(SprigError::standard(
+                1142,
+                *b"42000",
+                format!(
+                    "TRIGGER command denied to user '{}'@'{}' for table {shown}",
+                    who.0, who.1
+                ),
+            ));
+        }
+        let _ = RIGHTS.try_with(|r| r.borrow_mut().push(key));
+        Ok(())
+    }
+
     /// Runs `trigs` for one row: `new` / `old` are the slots' values
     /// (`new` is written back: a `BEFORE` trigger may change it).
     async fn trg_fire(
@@ -671,6 +1038,7 @@ impl PassSession {
         let names: Vec<String> = def.columns.iter().map(|c| c.name.clone()).collect();
         let n = def.columns.len();
         for t in trigs {
+            self.trg_rights(t, db, def)?;
             let prog = t.program(&names)?;
             let has_new = t.when().is_some_and(|(_, e)| e != Event::Delete);
             let has_old = t.when().is_some_and(|(_, e)| e != Event::Insert);
@@ -778,6 +1146,38 @@ impl PassSession {
         }
     }
 
+    /// An assignment's value read against the stored row `old`, with the
+    /// columns assigned before it (`earlier`) at their new values in `new`.
+    #[allow(clippy::too_many_arguments)]
+    async fn trg_eval_after(
+        &mut self,
+        cx: &mut ExecCtx<'_>,
+        def: &TableDef,
+        db: &str,
+        earlier: &[usize],
+        e: &str,
+        new: &[Datum],
+        old: &[Datum],
+    ) -> Result<Datum> {
+        let (e, _) = cols_subst(e, &|n| {
+            earlier
+                .iter()
+                .find(|&&i| def.columns[i].name.eq_ignore_ascii_case(n))
+                .map(|&i| literal(&new[i], Some(&def.columns[i])))
+        });
+        let sql = format!(
+            "SELECT {e} FROM {}.{}{}",
+            q(db),
+            q(&def.name),
+            Self::trg_match(def, old)
+        );
+        let ran = self.trg_raw(cx, &sql).await?;
+        Ok(match (ran.columns.first(), ran.rows.first()) {
+            (Some(cd), Some(r)) => wire_datum(r.first().and_then(|v| v.as_deref()), cd),
+            _ => Datum::Null,
+        })
+    }
+
     /// The rows holding one of `new`'s unique keys, locked.
     async fn trg_conflicts(
         &mut self,
@@ -854,9 +1254,16 @@ impl PassSession {
             idx.push(i);
             exprs.push(values_subst(e, def, new));
         }
+        let refs: Vec<&str> = exprs.iter().map(String::as_str).collect();
+        let deps = reads_earlier(def, &idx, &refs);
+        let list: Vec<&str> = refs
+            .iter()
+            .zip(&deps)
+            .map(|(e, dep)| if *dep { "NULL" } else { e })
+            .collect();
         let sql = format!(
             "SELECT {} FROM {}.{}{}",
-            exprs.join(", "),
+            list.join(", "),
             q(db),
             q(&def.name),
             Self::trg_match(def, old)
@@ -866,12 +1273,20 @@ impl PassSession {
         let mut upd = old.to_vec();
         let mut conds = Vec::new();
         for (k, &i) in idx.iter().enumerate() {
-            let v = ran.columns.get(k).map_or(Datum::Null, |cd| {
-                wire_datum(one.get(k).and_then(|v| v.as_deref()), cd)
-            });
+            let v = if deps[k] {
+                self.trg_eval_after(cx, def, db, &idx[..k], refs[k], &upd, old)
+                    .await?
+            } else {
+                ran.columns.get(k).map_or(Datum::Null, |cd| {
+                    wire_datum(one.get(k).and_then(|v| v.as_deref()), cd)
+                })
+            };
             upd[i] = store(Some(&def.columns[i]), v, env, &mut conds)?;
         }
+        let (bu, au) = (of_assigned(bu, def, &idx), of_assigned(au, def, &idx));
+        let (bu, au) = (bu.as_slice(), au.as_slice());
         self.trg_fire(cx, def, db, bu, &mut upd, old).await?;
+        self.val_check(cx, def, db, &upd, Some(old)).await?;
         let sets: Vec<String> = def
             .columns
             .iter()
@@ -1012,6 +1427,7 @@ impl PassSession {
                 .map(|(i, c)| literal(&new[i], Some(c)))
                 .collect();
             self.trg_fire(cx, def, db, before, &mut new, &[]).await?;
+            self.val_check(cx, def, db, &new, None).await?;
             let mut names = Vec::new();
             let mut lits = Vec::new();
             for (i, c) in def.columns.iter().enumerate() {
@@ -1031,9 +1447,15 @@ impl PassSession {
                 && let Some(r) = found.rows.first()
             {
                 let old = self.trg_row(cx, def, &found.columns, r)?;
-                let n = Box::pin(self.trg_upsert(cx, def, db, upsert, &new, &old, [
-                    del_before, del_after,
-                ]))
+                let n = Box::pin(self.trg_upsert(
+                    cx,
+                    def,
+                    db,
+                    upsert,
+                    &new,
+                    &old,
+                    [del_before, del_after],
+                ))
                 .await?;
                 done.affected += n;
                 done.rows += 1;
@@ -1125,24 +1547,14 @@ impl PassSession {
             targets.push(i);
         }
         // An assignment reading a column assigned before it sees the new
-        // value on both servers: not done here yet.
-        for (k, (_, e)) in sets.iter().enumerate() {
-            let lower = e.to_ascii_lowercase();
-            if sets[..k]
-                .iter()
-                .any(|(n, _)| lower.contains(&n.to_ascii_lowercase()))
-            {
-                return Err(not_on_engine(
-                    "an UPDATE of a table with triggers whose SET reads a column it assigned earlier",
-                ));
-            }
-        }
+        // value on both servers: such ones run per row, after the others.
         let exprs: Vec<&str> = sets.iter().map(|(_, e)| e.as_str()).collect();
+        let deps = reads_earlier(def, &targets, &exprs);
         let n = def.columns.len();
         let mut list = Self::trg_select_list(def);
-        if !exprs.is_empty() {
+        for (e, dep) in exprs.iter().zip(&deps) {
             list.push_str(", ");
-            list.push_str(&exprs.join(", "));
+            list.push_str(if *dep { "NULL" } else { e });
         }
         let sql = format!("SELECT {list}{tail} FOR UPDATE");
         let ran = self.trg_raw(cx, &sql).await?;
@@ -1153,50 +1565,279 @@ impl PassSession {
             let mut new = old.clone();
             let mut conds = Vec::new();
             for (k, &i) in targets.iter().enumerate() {
-                let d = match ran.columns.get(n + k) {
-                    Some(cd) => wire_datum(r.get(n + k).and_then(|v| v.as_deref()), cd),
-                    None => Datum::Null,
+                let d = if deps[k] {
+                    self.trg_eval_after(cx, def, db, &targets[..k], exprs[k], &new, &old)
+                        .await?
+                } else {
+                    match ran.columns.get(n + k) {
+                        Some(cd) => wire_datum(r.get(n + k).and_then(|v| v.as_deref()), cd),
+                        None => Datum::Null,
+                    }
                 };
                 new[i] = store(Some(&def.columns[i]), d, env, &mut conds)?;
             }
-            let start: Vec<String> = def
-                .columns
-                .iter()
-                .enumerate()
-                .map(|(i, c)| literal(&new[i], Some(c)))
-                .collect();
-            self.trg_fire(cx, def, db, before, &mut new, &old).await?;
-            let mut parts = Vec::new();
-            for (i, c) in def.columns.iter().enumerate() {
-                if c.generated.is_some() {
-                    continue;
-                }
-                let value = literal(&new[i], Some(c));
-                if targets.contains(&i) || value != start[i] {
-                    parts.push(format!("{} = {value}", q(&c.name)));
-                }
-            }
-            done.matched += 1;
-            if !parts.is_empty() {
-                let sql = format!(
-                    "UPDATE {}.{} SET {}{}",
-                    q(db),
-                    q(&def.name),
-                    parts.join(", "),
-                    Self::trg_match(def, &old)
-                );
-                let ran = self.trg_raw(cx, &sql).await?;
-                done.affected += ran.affected;
-            }
-            if after.is_empty() {
+            self.trg_update_row(cx, def, db, &targets, new, &old, [before, after], &mut done)
+                .await?;
+        }
+        Ok(done)
+    }
+
+    /// One row of an `UPDATE`: `new` (the assignments' values, `targets`
+    /// their columns) through the `BEFORE` triggers, the change, then the
+    /// `AFTER` triggers on the row as stored.
+    #[allow(clippy::too_many_arguments)]
+    async fn trg_update_row(
+        &mut self,
+        cx: &mut ExecCtx<'_>,
+        def: &TableDef,
+        db: &str,
+        targets: &[usize],
+        mut new: Vec<Datum>,
+        old: &[Datum],
+        [before, after]: [&[Arc<Trigger>]; 2],
+        done: &mut Done,
+    ) -> Result<()> {
+        let (before, after) = (
+            of_assigned(before, def, targets),
+            of_assigned(after, def, targets),
+        );
+        let (before, after) = (before.as_slice(), after.as_slice());
+        let start: Vec<String> = def
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, c)| literal(&new[i], Some(c)))
+            .collect();
+        self.trg_fire(cx, def, db, before, &mut new, old).await?;
+        self.val_check(cx, def, db, &new, Some(old)).await?;
+        let mut parts = Vec::new();
+        for (i, c) in def.columns.iter().enumerate() {
+            if c.generated.is_some() {
                 continue;
             }
-            let mut stored = if def.hidden {
-                new.clone()
-            } else {
-                self.trg_reread(cx, def, db, &new).await?.unwrap_or(new)
+            let value = literal(&new[i], Some(c));
+            if targets.contains(&i) || value != start[i] {
+                parts.push(format!("{} = {value}", q(&c.name)));
+            }
+        }
+        done.matched += 1;
+        if !parts.is_empty() {
+            let sql = format!(
+                "UPDATE {}.{} SET {}{}",
+                q(db),
+                q(&def.name),
+                parts.join(", "),
+                Self::trg_match(def, old)
+            );
+            let ran = self.trg_raw(cx, &sql).await?;
+            done.affected += ran.affected;
+        }
+        if after.is_empty() {
+            return Ok(());
+        }
+        let mut stored = if def.hidden {
+            new.clone()
+        } else {
+            self.trg_reread(cx, def, db, &new).await?.unwrap_or(new)
+        };
+        self.trg_fire(cx, def, db, after, &mut stored, old).await
+    }
+
+    /// One row of a `DELETE`, between its triggers.
+    async fn trg_delete_row(
+        &mut self,
+        cx: &mut ExecCtx<'_>,
+        def: &TableDef,
+        db: &str,
+        old: &[Datum],
+        [before, after]: [&[Arc<Trigger>]; 2],
+        done: &mut Done,
+    ) -> Result<()> {
+        self.trg_fire(cx, def, db, before, &mut [], old).await?;
+        let sql = format!(
+            "DELETE FROM {}.{}{}",
+            q(db),
+            q(&def.name),
+            Self::trg_match(def, old)
+        );
+        let ran = self.trg_raw(cx, &sql).await?;
+        done.affected += ran.affected;
+        self.trg_fire(cx, def, db, after, &mut [], old).await
+    }
+
+    /// A multi-table `UPDATE` / `DELETE` whose targets have triggers: run
+    /// here (`None`: not one, or no trigger fires).
+    #[allow(clippy::too_many_arguments)]
+    async fn trg_multi_hook(
+        &mut self,
+        cx: &mut ExecCtx<'_>,
+        cat: &Arc<sprig_catalog::TenantCatalog>,
+        eng: &catalog::EngineCatalog,
+        vals: &Arc<validation::Validations>,
+        text: &str,
+        more: bool,
+        out: &mut dyn ResultSink,
+    ) -> Result<Option<Step>> {
+        let first = text.trim_start().get(..6).map(str::to_ascii_uppercase);
+        if !matches!(first.as_deref(), Some("UPDATE" | "DELETE")) {
+            return Ok(None);
+        }
+        let lctn = self
+            .tenant
+            .as_deref()
+            .is_some_and(crate::tenant::session::TenantSession::lower_case_table_names);
+        let current = self
+            .current_logical()
+            .and_then(|d| cat.database(&database_key(&d, lctn)))
+            .map(|r| r.db_id);
+        let lex = self.lex_opts().0;
+        let mysql = self.persona == sprig_proto_mysql::Persona::MySql84;
+        let found = {
+            let names = crate::engine::plan::CatalogNames {
+                cat,
+                eng,
+                lower_case: lctn,
             };
-            self.trg_fire(cx, def, db, after, &mut stored, &old).await?;
+            let bcx = crate::engine::plan::BindCtx {
+                tenant: cat.tenant,
+                names: &names,
+                current,
+                backslash: !lex.no_backslash_escapes,
+            };
+            crate::engine::multiwrite::rows_select(&bcx, text, lex, mysql)
+        };
+        // An error is the statement's usual path's to give.
+        let Ok(Some(rs)) = found else {
+            return Ok(None);
+        };
+        let ev = if rs.update {
+            Event::Update
+        } else {
+            Event::Delete
+        };
+        let trigs: Vec<[Vec<Arc<Trigger>>; 2]> = rs
+            .targets
+            .iter()
+            .map(|t| {
+                [
+                    firing(eng.triggers.values(), t.def.object, true, ev),
+                    firing(eng.triggers.values(), t.def.object, false, ev),
+                ]
+            })
+            .collect();
+        let checks = rs.update && rs.targets.iter().any(|t| vals.fires(t.def.object, true));
+        if !checks && trigs.iter().all(|[b, a]| b.is_empty() && a.is_empty()) {
+            return Ok(None);
+        }
+        if let Some(t) = rs.targets.iter().find(|t| on_stack(&busy(t.def.object))) {
+            let e = SprigError::standard(
+                1442,
+                *b"HY000",
+                format!(
+                    "Can't update table '{}' in stored function/trigger because it is already used by statement which invoked this stored function/trigger",
+                    t.def.name
+                ),
+            );
+            return Ok(Some(self.fail(out, &e).await?));
+        }
+        let dbs: Vec<String> = rs
+            .targets
+            .iter()
+            .map(|t| {
+                cat.databases
+                    .get(t.db)
+                    .map_or_else(String::new, |d| d.name.clone())
+            })
+            .collect();
+        let def = Arc::clone(&rs.targets[0].def);
+        let db = dbs[0].clone();
+        let dml = Dml::Multi {
+            rs: Box::new(rs),
+            trigs,
+            dbs,
+        };
+        let fut = self.trg_statement(cx, def, db, dml, Default::default(), more, out);
+        let fut = RIGHTS.scope(std::cell::RefCell::new(Vec::new()), fut);
+        Ok(Some(
+            Box::pin(validation::with(Arc::clone(vals), with_stack(fut))).await?,
+        ))
+    }
+
+    /// Runs a multi-table write row by row: the rows found first (the
+    /// values worked out from them as they were), then each target's rows
+    /// in turn, each once, the first table's first, as both servers do.
+    async fn trg_multi(
+        &mut self,
+        cx: &mut ExecCtx<'_>,
+        rs: &crate::engine::multiwrite::RowsSelect,
+        trigs: &[[Vec<Arc<Trigger>>; 2]],
+        dbs: &[String],
+    ) -> Result<Done> {
+        // Every table the statement reads is in use: a trigger writing
+        // one fails (1442).
+        let marks: Vec<String> = rs.tables.iter().map(|d| busy(d.object)).collect();
+        let _ = STACK.try_with(|s| s.borrow_mut().extend(marks.iter().cloned()));
+        let r = self.trg_multi_rows(cx, rs, trigs, dbs).await;
+        let _ = STACK.try_with(|s| {
+            let mut s = s.borrow_mut();
+            let n = s.len().saturating_sub(marks.len());
+            s.truncate(n);
+        });
+        r
+    }
+
+    async fn trg_multi_rows(
+        &mut self,
+        cx: &mut ExecCtx<'_>,
+        rs: &crate::engine::multiwrite::RowsSelect,
+        trigs: &[[Vec<Arc<Trigger>>; 2]],
+        dbs: &[String],
+    ) -> Result<Done> {
+        let ran = self
+            .trg_raw(cx, &format!("{} FOR UPDATE", rs.select))
+            .await?;
+        let env = self.engine_vars(cx).env;
+        let mut done = Done::default();
+        for (k, t) in rs.targets.iter().enumerate() {
+            let def = &*t.def;
+            let db = &dbs[k];
+            let [before, after] = &trigs[k];
+            let targets: Vec<usize> = t.sets.iter().map(|s| s.0).collect();
+            let mut seen = std::collections::HashSet::new();
+            let cols = ran.columns.get(t.cols.clone()).unwrap_or(&[]);
+            for r in &ran.rows {
+                let old = self.trg_row(cx, def, cols, r.get(t.cols.clone()).unwrap_or(&[]))?;
+                // A row matched again is written once, as its first match
+                // gave.
+                if !seen.insert(Self::trg_match(def, &old)) {
+                    continue;
+                }
+                if rs.update {
+                    let mut new = old.clone();
+                    let mut conds = Vec::new();
+                    for &(ci, pos) in &t.sets {
+                        let d = match ran.columns.get(pos) {
+                            Some(cd) => wire_datum(r.get(pos).and_then(|v| v.as_deref()), cd),
+                            None => Datum::Null,
+                        };
+                        new[ci] = store(Some(&def.columns[ci]), d, env, &mut conds)?;
+                    }
+                    self.trg_update_row(
+                        cx,
+                        def,
+                        db,
+                        &targets,
+                        new,
+                        &old,
+                        [before, after],
+                        &mut done,
+                    )
+                    .await?;
+                } else {
+                    self.trg_delete_row(cx, def, db, &old, [before, after], &mut done)
+                        .await?;
+                }
+            }
         }
         Ok(done)
     }
@@ -1215,19 +1856,26 @@ impl PassSession {
         let mut done = Done::default();
         for r in &ran.rows {
             let old = self.trg_row(cx, def, &ran.columns, r)?;
-            self.trg_fire(cx, def, db, before, &mut [], &old).await?;
-            let sql = format!(
-                "DELETE FROM {}.{}{}",
-                q(db),
-                q(&def.name),
-                Self::trg_match(def, &old)
-            );
-            let ran = self.trg_raw(cx, &sql).await?;
-            done.affected += ran.affected;
-            self.trg_fire(cx, def, db, after, &mut [], &old).await?;
+            self.trg_delete_row(cx, def, db, &old, [before, after], &mut done)
+                .await?;
         }
         Ok(done)
     }
+}
+
+/// The `UPDATE` triggers of `trigs` that an update assigning the columns
+/// `assigned` (positions in `def`) fires: `UPDATE OF c, ...` ones only when
+/// one of their columns is assigned.
+fn of_assigned(trigs: &[Arc<Trigger>], def: &TableDef, assigned: &[usize]) -> Vec<Arc<Trigger>> {
+    let names: Vec<&str> = assigned
+        .iter()
+        .filter_map(|&i| def.columns.get(i).map(|c| c.name.as_str()))
+        .collect();
+    trigs
+        .iter()
+        .filter(|t| t.fires_on(&names))
+        .cloned()
+        .collect()
 }
 
 /// Triggers list by event in the servers' order: INSERT, UPDATE, DELETE.
@@ -1379,5 +2027,23 @@ impl PassSession {
             }
             None => Some(Ok(answer)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cols_subst;
+
+    #[test]
+    fn column_references_are_replaced_but_not_names_of_other_things() {
+        let r = |n: &str| n.eq_ignore_ascii_case("a").then(|| "7".to_owned());
+        let (s, hit) = cols_subst("a + t.a * `a` - A", &r);
+        assert_eq!(s, "7 + 7 * 7 - 7");
+        assert!(hit);
+        let (s, hit) = cols_subst("a(1) + @a + 'a' + \"a\" + ab + b.a.c + 1a", &r);
+        assert_eq!(s, "a(1) + @a + 'a' + \"a\" + ab + b.a.c + 1a");
+        assert!(!hit);
+        let (s, _) = cols_subst("CONCAT('it''s', a, db.t.a)", &r);
+        assert_eq!(s, "CONCAT('it''s', 7, 7)");
     }
 }

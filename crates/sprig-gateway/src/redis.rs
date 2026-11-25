@@ -530,9 +530,7 @@ impl ResultSink for Collect {
     async fn begin_rows(&mut self, columns: &[ColumnDef], format: RowFormat) -> Result<()> {
         self.columns = columns.len();
         self.binary = format == RowFormat::Binary;
-        if self.binary {
-            self.defs = columns.to_vec();
-        }
+        self.defs = columns.to_vec();
         Ok(())
     }
 
@@ -827,6 +825,16 @@ impl SqlSession {
     }
 
     async fn run(&mut self, sql: &str) -> std::result::Result<Collect, SqlError> {
+        self.run_as(sql, true).await
+    }
+
+    /// `sql` as the session's own statement (`internal`: SprigDB's, which
+    /// may name internal objects) or as the client's (`SPRIG.QUERY`).
+    async fn run_as(
+        &mut self,
+        sql: &str,
+        internal: bool,
+    ) -> std::result::Result<Collect, SqlError> {
         // A Redis command's write is marked in the binlog, so the
         // keyspace notifications from the feed pass over it.
         let marked;
@@ -841,7 +849,7 @@ impl SqlSession {
         let end = sql.char_indices().nth(1024).map_or(sql.len(), |(i, _)| i);
         self.session
             .begin_command("Query", Some(sql[..end].to_owned()));
-        self.exec.set_internal(true);
+        self.exec.set_internal(internal);
         let r = {
             let mut cx = ExecCtx {
                 session: &mut self.session,
@@ -915,6 +923,26 @@ impl SqlRunner for SqlSession {
         params: &[&[u8]],
     ) -> std::result::Result<Vec<Row>, SqlError> {
         Ok(self.run_bound(sql, params).await?.rows)
+    }
+
+    async fn query_columns(
+        &mut self,
+        sql: &str,
+    ) -> std::result::Result<sprig_kv::sql::Table, SqlError> {
+        let c = self.run_as(sql, false).await?;
+        let columns = c
+            .defs
+            .iter()
+            .map(|d| sprig_kv::sql::Column {
+                name: String::from_utf8_lossy(&d.name).into_owned(),
+                ty: d.col_type,
+                unsigned: d.is_unsigned(),
+            })
+            .collect();
+        Ok(sprig_kv::sql::Table {
+            columns,
+            rows: c.rows,
+        })
     }
 }
 

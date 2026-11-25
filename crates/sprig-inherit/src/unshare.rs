@@ -53,7 +53,7 @@ use crate::plan::{Ctx, state_of};
 use crate::view::q;
 
 /// Keys per `IN (...)` list.
-const CHUNK: usize = 500;
+pub(crate) const CHUNK: usize = 500;
 
 /// How many times a drop runs its cleanup before it gives up.
 pub const ATTEMPTS: usize = 3;
@@ -221,12 +221,13 @@ pub async fn after_drop(
                 // Below a cut child: the levels from that child down.
                 let above: Vec<&TreeTable> =
                     t.ancestors[i..].iter().filter_map(|a| at.get(a)).collect();
-                let lost = lost_keys(r, t.tenant, &table, &key, &above, c, ctx.lctn, "ovr").await?;
+                let lost =
+                    lost_keys(r, t.tenant, &table, &key, &above, c, ctx.lctn, "ovr", None).await?;
                 for part in lost.chunks(CHUNK) {
                     out.orphaned += orphan(r, t.tenant, &table, &key, Some(part)).await?;
                 }
                 let lost =
-                    lost_keys(r, t.tenant, &table, &key, &above, c, ctx.lctn, "hide").await?;
+                    lost_keys(r, t.tenant, &table, &key, &above, c, ctx.lctn, "hide", None).await?;
                 for part in lost.chunks(CHUNK) {
                     out.unhidden += unhide(r, t.tenant, &table, &key, Some(part)).await?;
                 }
@@ -271,6 +272,140 @@ pub async fn after_drop(
             .increment(out.orphaned);
     }
     Ok(out)
+}
+
+/// The orphan pass across tenants over the current state, for table
+/// `db.table` of the tenants at or below `top`: each tenant below that
+/// inherits the table through tenant edges has its overrides (`ovr` rows of
+/// its root space) of records that no level above it still holds (ignoring
+/// share filters; a hide above hides) turned into `orphan` rows with every
+/// bit set, as the copy worker's orphan pass does (its "keep"). Parents
+/// first, so a child's new orphans count for its children. `only`: just
+/// the overrides of these keys (SQL literals of the key's columns), the
+/// keys whose rows changed somewhere in the tree; `None`: every override.
+///
+/// As the copy worker's pass, for a table with foreign keys to inheritable
+/// tables, the new orphans first take, for each foreign key they inherit,
+/// the value their view showed when the record left
+/// ([`crate::orphan_refs::fill`]), then claim what they reference in the
+/// reference index ([`crate::orphan_refs::claim`]), so a handover no longer
+/// has to stand in for them; a record hierarchy's path-only overrides go
+/// with their records. Every step can run again. Returns how many rows
+/// became orphans.
+///
+/// # Errors
+/// The directory's, the cache's and the statements'.
+pub async fn orphan_pass(
+    r: &mut dyn Runner,
+    top: TenantId,
+    db: &str,
+    table: &str,
+    lctn: bool,
+    only: Option<&[Vec<String>]>,
+) -> Result<u64> {
+    if only.is_some_and(<[Vec<String>]>::is_empty) {
+        return Ok(0);
+    }
+    let mut tree = r.tree_tables(top, db, table).await?;
+    tree.sort_by_key(|t| t.ancestors.len());
+    let at: BTreeMap<TenantId, TreeTable> = tree.iter().map(|t| (t.tenant, t.clone())).collect();
+    let mut cats: BTreeMap<TenantId, std::sync::Arc<TenantCatalog>> = BTreeMap::new();
+    for t in &tree {
+        cats.insert(t.tenant, r.tenant_catalog(t.tenant).await?);
+    }
+    let c = Carried {
+        object: ObjectId(0),
+        share: 0,
+        db: db.to_owned(),
+        table: table.to_owned(),
+    };
+    let mut n = 0;
+    for t in &tree {
+        // The levels its records come through: its tenant edges upwards.
+        let mut above: Vec<&TreeTable> = Vec::new();
+        let mut child = t.tenant;
+        for a in t.ancestors.iter().rev() {
+            let (Some(pc), Some(cc), Some(y)) = (cats.get(a), cats.get(&child), at.get(a)) else {
+                break;
+            };
+            if crate::plan::tenant_edge(pc, cc, db, table, lctn)?.is_none() {
+                break;
+            }
+            above.push(y);
+            child = *a;
+        }
+        if above.is_empty() {
+            continue;
+        }
+        above.reverse();
+        let Some((xtable, key, xid)) = table_of(r, t, &c, lctn).await? else {
+            continue;
+        };
+        let lost = lost_keys(r, t.tenant, &xtable, &key, &above, &c, lctn, "ovr", only).await?;
+        if lost.is_empty() {
+            continue;
+        }
+        let xo = cats
+            .get(&t.tenant)
+            .and_then(|cat| state_of(cat))
+            .and_then(|st| st.object(xid).cloned());
+        let links = xo.as_ref().is_some_and(|o| !o.links.is_empty());
+        if links && let Some(xo) = &xo {
+            crate::orphan_refs::fill(r, t, xo, db, &above, &xtable, &lost, lctn).await?;
+        }
+        if let Some(xo) = xo.as_ref().filter(|o| crate::hier::has_paths(o)) {
+            // A record hierarchy's path-only overrides go with their records
+            // (found by a read, deleted by key: the engine's single-table
+            // writes take plain comparisons).
+            let cols = key.iter().map(|k| q(k)).collect::<Vec<_>>().join(", ");
+            for part in lost.chunks(CHUNK) {
+                let only: Vec<Vec<String>> = r
+                    .ctl_query(
+                        t.tenant,
+                        &format!(
+                            "SELECT {cols} FROM {xtable} WHERE `_sprig_space` = {} AND \
+                             `_sprig_state` = 'ovr' AND `_sprig_ovr` & {} = 0 AND {}",
+                            ROOT_SPACE.0,
+                            !crate::hier::path_bits(xo),
+                            key_pred(&key, part)
+                        ),
+                    )
+                    .await?
+                    .iter()
+                    .map(|row| key_lits(row))
+                    .collect();
+                if only.is_empty() {
+                    continue;
+                }
+                r.ctl_query(
+                    t.tenant,
+                    &format!(
+                        "DELETE FROM {xtable} WHERE `_sprig_space` = {} AND `_sprig_state` = \
+                         'ovr' AND {}",
+                        ROOT_SPACE.0,
+                        key_pred(&key, &only)
+                    ),
+                )
+                .await?;
+            }
+        }
+        let mut made = 0;
+        for part in lost.chunks(CHUNK) {
+            made += orphan(r, t.tenant, &xtable, &key, Some(part)).await?;
+        }
+        n += made;
+        if made > 0
+            && links
+            && let Some(xo) = &xo
+        {
+            crate::orphan_refs::claim(r, t, xo, db, &xtable, &lost, lctn).await?;
+        }
+    }
+    if n > 0 {
+        metrics::counter!("sprig_inherit_orphans_total", "policy" => "keep", "path" => "pass")
+            .increment(n);
+    }
+    Ok(n)
 }
 
 /// A failed sweep of a dropped share is tried again after this long.
@@ -517,7 +652,7 @@ async fn drop_copy(r: &mut dyn Runner, t: TenantId, schema: &str, object: Object
 }
 
 /// `(k1, k2) IN ((..), ..)`, or `k IN (..)`.
-fn key_pred(key: &[String], keys: &[Vec<String>]) -> String {
+pub(crate) fn key_pred(key: &[String], keys: &[Vec<String>]) -> String {
     let tuple = |v: &[String]| {
         if v.len() == 1 {
             v[0].clone()
@@ -592,20 +727,23 @@ async fn lost_keys(
     c: &Carried,
     lctn: bool,
     state: &str,
+    only: Option<&[Vec<String>]>,
 ) -> Result<Vec<Vec<String>>> {
     let cols = key.iter().map(|k| q(k)).collect::<Vec<_>>().join(", ");
-    let ovr: Vec<Vec<String>> = r
-        .ctl_query(
-            t,
-            &format!(
-                "SELECT {cols} FROM {table} WHERE `_sprig_space` = {} AND `_sprig_state` = '{state}'",
-                ROOT_SPACE.0
-            ),
-        )
-        .await?
-        .iter()
-        .map(|row| key_lits(row))
-        .collect();
+    let base = format!(
+        "SELECT {cols} FROM {table} WHERE `_sprig_space` = {} AND `_sprig_state` = '{state}'",
+        ROOT_SPACE.0
+    );
+    let mut ovr: Vec<Vec<String>> = Vec::new();
+    match only {
+        None => ovr.extend(r.ctl_query(t, &base).await?.iter().map(|row| key_lits(row))),
+        Some(keys) => {
+            for part in keys.chunks(CHUNK) {
+                let sql = format!("{base} AND {}", key_pred(key, part));
+                ovr.extend(r.ctl_query(t, &sql).await?.iter().map(|row| key_lits(row)));
+            }
+        }
+    }
     if ovr.is_empty() {
         return Ok(Vec::new());
     }

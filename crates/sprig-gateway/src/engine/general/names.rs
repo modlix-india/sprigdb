@@ -73,6 +73,12 @@ pub(crate) struct TableUse {
     /// The columns a `*` of a select list names: a missing privilege on
     /// one of them denies the whole table (1142), as the servers answer.
     pub starred: Vec<bool>,
+    /// A parent tenant's table read through a share ([`Views::foreign`]):
+    /// its keyspace's tenant. The share is what allows the read: no
+    /// privilege of the session applies to it.
+    pub tenant: Option<u64>,
+    /// A MongoDB collection read as a table (`engine::collection`).
+    pub coll: Option<Arc<crate::engine::collection::CollTable>>,
 }
 
 impl TableUse {
@@ -131,6 +137,11 @@ pub(crate) struct Views {
     pub uses: Vec<ViewUse>,
     /// The tables the statement names outside any view.
     pub direct: Vec<(DbId, String)>,
+    /// The parent tenants whose shares the statement reads in process
+    /// (`__sprig_share_<id>`, see `sprig_inherit::upstream`): each one's
+    /// snapshot. Names in a parent's physical schemas resolve in it, and
+    /// only inside the share's query.
+    pub foreign: Vec<Arc<sprig_catalog::TenantCatalog>>,
 }
 
 impl Views {
@@ -188,6 +199,92 @@ struct Expand<'a, 'b> {
 }
 
 impl Expand<'_, '_> {
+    /// A share read in process: `__sprig_share_<id>` in the session's
+    /// schema (or, inside a share's query, in a parent's) as the derived
+    /// table of the share's query (`None`: not such a name).
+    fn share(&mut self, f: &TableFactor) -> Option<Result<TableFactor>> {
+        let TableFactor::Table {
+            name, alias, args, ..
+        } = f
+        else {
+            return None;
+        };
+        if args.is_some() {
+            return None;
+        }
+        let parts: Option<Vec<&Ident>> = name.0.iter().map(ident_of).collect();
+        let parts = parts?;
+        let (schema, table) = match parts.as_slice() {
+            [t] => (None, *t),
+            [s, t] => (Some(*s), *t),
+            _ => return None,
+        };
+        let id: u64 = table.value.strip_prefix("__sprig_share_")?.parse().ok()?;
+        // Whose share view this is: the session's tenant, or a parent whose
+        // share's query is being read.
+        let tenant = match schema {
+            None => self.cx.tenant,
+            Some(s)
+                if physical_db(self.cx.tenant, &s.value).is_some()
+                    || self.cx.names.db_by_name(&s.value).is_some() =>
+            {
+                self.cx.tenant
+            }
+            Some(s) => {
+                let t = s
+                    .value
+                    .parse::<sprig_common::names::SchemaName>()
+                    .ok()?
+                    .tenant();
+                if !self.out.foreign.iter().any(|c| c.tenant == t) {
+                    return None;
+                }
+                t
+            }
+        };
+        let Some(sh) = sprig_inherit::upstream::engine_share(tenant, id) else {
+            return Some(Err(SprigError::standard(
+                1146,
+                *b"42S02",
+                format!("Table '{}' doesn't exist", table.value),
+            )));
+        };
+        let parsed = sqlparser::parser::Parser::new(&sprig_plan::dialect::SprigMySql)
+            .try_with_sql(&sh.sql)
+            .and_then(|mut p| p.parse_query());
+        let q = match parsed {
+            Ok(q) => q,
+            Err(e) => {
+                return Some(Err(SprigError::internal(format!(
+                    "a share's query doesn't parse: {e}"
+                ))));
+            }
+        };
+        if !self
+            .out
+            .foreign
+            .iter()
+            .any(|c| c.tenant == sh.parent.tenant)
+        {
+            self.out.foreign.push(Arc::clone(&sh.parent));
+        }
+        let name = alias.as_ref().map_or_else(
+            || Ident::with_quote('`', table.value.clone()),
+            |a| a.name.clone(),
+        );
+        Some(Ok(TableFactor::Derived {
+            lateral: false,
+            subquery: q,
+            alias: Some(sqlparser::ast::TableAlias {
+                explicit: true,
+                at: None,
+                name,
+                columns: Vec::new(),
+            }),
+            sample: None,
+        }))
+    }
+
     fn resolve(&self, name: &ObjectName) -> Option<(DbId, String)> {
         let parts: Option<Vec<&Ident>> = name.0.iter().map(ident_of).collect();
         match parts.as_deref()? {
@@ -220,6 +317,16 @@ impl VisitorMut for Expand<'_, '_> {
     }
 
     fn pre_visit_table_factor(&mut self, f: &mut TableFactor) -> ControlFlow<()> {
+        if let Some(d) = self.share(f) {
+            match d {
+                Ok(d) => *f = d,
+                Err(e) => {
+                    self.err = Some(e);
+                    return ControlFlow::Break(());
+                }
+            }
+            return ControlFlow::Continue(());
+        }
         let TableFactor::Table { name, alias, .. } = f else {
             return ControlFlow::Continue(());
         };
@@ -444,6 +551,287 @@ impl VisitorMut for Logical<'_, '_> {
     }
 }
 
+/// Comparisons of an `ENUM` column with string constants, written as
+/// comparisons of its member numbers: `c = 'b'`, `c <> 'b'`, `c <=> 'b'`
+/// and `c [NOT] IN ('a', 'b')` (the expression engine holds an `ENUM` as
+/// its member number). A constant that is no member (by the column's
+/// collation) becomes a number no row holds; `''` is the error value 0.
+/// `c IS [NOT] NULL` needs no change. The column references so written
+/// are returned: computing with them is safe (see [`Mark::Safe`]).
+struct EnumLits<'a> {
+    /// The statement's base tables with an `ENUM` column, under each name
+    /// they are read by (lower case).
+    tables: Vec<(String, Arc<TableDef>)>,
+    /// Names a derived table or common table expression gives a column:
+    /// an unqualified reference to one of them may not be the table's.
+    derived: HashSet<String>,
+    backslash: bool,
+    safe: HashSet<*const Expr>,
+    _cx: std::marker::PhantomData<&'a ()>,
+}
+
+impl EnumLits<'_> {
+    /// The members and collation of the `ENUM` column `e` names.
+    fn column(&self, e: &Expr) -> Option<(Arc<[bytes::Bytes]>, crate::engine::table::Column)> {
+        let (qual, name) = match e {
+            Expr::Identifier(i) => (None, i.value.to_lowercase()),
+            Expr::CompoundIdentifier(p) if p.len() >= 2 => (
+                Some(p[p.len() - 2].value.to_lowercase()),
+                p[p.len() - 1].value.to_lowercase(),
+            ),
+            _ => return None,
+        };
+        if qual.is_none() && self.derived.contains(&name) {
+            return None;
+        }
+        let mut found: Option<crate::engine::table::Column> = None;
+        for (alias, def) in &self.tables {
+            if qual.as_ref().is_some_and(|q| q != alias) {
+                continue;
+            }
+            let Some(c) = def.column(&name) else { continue };
+            let col = &def.columns[c];
+            if !matches!(col.ty, ColType::Enum { .. }) {
+                return None;
+            }
+            match &found {
+                Some(f) if f.members != col.members || f.collation != col.collation => {
+                    return None;
+                }
+                _ => found = Some(col.clone()),
+            }
+        }
+        // A qualified name of no base table is a derived table's.
+        found.map(|c| (Arc::clone(&c.members), c))
+    }
+
+    /// The member number of string constant `v` (`None`: not a plain
+    /// string constant).
+    fn number(&self, col: &crate::engine::table::Column, v: &Expr) -> Option<i64> {
+        let Expr::Value(ValueWithSpan {
+            value: SqlValue::SingleQuotedString(s),
+            ..
+        }) = v
+        else {
+            return None;
+        };
+        if (self.backslash && s.contains('\\')) || s.contains('\'') {
+            return None;
+        }
+        let text = crate::engine::row::Datum::Str(bytes::Bytes::from(s.clone().into_bytes()));
+        let cx = crate::engine::expr::CmpCx {
+            collation: col.collation,
+            mb3: col.mb3,
+            text_right: true,
+            ..crate::engine::expr::CmpCx::default()
+        };
+        let env = crate::engine::assign::Env::STRICT;
+        for i in 0..=col.members.len() {
+            let m = crate::engine::expr::enum_text(&col.members, u16::try_from(i).ok()?);
+            match crate::engine::expr::compare(
+                &crate::engine::row::Datum::Str(m),
+                &text,
+                &cx,
+                &env,
+                "=",
+            ) {
+                Ok(Some(std::cmp::Ordering::Equal)) => return i64::try_from(i).ok(),
+                Ok(_) => {}
+                Err(_) => return None,
+            }
+        }
+        Some(-1)
+    }
+
+    fn num(n: i64) -> Expr {
+        Expr::Value(ValueWithSpan {
+            value: SqlValue::Number(n.to_string(), false),
+            span: sqlparser::tokenizer::Span::empty(),
+        })
+    }
+}
+
+impl VisitorMut for EnumLits<'_> {
+    type Break = ();
+
+    fn post_visit_expr(&mut self, e: &mut Expr) -> ControlFlow<()> {
+        use sqlparser::ast::BinaryOperator as B;
+        match e {
+            Expr::BinaryOp {
+                left,
+                op: B::Eq | B::NotEq | B::Spaceship,
+                right,
+            } => {
+                if let Some((_, col)) = self.column(left)
+                    && let Some(n) = self.number(&col, right)
+                {
+                    **right = Self::num(n);
+                    self.safe.insert(std::ptr::from_ref(&**left));
+                } else if let Some((_, col)) = self.column(right)
+                    && let Some(n) = self.number(&col, left)
+                {
+                    **left = Self::num(n);
+                    self.safe.insert(std::ptr::from_ref(&**right));
+                }
+            }
+            Expr::InList { expr, list, .. } => {
+                if let Some((_, col)) = self.column(expr) {
+                    let nums: Option<Vec<i64>> =
+                        list.iter().map(|v| self.number(&col, v)).collect();
+                    if let Some(nums) = nums {
+                        *list = nums.into_iter().map(Self::num).collect();
+                        self.safe.insert(std::ptr::from_ref(&**expr));
+                    }
+                }
+            }
+            Expr::IsNull(x) | Expr::IsNotNull(x) => {
+                if self.column(x).is_some() {
+                    self.safe.insert(std::ptr::from_ref(&**x));
+                }
+            }
+            _ => {}
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+/// Runs [`EnumLits`] over `stmt` (after its views are expanded).
+#[allow(clippy::too_many_lines)] // the table collection, then the rewrite
+fn enum_literals(
+    cx: &BindCtx<'_>,
+    foreign: &[Arc<sprig_catalog::TenantCatalog>],
+    stmt: &mut Statement,
+) -> HashSet<*const Expr> {
+    struct Collect<'a, 'b> {
+        cx: &'a BindCtx<'b>,
+        foreign: &'a [Arc<sprig_catalog::TenantCatalog>],
+        tables: Vec<(String, Arc<TableDef>)>,
+        derived: HashSet<String>,
+    }
+    impl Visitor for Collect<'_, '_> {
+        type Break = ();
+        fn pre_visit_query(&mut self, q: &Query) -> ControlFlow<()> {
+            if let Some(w) = &q.with {
+                for c in &w.cte_tables {
+                    names_of(&c.query, &mut self.derived);
+                    for col in &c.alias.columns {
+                        self.derived.insert(col.name.value.to_lowercase());
+                    }
+                }
+            }
+            ControlFlow::Continue(())
+        }
+        fn pre_visit_table_factor(&mut self, f: &TableFactor) -> ControlFlow<()> {
+            match f {
+                TableFactor::Derived { subquery, .. } => names_of(subquery, &mut self.derived),
+                TableFactor::Table { name, alias, .. } => {
+                    let parts: Option<Vec<&Ident>> = name.0.iter().map(ident_of).collect();
+                    let (db, t) = match parts.as_deref() {
+                        Some([t]) => (self.cx.current, *t),
+                        Some([s, t]) => (
+                            physical_db(self.cx.tenant, &s.value)
+                                .or_else(|| self.cx.names.db_by_name(&s.value)),
+                            *t,
+                        ),
+                        _ => return ControlFlow::Continue(()),
+                    };
+                    // A parent's table read through a share.
+                    let foreign = match (db, parts.as_deref()) {
+                        (None, Some([s, _])) => s
+                            .value
+                            .parse::<sprig_common::names::SchemaName>()
+                            .ok()
+                            .and_then(|sn| {
+                                let c = self.foreign.iter().find(|c| c.tenant == sn.tenant())?;
+                                let eng = crate::engine::catalog::of(c)?;
+                                let d = sn.db()?;
+                                let p = eng
+                                    .table(d, &t.value, false)
+                                    .or_else(|| eng.table(d, &t.value, true))?;
+                                p.as_ref().as_ref().ok().cloned()
+                            }),
+                        _ => None,
+                    };
+                    let def = foreign.or_else(|| {
+                        db.and_then(|db| self.cx.names.table(db, &t.value))
+                            .and_then(|p| p.as_ref().as_ref().ok().cloned())
+                    });
+                    if let Some(def) = &def
+                        && def
+                            .columns
+                            .iter()
+                            .any(|c| matches!(c.ty, ColType::Enum { .. }))
+                    {
+                        let a = alias.as_ref().map_or_else(
+                            || t.value.to_lowercase(),
+                            |a| a.name.value.to_lowercase(),
+                        );
+                        self.tables.push((a, Arc::clone(def)));
+                    }
+                }
+                _ => {}
+            }
+            ControlFlow::Continue(())
+        }
+    }
+    fn names_of(q: &Query, out: &mut HashSet<String>) {
+        fn selects<'q>(b: &'q SetExpr, v: &mut Vec<&'q Select>) {
+            match b {
+                SetExpr::Select(s) => v.push(s),
+                SetExpr::SetOperation { left, right, .. } => {
+                    selects(left, v);
+                    selects(right, v);
+                }
+                SetExpr::Query(q) => selects(&q.body, v),
+                _ => {}
+            }
+        }
+        let mut add = |s: &Select| {
+            for item in &s.projection {
+                match item {
+                    SelectItem::ExprWithAlias { alias, .. } => {
+                        out.insert(alias.value.to_lowercase());
+                    }
+                    SelectItem::UnnamedExpr(e) => {
+                        if let Some(n) = match e {
+                            Expr::Identifier(i) => Some(&i.value),
+                            Expr::CompoundIdentifier(p) => p.last().map(|i| &i.value),
+                            _ => None,
+                        } {
+                            out.insert(n.to_lowercase());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        };
+        let mut v = Vec::new();
+        selects(&q.body, &mut v);
+        for s in v {
+            add(s);
+        }
+    }
+    let mut c = Collect {
+        cx,
+        foreign,
+        tables: Vec::new(),
+        derived: HashSet::new(),
+    };
+    let _ = Visit::visit(&*stmt, &mut c);
+    if c.tables.is_empty() {
+        return HashSet::new();
+    }
+    let mut e = EnumLits {
+        tables: c.tables,
+        derived: c.derived,
+        backslash: cx.backslash,
+        safe: HashSet::new(),
+        _cx: std::marker::PhantomData,
+    };
+    let _ = VisitMut::visit(stmt, &mut e);
+    e.safe
+}
+
 /// A column the text names, or a run of them.
 enum Mark {
     /// `[q.]c`; `plain`: as a select-list column of the outermost SELECT.
@@ -461,6 +849,9 @@ enum Mark {
     },
     /// Every column of the tables read under `q`, anywhere.
     AllUnder(String),
+    /// `[q.]c` of an `ENUM` column compared with its member numbers only
+    /// ([`EnumLits`]): read, and safe to compute with.
+    Safe { qual: Option<String>, name: String },
 }
 
 /// A base table in a `FROM`, with the name it is read under.
@@ -488,6 +879,10 @@ struct Walk<'a, 'b> {
     sequences: Vec<SeqUse>,
     /// A sequence function was seen.
     seq_calls: bool,
+    /// Column references [`EnumLits`] made comparisons of member numbers.
+    safe: HashSet<*const Expr>,
+    /// [`Views::foreign`].
+    foreign: Vec<Arc<sprig_catalog::TenantCatalog>>,
 }
 
 impl Walk<'_, '_> {
@@ -564,11 +959,14 @@ impl Walk<'_, '_> {
                 }
                 (self.cx.current, &t.value)
             }
-            Some([s, t]) => (
-                physical_db(self.cx.tenant, &s.value)
-                    .or_else(|| self.cx.names.db_by_name(&s.value)),
-                &t.value,
-            ),
+            Some([s, t]) => {
+                let db = physical_db(self.cx.tenant, &s.value)
+                    .or_else(|| self.cx.names.db_by_name(&s.value));
+                if db.is_none() && self.foreign_schema(&s.value) {
+                    return self.foreign_table(&s.value, &t.value, alias);
+                }
+                (db, &t.value)
+            }
             _ => {
                 self.fail(not_on_engine("a table name of more than two parts"));
                 return None;
@@ -578,7 +976,21 @@ impl Walk<'_, '_> {
             self.elsewhere = true;
             return None;
         };
-        let Some(parsed) = self.cx.names.table(db, table) else {
+        let (def, coll) = if let Some(parsed) = self.cx.names.table(db, table) {
+            match &*parsed {
+                Ok(def) => (Arc::clone(def), None),
+                Err(why) => {
+                    self.fail(not_on_engine(why));
+                    return None;
+                }
+            }
+        } else if let Some(c) = (!self.cx.names.other_relation(db, table))
+            .then(|| self.cx.names.collection(db, table))
+            .flatten()
+        {
+            // A MongoDB collection of the database of the same name.
+            (Arc::clone(&c.def), Some(c))
+        } else {
             if self.cx.names.other_relation(db, table) {
                 self.fail(not_on_engine("a view or another relation kind"));
             } else {
@@ -593,25 +1005,86 @@ impl Walk<'_, '_> {
             }
             return None;
         };
-        let def = match &*parsed {
-            Ok(def) => Arc::clone(def),
-            Err(why) => {
-                self.fail(not_on_engine(why));
-                return None;
-            }
-        };
-        let at = if let Some(at) = self.tables.iter().position(|t| t.def.object == def.object) {
+        let at = if let Some(at) = self
+            .tables
+            .iter()
+            .position(|t| t.tenant.is_none() && t.def.object == def.object)
+        {
             at
         } else {
             let db_name = self.cx.names.db_name(db);
             self.tables.push(TableUse {
-                plan: Arc::new(plan_table(&def, &db_name)),
+                plan: Arc::new(if coll.is_some() {
+                    crate::engine::collection::plan_table(&def, &db_name)
+                } else {
+                    plan_table(&def, &db_name)
+                }),
+                coll,
                 read: vec![false; def.columns.len()],
                 order: Vec::new(),
                 aliases: Vec::new(),
                 starred: vec![false; def.columns.len()],
                 db_name,
                 def,
+                tenant: None,
+            });
+            self.tables.len() - 1
+        };
+        let alias = alias.map_or_else(|| table.to_lowercase(), |a| a.value.to_lowercase());
+        if !self.tables[at].aliases.contains(&alias) {
+            self.tables[at].aliases.push(alias);
+        }
+        Some(at)
+    }
+
+    /// Whether `schema` is a physical schema of a parent tenant whose share
+    /// the statement reads ([`Views::foreign`]).
+    fn foreign_schema(&self, schema: &str) -> bool {
+        schema
+            .parse::<sprig_common::names::SchemaName>()
+            .is_ok_and(|sn| {
+                sn.db().is_some() && self.foreign.iter().any(|c| c.tenant == sn.tenant())
+            })
+    }
+
+    /// Table `table` of a parent tenant's physical schema `schema` (see
+    /// [`Self::foreign_schema`]), registered under the schema's physical
+    /// name.
+    fn foreign_table(&mut self, schema: &str, table: &str, alias: Option<&Ident>) -> Option<usize> {
+        let sn = schema.parse::<sprig_common::names::SchemaName>().ok()?;
+        let cat = Arc::clone(self.foreign.iter().find(|c| c.tenant == sn.tenant())?);
+        let db = sn.db()?;
+        let def = crate::engine::catalog::of(&cat).and_then(|eng| {
+            eng.table(db, table, false)
+                .or_else(|| eng.table(db, table, true))
+                .and_then(|p| p.as_ref().as_ref().ok().cloned())
+        });
+        let Some(def) = def else {
+            self.fail(SprigError::standard(
+                1146,
+                *b"42S02",
+                format!("Table '{schema}.{table}' doesn't exist"),
+            ));
+            return None;
+        };
+        let tenant = cat.tenant.0;
+        let at = if let Some(at) = self
+            .tables
+            .iter()
+            .position(|t| t.tenant == Some(tenant) && t.def.object == def.object)
+        {
+            at
+        } else {
+            self.tables.push(TableUse {
+                plan: Arc::new(plan_table(&def, schema)),
+                read: vec![false; def.columns.len()],
+                order: Vec::new(),
+                aliases: Vec::new(),
+                starred: vec![false; def.columns.len()],
+                db_name: schema.to_owned(),
+                def,
+                tenant: Some(tenant),
+                coll: None,
             });
             self.tables.len() - 1
         };
@@ -791,6 +1264,19 @@ impl Visitor for Walk<'_, '_> {
 
     fn pre_visit_expr(&mut self, e: &Expr) -> ControlFlow<()> {
         let plain = self.plain.contains(&std::ptr::from_ref(e));
+        if self.safe.contains(&std::ptr::from_ref(e)) {
+            let (qual, name) = match e {
+                Expr::CompoundIdentifier(p) if p.len() >= 2 => (
+                    Some(p[p.len() - 2].value.to_lowercase()),
+                    p[p.len() - 1].value.to_lowercase(),
+                ),
+                Expr::CompoundIdentifier(p) if p.len() == 1 => (None, p[0].value.to_lowercase()),
+                Expr::Identifier(i) => (None, i.value.to_lowercase()),
+                _ => return ControlFlow::Continue(()),
+            };
+            self.marks.push(Mark::Safe { qual, name });
+            return ControlFlow::Continue(());
+        }
         match e {
             Expr::Identifier(i) => self.marks.push(Mark::Column {
                 qual: None,
@@ -980,6 +1466,7 @@ pub(super) fn analyze(
     let _ = VisitMut::visit(&mut stmt, &mut Logical { cx });
     let views = expand_views(cx, &mut stmt)?;
     let tableless = tableless || !views.uses.is_empty();
+    let safe = enum_literals(cx, &views.foreign, &mut stmt);
     let Some(query) = query_of(&stmt) else {
         return Ok(None);
     };
@@ -999,6 +1486,8 @@ pub(super) fn analyze(
         params: 0,
         sequences: Vec::new(),
         seq_calls: false,
+        safe,
+        foreign: views.foreign.clone(),
     };
     let _ = Visit::visit(&stmt, &mut w);
     // Sequence functions are the engine's: such a statement needs no table.
@@ -1028,6 +1517,8 @@ pub(super) fn analyze(
         .iter()
         .map(|t| vec![false; t.def.columns.len()])
         .collect();
+    // `other`: named some other way than as a member-number comparison.
+    let mut other = computed.clone();
     for m in &w.marks {
         match m {
             Mark::Column { qual, name, plain } => {
@@ -1038,6 +1529,17 @@ pub(super) fn analyze(
                     if let Some(c) = t.def.column(name) {
                         t.mark(c);
                         computed[ti][c] |= !plain;
+                        other[ti][c] = true;
+                    }
+                }
+            }
+            Mark::Safe { qual, name } => {
+                for t in &mut w.tables {
+                    if qual.as_ref().is_some_and(|q| !t.aliases.contains(q)) {
+                        continue;
+                    }
+                    if let Some(c) = t.def.column(name) {
+                        t.mark(c);
                     }
                 }
             }
@@ -1048,6 +1550,7 @@ pub(super) fn analyze(
             } => {
                 for &ti in tables {
                     w.tables[ti].mark_all(*star);
+                    other[ti].fill(true);
                     if !plain {
                         computed[ti].fill(true);
                     }
@@ -1058,6 +1561,7 @@ pub(super) fn analyze(
                     if t.aliases.contains(q) {
                         t.mark_all(false);
                         computed[ti].fill(true);
+                        other[ti].fill(true);
                     }
                 }
             }
@@ -1089,6 +1593,11 @@ pub(super) fn analyze(
     for (ti, t) in w.tables.iter().enumerate() {
         for (ci, c) in t.def.columns.iter().enumerate() {
             let Some(kind) = opaque(c.ty) else { continue };
+            // Compared with member numbers only: the engine computes with
+            // those.
+            if !other[ti][ci] {
+                continue;
+            }
             // Passing through is fine where the result's encoders know
             // the column; anything else would show its stored number.
             let passes = origins

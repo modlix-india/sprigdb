@@ -485,13 +485,38 @@ fn subquery_reads(text: &str, name: &str, opts: LexOptions) -> bool {
 /// # Errors
 /// The servers' errors for the statement (1054, 1052, 1109, 1288, 1093,
 /// 1221, 1064, 1146); `ER_SPRIG_NOT_ON_ENGINE` for a form not run here.
-#[allow(clippy::too_many_lines)] // the port rules, the targets, then the plans
 pub(crate) fn bind(
     cx: &BindCtx<'_>,
     text: &str,
     opts: LexOptions,
     mysql: bool,
 ) -> Result<Option<MultiWrite>> {
+    let Some(r) = resolve_parts(cx, text, opts, mysql)? else {
+        return Ok(None);
+    };
+    plans(cx, r, opts)
+}
+
+/// A write's parts with its tables, targets and assignments resolved.
+struct Resolved<'a> {
+    p: Parts<'a>,
+    fs: Vec<Factor>,
+    /// The target factors, in the order first named.
+    chosen: Vec<usize>,
+    /// Per assignment: (factor, column, value text).
+    sets: Vec<(usize, usize, &'a str)>,
+    /// More than one table, or `DELETE t FROM ...`.
+    multi: bool,
+}
+
+/// [`bind`]'s first part: the statement read, the port rules checked.
+#[allow(clippy::too_many_lines)] // the port rules, then the targets
+fn resolve_parts<'a>(
+    cx: &BindCtx<'_>,
+    text: &'a str,
+    opts: LexOptions,
+    mysql: bool,
+) -> Result<Option<Resolved<'a>>> {
     let Some(p) = split(text, opts) else {
         return Ok(None);
     };
@@ -631,7 +656,26 @@ pub(crate) fn bind(
             }
         }
     }
+    Ok(Some(Resolved {
+        p,
+        fs,
+        chosen,
+        sets,
+        multi,
+    }))
+}
 
+/// [`bind`]'s second part: the `SELECT` and each target's one-row write.
+#[allow(clippy::too_many_lines)] // the SELECT's items, then each target's write
+fn plans(cx: &BindCtx<'_>, r: Resolved<'_>, opts: LexOptions) -> Result<Option<MultiWrite>> {
+    let Resolved {
+        p,
+        fs,
+        chosen,
+        sets,
+        ..
+    } = r;
+    let ci = |a: &str, b: &str| a.eq_ignore_ascii_case(b);
     // Which values the SELECT works out: every one with several tables;
     // with one, those holding a subquery (the rest run on the row).
     let hoist_all = fs.len() > 1;
@@ -791,6 +835,99 @@ pub(crate) fn bind(
         select: g,
         targets,
         update: p.update,
+    }))
+}
+
+/// A multi-table `UPDATE` or `DELETE` (or `DELETE t FROM ...`) run row
+/// by row by the session, for tables with SQL triggers: the `SELECT` that
+/// finds every target's rows (all their columns) and works out the values.
+#[derive(Debug)]
+pub(crate) struct RowsSelect {
+    /// An `UPDATE` (else a `DELETE`).
+    pub update: bool,
+    /// `SELECT <each target's columns>, <values> FROM ... WHERE ...`.
+    pub select: String,
+    /// The targets, in the order first named.
+    pub targets: Vec<RowsTarget>,
+    /// Every engine table the statement reads.
+    pub tables: Vec<Arc<TableDef>>,
+}
+
+/// One target of a [`RowsSelect`].
+#[derive(Debug)]
+pub(crate) struct RowsTarget {
+    pub def: Arc<TableDef>,
+    pub db: DbId,
+    /// Where its columns are in the `SELECT`'s rows.
+    pub cols: Range<usize>,
+    /// Its assignments: (column, where the value is in the rows).
+    pub sets: Vec<(usize, usize)>,
+}
+
+/// `text` as a [`RowsSelect`]; `None` when it isn't a multi-table write
+/// of engine tables.
+///
+/// # Errors
+/// As [`bind`].
+pub(crate) fn rows_select(
+    cx: &BindCtx<'_>,
+    text: &str,
+    opts: LexOptions,
+    mysql: bool,
+) -> Result<Option<RowsSelect>> {
+    let Some(r) = resolve_parts(cx, text, opts, mysql)? else {
+        return Ok(None);
+    };
+    if !r.multi {
+        return Ok(None);
+    }
+    let mut items: Vec<String> = Vec::new();
+    let mut targets = Vec::new();
+    for &fi in &r.chosen {
+        let f = &r.fs[fi];
+        let Some((def, db)) = &f.def else {
+            return Err(not_updatable(&f.visible, r.p.update));
+        };
+        let start = items.len();
+        for c in &def.columns {
+            items.push(format!("{}.{}", q(&f.visible), q(&c.name)));
+        }
+        targets.push(RowsTarget {
+            def: Arc::clone(def),
+            db: *db,
+            cols: start..items.len(),
+            sets: Vec::new(),
+        });
+    }
+    for (sfi, col, v) in &r.sets {
+        let Some(n) = r.chosen.iter().position(|c| c == sfi) else {
+            continue;
+        };
+        targets[n].sets.push((*col, items.len()));
+        items.push(format!("({v})"));
+    }
+    let mut select = format!("SELECT {} FROM {}", items.join(", "), r.p.refs);
+    if let Some(w) = r.p.filter {
+        select.push_str(" WHERE ");
+        select.push_str(w);
+    }
+    if let Some(o) = r.p.order {
+        select.push_str(" ORDER BY ");
+        select.push_str(o);
+    }
+    if let Some(l) = r.p.limit {
+        select.push_str(" LIMIT ");
+        select.push_str(l);
+    }
+    Ok(Some(RowsSelect {
+        update: r.p.update,
+        select,
+        targets,
+        tables: r
+            .fs
+            .iter()
+            .filter_map(|f| f.def.as_ref().map(|(d, _)| Arc::clone(d)))
+            .collect(),
     }))
 }
 

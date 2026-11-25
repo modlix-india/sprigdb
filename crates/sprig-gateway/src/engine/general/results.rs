@@ -78,6 +78,7 @@ fn wire_type(f: FieldType) -> u8 {
         FieldType::Time => column_type::TIME,
         FieldType::DateTime => column_type::DATETIME,
         FieldType::Timestamp => column_type::TIMESTAMP,
+        FieldType::Json => column_type::JSON,
     }
 }
 
@@ -92,10 +93,13 @@ pub(crate) fn value_def(name: &str, ty: &ExprType, results: Results) -> ColumnDe
             Some(r) => (r.id, r.mbmax),
             None => (meta::id_of(ty.coll.name()).unwrap_or(224), own_mb),
         };
-        (
-            id,
-            u32::try_from(u64::from(ty.len) * u64::from(mb)).unwrap_or(u32::MAX),
-        )
+        let length = if m.field == FieldType::Json {
+            // MySQL's JSON: one fixed length.
+            m.len
+        } else {
+            u32::try_from(u64::from(ty.len) * u64::from(mb)).unwrap_or(u32::MAX)
+        };
+        (id, length)
     } else {
         (63, m.len)
     };
@@ -106,15 +110,13 @@ pub(crate) fn value_def(name: &str, ty: &ExprType, results: Results) -> ColumnDe
     if m.unsigned {
         flags |= ColumnFlags::UNSIGNED;
     }
-    if m.binary || ty.coll.name().ends_with("_bin") {
+    // A JSON value is binary text on both servers (MariaDB's JSON columns
+    // are utf8mb4_bin).
+    if m.binary || ty.coll.name().ends_with("_bin") || ty.json {
         flags |= ColumnFlags::BINARY;
     }
-    if matches!(
-        m.field,
-        FieldType::Blob | FieldType::MediumBlob | FieldType::LongBlob
-    ) {
-        flags |= ColumnFlags::BLOB;
-    }
+    // Neither server marks a computed long text or blob with BLOB_FLAG;
+    // MySQL's temporary tables do (see `set_result_def`).
     ColumnDef {
         name: Bytes::from(name.to_owned()),
         charset,
@@ -306,6 +308,19 @@ fn set_result_def(d: &mut ColumnDef, ty: &ExprType, dedup: bool, results: Result
     if dedup && !results.mysql {
         // PART_KEY_FLAG.
         d.flags |= 1 << 14;
+    }
+    // MySQL's temporary table holds a long value in a BLOB (or JSON)
+    // column, and says so.
+    if results.mysql
+        && matches!(
+            d.col_type,
+            column_type::BLOB
+                | column_type::MEDIUM_BLOB
+                | column_type::LONG_BLOB
+                | column_type::JSON
+        )
+    {
+        d.flags |= ColumnFlags::BLOB.bits();
     }
 }
 

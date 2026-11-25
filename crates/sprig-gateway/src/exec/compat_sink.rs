@@ -452,17 +452,17 @@ fn explain_columns(columns: &[ColumnDef]) -> Vec<ColumnDef> {
     if let Some(rows) = after.get_mut(8) {
         rows.col_type = column_type::LONGLONG;
         rows.charset = 63;
-        rows.length = 21;
+        rows.length = 11;
         rows.decimals = 0;
-        // NUM and BINARY, as MySQL sends them.
-        rows.flags = (1 << 15) | (1 << 7);
+        // UNSIGNED and BINARY, as MySQL sends them.
+        rows.flags = (1 << 5) | (1 << 7);
     }
     let mut partitions = columns[2].clone();
     partitions.name = Bytes::from_static(b"partitions");
-    partitions.org_name = Bytes::from_static(b"partitions");
+    partitions.org_name = Bytes::new();
     partitions.col_type = column_type::MEDIUM_BLOB;
     partitions.length = 25_264_128;
-    partitions.flags = 1 << 4;
+    partitions.flags = 0;
     after.insert(sprig_sql::compat::explain::PARTITIONS_AT, partitions);
     after
 }

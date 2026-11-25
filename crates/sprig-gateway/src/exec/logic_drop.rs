@@ -79,6 +79,7 @@ impl PassSession {
         if let Some(ts) = self.tenant.as_deref() {
             super::logic_rollout::invalidate(ts.tenant.0);
         }
+        self.validations_changed();
         self.answer_notes(r, status, out).await
     }
 
@@ -232,7 +233,15 @@ impl PassSession {
                 ));
             }
         }
-        let shard_list = super::logic::shard_list(ts, &self.target.cluster, &row.name, &row)?;
+        // An engine database's code made nothing on MariaDB (its routines
+        // and validations live in the records alone): no shard to visit.
+        let engine_db =
+            crate::engine::catalog::of(&catalog).is_some_and(|e| e.dbs.contains(&row.db_id));
+        let shard_list = if engine_db {
+            Vec::new()
+        } else {
+            super::logic::shard_list(ts, &self.target.cluster, &row.name, &row)?
+        };
         let mut shards = CtlShards {
             list: shard_list,
             conns: HashMap::new(),
@@ -278,6 +287,7 @@ impl PassSession {
             .map(|v| v.version)
             .collect();
         if d.kind == Kind::Validation
+            && !engine_db
             && let Some(b) = &binding
             && b.enforcement.as_deref() == Some("check")
             && let Some(obj) = b.object_id

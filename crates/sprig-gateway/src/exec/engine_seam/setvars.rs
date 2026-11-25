@@ -13,11 +13,14 @@
 //! | `SET sql_select_limit = DEFAULT` | as is |
 //! | `SET wait_timeout \| interactive_timeout \| net_read_timeout \| net_write_timeout = n` | the gateway's own (backend connections keep theirs) |
 //! | `SET group_concat_max_len = n`, `max_execution_time = n` (3306), `max_statement_time = x` (3307) | as is |
+//! | `SET max_recursive_iterations = n \| DEFAULT` (3307; 3306's `cte_max_recursion_depth` arrives under this name) | as is (`WITH RECURSIVE`'s limit) |
 //! | `SET NAMES cs [COLLATE c]` (a character set the engine knows) | `character_set_client`, `_connection`, `_results`, `collation_connection` (without `COLLATE`: the session's `character_set_collations` entry, else the default) |
 //!
 //! Switches: `autocommit`, `foreign_key_checks`, `unique_checks`,
 //! `sql_notes`, `sql_warnings`, `sql_safe_updates`, `sql_auto_is_null`,
-//! `sql_big_selects`, `sql_quote_show_create`, `big_tables`.
+//! `sql_big_selects`, `sql_quote_show_create`, `big_tables`,
+//! `innodb_snapshot_isolation` (the next engine transaction's rule; the
+//! inheritance and type layers turn it off around their plans).
 //!
 //! Anything else still goes to MariaDB as before: other variables, an
 //! expression or a quoted switch value, a value the servers would refuse
@@ -56,6 +59,7 @@ const SWITCHES: &[&str] = &[
     "sql_big_selects",
     "sql_quote_show_create",
     "big_tables",
+    "innodb_snapshot_isolation",
 ];
 
 /// Gateway-owned timeouts a client may set (whole seconds).
@@ -398,6 +402,20 @@ fn assignment(name: &str, value: &Token, sql: &[u8], opts: LexOptions) -> Option
         return Some(Assign::Var {
             names: vec!["group_concat_max_len"],
             value: v.to_string(),
+        });
+    }
+    // `WITH RECURSIVE`'s limit. The MySQL port's `cte_max_recursion_depth`
+    // arrives here under MariaDB's name (the compatibility pass renames
+    // it), so MariaDB's name is kept on both ports.
+    if name == "max_recursive_iterations" || name == "cte_max_recursion_depth" {
+        let value = if word(value, sql).as_deref() == Some("default") {
+            "1000".to_owned()
+        } else {
+            number().filter(|v| u32::try_from(*v).is_ok())?.to_string()
+        };
+        return Some(Assign::Var {
+            names: vec!["max_recursive_iterations"],
+            value,
         });
     }
     if name == "max_execution_time" {

@@ -235,14 +235,29 @@ pub enum Mark {
 /// an unread key that isn't marked.
 pub const MARKED: &[(&str, Mark, &str)] = &[
     (
+        "ddl.mover_wait_minutes",
+        Mark::Unbuilt,
+        "schema changes wait for shard jobs only on table groups, which went with the MariaDB shards; the engine mover's locks aren't waited for yet",
+    ),
+    (
         "failover.quarantine_days",
         Mark::Unbuilt,
         "diverged-transaction extracts are kept until an operator removes them",
     ),
     (
+        "inherit.fan_in_sql_max_tenants",
+        Mark::Unbuilt,
+        "fan-in SELECTs over members' stream instances went with the MariaDB stream path; FOR EACH TENANT streams aren't built on the engine",
+    ),
+    (
         "inherit.instance_precreate",
         Mark::Unbuilt,
         "instances are created on first use; the background precreate job isn't built",
+    ),
+    (
+        "inherit.member_publish",
+        Mark::Unbuilt,
+        "a member always publishes into its own queue instances; the switch was read only by FOR EACH TENANT streams, which went with the MariaDB stream path",
     ),
     (
         "inherit.precreate_rate",
@@ -278,6 +293,16 @@ pub const MARKED: &[(&str, Mark, &str)] = &[
         "queue.descendant_publish",
         Mark::Unbuilt,
         "publishing into an ancestor's ordinary exchange isn't built",
+    ),
+    (
+        "stream.descendant_key",
+        Mark::Unbuilt,
+        "publishing into an ancestor's stream went with the MariaDB stream path; not built on the engine streams",
+    ),
+    (
+        "stream.descendant_publish",
+        Mark::Unbuilt,
+        "publishing into an ancestor's stream went with the MariaDB stream path; not built on the engine streams",
     ),
     (
         "recovery.max_latency_increase_pct",

@@ -1223,6 +1223,40 @@ impl DdlExecutor for EngineDdl<'_> {
                 self.note_dropped(objects);
                 Ok(())
             }
+            // `ALTER EVENT ... RENAME TO`: the event's record under its
+            // new name, with the statement's other changes.
+            Effect::Rename { moves }
+                if super::routine::parse::parse_event(&stmt.sql).is_ok_and(|st| !st.create) =>
+            {
+                for (fs, fname, ts, tname) in moves {
+                    let Some(old) = self.hook.routine_text(fs, ObjectKind::Event, fname) else {
+                        return Err(SprigError::standard(
+                            1539,
+                            *b"HY000",
+                            format!("Unknown event '{fname}'"),
+                        ));
+                    };
+                    let db = ts.db();
+                    let db_name =
+                        db.map_or_else(|| self.hook.sess.db.clone(), |d| self.hook.db_name(d));
+                    let cx = db.map_or_else(|| self.hook.ctx(DbId(0)), |d| self.hook.ctx(d));
+                    let rs = self.hook.routine.clone().unwrap_or_default();
+                    let text = super::routine::event::create(
+                        &stmt.sql,
+                        &rs,
+                        &self.hook.sess.account,
+                        self.hook.sess.env.mysql,
+                        &cx.db_cs,
+                        &db_name,
+                        Some(&old),
+                    )?;
+                    self.hook
+                        .produce_routine(*fs, ObjectKind::Event, fname, None);
+                    self.hook
+                        .produce_routine(*ts, ObjectKind::Event, tname, Some(text));
+                }
+                Ok(())
+            }
             Effect::Rename { moves } => {
                 for (fs, fname, ts, tname) in moves {
                     let Some(Some(text)) = self.hook.text(fs, fname) else {
@@ -1357,7 +1391,9 @@ impl DdlExecutor for EngineDdl<'_> {
             } => {
                 let alter = matches!(&stmt.effect, Effect::Alter { .. });
                 let old = if alter {
-                    let Some(old) = self.hook.routine_text(&stmt.schema, ObjectKind::Event, name)
+                    let Some(old) = self
+                        .hook
+                        .routine_text(&stmt.schema, ObjectKind::Event, name)
                     else {
                         return Err(SprigError::standard(
                             1539,

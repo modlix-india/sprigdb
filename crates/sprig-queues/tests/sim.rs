@@ -452,6 +452,63 @@ async fn owner_survives_crashes_fencing_and_store_faults() {
     assert!(crashes > 0 && fenced > 0 && faults > 0);
 }
 
+/// A backlog bigger than the cache drains a consumer's window in a few
+/// writes: between writes the owner reads as many pages as the window
+/// needs, not one page per write (which capped delivery from a backlog at
+/// a page per write round trip).
+#[tokio::test(flavor = "current_thread")]
+async fn a_backlog_beyond_the_cache_drains_a_window_in_few_writes() {
+    let store = MemStore::new();
+    // About 550 of the small messages fit; the rest wait on disk.
+    let owner = start(&store, 3000);
+    let mut confirms = Vec::new();
+    for b in 0..60u64 {
+        let mut items = Vec::new();
+        for i in 0..50 {
+            let (tx, rx) = oneshot::channel();
+            confirms.push(rx);
+            items.push((
+                Incoming {
+                    msg: message(b * 50 + i + 1),
+                    msg_id: new_msg_id(),
+                    dedup: false,
+                    deaths: None,
+                },
+                Some(tx),
+            ));
+        }
+        let _ = owner.tx.send(Cmd::Enqueue(items));
+    }
+    for rx in confirms {
+        rx.await.unwrap().unwrap();
+    }
+    let before = store.writes();
+    let (stx, mut srx) = mpsc::unbounded_channel::<Seen>();
+    let holder = Holder {
+        origin: 0,
+        conn: ConnKey(1),
+    };
+    attach(&owner, ConsumerId(1), holder, &stx, 1000).await;
+    // Deliveries are held (not acknowledged): the window is 1,000.
+    let mut got = 0;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while got < 1000 {
+        match tokio::time::timeout_at(deadline, srx.recv()).await {
+            Ok(Some(Seen::Deliver(..))) => got += 1,
+            Ok(Some(Seen::Cancelled(_)) | None) => panic!("consumer cancelled"),
+            Err(_) => break,
+        }
+    }
+    let writes = store.writes() - before;
+    assert_eq!(got, 1000, "the window wasn't filled");
+    // One page (16 rows here) per write took about 30 writes.
+    assert!(
+        writes <= 8,
+        "{writes} writes to deliver a 1,000-message window"
+    );
+    owner.task.abort();
+}
+
 /// Unused helper kept for symmetry with the engine's sinks.
 #[allow(dead_code)]
 fn unused(_: EventSender) {}

@@ -60,6 +60,7 @@ use sprig_types::Done;
 use crate::grammar::{Name, Toks, unsupported};
 use crate::model::{InheritableObject, Link, ROOT_SPACE, ShareTarget, SpaceId};
 use crate::plan::{Ctx, Resolved, physical_schema, state_of};
+use crate::refs::RefsOp;
 use crate::view::{ViewSql, q};
 use crate::{Handled, RawRows, Runner};
 
@@ -995,7 +996,13 @@ pub async fn hand_over(
         for chunk in found.chunks(500) {
             r.refs(
                 root.0,
-                &claims_sql(root.1, here.at, o.object_id, &name, chunk),
+                &RefsOp::Claim {
+                    ref_obj: root.1,
+                    here: here.at,
+                    from_obj: o.object_id,
+                    link: &name,
+                    refs: chunk,
+                },
             )
             .await?;
         }
@@ -1038,12 +1045,28 @@ async fn handover_live(
         return Ok(None);
     };
     let Some(f) = st.object(c.from_obj).cloned() else {
-        r.refs(root.0, &forget_sql(root.1, "ref", c)).await?;
+        r.refs(
+            root.0,
+            &RefsOp::Forget {
+                ref_obj: root.1,
+                kind: "ref",
+                entry: c,
+            },
+        )
+        .await?;
         return Ok(None);
     };
     let name = c.link.trim_start_matches(HANDOVER);
     let Some(l) = f.links.iter().find(|l| l.name == name).cloned() else {
-        r.refs(root.0, &forget_sql(root.1, "ref", c)).await?;
+        r.refs(
+            root.0,
+            &RefsOp::Forget {
+                ref_obj: root.1,
+                kind: "ref",
+                entry: c,
+            },
+        )
+        .await?;
         return Ok(None);
     };
     let Some(db) = cc.databases.get(f.db).map(|d| d.name.clone()) else {
@@ -1065,7 +1088,15 @@ async fn handover_live(
             let state = rows.first().and_then(|row| text(row.first()));
             if matches!(state.as_deref(), Some("own" | "orphan" | "ovr")) {
                 tracing::debug!(handover = ?c, state = ?state, "handover's row still at its level");
-                r.refs(root.0, &forget_sql(root.1, "ref", c)).await?;
+                r.refs(
+                    root.0,
+                    &RefsOp::Forget {
+                        ref_obj: root.1,
+                        kind: "ref",
+                        entry: c,
+                    },
+                )
+                .await?;
                 return Ok(None);
             }
         }
@@ -1113,7 +1144,15 @@ async fn handover_live(
         below = tables.len(),
         "handover no longer needed"
     );
-    r.refs(root.0, &forget_sql(root.1, "ref", c)).await?;
+    r.refs(
+        root.0,
+        &RefsOp::Forget {
+            ref_obj: root.1,
+            kind: "ref",
+            entry: c,
+        },
+    )
+    .await?;
     Ok(None)
 }
 
@@ -1219,8 +1258,17 @@ async fn claim(
     refs: &[Ref],
 ) -> Result<()> {
     for chunk in refs.chunks(500) {
-        r.refs(root.0, &claims_sql(root.1, at, from, &l.name, chunk))
-            .await?;
+        r.refs(
+            root.0,
+            &RefsOp::Claim {
+                ref_obj: root.1,
+                here: at,
+                from_obj: from,
+                link: &l.name,
+                refs: chunk,
+            },
+        )
+        .await?;
     }
     Ok(())
 }
@@ -1305,7 +1353,17 @@ pub async fn after_write(
         let wanted = by_ref(&found);
         let hexes: Vec<String> = wanted.keys().cloned().collect();
         // Deletion markers at this level and above.
-        let markers = parse_entries(&r.refs(root.0, &entries_sql(root.1, "del", &hexes)).await?);
+        let markers = parse_entries(
+            &r.refs(
+                root.0,
+                &RefsOp::Entries {
+                    ref_obj: root.1,
+                    kind: "del",
+                    keys: &hexes,
+                },
+            )
+            .await?,
+        );
         for m in markers {
             let mine = m.at.tenant == ctx.cat.tenant
                 || ctx.ancestors.iter().any(|a| a.tenant == m.at.tenant);
@@ -1325,7 +1383,15 @@ pub async fn after_write(
                 }
                 continue;
             }
-            r.refs(root.0, &forget_sql(root.1, "del", &m)).await?;
+            r.refs(
+                root.0,
+                &RefsOp::Forget {
+                    ref_obj: root.1,
+                    kind: "del",
+                    entry: &m,
+                },
+            )
+            .await?;
         }
         // The referenced keys in this space's view, read fresh.
         crate::upstream::ensure(ctx, r, &rr).await?;
@@ -1646,13 +1712,31 @@ pub async fn before_delete(
         hexes.iter().cloned().partition(|h| hidden.contains(h));
     for (what, hs) in [("hide", &hide), ("drop", &drop)] {
         for chunk in hs.chunks(500) {
-            r.refs(root.0, &markers_sql(root.1, here.at, what, chunk))
-                .await?;
+            r.refs(
+                root.0,
+                &RefsOp::Mark {
+                    ref_obj: root.1,
+                    here: here.at,
+                    what,
+                    keys: chunk,
+                },
+            )
+            .await?;
         }
     }
     let mut blocking = None;
     for chunk in hexes.chunks(500) {
-        let claims = parse_entries(&r.refs(root.0, &entries_sql(root.1, "ref", chunk)).await?);
+        let claims = parse_entries(
+            &r.refs(
+                root.0,
+                &RefsOp::Entries {
+                    ref_obj: root.1,
+                    kind: "ref",
+                    keys: chunk,
+                },
+            )
+            .await?,
+        );
         for c in claims {
             let anc = ancestors_of(ctx, r, c.at.tenant).await;
             let kin = here.kin(c.at, &anc);
@@ -1672,7 +1756,15 @@ pub async fn before_delete(
                         break;
                     }
                     None => {
-                        r.refs(root.0, &forget_sql(root.1, "ref", &c)).await?;
+                        r.refs(
+                            root.0,
+                            &RefsOp::Forget {
+                                ref_obj: root.1,
+                                kind: "ref",
+                                entry: &c,
+                            },
+                        )
+                        .await?;
                     }
                 },
                 Kin::Above => {
@@ -1692,7 +1784,15 @@ pub async fn before_delete(
         return Ok(());
     };
     for chunk in hexes.chunks(500) {
-        r.refs(root.0, &unmark_sql(root.1, here.at, chunk)).await?;
+        r.refs(
+            root.0,
+            &RefsOp::Unmark {
+                ref_obj: root.1,
+                here: here.at,
+                keys: chunk,
+            },
+        )
+        .await?;
     }
     let where_ = if at.tenant == ctx.cat.tenant {
         if at.space == ctx.space {
@@ -1702,10 +1802,16 @@ pub async fn before_delete(
         }
     } else if ctx.privileges.space_admin() && !ctx.ancestors.iter().any(|a| a.tenant == at.tenant) {
         match r.tenant_catalog(at.tenant).await {
-            Ok(c) => format!(
-                " (referenced in tenant '{}')",
-                tenant_name(&c).unwrap_or_else(|| at.tenant.to_string())
-            ),
+            Ok(c) => {
+                let n = match tenant_name(&c) {
+                    Some(n) => n,
+                    None => r
+                        .tenant_label(at.tenant)
+                        .await
+                        .unwrap_or_else(|| at.tenant.to_string()),
+                };
+                format!(" (referenced in tenant '{n}')")
+            }
             Err(_) => " (referenced in a descendant tenant)".to_owned(),
         }
     } else if ctx.ancestors.iter().any(|a| a.tenant == at.tenant) {
@@ -1737,10 +1843,14 @@ async fn level_label(ctx: &Ctx<'_>, r: &mut dyn Runner, at: At) -> (String, Stri
     if ctx.privileges.space_admin()
         && let Ok(c) = r.tenant_catalog(at.tenant).await
     {
-        return (
-            tenant_name(&c).unwrap_or_else(|| at.tenant.to_string()),
-            String::new(),
-        );
+        let n = match tenant_name(&c) {
+            Some(n) => n,
+            None => r
+                .tenant_label(at.tenant)
+                .await
+                .unwrap_or_else(|| at.tenant.to_string()),
+        };
+        return (n, String::new());
     }
     ("a descendant tenant".to_owned(), String::new())
 }
@@ -1809,7 +1919,17 @@ pub async fn check_refs(
         let root = crate::ids::tree_root(ctx, &res.obj)?;
         let admin = ctx.privileges.space_admin();
         for chunk in hexes.chunks(500) {
-            let claims = parse_entries(&r.refs(root.0, &entries_sql(root.1, "ref", chunk)).await?);
+            let claims = parse_entries(
+                &r.refs(
+                    root.0,
+                    &RefsOp::Entries {
+                        ref_obj: root.1,
+                        kind: "ref",
+                        keys: chunk,
+                    },
+                )
+                .await?,
+            );
             for c in claims {
                 let anc = ancestors_of(ctx, r, c.at.tenant).await;
                 let kin = here.kin(c.at, &anc);

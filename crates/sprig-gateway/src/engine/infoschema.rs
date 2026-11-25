@@ -490,11 +490,72 @@ const COLS: &[(&str, &str, u16, u32, u8, u16)] = &[
     ("EVENTS", "CHARACTER_SET_CLIENT", 224, 128, 0xfd, 0x1001),
     ("EVENTS", "COLLATION_CONNECTION", 224, 256, 0xfd, 0x1001),
     ("EVENTS", "DATABASE_COLLATION", 224, 256, 0xfd, 0x1001),
+    ("PARTITIONS", "TABLE_CATALOG", 224, 2048, 0xfd, 0x1001),
+    ("PARTITIONS", "TABLE_SCHEMA", 224, 256, 0xfd, 0x1001),
+    ("PARTITIONS", "TABLE_NAME", 224, 256, 0xfd, 0x1001),
+    ("PARTITIONS", "PARTITION_NAME", 224, 256, 0xfd, 0x1000),
+    ("PARTITIONS", "SUBPARTITION_NAME", 224, 256, 0xfd, 0x1000),
+    (
+        "PARTITIONS",
+        "PARTITION_ORDINAL_POSITION",
+        63,
+        21,
+        0x08,
+        0x1020,
+    ),
+    (
+        "PARTITIONS",
+        "SUBPARTITION_ORDINAL_POSITION",
+        63,
+        21,
+        0x08,
+        0x1020,
+    ),
+    ("PARTITIONS", "PARTITION_METHOD", 224, 72, 0xfd, 0x1000),
+    ("PARTITIONS", "SUBPARTITION_METHOD", 224, 48, 0xfd, 0x1000),
+    (
+        "PARTITIONS",
+        "PARTITION_EXPRESSION",
+        224,
+        786_420,
+        0xfc,
+        0x1010,
+    ),
+    (
+        "PARTITIONS",
+        "SUBPARTITION_EXPRESSION",
+        224,
+        786_420,
+        0xfc,
+        0x1010,
+    ),
+    (
+        "PARTITIONS",
+        "PARTITION_DESCRIPTION",
+        224,
+        786_420,
+        0xfc,
+        0x1010,
+    ),
+    ("PARTITIONS", "TABLE_ROWS", 63, 21, 0x08, 0x1021),
+    ("PARTITIONS", "AVG_ROW_LENGTH", 63, 21, 0x08, 0x1021),
+    ("PARTITIONS", "DATA_LENGTH", 63, 21, 0x08, 0x1021),
+    ("PARTITIONS", "MAX_DATA_LENGTH", 63, 21, 0x08, 0x1020),
+    ("PARTITIONS", "INDEX_LENGTH", 63, 21, 0x08, 0x1021),
+    ("PARTITIONS", "DATA_FREE", 63, 21, 0x08, 0x1021),
+    ("PARTITIONS", "CREATE_TIME", 63, 19, 0x0c, 0x1080),
+    ("PARTITIONS", "UPDATE_TIME", 63, 19, 0x0c, 0x1080),
+    ("PARTITIONS", "CHECK_TIME", 63, 19, 0x0c, 0x1080),
+    ("PARTITIONS", "CHECKSUM", 63, 21, 0x08, 0x1020),
+    ("PARTITIONS", "PARTITION_COMMENT", 224, 320, 0xfd, 0x1001),
+    ("PARTITIONS", "NODEGROUP", 224, 48, 0xfd, 0x1001),
+    ("PARTITIONS", "TABLESPACE_NAME", 224, 256, 0xfd, 0x1000),
 ];
 
 /// The tables built here.
-pub(crate) const TABLES: [&str; 13] = [
+pub(crate) const TABLES: [&str; 14] = [
     "SCHEMATA",
+    "PARTITIONS",
     "TRIGGERS",
     "EVENTS",
     "ROUTINES",
@@ -917,7 +978,25 @@ fn add_table(db: &mut MemDb, schema: &str, def: &Def, next: Option<u64>) {
     v.insert("TABLE_COMMENT", s(def.comment.clone().unwrap_or_default()));
     v.insert("MAX_INDEX_LENGTH", V::U(0));
     v.insert("TEMPORARY", s("N"));
+    // Engine tables aren't partitioned: one row with no partition, as
+    // MariaDB lists an unpartitioned table.
+    let mut p = HashMap::new();
+    base(&mut p);
+    for k in [
+        "TABLE_ROWS",
+        "AVG_ROW_LENGTH",
+        "DATA_LENGTH",
+        "INDEX_LENGTH",
+        "DATA_FREE",
+    ] {
+        if let Some(V::U(n)) = v.get(k) {
+            p.insert(k, V::U(*n));
+        }
+    }
+    p.insert("PARTITION_COMMENT", s(""));
+    p.insert("NODEGROUP", s(""));
     put("TABLES", v);
+    put("PARTITIONS", p);
     for (i, c) in def.cols.iter().enumerate() {
         let mut v = HashMap::new();
         base(&mut v);
@@ -1150,6 +1229,20 @@ fn add_sequence(db: &mut MemDb, schema: &str, name: &str) {
     if let Err(e) = db.insert("TABLES", row_of("TABLES", &t)) {
         tracing::warn!(table = "TABLES", error = %e.message, "information_schema: a row doesn't fit its table");
     }
+    let mut p = HashMap::new();
+    p.insert("TABLE_CATALOG", s("def"));
+    p.insert("TABLE_SCHEMA", s(schema));
+    p.insert("TABLE_NAME", s(name.to_owned()));
+    p.insert("TABLE_ROWS", V::U(1));
+    p.insert("AVG_ROW_LENGTH", V::U(16384));
+    p.insert("DATA_LENGTH", V::U(16384));
+    p.insert("INDEX_LENGTH", V::U(0));
+    p.insert("DATA_FREE", V::U(0));
+    p.insert("PARTITION_COMMENT", s(""));
+    p.insert("NODEGROUP", s(""));
+    if let Err(e) = db.insert("PARTITIONS", row_of("PARTITIONS", &p)) {
+        tracing::warn!(table = "PARTITIONS", error = %e.message, "information_schema: a row doesn't fit its table");
+    }
 }
 
 /// A view's rows: `TABLES` (type `VIEW`) and `VIEWS`.
@@ -1337,7 +1430,11 @@ fn add_events(db: &mut MemDb, schema: &str, src: &Source<'_>, dbid: DbId, mysql:
         v.insert("EVENT_DEFINITION", s(e.body.clone()));
         v.insert(
             "EVENT_TYPE",
-            s(if d.at.is_some() { "ONE TIME" } else { "RECURRING" }),
+            s(if d.at.is_some() {
+                "ONE TIME"
+            } else {
+                "RECURRING"
+            }),
         );
         v.insert("EXECUTE_AT", t(&d.at));
         v.insert(
@@ -1354,7 +1451,11 @@ fn add_events(db: &mut MemDb, schema: &str, src: &Source<'_>, dbid: DbId, mysql:
         v.insert("STATUS", s(event::status_word(d.status, mysql)));
         v.insert(
             "ON_COMPLETION",
-            s(if d.preserve { "PRESERVE" } else { "NOT PRESERVE" }),
+            s(if d.preserve {
+                "PRESERVE"
+            } else {
+                "NOT PRESERVE"
+            }),
         );
         v.insert("CREATED", s(e.cx.created.clone()));
         v.insert("LAST_ALTERED", s(e.cx.modified.clone()));
@@ -1753,6 +1854,139 @@ pub(crate) struct Source<'a> {
     pub tenant: u64,
     /// The next `AUTO_INCREMENT` value per table object.
     pub counters: &'a HashMap<u64, u64>,
+    /// The tenant's logic functions and procedures (engine-tier code).
+    pub logic: &'a [LogicRoutine],
+    /// `@sprig_show_auto_indexes = 1`: automatic indexes (`sprig_auto_*`)
+    /// are listed in `STATISTICS` and count in `COLUMN_KEY`; otherwise
+    /// they are left out, as schema tools expect.
+    pub show_auto_indexes: bool,
+}
+
+/// A function or procedure of a logic module (`CREATE FUNCTION ...
+/// LANGUAGE kirun | javascript | lua`): engine-tier code, listed in
+/// `ROUTINES` and `PARAMETERS` beside the SQL routines, with
+/// `ROUTINE_BODY` `EXTERNAL` and its language in `EXTERNAL_LANGUAGE`.
+#[derive(Debug, Clone)]
+pub(crate) struct LogicRoutine {
+    /// The database.
+    pub db: DbId,
+    /// The name.
+    pub name: String,
+    /// A function (else a procedure).
+    pub function: bool,
+    /// `kirun`, `javascript`, `lua`.
+    pub runtime: String,
+    /// `SQL SECURITY INVOKER`.
+    pub invoker: bool,
+    /// Declared `DETERMINISTIC`.
+    pub deterministic: bool,
+    /// The parameters: name and SQL type.
+    pub params: Vec<(String, String)>,
+    /// A function's SQL return type, when it declares one.
+    pub returns: Option<String>,
+    /// `user@host`.
+    pub definer: String,
+    /// When it was created (`YYYY-MM-DD hh:mm:ss`, UTC).
+    pub created: String,
+}
+
+/// The SQL type a logic parameter of type `ty` (the runtime's name) is
+/// declared with, when the module records none.
+pub(crate) fn logic_sql_type(ty: &str) -> &'static str {
+    match ty {
+        "i8" | "i16" | "i32" | "i64" | "int" | "integer" | "long" => "bigint(20)",
+        "u8" | "u16" | "u32" | "u64" => "bigint(20) unsigned",
+        "f32" | "f64" | "float" | "double" | "number" => "double",
+        "bool" | "boolean" => "tinyint(1)",
+        _ => "longtext",
+    }
+}
+
+/// A logic routine's `ROUTINES` and `PARAMETERS` rows.
+fn add_logic_routine(db: &mut MemDb, schema: &str, r: &LogicRoutine, db_cs: &(String, String)) {
+    let mut put = |t: &str, vals: HashMap<&str, V>| {
+        if let Err(e) = db.insert(t, row_of(t, &vals)) {
+            tracing::warn!(table = t, error = %e.message, "information_schema: a row doesn't fit its table");
+        }
+    };
+    let kind = if r.function { "FUNCTION" } else { "PROCEDURE" };
+    let names = [
+        "DATA_TYPE",
+        "CHARACTER_MAXIMUM_LENGTH",
+        "CHARACTER_OCTET_LENGTH",
+        "NUMERIC_PRECISION",
+        "NUMERIC_SCALE",
+        "DATETIME_PRECISION",
+        "CHARACTER_SET_NAME",
+        "COLLATION_NAME",
+        "DTD_IDENTIFIER",
+    ];
+    let mut v = HashMap::new();
+    v.insert("SPECIFIC_NAME", s(r.name.clone()));
+    v.insert("ROUTINE_CATALOG", s("def"));
+    v.insert("ROUTINE_SCHEMA", s(schema));
+    v.insert("ROUTINE_NAME", s(r.name.clone()));
+    v.insert("ROUTINE_TYPE", s(kind));
+    v.insert("DATA_TYPE", s(""));
+    if let Some(ty) = r.returns.as_deref()
+        && let Some(f) = type_facts(ty, db_cs)
+    {
+        for (n, x) in names.into_iter().zip(f) {
+            v.insert(n, x);
+        }
+    }
+    v.insert("ROUTINE_BODY", s("EXTERNAL"));
+    v.insert("EXTERNAL_NAME", s(r.name.clone()));
+    v.insert("EXTERNAL_LANGUAGE", s(r.runtime.to_ascii_uppercase()));
+    v.insert("PARAMETER_STYLE", s("SQL"));
+    v.insert(
+        "IS_DETERMINISTIC",
+        s(if r.deterministic { "YES" } else { "NO" }),
+    );
+    v.insert("SQL_DATA_ACCESS", s("CONTAINS SQL"));
+    v.insert(
+        "SECURITY_TYPE",
+        s(if r.invoker { "INVOKER" } else { "DEFINER" }),
+    );
+    v.insert("CREATED", s(r.created.clone()));
+    v.insert("LAST_ALTERED", s(r.created.clone()));
+    v.insert("SQL_MODE", s(""));
+    v.insert("ROUTINE_COMMENT", s(""));
+    v.insert("DEFINER", s(r.definer.clone()));
+    v.insert("CHARACTER_SET_CLIENT", s(db_cs.0.clone()));
+    v.insert("COLLATION_CONNECTION", s(db_cs.1.clone()));
+    v.insert("DATABASE_COLLATION", s(db_cs.1.clone()));
+    put("ROUTINES", v);
+    let base = |v: &mut HashMap<&str, V>| {
+        v.insert("SPECIFIC_CATALOG", s("def"));
+        v.insert("SPECIFIC_SCHEMA", s(schema));
+        v.insert("SPECIFIC_NAME", s(r.name.clone()));
+        v.insert("ROUTINE_TYPE", s(kind));
+    };
+    if let Some(ty) = r.returns.as_deref() {
+        let mut v = HashMap::new();
+        base(&mut v);
+        v.insert("ORDINAL_POSITION", V::U(0));
+        if let Some(f) = type_facts(ty, db_cs) {
+            for (n, x) in names.into_iter().zip(f) {
+                v.insert(n, x);
+            }
+        }
+        put("PARAMETERS", v);
+    }
+    for (i, (name, ty)) in r.params.iter().enumerate() {
+        let mut v = HashMap::new();
+        base(&mut v);
+        v.insert("ORDINAL_POSITION", V::U(i as u64 + 1));
+        v.insert("PARAMETER_MODE", s("IN"));
+        v.insert("PARAMETER_NAME", s(name.clone()));
+        if let Some(f) = type_facts(ty, db_cs) {
+            for (n, x) in names.into_iter().zip(f) {
+                v.insert(n, x);
+            }
+        }
+        put("PARAMETERS", v);
+    }
 }
 
 /// The answer to `sql`, or `None` when the engine leaves it to the
@@ -1803,6 +2037,7 @@ fn try_answer(sql: &str, src: &Source<'_>, mysql: bool) -> Result<Answer, String
             let Ok(def) = define::parse_stored(text) else {
                 continue;
             };
+            let def = super::show::visible(def, src.show_auto_indexes);
             add_table(&mut db, &schema, &def, src.counters.get(&o.0).copied());
         }
         let mut views: Vec<_> = src
@@ -1841,6 +2076,17 @@ fn try_answer(sql: &str, src: &Source<'_>, mysql: bool) -> Result<Answer, String
         routines.sort_by(|a, b| a.name.cmp(&b.name));
         for r in routines {
             add_routine(&mut db, &schema, r, &(cs.clone(), coll.clone()));
+        }
+        for r in src.logic.iter().filter(|r| r.db == dbid) {
+            // A SQL routine of the same name is the one the database runs.
+            if src.eng.routines.keys().any(|(d, k, n)| {
+                *d == dbid
+                    && n.eq_ignore_ascii_case(&r.name)
+                    && (*k == super::routine::Kind::Function) == r.function
+            }) {
+                continue;
+            }
+            add_logic_routine(&mut db, &schema, r, &(cs.clone(), coll.clone()));
         }
         add_triggers(&mut db, &schema, src.eng, dbid);
         add_events(&mut db, &schema, src, dbid, mysql);
@@ -1979,6 +2225,8 @@ mod tests {
             eng: &eng,
             tenant: 7,
             counters: &counters,
+            logic: &[],
+            show_auto_indexes: false,
         };
         let sql = "SELECT CONSTRAINT_NAME, CONSTRAINT_TYPE FROM (SELECT `CONSTRAINT_CATALOG`, 'cc_ddl' AS `CONSTRAINT_SCHEMA`, `CONSTRAINT_NAME`, 'cc_ddl' AS `TABLE_SCHEMA`, `TABLE_NAME`, `CONSTRAINT_TYPE` FROM information_schema.TABLE_CONSTRAINTS WHERE `TABLE_SCHEMA` = 't7_d3_g1_s1' AND `TABLE_NAME` = 'k2' AND LEFT(`TABLE_NAME`, 8) <> '__sprig_') AS `TABLE_CONSTRAINTS` WHERE table_schema = 'cc_ddl' AND table_name = 'k2' ORDER BY CONSTRAINT_NAME";
         let a = answer(sql, &src, false).expect("answered");
@@ -2000,6 +2248,8 @@ mod tests {
             eng: &eng,
             tenant: 7,
             counters: &counters,
+            logic: &[],
+            show_auto_indexes: false,
         };
         let branch = |s: &str, d: &str| {
             format!(
@@ -2033,6 +2283,8 @@ mod tests {
             eng: &eng,
             tenant: 61_306_000_000,
             counters: &counters,
+            logic: &[],
+            show_auto_indexes: false,
         };
         if let Ok(sql) = std::fs::read_to_string("../../target/agent-c-catalog/obs/stat.sql") {
             let a = super::try_answer(&sql, &src, true).unwrap_or_else(|e| panic!("{e}"));
@@ -2041,6 +2293,44 @@ mod tests {
         let maria = "SELECT INDEX_NAME, SEQ_IN_INDEX, COLUMN_NAME, NON_UNIQUE FROM (SELECT `TABLE_CATALOG`, CONVERT('cc_ddl' USING utf8mb3) COLLATE utf8mb3_general_ci AS `TABLE_SCHEMA`, `TABLE_NAME`, `NON_UNIQUE`, `INDEX_NAME`, `SEQ_IN_INDEX`, `COLUMN_NAME` FROM information_schema.STATISTICS WHERE `TABLE_SCHEMA` = 't61306000000_d37_g37_s37' AND LEFT(`TABLE_NAME`, 8) <> '__sprig_' AND (`TABLE_NAME`, `INDEX_NAME`) NOT IN (SELECT `TABLE_NAME`, `INDEX_NAME` FROM information_schema.STATISTICS WHERE `TABLE_SCHEMA` = 't61306000000_d37_g37_s37' AND LEFT(`COLUMN_NAME`, 7) = '_sprig_') AND `TABLE_NAME` = 'v1') AS `STATISTICS` WHERE table_schema = 'cc_ddl' AND table_name = 'v1' ORDER BY INDEX_NAME, SEQ_IN_INDEX";
         let a = super::try_answer(maria, &src, false).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(a.rows.len(), 2);
+    }
+
+    #[test]
+    fn automatic_indexes_are_listed_only_when_the_session_shows_them() {
+        let text = "CREATE TABLE `v1` (\n  `id` int(11) NOT NULL,\n  `a` int(11) DEFAULT NULL,\n  `b` int(11) DEFAULT NULL,\n  PRIMARY KEY (`id`),\n  KEY `ka` (`a`),\n  KEY `sprig_auto_00c0ffee` (`b`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci";
+        let mut eng = EngineCatalog::default();
+        eng.dbs.insert(DbId(37));
+        eng.by_name.insert((DbId(37), "v1".into()), ObjectId(20));
+        eng.texts.insert(ObjectId(20), Arc::from(text));
+        let counters = HashMap::new();
+        let stats = "SELECT INDEX_NAME FROM (SELECT `TABLE_CATALOG`, 'cc_ddl' AS `TABLE_SCHEMA`, `TABLE_NAME`, `INDEX_NAME` FROM information_schema.STATISTICS WHERE `TABLE_SCHEMA` = 't7_d37_g37_s37' AND LEFT(`TABLE_NAME`, 8) <> '__sprig_') AS `STATISTICS` WHERE table_schema = 'cc_ddl' AND table_name = 'v1' ORDER BY INDEX_NAME";
+        let keys = "SELECT COLUMN_KEY FROM (SELECT `TABLE_CATALOG`, 'cc_ddl' AS `TABLE_SCHEMA`, `TABLE_NAME`, `COLUMN_NAME`, `COLUMN_KEY` FROM information_schema.COLUMNS WHERE `TABLE_SCHEMA` = 't7_d37_g37_s37') AS `COLUMNS` WHERE table_schema = 'cc_ddl' AND table_name = 'v1' AND column_name = 'b'";
+        for (shown, names, key) in [
+            (false, vec!["PRIMARY", "ka"], ""),
+            (true, vec!["PRIMARY", "ka", "sprig_auto_00c0ffee"], "MUL"),
+        ] {
+            let src = Source {
+                eng: &eng,
+                tenant: 7,
+                counters: &counters,
+                logic: &[],
+                show_auto_indexes: shown,
+            };
+            let a = super::try_answer(stats, &src, false).unwrap_or_else(|e| panic!("{e}"));
+            let mut got: Vec<String> = a
+                .rows
+                .iter()
+                .map(|r| {
+                    let v = sprig_proto_mysql::resultset::decode_text_row(r, 1).expect("row");
+                    String::from_utf8_lossy(v[0].unwrap_or_default()).into_owned()
+                })
+                .collect();
+            got.sort();
+            assert_eq!(got, names, "shown = {shown}");
+            let a = super::try_answer(keys, &src, false).unwrap_or_else(|e| panic!("{e}"));
+            let v = sprig_proto_mysql::resultset::decode_text_row(&a.rows[0], 1).expect("row");
+            assert_eq!(v[0].unwrap_or_default(), key.as_bytes(), "shown = {shown}");
+        }
     }
 
     #[test]

@@ -836,6 +836,8 @@ pub(crate) fn to_bool(ctx: &mut Ctx<'_>, v: &Value) -> Option<bool> {
 pub(crate) fn to_text(v: &Value, ty: &ExprType, maria: bool) -> Option<Bytes> {
     let s: String = match v {
         Value::Null => return None,
+        // MySQL keeps JSON in its own form: its text is always that form.
+        Value::Json(s) if !maria => return Some(crate::func::json::mysql_text(s)),
         Value::Str(s) | Value::Bytes(s) | Value::Json(s) => return Some(s.clone()),
         Value::Int(i) => i.to_string(),
         Value::UInt(u) | Value::Bit(u) | Value::Set(u) => u.to_string(),

@@ -12,7 +12,7 @@ use crate::conv::{
     self, Info, IntVal, dec_to_int, err_text, f64_to_i64, fmt_double, range_error, str_to_dec,
     str_to_int, to_dec, to_f64,
 };
-use crate::error::{Level, Result};
+use crate::error::{Level, Result, SqlError};
 use crate::num::{Dec, Round};
 use crate::session::Ctx;
 use crate::temporal;
@@ -21,6 +21,23 @@ use crate::types::{Derivation, ExprType, Kind, NOT_FIXED};
 /// The node as a string: itself when it is one, else its text in the
 /// connection collation with the `NUMERIC` derivation.
 pub(crate) fn string_node(n: Node, env: Env<'_>) -> Node {
+    // A JSON value read as a string on MySQL is its text in MySQL's form.
+    if n.ty.json && !env.maria() {
+        let ty = ExprType {
+            json: false,
+            ..n.ty
+        };
+        let text = n.text.clone();
+        let konst = n.konst;
+        let mut out = Node::new(ty, text, move |ctx, row| {
+            Ok(match n.eval(ctx, row)? {
+                Value::Json(b) => Value::Str(crate::func::json::mysql_text(&b)),
+                other => other,
+            })
+        });
+        out.konst = konst;
+        return out;
+    }
     if n.ty.kind == Kind::Str {
         return n;
     }
@@ -115,6 +132,15 @@ pub(crate) fn coerce_fn(from: &ExprType, to: &ExprType, env: Env<'_>) -> CoerceF
                     Value::Null => Value::Null,
                     Value::Str(b) if recode => {
                         Value::Str(crate::charset::convert(&b, fc, tc).0.into())
+                    }
+                    // A JSON value made text on MySQL: its MySQL form.
+                    Value::Json(b) if !maria && !to.json => {
+                        let t = crate::func::json::mysql_text(&b);
+                        if binary {
+                            Value::Bytes(t)
+                        } else {
+                            Value::Str(t)
+                        }
                     }
                     Value::Str(b) | Value::Bytes(b) | Value::Json(b) => {
                         if binary {
@@ -271,11 +297,24 @@ pub(crate) fn agg_result_type(types: &[ExprType], op: &str, env: Env<'_>) -> Res
         // decimals: arithmetic on it is a double with the other
         // operand's.
         let empty = env.maria() && chars == 0 && live.iter().all(|t| t.kind == Kind::Str);
+        // JSON values: on MySQL, all of them make a JSON value; JSON with
+        // anything else (and any JSON on MariaDB) is the longest text.
+        let all_json = live.iter().all(|t| t.json);
+        let any_json = live.iter().any(|t| t.json);
         ExprType {
             hex: all_hex,
             unsigned: all_hex,
             dec: if all_hex || empty { 0 } else { NOT_FIXED },
-            ..ExprType::string(chars, dtc.coll, dtc.deriv)
+            json: all_json,
+            ..ExprType::string(
+                if any_json && (env.maria() || !all_json) {
+                    crate::types::JSON_TEXT_LEN
+                } else {
+                    chars
+                },
+                dtc.coll,
+                dtc.deriv,
+            )
         }
     };
     Ok(out.with_null(nullable))
@@ -546,6 +585,9 @@ pub(crate) fn cast(a: Node, target: CastTarget, env: Env<'_>) -> Result<Node> {
         CastTarget::Date | CastTarget::Time(_) | CastTarget::DateTime(_) => {
             temporal::cast(a, target, env)?
         }
+        // MariaDB has no JSON cast (its parser refuses it).
+        CastTarget::Json if maria => return Err(SqlError::unsupported("CAST AS JSON")),
+        CastTarget::Json => crate::func::json::cast_json(a, env),
     })
 }
 

@@ -85,7 +85,15 @@ impl PassSession {
         }
         self.eng.event_eval = None;
         let text = std::str::from_utf8(text).ok()?;
-        let st = parse::parse_event(text).ok()?;
+        let st = match parse::parse_event(text) {
+            Ok(st) => st,
+            Err(mut e) => {
+                if self.persona == sprig_proto_mysql::Persona::MySql84 {
+                    e.message = e.message.replace("MariaDB server", "MySQL server");
+                }
+                return Some(self.fail(out, &e).await);
+            }
+        };
         let (db, _) = self.ev_db(st.db.as_deref())?;
         let mysql = self.persona == sprig_proto_mysql::Persona::MySql84;
         let r = Box::pin(self.ev_prepare(cx, &st, db, mysql)).await;
@@ -109,6 +117,7 @@ impl PassSession {
 
     /// The schedule's values kept for the DDL path; `Some(note)` when the
     /// statement is answered with that note and changes nothing.
+    #[allow(clippy::too_many_lines)] // the checks, then the evaluation
     async fn ev_prepare(
         &mut self,
         cx: &mut ExecCtx<'_>,
@@ -139,12 +148,17 @@ impl PassSession {
                     "Same old and new event name",
                 ));
             }
-            return Err(not_on_engine("ALTER EVENT ... RENAME TO"));
+            // The move itself is the catalog's rename (`EngineDdl`).
         }
         let Some(schedule) = &st.schedule else {
             return Ok(None);
         };
-        let at = |x: &str| [format!("CAST(({x}) AS DATETIME)"), format!("UNIX_TIMESTAMP({x})")];
+        let at = |x: &str| {
+            [
+                format!("CAST(({x}) AS DATETIME)"),
+                format!("UNIX_TIMESTAMP({x})"),
+            ]
+        };
         let mut exprs = vec![
             "@@time_zone".to_owned(),
             "CAST(NOW() AS DATETIME)".to_owned(),
@@ -172,7 +186,11 @@ impl PassSession {
         };
         let now = pair(1).ok_or_else(|| SprigError::internal("NOW() read as NULL"))?;
         let mut eval = Eval {
-            time_zone: v.first().cloned().flatten().unwrap_or_else(|| "SYSTEM".into()),
+            time_zone: v
+                .first()
+                .cloned()
+                .flatten()
+                .unwrap_or_else(|| "SYSTEM".into()),
             now: now.clone(),
             ..Eval::default()
         };
@@ -235,11 +253,7 @@ impl PassSession {
             .ev_db(Some(&req.db))
             .and_then(|(db, name)| Some((self.ev_find(db, &req.name)?, db, name)));
         let Some((ev, db, db_name)) = found else {
-            let e = SprigError::standard(
-                1539,
-                *b"HY000",
-                format!("Unknown event '{}'", req.name),
-            );
+            let e = SprigError::standard(1539, *b"HY000", format!("Unknown event '{}'", req.name));
             return self.fail(out, &e).await.map(Some);
         };
         let (c, prog) = match &ev.code {
@@ -391,7 +405,17 @@ impl PassSession {
             dt("Starts"),
             dt("Ends"),
             c("Status", if mysql { 84 } else { 72 }),
-            coldef("", "", "Originator", "", 63, 10, if mysql { 0x03 } else { 0x08 }, 0x1021, 0),
+            coldef(
+                "",
+                "",
+                "Originator",
+                "",
+                63,
+                10,
+                if mysql { 0x03 } else { 0x08 },
+                0x1021,
+                0,
+            ),
             c("character_set_client", if mysql { 256 } else { 128 }),
             c("collation_connection", 256),
             c("Database Collation", 256),

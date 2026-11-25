@@ -185,7 +185,7 @@ impl CtlShards {
 /// database (see [`PassSession::logic_prepare_bound`]).
 fn bound_not_on_engine(kind: Kind, db: &str) -> SprigError {
     let what = match kind {
-        Kind::Validation => "a validation (the engine's pre-write hook isn't built yet)",
+        Kind::Validation => "a validation recompiled for a column change",
         Kind::Trigger => "an after-commit trigger recompiled for a column change",
         Kind::Schedule => "a schedule (the engine's schedule runner isn't built yet)",
         Kind::Function | Kind::Procedure => "this routine",
@@ -361,8 +361,9 @@ impl PassSession {
         decl: Declaration,
     ) -> Result<Vec<String>> {
         // An after-commit trigger on an engine table runs from the change
-        // log (`exec::change_trigger`).
-        if decl.kind == Kind::Trigger
+        // log (`exec::change_trigger`); a validation in the engine's write
+        // path (`engine_seam::routine::validation`).
+        if matches!(decl.kind, Kind::Trigger | Kind::Validation)
             && let Some(db) = decl
                 .table
                 .as_ref()
@@ -371,6 +372,9 @@ impl PassSession {
                 .or_else(|| self.current_logical())
             && self.engine_database_named(&db)
         {
+            if decl.kind == Kind::Validation {
+                return Box::pin(self.logic_deploy_validation(decl, &db)).await;
+            }
             return Box::pin(self.logic_deploy_change_trigger(decl, &db)).await;
         }
         self.logic_deploy_bound_as(cx, decl, None).await
@@ -723,10 +727,18 @@ impl PassSession {
         };
         let current = self.current_logical();
         let cluster = self.target.cluster.clone();
-        let Some(ts) = self.tenant.as_deref_mut() else {
+        if self.tenant.is_none() {
+            return Ok(None);
+        }
+        let Some(db) = change.db.clone().or(current) else {
             return Ok(None);
         };
-        let Some(db) = change.db.clone().or(current) else {
+        // An engine table's validations take their row by name when they
+        // run: nothing is compiled against its columns.
+        if self.engine_database_named(&db) {
+            return Ok(None);
+        }
+        let Some(ts) = self.tenant.as_deref_mut() else {
             return Ok(None);
         };
         let catalog = match ts.catalog() {

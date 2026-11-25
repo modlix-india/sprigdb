@@ -7,7 +7,10 @@
 //! run(env):
 //!   off (auto_index.enabled = false): nothing
 //!   watch    every built index: reads counted since the last pass; the
-//!            watch rule; drop -> Env::drop_index, record dropped
+//!            watch rule (a pinned index is never dropped); drop ->
+//!            Env::drop_index, record dropped
+//!   reconcile  an automatic index on a table that no live record explains
+//!            is dropped (`unexplained`)
 //!   approve  every recommendation: approved -> build; rejected or past
 //!            recommend_ttl_days -> rejected
 //!   resume   a record left `building` by a crash: built again (the build
@@ -24,6 +27,11 @@
 //! Every change of a record and every decision is written at once, in a
 //! transaction of its own, so a pass cut short leaves records that the
 //! next pass continues from.
+//!
+//! Between passes the node calls [`note_usage`] (every minute, and when it
+//! stops) so reads counted in memory reach the records and a restart
+//! forgets at most a minute of them, and [`apply_requests`] for operators'
+//! requests (`sprigctl index drop|pin|unpin|restore`).
 
 use std::collections::HashMap;
 
@@ -33,7 +41,9 @@ use sprig_workload::shape::StmtType;
 use sprig_workload::window::FpWindowStats;
 
 use super::candidates::{self, Reason, TableInfo};
-use super::model::{Baseline, BuildReport, Event, IndexRecord, IndexSpec, State};
+use super::model::{
+    Action, Baseline, BuildReport, Event, IndexRecord, IndexSpec, OperatorRequest, State,
+};
 use super::policy::{self, DAY_US, Dampers, HOUR_US, Replay, Verdict, Watch};
 use super::settings::{AutoIndexSettings, Mode};
 use super::store::AutoIndexStore;
@@ -73,6 +83,16 @@ pub trait Env: Send + Sync {
     /// Plans that read index `name` of `spec`'s table, as counted by this
     /// node since it started.
     fn reads(&self, spec: &IndexSpec, name: &str) -> u64;
+    /// When a plan last read index `name` of `spec`'s table, as this node
+    /// saw it; `None`: not known (the pass's time is used).
+    fn last_read_us(&self, _spec: &IndexSpec, _name: &str) -> Option<u64> {
+        None
+    }
+    /// Every automatic index (`sprig_auto_*`) on the tenant's tables, as
+    /// the catalog has it: its table and columns, and its name.
+    async fn auto_indexes(&self) -> Result<Vec<(IndexSpec, String)>> {
+        Ok(Vec::new())
+    }
     /// Sends `rec` to the approvals inbox: the request's id.
     async fn propose(&self, rec: &IndexRecord) -> Result<String>;
     /// The answer to approval request `id`.
@@ -102,12 +122,16 @@ pub struct PassReport {
     pub rejected: Vec<(String, String)>,
     /// Indexes whose observation ended with them kept.
     pub activated: Vec<String>,
+    /// Index records the tenant has (any state), after the pass.
+    pub records: usize,
 }
 
 struct Recorder<'a> {
     env: &'a dyn Env,
-    seq: u32,
 }
+
+/// Tells apart events of the same µs, across passes and requests.
+static EVENT_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 impl Recorder<'_> {
     async fn save(&mut self, r: &IndexRecord) -> Result<()> {
@@ -124,19 +148,32 @@ impl Recorder<'_> {
         reason: &str,
         est: Option<(f64, f64)>,
     ) -> Result<()> {
+        self.event_named(kind, &spec.name(), spec, fps, reason, est)
+            .await
+    }
+
+    async fn event_named(
+        &mut self,
+        kind: &str,
+        name: &str,
+        spec: &IndexSpec,
+        fps: &[u64],
+        reason: &str,
+        est: Option<(f64, f64)>,
+    ) -> Result<()> {
         let e = Event {
             at_us: self.env.now_us(),
             kind: kind.into(),
-            index: spec.name(),
+            index: name.to_owned(),
             def: spec.canonical(),
             table: spec.table_key(),
             fingerprints: fps.to_vec(),
             reason: reason.into(),
             est,
         };
-        self.seq += 1;
+        let seq = EVENT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut tx = self.env.records().await?;
-        AutoIndexStore::add_event(&mut *tx, &e, self.seq).await?;
+        AutoIndexStore::add_event(&mut *tx, &e, seq).await?;
         tx.commit().await
     }
 
@@ -198,10 +235,14 @@ pub async fn run(env: &dyn Env) -> Result<PassReport> {
     let mut report = PassReport::default();
     if !s.enabled {
         report.disabled = true;
+        // Operators' requests still apply to the records it has.
+        let mut tx = env.records().await?;
+        report.records = AutoIndexStore::indexes(&mut *tx).await?.len();
+        tx.commit().await?;
         return Ok(report);
     }
     let now = env.now_us();
-    let mut rec = Recorder { env, seq: 0 };
+    let mut rec = Recorder { env };
     let mut records = {
         let mut tx = env.records().await?;
         let r = AutoIndexStore::indexes(&mut *tx).await?;
@@ -237,18 +278,7 @@ pub async fn run(env: &dyn Env) -> Result<PassReport> {
             report.dropped.push((r.name.clone(), "index_gone".into()));
             continue;
         }
-        let reads = env.reads(&r.spec, &r.name);
-        let fresh = if reads >= r.reads_seen {
-            reads - r.reads_seen
-        } else {
-            // The node restarted: its count started again from zero.
-            reads
-        };
-        if fresh > 0 {
-            r.last_used_us = Some(now);
-            r.reads_total += fresh;
-        }
-        r.reads_seen = reads;
+        let fresh = absorb(env, r, now);
         match policy::watch(r, now, &current, &s) {
             Watch::Keep => {
                 if fresh > 0 {
@@ -279,6 +309,24 @@ pub async fn run(env: &dyn Env) -> Result<PassReport> {
                 report.dropped.push((r.name.clone(), why.into()));
             }
         }
+    }
+
+    // Reconcile: an automatic index no live record explains goes (a
+    // record lost, or a drop cut short). The catalog is the truth for what
+    // exists; the records only say why.
+    for (spec, name) in env.auto_indexes().await? {
+        let explained = records.iter().any(|r| {
+            !r.state.terminal()
+                && r.name.eq_ignore_ascii_case(&name)
+                && r.spec.table_key() == spec.table_key()
+        });
+        if explained {
+            continue;
+        }
+        env.drop_index(&spec, &name).await?;
+        rec.event_named("dropped", &name, &spec, &[], "unexplained", None)
+            .await?;
+        report.dropped.push((name, "unexplained".into()));
     }
 
     // 2. Recommendations: approved, refused or expired.
@@ -532,7 +580,164 @@ pub async fn run(env: &dyn Env) -> Result<PassReport> {
         }
         records.push(r);
     }
+    report.records = records.len();
     Ok(report)
+}
+
+/// Takes the reads counted since the record last saw them into `r`:
+/// `reads_total`, `last_used_us`. The fresh reads.
+fn absorb(env: &dyn Env, r: &mut IndexRecord, now: u64) -> u64 {
+    let reads = env.reads(&r.spec, &r.name);
+    let fresh = if reads >= r.reads_seen {
+        reads - r.reads_seen
+    } else {
+        // The node restarted: its count started again from zero.
+        reads
+    };
+    if fresh > 0 {
+        let at = env
+            .last_read_us(&r.spec, &r.name)
+            .map_or(now, |t| t.min(now));
+        r.last_used_us = Some(r.last_used_us.map_or(at, |u| u.max(at)));
+        r.reads_total += fresh;
+    }
+    r.reads_seen = reads;
+    fresh
+}
+
+/// Writes the reads counted in memory since the last pass (or the last
+/// call) into the built indexes' records, so a restart doesn't forget
+/// them. Returns the records written.
+///
+/// # Errors
+/// The records'.
+pub async fn note_usage(env: &dyn Env) -> Result<usize> {
+    let now = env.now_us();
+    let mut tx = env.records().await?;
+    let mut records = AutoIndexStore::indexes(&mut *tx).await?;
+    let mut written = 0;
+    for r in records.iter_mut().filter(|r| r.state.built()) {
+        if absorb(env, r, now) > 0 {
+            AutoIndexStore::put_index(&mut *tx, r).await?;
+            written += 1;
+        }
+    }
+    tx.commit().await?;
+    Ok(written)
+}
+
+/// What [`apply_requests`] did with one request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Applied {
+    /// The index.
+    pub index: String,
+    /// The action.
+    pub action: Action,
+    /// `done`, `waiting` (a restore while builds must wait; kept for the
+    /// next call), or why it was refused (`no_such_index`, a state).
+    pub outcome: String,
+}
+
+/// Applies operators' pending requests: drop, pin, unpin, restore. Each
+/// one is checked again against the record as it is now, recorded as an
+/// event with its actor, and deleted.
+///
+/// # Errors
+/// The records' and the environment's; a call stops at the first.
+pub async fn apply_requests(env: &dyn Env) -> Result<Vec<Applied>> {
+    let (reqs, mut records) = {
+        let mut tx = env.records().await?;
+        let q = AutoIndexStore::requests(&mut *tx).await?;
+        let r = if q.is_empty() {
+            Vec::new()
+        } else {
+            AutoIndexStore::indexes(&mut *tx).await?
+        };
+        tx.commit().await?;
+        (q, r)
+    };
+    let s = env.settings();
+    let mut rec = Recorder { env };
+    let mut out = Vec::new();
+    for q in reqs {
+        let outcome = apply_one(env, &mut rec, &mut records, &q, &s).await?;
+        if outcome != "waiting" {
+            let mut tx = env.records().await?;
+            AutoIndexStore::delete_request(&mut *tx, &q.index).await?;
+            tx.commit().await?;
+        }
+        out.push(Applied {
+            index: q.index.clone(),
+            action: q.action,
+            outcome,
+        });
+    }
+    Ok(out)
+}
+
+async fn apply_one(
+    env: &dyn Env,
+    rec: &mut Recorder<'_>,
+    records: &mut [IndexRecord],
+    q: &OperatorRequest,
+    s: &AutoIndexSettings,
+) -> Result<String> {
+    let Some(i) = records
+        .iter()
+        .position(|r| r.name.eq_ignore_ascii_case(&q.index))
+    else {
+        return Ok("no_such_index".into());
+    };
+    if let Err(why) = q.action.allowed(&records[i]) {
+        return Ok(why);
+    }
+    let now = env.now_us();
+    let mut who = String::from("operator");
+    if !q.actor.is_empty() {
+        who = format!("{who} {}", q.actor);
+    }
+    if !q.reason.is_empty() {
+        who = format!("{who}: {}", q.reason);
+    }
+    match q.action {
+        Action::Drop => {
+            let r = &mut records[i];
+            if r.state == State::Recommended {
+                r.state = State::Rejected;
+            } else {
+                env.drop_index(&r.spec, &r.name).await?;
+                r.state = State::Dropped;
+            }
+            r.changed_us = now;
+            r.pinned = false;
+            r.end_reason = Some("operator".into());
+            rec.save(r).await?;
+            rec.event("dropped", &r.spec, &r.serves, &who, None).await?;
+        }
+        Action::Pin | Action::Unpin => {
+            let r = &mut records[i];
+            r.pinned = q.action == Action::Pin;
+            rec.save(r).await?;
+            let kind = if r.pinned { "pinned" } else { "unpinned" };
+            rec.event(kind, &r.spec, &r.serves, &who, None).await?;
+        }
+        Action::Restore => {
+            let busy = records.iter().any(|r| r.state == State::Building);
+            if env.paused().is_some() || busy {
+                return Ok("waiting".into());
+            }
+            let mut r = records[i].clone();
+            r.end_reason = None;
+            r.pinned = true;
+            r.reads_seen = env.reads(&r.spec, &r.name);
+            rec.event("restored", &r.spec, &r.serves, &who, None)
+                .await?;
+            let mut report = PassReport::default();
+            build(env, rec, &mut r, s, &mut report).await?;
+            records[i] = r;
+        }
+    }
+    Ok("done".into())
 }
 
 /// Builds `r` (state `building` on entry and while it runs).

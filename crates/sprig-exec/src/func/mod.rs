@@ -3,7 +3,7 @@
 
 mod datetime;
 mod hash;
-mod json;
+pub(crate) mod json;
 pub(crate) mod misc;
 mod numeric;
 mod regexp;
@@ -313,15 +313,46 @@ pub(crate) fn build(name: &str, args: &[Expr], env: Env<'_>) -> Result<Node> {
             arity(name, &nodes, 0, 0)?;
             Ok(misc::uuid(env))
         }
+        "UUID_SHORT" => {
+            arity(name, &nodes, 0, 0)?;
+            Ok(misc::uuid_short())
+        }
+        "ADDTIME" | "SUBTIME" => {
+            let [a, b] = take(name, nodes)?;
+            Ok(misc::addtime(a, b, name == "SUBTIME", env))
+        }
         "JSON_EXTRACT" => json::extract(nodes, env),
+        "JSON_PRETTY" => {
+            let [a] = take(name, nodes)?;
+            Ok(json::pretty("JSON_PRETTY", a, env))
+        }
+        "JSON_DETAILED" if env.maria() => {
+            let [a] = take(name, nodes)?;
+            Ok(json::pretty("JSON_DETAILED", a, env))
+        }
+        "JSON_SEARCH" => json::search(nodes, env),
+        "JSON_COMPACT" => {
+            let [a] = take(name, nodes)?;
+            Ok(json::compact(a, env))
+        }
         "JSON_UNQUOTE" => {
             let [a] = take(name, nodes)?;
             Ok(json::unquote(a, env))
         }
-        "JSON_VALUE" => {
-            let [d, p] = take(name, nodes)?;
-            Ok(json::value(d, p, env))
-        }
+        "JSON_VALUE" => match keyword(args) {
+            // `RETURNING type` (the planner refuses it on MariaDB).
+            Some(k) if !env.maria() => {
+                let r = json::Returning::parse(k)
+                    .ok_or_else(|| SqlError::unsupported("JSON_VALUE with this RETURNING type"))?;
+                let [d, p] = take(name, nodes)?;
+                Ok(json::value_returning(d, p, r, env))
+            }
+            Some(_) => Err(SqlError::unsupported("JSON_VALUE with RETURNING")),
+            None => {
+                let [d, p] = take(name, nodes)?;
+                Ok(json::value(d, p, env))
+            }
+        },
         "JSON_TYPE" => {
             let [a] = take(name, nodes)?;
             Ok(json::type_of(a, env))
@@ -343,6 +374,14 @@ pub(crate) fn build(name: &str, args: &[Expr], env: Env<'_>) -> Result<Node> {
         "JSON_REMOVE" => json::remove_fn(nodes, env),
         "JSON_ARRAY_APPEND" => json::array_append(nodes, env),
         "JSON_MERGE_PATCH" => json::merge_patch_fn(nodes, env),
+        "JSON_MERGE_PRESERVE" => json::merge_preserve_fn(name, nodes, env),
+        // MariaDB's older name; MySQL deprecates it.
+        "JSON_MERGE" if env.maria() => json::merge_preserve_fn(name, nodes, env),
+        "JSON_ARRAY_INSERT" => json::array_insert(nodes, env),
+        "JSON_OVERLAPS" => {
+            let [a, b] = take(name, nodes)?;
+            Ok(json::overlaps(a, b, env))
+        }
         "MEMBER OF" if !env.maria() => {
             let [x, d] = take(name, nodes)?;
             Ok(json::member_of(x, d, env))
@@ -367,8 +406,12 @@ pub(crate) fn build(name: &str, args: &[Expr], env: Env<'_>) -> Result<Node> {
             let [d, f] = take(name, nodes)?;
             Ok(datetime::time_format(d, f, env))
         }
+        "LAST_INSERT_ID" if nodes.len() == 1 => {
+            let [a] = take(name, nodes)?;
+            misc::set_last_insert_id(a, env)
+        }
         "DATABASE" | "SCHEMA" | "CONNECTION_ID" | "LAST_INSERT_ID" | "USER" | "SESSION_USER"
-        | "SYSTEM_USER" | "CURRENT_USER" | "VERSION" => {
+        | "SYSTEM_USER" | "CURRENT_USER" | "VERSION" | "ROW_COUNT" | "FOUND_ROWS" => {
             if !nodes.is_empty() {
                 return Err(SqlError::unsupported(&format!("{name} with an argument")));
             }
@@ -625,6 +668,16 @@ pub(crate) fn write_sql(out: &mut String, name: &str, args: &[Expr]) {
             out.push(' ');
         }
         out.push_str(&lit.to_sql());
+        return;
+    }
+    if let ("JSON_VALUE", [d, p, Expr::Keyword(r)]) = (name, args) {
+        out.push_str("JSON_VALUE(");
+        out.push_str(&d.to_sql());
+        out.push_str(", ");
+        out.push_str(&p.to_sql());
+        out.push(' ');
+        out.push_str(r);
+        out.push(')');
         return;
     }
     if let ("CHAR", [rest @ .., Expr::Keyword(using)]) = (name, args) {

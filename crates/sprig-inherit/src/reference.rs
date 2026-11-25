@@ -288,14 +288,14 @@ impl Model {
             };
             match self.rows.get_mut(&(s, *k)) {
                 Some(r) if r.state != LayerState::Hide => {
+                    // An override written again takes every field of the
+                    // merged record (the layer write copies the record), so
+                    // an orphan later keeps the values of its last write.
+                    if r.state == LayerState::Ovr {
+                        r.fields.clone_from(merged);
+                    }
                     for (i, val) in set {
                         r.fields[*i].clone_from(val);
-                    }
-                    if record && r.state == LayerState::Ovr {
-                        r.fields.clone_from(merged);
-                        for (i, val) in set {
-                            r.fields[*i].clone_from(val);
-                        }
                     }
                     r.ovr |= bits;
                 }

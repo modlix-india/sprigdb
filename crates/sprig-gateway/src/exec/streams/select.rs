@@ -578,6 +578,7 @@ fn wire_type(f: FieldType) -> u8 {
         FieldType::Time => column_type::TIME,
         FieldType::DateTime => column_type::DATETIME,
         FieldType::Timestamp => column_type::TIMESTAMP,
+        FieldType::Json => column_type::JSON,
     }
 }
 

@@ -7,6 +7,11 @@ use sprig_engine::row::{ColumnType, LobSize};
 use crate::error::{Result, SqlError};
 use crate::session::Persona;
 
+/// The length, in characters, of a value computed from a JSON value whose
+/// type isn't JSON (a merge of JSON and text, a JSON value on MariaDB):
+/// reported as 4294967295 bytes, the most there is.
+pub const JSON_TEXT_LEN: u32 = u32::MAX / 4 + 1;
+
 /// The "decimals not fixed" marker of `DOUBLE` values.
 pub const NOT_FIXED: u8 = 31;
 
@@ -162,6 +167,11 @@ pub struct ExprType {
     /// character set, and gives way to the other side's set when
     /// collations are merged.
     pub ascii: bool,
+    /// A JSON value: a `JSON` column's, or a JSON function's result. MySQL
+    /// types it `JSON` (and prints it in its own form, compares it as
+    /// JSON); MariaDB's JSON is text, so there it only marks where the
+    /// value came from.
+    pub json: bool,
 }
 
 impl ExprType {
@@ -181,6 +191,7 @@ impl ExprType {
         cast_char: false,
         fixed: false,
         ascii: false,
+        json: false,
     };
 
     /// The type of the `NULL` literal.
@@ -407,9 +418,10 @@ impl ExprType {
                 ..Self::int(5, true)
             },
             ColumnType::Set { .. } => Self::bigint(true),
-            ColumnType::Json => {
-                Self::string(u32::MAX / 4, Collation::Utf8mb4Bin, Derivation::Implicit)
-            }
+            ColumnType::Json => Self {
+                json: true,
+                ..Self::string(u32::MAX / 4, Collation::Utf8mb4Bin, Derivation::Implicit)
+            },
         };
         Self {
             column: true,
@@ -473,6 +485,11 @@ impl ExprType {
             Kind::Decimal => (FieldType::NewDecimal, self.len, self.dec),
             Kind::Double => (FieldType::Double, self.len, self.dec),
             Kind::Float => (FieldType::Float, self.len, self.dec),
+            // MySQL's JSON type: its fixed length, in the result character
+            // set.
+            Kind::Str if self.json && !maria => {
+                (FieldType::Json, u32::MAX / 4 * 4, persona.not_fixed_dec())
+            }
             Kind::Str => {
                 // A character string is sent in the result character set,
                 // utf8mb4: four bytes a character, whatever its own.
@@ -573,6 +590,8 @@ pub enum FieldType {
     DateTime,
     /// `TIMESTAMP`.
     Timestamp,
+    /// MySQL's `JSON`.
+    Json,
 }
 
 impl FieldType {
@@ -600,6 +619,7 @@ impl FieldType {
             FieldType::Time => "TIME",
             FieldType::DateTime => "DATETIME",
             FieldType::Timestamp => "TIMESTAMP",
+            FieldType::Json => "JSON",
         }
     }
 }

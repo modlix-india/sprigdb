@@ -718,6 +718,7 @@ pub(crate) fn extreme(args: Vec<Node>, greatest: bool, env: Env<'_>) -> Result<N
                     Key::Int(i) => i.value(),
                     Key::Dec(d) => conv::dec_value(d),
                     Key::Real(x) => Value::Double(*x),
+                    Key::Json(j) => Value::Json(crate::func::json::key_text(j)),
                 };
                 (v, k)
             };

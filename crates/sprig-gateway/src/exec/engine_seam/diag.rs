@@ -616,6 +616,133 @@ impl PassSession {
     }
 }
 
+/// What a client statement answered (see [`CountSink`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::exec) enum Answered {
+    /// Nothing seen (an answer sent some other way).
+    Nothing,
+    /// An OK packet with these affected rows.
+    Ok(u64),
+    /// A result set of this many rows.
+    Rows(u64),
+    /// An error.
+    Error,
+}
+
+/// A sink that notes what a client statement answered (the last answer of
+/// it), for the session's `ROW_COUNT()` and `FOUND_ROWS()`, and gives an
+/// OK packet the value the statement's `LAST_INSERT_ID(expr)` set.
+pub(in crate::exec) struct CountSink<'a> {
+    inner: &'a mut dyn ResultSink,
+    conn: u64,
+    /// What it answered.
+    pub got: Answered,
+    rows: u64,
+    /// The value `LAST_INSERT_ID(expr)` set, once taken.
+    pub set_id: Option<u64>,
+}
+
+impl<'a> CountSink<'a> {
+    /// A sink over `inner` for connection `conn`.
+    pub(in crate::exec) fn new(inner: &'a mut dyn ResultSink, conn: u64) -> Self {
+        Self {
+            inner,
+            conn,
+            got: Answered::Nothing,
+            rows: 0,
+            set_id: None,
+        }
+    }
+
+    /// What the statement answered and the `LAST_INSERT_ID(expr)` value it
+    /// set, once it has ended.
+    pub(in crate::exec) fn finish(mut self) -> (Answered, Option<u64>) {
+        if let Some(v) = sprig_exec::take_set_insert_id(self.conn) {
+            self.set_id = Some(v);
+        }
+        (self.got, self.set_id)
+    }
+}
+
+#[async_trait]
+impl ResultSink for CountSink<'_> {
+    fn wire(&self) -> Wire {
+        self.inner.wire()
+    }
+
+    async fn begin_rows(&mut self, columns: &[ColumnDef], format: RowFormat) -> Result<()> {
+        self.rows = 0;
+        self.inner.begin_rows(columns, format).await
+    }
+
+    async fn begin_rows_raw(&mut self, defs: &[Bytes], format: RowFormat) -> Result<()> {
+        self.rows = 0;
+        self.inner.begin_rows_raw(defs, format).await
+    }
+
+    async fn cursor_opened(&mut self, columns: &[ColumnDef], end: EndOfRows) -> Result<()> {
+        self.got = Answered::Rows(0);
+        self.inner.cursor_opened(columns, end).await
+    }
+
+    async fn row(&mut self, values: RowValues<'_>) -> Result<()> {
+        self.rows += 1;
+        self.inner.row(values).await
+    }
+
+    async fn raw_row(&mut self, payload: Bytes) -> Result<()> {
+        self.rows += 1;
+        self.inner.raw_row(payload).await
+    }
+
+    fn try_raw_row(&mut self, payload: Bytes) -> std::result::Result<Result<()>, Bytes> {
+        let r = self.inner.try_raw_row(payload);
+        if r.is_ok() {
+            self.rows += 1;
+        }
+        r
+    }
+
+    async fn end_rows(&mut self, end: EndOfRows) -> Result<()> {
+        self.got = Answered::Rows(self.rows);
+        self.inner.end_rows(end).await
+    }
+
+    async fn ok(&mut self, mut ok: OkPacket) -> Result<()> {
+        self.got = Answered::Ok(ok.affected_rows);
+        if let Some(v) = sprig_exec::take_set_insert_id(self.conn) {
+            ok.last_insert_id = v;
+            self.set_id = Some(v);
+        }
+        self.inner.ok(ok).await
+    }
+
+    async fn error(&mut self, err: &SprigError) -> Result<()> {
+        self.got = Answered::Error;
+        self.inner.error(err).await
+    }
+
+    async fn column_list(&mut self, columns: &[ColumnDef], end: EndOfRows) -> Result<()> {
+        self.inner.column_list(columns, end).await
+    }
+
+    async fn local_infile_request(&mut self, file_name: &[u8]) -> Result<()> {
+        self.inner.local_infile_request(file_name).await
+    }
+
+    async fn local_infile_read(&mut self) -> Result<Bytes> {
+        self.inner.local_infile_read().await
+    }
+
+    async fn flush(&mut self) -> Result<()> {
+        self.inner.flush().await
+    }
+
+    fn finished(&self) -> bool {
+        self.inner.finished()
+    }
+}
+
 /// A sink that notes what a statement relayed from a backend connection
 /// raised: its warning count and its error.
 pub(in crate::exec) struct DiagSink<'a> {

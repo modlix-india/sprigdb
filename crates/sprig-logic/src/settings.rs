@@ -96,6 +96,11 @@ key! {
     "One trigger invocation"
 }
 key! {
+    /// `logic.validation_budget_ms`: one validation's run on one row.
+    VALIDATION_BUDGET_MS = "logic.validation_budget_ms", Scopes::DATA, 50, 1, 3_600_000,
+    "Wall time of one validation on one row"
+}
+key! {
     /// `logic.job_budget_ms`.
     JOB_BUDGET_MS = "logic.job_budget_ms", Scopes::DATA, 300_000, 1, 86_400_000,
     "One scheduled run"

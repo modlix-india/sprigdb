@@ -137,6 +137,13 @@ pub(crate) fn of(cat: &TenantCatalog) -> Option<&EngineCatalog> {
         .filter(|e| !e.dbs.is_empty())
 }
 
+/// The module state of a tenant with no database at all: nothing in it
+/// (a statement that reads no table is still the engine's).
+pub(crate) fn empty() -> &'static EngineCatalog {
+    static E: std::sync::OnceLock<EngineCatalog> = std::sync::OnceLock::new();
+    E.get_or_init(EngineCatalog::default)
+}
+
 /// The catalog module.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct EngineExtension;

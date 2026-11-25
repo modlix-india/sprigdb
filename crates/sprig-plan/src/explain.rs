@@ -192,28 +192,59 @@ pub(crate) fn describe_path(
     }
 }
 
-/// The plan as a result set with the servers' ten columns.
-pub(crate) fn as_rows(rows: &[ExplainRow], session: &Session) -> (Box<dyn RowSource>, Vec<Column>) {
+/// The plan as a result set with the servers' ten columns; `extended`
+/// (`EXPLAIN EXTENDED`, which the MySQL port sends for its plain
+/// `EXPLAIN`) adds `filtered` before `Extra`: the planner keeps no
+/// estimate of what a condition filters, so it is always 100.00.
+pub(crate) fn as_rows(
+    rows: &[ExplainRow],
+    session: &Session,
+    extended: bool,
+) -> (Box<dyn RowSource>, Vec<Column>) {
     let text = |n: u32| {
         ExprType::string(n, session.collation_connection, Derivation::Coercible).nullable()
     };
-    let columns = vec![
-        ("id", ExprType::bigint(false).nullable()),
-        ("select_type", text(19)),
+    let maria = session.persona.is_maria();
+    // The servers' own column definitions: `id` an unsigned BIGINT of
+    // three (MariaDB) or four (MySQL, not null) digits; `select_type` and
+    // `Extra` never NULL; MySQL's `ref` half as long.
+    let id = ExprType {
+        unsigned: true,
+        width: 8,
+        len: if maria { 3 } else { 4 },
+        nullable: maria,
+        ..ExprType::bigint(true)
+    };
+    let not_null = |n: u32| ExprType {
+        nullable: false,
+        ..text(n)
+    };
+    let mut columns = vec![
+        ("id", id),
+        ("select_type", not_null(19)),
         ("table", text(64)),
         ("type", text(10)),
         ("possible_keys", text(4096)),
         ("key", text(64)),
         ("key_len", text(4096)),
-        ("ref", text(2048)),
+        ("ref", text(if maria { 2048 } else { 1024 })),
         ("rows", text(64)),
-        ("Extra", text(255)),
+        ("Extra", not_null(255)),
     ];
+    if extended {
+        let filtered = ExprType {
+            dec: 2,
+            len: 4,
+            ..ExprType::double()
+        }
+        .nullable();
+        columns.insert(9, ("filtered", filtered));
+    }
     let opt = |s: &Option<String>| s.as_deref().map_or(Value::Null, Value::str);
     let data = rows
         .iter()
         .map(|r| {
-            vec![
+            let mut row = vec![
                 Value::Int(r.id as i64),
                 Value::str(&r.select_type),
                 opt(&r.table),
@@ -223,8 +254,16 @@ pub(crate) fn as_rows(rows: &[ExplainRow], session: &Session) -> (Box<dyn RowSou
                 opt(&r.key_len),
                 opt(&r.r#ref),
                 r.rows.map_or(Value::Null, |n| Value::str(&n.to_string())),
-                Value::str(&r.extra_text()),
-            ]
+                // MySQL leaves an empty `Extra` NULL.
+                match r.extra_text() {
+                    t if t.is_empty() && !maria => Value::Null,
+                    t => Value::str(&t),
+                },
+            ];
+            if extended {
+                row.insert(9, Value::Double(100.0));
+            }
+            row
         })
         .collect();
     let types: Vec<ExprType> = columns.iter().map(|c| c.1).collect();

@@ -5,12 +5,24 @@
 //!   rejected and failed ones)
 //! - `events --tenant T [--kind K]`: the loop's decisions of the last 30
 //!   days: candidates, builds, drops, deferrals, refusals
+//! - `drop|pin|unpin|restore <index> --tenant T [--reason R] [--no-wait]`:
+//!   an operator's action, over `POST .../indexes/{index}:{action}`. The
+//!   node running the tenant's loop applies it within a minute; the command
+//!   waits for that (up to two minutes) unless `--no-wait`, then prints the
+//!   index. `pin` keeps an index whatever the watch finds (alias `freeze`;
+//!   `unpin`, `unfreeze`); `drop` drops it and blocks its definition for
+//!   `auto_index.recreate_block_days`; `restore` builds a dropped or failed
+//!   one again, pinned.
 //!
 //! Approving a recommendation (mode `recommend`) is `sprigctl
 //! recommendations approve <id>`: the record's `approval` column names it.
 
+use std::time::Duration;
+
 use clap::{Arg, ArgAction, ArgMatches, Command};
-use sprig_controller::autoindex_admin::IndexesResponse;
+use sprig_controller::autoindex_admin::{
+    ActionBody, IndexRecord, IndexesResponse, OperatorRequest,
+};
 
 use crate::client::AdminClient;
 use crate::render::table;
@@ -42,6 +54,21 @@ pub(crate) fn group() -> Command {
                         .help("Dropped, rejected and failed too"),
                 ),
         )
+        .subcommand(action(
+            "drop",
+            "Drop an automatic index now (its definition is then blocked)",
+        ))
+        .subcommand(
+            action("pin", "Keep an automatic index whatever the watch finds")
+                .visible_alias("freeze"),
+        )
+        .subcommand(
+            action("unpin", "Let the watch judge a pinned index again").visible_alias("unfreeze"),
+        )
+        .subcommand(action(
+            "restore",
+            "Build a dropped or failed automatic index again, pinned",
+        ))
         .subcommand(
             Command::new("events")
                 .about("Candidates, builds, drops and deferrals of the last 30 days")
@@ -51,6 +78,28 @@ pub(crate) fn group() -> Command {
                         .long("kind")
                         .help("Only this kind (candidate, built, dropped, deferred, ...)"),
                 ),
+        )
+}
+
+fn action(name: &'static str, about: &'static str) -> Command {
+    Command::new(name)
+        .about(about)
+        .arg(
+            Arg::new("index")
+                .required(true)
+                .help("The index: sprig_auto_<hex>, table.name or db.table.name"),
+        )
+        .arg(tenant())
+        .arg(
+            Arg::new("reason")
+                .long("reason")
+                .help("Why (kept in the events)"),
+        )
+        .arg(
+            Arg::new("no-wait")
+                .long("no-wait")
+                .action(ArgAction::SetTrue)
+                .help("Return once the request is recorded"),
         )
 }
 
@@ -74,6 +123,7 @@ fn list_text(r: &IndexesResponse, all: bool) -> String {
                 x.end_reason
                     .clone()
                     .or_else(|| x.approval.clone())
+                    .or_else(|| x.pinned.then(|| "pinned".to_owned()))
                     .unwrap_or_default(),
             ]
         })
@@ -110,11 +160,92 @@ fn events_text(r: &IndexesResponse, kind: Option<&str>) -> String {
     table(["AT", "KIND", "TABLE", "DEFINITION", "WHY"], &rows)
 }
 
+fn record_text(r: &IndexRecord) -> String {
+    let note = r
+        .end_reason
+        .clone()
+        .or_else(|| r.approval.clone())
+        .unwrap_or_default();
+    table(
+        [
+            "NAME",
+            "TABLE",
+            "DEFINITION",
+            "STATE",
+            "PINNED",
+            "READS",
+            "NOTE",
+        ],
+        &[[
+            r.name.clone(),
+            r.spec.table_key(),
+            r.spec.canonical(),
+            r.state.name().to_owned(),
+            if r.pinned { "yes" } else { "no" }.to_owned(),
+            r.reads_total.to_string(),
+            note,
+        ]],
+    )
+}
+
+/// `sprigctl index drop|pin|unpin|restore`.
+async fn act(c: &AdminClient, cmd: &str, sub: &ArgMatches, out: Output) -> Result<(), Failed> {
+    let t = sub.get_one::<String>("tenant").cloned().unwrap_or_default();
+    let index = sub.get_one::<String>("index").cloned().unwrap_or_default();
+    let body = ActionBody {
+        reason: sub.get_one::<String>("reason").cloned().unwrap_or_default(),
+        actor: String::new(),
+    };
+    let req: OperatorRequest = c
+        .post(
+            &format!(
+                "/admin/v1/tenants/{}/indexes/{}:{cmd}",
+                escape(&t),
+                escape(&index)
+            ),
+            &body,
+        )
+        .await?;
+    if sub.get_flag("no-wait") {
+        print(out, &req, |r| {
+            format!(
+                "{} {}: requested; the node applies it within a minute\n",
+                r.action.name(),
+                r.index
+            )
+        });
+        return Ok(());
+    }
+    // The node applies it at its next minute (a restore also builds).
+    let path = format!("/admin/v1/tenants/{}/indexes", escape(&t));
+    for _ in 0..60 {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let r: IndexesResponse = c.get(&path).await?;
+        if r.requests.iter().any(|q| q.index == req.index) {
+            continue;
+        }
+        let Some(rec) = r.indexes.into_iter().find(|x| x.name == req.index) else {
+            break;
+        };
+        print(out, &rec, record_text);
+        return Ok(());
+    }
+    Err(Failed(format!(
+        "{} {}: still waiting after two minutes; is the tenant's node running? \
+         (sprigctl index list --tenant {t} shows it once applied)",
+        req.action.name(),
+        req.index
+    )))
+}
+
 /// Runs `sprigctl index <cmd>`.
 pub(crate) async fn run(c: &AdminClient, group: &ArgMatches, out: Output) -> Result<(), Failed> {
     let Some((cmd, sub)) = group.subcommand() else {
         return Err(Failed("a subcommand is required".into()));
     };
+    if matches!(cmd, "drop" | "pin" | "unpin" | "restore") {
+        return act(c, cmd, sub, out).await;
+    }
     let t = sub.get_one::<String>("tenant").cloned().unwrap_or_default();
     let r: IndexesResponse = c
         .get(&format!("/admin/v1/tenants/{}/indexes", escape(&t)))

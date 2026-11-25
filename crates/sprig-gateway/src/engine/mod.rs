@@ -41,6 +41,7 @@
 pub(crate) mod alter;
 pub(crate) mod assign;
 pub(crate) mod catalog;
+pub(crate) mod collection;
 pub(crate) mod control;
 pub(crate) mod ddl;
 pub(crate) mod ddlexec;

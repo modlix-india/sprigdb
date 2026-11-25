@@ -67,6 +67,7 @@ mod keyval;
 pub mod mem;
 mod plan;
 mod range;
+mod recursive;
 mod resolve;
 mod sources;
 pub mod whatif;

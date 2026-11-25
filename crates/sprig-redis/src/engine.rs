@@ -199,6 +199,7 @@ pub fn session_command(name: &str) -> bool {
             | "publish"
             | "spublish"
             | "pubsub"
+            | "sprig.query"
     )
 }
 

@@ -594,3 +594,184 @@ fn joins() {
         assert_eq!(out(Box::new(hj)), want);
     }
 }
+
+fn js(t: &str) -> Expr {
+    f("JSON_EXTRACT", vec![s(t), s("$")])
+}
+
+fn mysql(e: &Expr) -> String {
+    run(e, Persona::MySql).0
+}
+
+#[test]
+fn json_values_are_a_type_on_mysql_and_text_on_mariadb() {
+    // MySQL's cast, and the JSON_COMPACT its port's rewrite makes of it.
+    assert_eq!(
+        mysql(&Expr::Cast(
+            b(s(r#"{"b":1,"a":[1, 2.50]}"#)),
+            CastTarget::Json
+        )),
+        r#"{"a": [1, 2.5], "b": 1}"#
+    );
+    assert_eq!(mysql(&Expr::Cast(b(i(7)), CastTarget::Json)), "7");
+    assert_eq!(
+        mysql(&Expr::Cast(b(s("nope")), CastTarget::Json)),
+        "ERROR 3141"
+    );
+    each(
+        &f("JSON_COMPACT", vec![s(r#"{ "b" : 1, "a" : [1, 2] }"#)]),
+        r#"{"b":1,"a":[1,2]}"#,
+        r#"{"a": [1, 2], "b": 1}"#,
+    );
+    // MySQL compares JSON by type, then value: numbers < strings <
+    // objects < arrays < booleans; MariaDB compares the text.
+    each(&bin(BinOp::Lt, js("12.5"), js("100")), "0", "1");
+    each(&bin(BinOp::Gt, js("[1,2]"), js(r#"{"a":1}"#)), "0", "1");
+    each(&bin(BinOp::Gt, js("true"), js("[9]")), "1", "1");
+    each(&bin(BinOp::Lt, js(r#""b""#), js(r#"{"a":1}"#)), "1", "1");
+    each(&bin(BinOp::Eq, js("1.0"), js("1")), "0", "1");
+    // A non-JSON operand is a JSON scalar: 'b' is the string "b".
+    each(&bin(BinOp::Eq, js(r#""b""#), s("b")), "0", "1");
+    each(&bin(BinOp::Lt, js(r#""b""#), i(50)), "1", "0");
+}
+
+#[test]
+fn json_value_returning_converts_or_gives_null() {
+    let jv = |doc: &str, ret: &str| {
+        f(
+            "JSON_VALUE",
+            vec![s(doc), s("$.a"), Expr::Keyword(format!("RETURNING {ret}"))],
+        )
+    };
+    assert_eq!(mysql(&jv(r#"{"a":12.7}"#, "SIGNED")), "13");
+    assert_eq!(mysql(&jv(r#"{"a":"12abc"}"#, "SIGNED")), "NULL");
+    assert_eq!(mysql(&jv(r#"{"a":[1]}"#, "SIGNED")), "NULL");
+    assert_eq!(mysql(&jv(r#"{"a":true}"#, "SIGNED")), "1");
+    assert_eq!(mysql(&jv(r#"{"a":-3}"#, "UNSIGNED")), "NULL");
+    assert_eq!(
+        mysql(&jv(r#"{"a":99999999999999999999}"#, "SIGNED")),
+        "NULL"
+    );
+    assert_eq!(mysql(&jv(r#"{"a":12.756}"#, "DECIMAL(5,2)")), "12.76");
+    assert_eq!(mysql(&jv(r#"{"a":"1.5"}"#, "DECIMAL")), "2");
+    assert_eq!(mysql(&jv(r#"{"a":1.5}"#, "DOUBLE")), "1.5");
+    assert_eq!(mysql(&jv(r#"{"a":"abcdef"}"#, "CHAR(3)")), "NULL");
+    assert_eq!(mysql(&jv(r#"{"a":"abc"}"#, "CHAR(3)")), "abc");
+    assert_eq!(mysql(&jv(r#"{"a":"2024-01-02"}"#, "DATE")), "2024-01-02");
+    assert_eq!(mysql(&jv(r#"{"a":"x"}"#, "DATE")), "NULL");
+    assert_eq!(mysql(&jv(r#"{"a":1.5}"#, "YEAR")), "NULL");
+    assert_eq!(mysql(&jv(r#"{"a":{"b":1}}"#, "JSON")), r#"{"b": 1}"#);
+    assert_eq!(mysql(&jv(r#"{"a":null}"#, "SIGNED")), "NULL");
+}
+
+#[test]
+fn json_columns_sort_group_and_type_as_mysql_does() {
+    let ty = ExprType::of_column(&ColumnType::Json, true);
+    assert!(ty.json);
+    assert_eq!(ty.meta(Persona::MySql).field, FieldType::Json);
+    assert_ne!(ty.meta(Persona::MariaDb).field, FieldType::Json);
+    let rows: Vec<Row> = [
+        "true",
+        "[1,2]",
+        r#"{"a":1}"#,
+        r#""b""#,
+        "100.25",
+        "12.5",
+        "null",
+    ]
+    .iter()
+    .map(|t| vec![Value::Json(bytes::Bytes::copy_from_slice(t.as_bytes()))])
+    .collect();
+    let col = Expr::column(0, "j", ColumnType::Json, true);
+    let sorted = |persona| {
+        let session = Session::new(persona);
+        let key = SortKey {
+            expr: compile(&col, &session).unwrap(),
+            desc: false,
+        };
+        let src = Box::new(VecSource::new(rows.clone(), vec![ty]));
+        texts(
+            &mut Sort::new(src, vec![key], Memory::unlimited()),
+            &session,
+        )
+    };
+    assert_eq!(
+        sorted(Persona::MySql),
+        [
+            "null",
+            "12.5",
+            "100.25",
+            "\"b\"",
+            "{\"a\": 1}",
+            "[1, 2]",
+            "true"
+        ]
+    );
+    assert_eq!(
+        sorted(Persona::MariaDb),
+        [
+            "\"b\"",
+            "100.25",
+            "12.5",
+            "[1,2]",
+            "null",
+            "true",
+            "{\"a\":1}"
+        ]
+    );
+}
+
+#[test]
+fn json_pretty_and_json_search_per_server() {
+    each(
+        &f(
+            "JSON_PRETTY",
+            vec![s(r#"{"b":[1,{"c":2},[]],"a":{},"d":"x"}"#)],
+        ),
+        "{\n    \"b\": \n    [\n        1,\n        {\n            \"c\": 2\n        },\n        []\n    ],\n    \"a\": \n    {\n    },\n    \"d\": \"x\"\n}",
+        "{\n  \"a\": {},\n  \"b\": [\n    1,\n    {\n      \"c\": 2\n    },\n    []\n  ],\n  \"d\": \"x\"\n}",
+    );
+    each(&f("JSON_PRETTY", vec![s("[1]")]), "[1]", "[\n  1\n]");
+    each(&f("JSON_PRETTY", vec![s("{}")]), "{\n}", "{}");
+    let doc = r#"{"b":["Abc",{"c":"abc"}],"a":"abc","x y":"abd"}"#;
+    each(
+        &f("JSON_SEARCH", vec![s(doc), s("all"), s("ab%")]),
+        r#"["$.b[0]", "$.b[1].c", "$.a", "$.x y"]"#,
+        r#"["$.a", "$.b[1].c", "$.\"x y\""]"#,
+    );
+    each(
+        &f("JSON_SEARCH", vec![s(doc), s("one"), s("abc")]),
+        r#""$.b[0]""#,
+        r#""$.a""#,
+    );
+    both(
+        &f(
+            "JSON_SEARCH",
+            vec![s(r#"{"a":"a_c","b":"abc"}"#), s("all"), s("a|_c"), s("|")],
+        ),
+        r#""$.a""#,
+    );
+    both(
+        &f(
+            "JSON_SEARCH",
+            vec![
+                s(r#"{"a":["x","x"]}"#),
+                s("all"),
+                s("x"),
+                Expr::Null,
+                s("$.a[*]"),
+            ],
+        ),
+        r#"["$.a[0]", "$.a[1]"]"#,
+    );
+    each(
+        &f("JSON_SEARCH", vec![s(r#"{"a":1}"#), s("all"), s("1")]),
+        r#""$.a""#,
+        "NULL",
+    );
+    each(
+        &f("JSON_SEARCH", vec![s(r#"{"a":"x"}"#), s("any"), s("x")]),
+        "NULL",
+        "ERROR 3154",
+    );
+}

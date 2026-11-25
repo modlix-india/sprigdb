@@ -22,7 +22,7 @@ use crate::expr::cmp::{CmpKind, Comparator, Key, comparator};
 use crate::expr::{Compiled, Env, agg_result_type, coerce_fn};
 use crate::num::{Dec, Round};
 use crate::session::{Ctx, Session};
-use crate::types::{Derivation, ExprType, Kind, NOT_FIXED};
+use crate::types::{Derivation, ExprType, JSON_TEXT_LEN, Kind, NOT_FIXED};
 
 /// One row: a value per column.
 pub type Row = Vec<Value>;
@@ -277,9 +277,23 @@ enum OrdKey {
     Num(Dec),
     Real(f64),
     Bytes(Vec<u8>),
+    /// A JSON value on MySQL, in MySQL's JSON order.
+    Json(crate::func::json::J),
 }
 
 impl OrdKey {
+    /// The key of `v` (of type `ty`) for a session of either server: on
+    /// MySQL a JSON value orders as JSON, otherwise as [`OrdKey::of`].
+    fn of_in(v: &Value, ty: &ExprType, maria: bool) -> Self {
+        if ty.json && !maria {
+            return match crate::func::json::compared(v, ty) {
+                Some(j) => OrdKey::Json(j),
+                None => OrdKey::Null,
+            };
+        }
+        Self::of(v, ty)
+    }
+
     fn of(v: &Value, ty: &ExprType) -> Self {
         match v {
             Value::Null => OrdKey::Null,
@@ -326,6 +340,9 @@ impl OrdKey {
             (OrdKey::Num(a), OrdKey::Num(b)) => a.cmp(b),
             (OrdKey::Real(a), OrdKey::Real(b)) => a.partial_cmp(b).unwrap_or(Ordering::Equal),
             (OrdKey::Bytes(a), OrdKey::Bytes(b)) => a.cmp(b),
+            (OrdKey::Json(a), OrdKey::Json(b)) => crate::func::json::mysql_cmp(a, b),
+            (OrdKey::Json(_), _) => Ordering::Greater,
+            (_, OrdKey::Json(_)) => Ordering::Less,
             (OrdKey::Num(a), OrdKey::Real(b)) => {
                 a.to_f64().partial_cmp(b).unwrap_or(Ordering::Equal)
             }
@@ -369,14 +386,18 @@ impl OrdKey {
                 out.extend_from_slice(&(b.len() as u32).to_be_bytes());
                 out.extend_from_slice(b);
             }
+            OrdKey::Json(j) => {
+                out.push(4);
+                crate::func::json::mysql_hash(j, out);
+            }
         }
     }
 }
 
-fn row_hash_key(row: &[Value], types: &[ExprType]) -> Vec<u8> {
+fn row_hash_key(row: &[Value], types: &[ExprType], maria: bool) -> Vec<u8> {
     let mut out = Vec::with_capacity(row.len() * 12);
     for (v, ty) in row.iter().zip(types) {
-        OrdKey::of(v, ty).hash_bytes(&mut out);
+        OrdKey::of_in(v, ty, maria).hash_bytes(&mut out);
     }
     out
 }
@@ -476,10 +497,24 @@ impl Sort {
         let mut seq = 0usize;
         let mut all: Vec<Sortable> = Vec::new();
         let mut heap: BinaryHeap<HeapItem> = BinaryHeap::new();
+        let mut warned = false;
         while let Some(row) = self.input.next(ctx)? {
             let mut keys = Vec::with_capacity(self.keys.len());
             for (k, ty) in self.keys.iter().zip(&key_types) {
-                keys.push(OrdKey::of(&k.expr.eval(ctx, &row)?, ty));
+                let key = OrdKey::of_in(&k.expr.eval(ctx, &row)?, ty, ctx.maria());
+                // MySQL sorts arrays and objects, and says it doesn't
+                // fully support that.
+                if !warned
+                    && let OrdKey::Json(crate::func::json::J::Arr(_) | crate::func::json::J::Obj(_)) =
+                        &key
+                {
+                    warned = true;
+                    ctx.warn(
+                        1235,
+                        "This version of MySQL doesn't yet support 'sorting of non-scalar JSON values'",
+                    );
+                }
+                keys.push(key);
             }
             let bytes = row_bytes(&row);
             let item = Sortable { keys, seq, row };
@@ -552,7 +587,7 @@ impl Distinct {
 impl RowSource for Distinct {
     fn next(&mut self, ctx: &mut Ctx<'_>) -> Result<Option<Row>> {
         while let Some(row) = self.input.next(ctx)? {
-            let key = row_hash_key(&row, &self.types);
+            let key = row_hash_key(&row, &self.types, ctx.maria());
             let bytes = key.len();
             if self.seen.insert(key) {
                 self.memory.charge(bytes)?;
@@ -670,6 +705,8 @@ impl Aggregate {
             }
             (AggKind::Min | AggKind::Max, Some(t), _) => ExprType {
                 column: false,
+                // A JSON value is any length of text.
+                len: if t.json { JSON_TEXT_LEN } else { t.len },
                 ..t.nullable()
             },
             (AggKind::GroupConcat, Some(t), _) => {
@@ -798,7 +835,7 @@ impl Aggregate {
         st.group = group;
         if self.distinct {
             let mut key = Vec::new();
-            OrdKey::of(&v, arg.ty()).hash_bytes(&mut key);
+            OrdKey::of_in(&v, arg.ty(), ctx.maria()).hash_bytes(&mut key);
             if !st.seen.insert(key) {
                 return Ok(());
             }
@@ -819,7 +856,7 @@ impl Aggregate {
                 }
             }
             AggKind::Min | AggKind::Max => {
-                let key = OrdKey::of(&v, arg.ty());
+                let key = OrdKey::of_in(&v, arg.ty(), ctx.maria());
                 let better = match &st.best {
                     None => true,
                     Some((k, _)) => {
@@ -1098,7 +1135,7 @@ impl Aggregation {
             let mut values = Vec::with_capacity(k);
             for g in &self.group_by {
                 let v = g.eval(ctx, &row)?;
-                keys.push(OrdKey::of(&v, g.ty()));
+                keys.push(OrdKey::of_in(&v, g.ty(), ctx.maria()));
                 values.push(v);
             }
             self.memory
@@ -1165,7 +1202,7 @@ impl Aggregation {
         let mut key = Vec::new();
         for g in &self.group_by {
             let v = g.eval(ctx, row)?;
-            OrdKey::of(&v, g.ty()).hash_bytes(&mut key);
+            OrdKey::of_in(&v, g.ty(), ctx.maria()).hash_bytes(&mut key);
             values.push(v);
         }
         Ok((key, values))
@@ -1408,6 +1445,7 @@ fn key_bytes(k: &Key, kind: CmpKind, out: &mut Vec<u8>) {
         Key::Int(i) => OrdKey::Num(i.dec()).hash_bytes(out),
         Key::Dec(d) => OrdKey::Num(d.clone()).hash_bytes(out),
         Key::Real(x) => OrdKey::Real(if *x == 0.0 { 0.0 } else { *x }).hash_bytes(out),
+        Key::Json(j) => OrdKey::Json(j.clone()).hash_bytes(out),
     }
 }
 
@@ -1645,7 +1683,7 @@ impl RowSource for Union {
                 out.push(co(ctx, v)?);
             }
             if let Some(seen) = &mut self.seen {
-                let key = row_hash_key(&out, &self.types);
+                let key = row_hash_key(&out, &self.types, ctx.maria());
                 let bytes = key.len();
                 if !seen.insert(key) {
                     continue;
@@ -1659,6 +1697,152 @@ impl RowSource for Union {
 
     fn types(&self) -> Vec<ExprType> {
         self.types.clone()
+    }
+}
+
+/// The rows of a recursive common table expression as they are made. The
+/// columns have the types the non-recursive parts gave (every one
+/// nullable); each row a part makes is stored into them as into a
+/// temporary table's columns: converted, a string longer than its column
+/// failing with 1406 under a strict mode (cut with 1265 otherwise), text
+/// that is no number failing with 1366. Under `UNION DISTINCT` a row
+/// already held is dropped. The rows held are charged to the statement's
+/// memory; past its limit the statement fails with 1114.
+pub struct CteRows {
+    name: String,
+    names: Vec<String>,
+    types: Vec<ExprType>,
+    seen: Option<HashSet<Vec<u8>>>,
+    memory: Arc<Memory>,
+    /// The rows so far, in the order they were made.
+    pub rows: Vec<Row>,
+}
+
+impl CteRows {
+    /// An empty set of rows for the expression `name` with columns
+    /// `names` of types `types`; `all` keeps duplicates (`UNION ALL`).
+    #[must_use]
+    pub fn new(
+        name: &str,
+        names: Vec<String>,
+        types: Vec<ExprType>,
+        all: bool,
+        memory: Arc<Memory>,
+    ) -> Self {
+        Self {
+            name: name.to_owned(),
+            names,
+            types,
+            seen: (!all).then(HashSet::new),
+            memory,
+            rows: Vec::new(),
+        }
+    }
+
+    /// The column types.
+    #[must_use]
+    pub fn types(&self) -> &[ExprType] {
+        &self.types
+    }
+
+    /// Stores a row a part made, whose values have the static types
+    /// `from`. `at` is the row number an error names. Gives whether the
+    /// row was kept (`false`: a duplicate under `UNION DISTINCT`).
+    ///
+    /// # Errors
+    /// 1406 and 1366 as described on [`CteRows`]; 1114 when the rows no
+    /// longer fit the statement's memory.
+    pub fn add(&mut self, ctx: &mut Ctx<'_>, row: Row, from: &[ExprType], at: u64) -> Result<bool> {
+        let env = Env {
+            s: ctx.session,
+            prep: None,
+            counts: None,
+        };
+        let strict = ctx.session.sql_mode.has(crate::session::SqlMode::STRICT);
+        let maria = ctx.maria();
+        let mut out = Vec::with_capacity(row.len());
+        for (i, v) in row.into_iter().enumerate() {
+            let to = self.types[i];
+            let fty = from.get(i).copied().unwrap_or(to);
+            let name = self.names.get(i).map_or("", String::as_str);
+            let column = if maria {
+                format!("``.`(temporary)`.`{name}`")
+            } else {
+                format!("'{name}'")
+            };
+            let text = matches!(v, Value::Str(_) | Value::Bytes(_));
+            let shown = match &v {
+                Value::Str(b) | Value::Bytes(b) => String::from_utf8_lossy(b).into_owned(),
+                _ => String::new(),
+            };
+            let kept = ctx.warnings.len();
+            let counted = ctx.warning_count;
+            let mut v = coerce_fn(&fty, &to, env)(ctx, v)?;
+            if text && ctx.warning_count > counted && strict {
+                let word = match to.kind {
+                    Kind::Int | Kind::Year | Kind::Bit => Some("integer"),
+                    Kind::Decimal => Some("decimal"),
+                    Kind::Double | Kind::Float => Some("double"),
+                    _ => None,
+                };
+                if let Some(word) = word {
+                    ctx.warnings.truncate(kept);
+                    ctx.warning_count = counted;
+                    return Err(SqlError::new(
+                        1366,
+                        if maria { "22007" } else { "HY000" },
+                        format!(
+                            "Incorrect {word} value: '{shown}' for column {column} at row {at}"
+                        ),
+                    ));
+                }
+            }
+            if to.kind == Kind::Str {
+                let cut = match &v {
+                    Value::Str(b) | Value::Bytes(b) => {
+                        let chars = crate::expr::like::chars_of(to.coll.charset(), b);
+                        let max = usize::try_from(to.len).unwrap_or(usize::MAX);
+                        (chars.len() > max).then(|| chars[..max].concat())
+                    }
+                    _ => None,
+                };
+                if let Some(short) = cut {
+                    if strict {
+                        return Err(SqlError::new(
+                            1406,
+                            "22001",
+                            format!("Data too long for column '{name}' at row {at}"),
+                        ));
+                    }
+                    ctx.warn(
+                        1265,
+                        format!("Data truncated for column '{name}' at row {at}"),
+                    );
+                    v = match v {
+                        Value::Bytes(_) => Value::Bytes(short.into()),
+                        _ => Value::Str(short.into()),
+                    };
+                }
+            }
+            out.push(v);
+        }
+        let mut bytes = row_bytes(&out);
+        if let Some(seen) = &mut self.seen {
+            let key = row_hash_key(&out, &self.types, maria);
+            bytes += key.len();
+            if !seen.insert(key) {
+                return Ok(false);
+            }
+        }
+        if self.memory.charge(bytes).is_err() {
+            return Err(SqlError::new(
+                1114,
+                "HY000",
+                format!("The table '{}' is full", self.name),
+            ));
+        }
+        self.rows.push(out);
+        Ok(true)
     }
 }
 
@@ -1760,7 +1944,7 @@ impl SetOp {
         for (v, co) in row.into_iter().zip(&self.coerce[side]) {
             out.push(co(ctx, v)?);
         }
-        let key = row_hash_key(&out, &self.types);
+        let key = row_hash_key(&out, &self.types, ctx.maria());
         Ok((out, key))
     }
 }

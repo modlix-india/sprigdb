@@ -119,6 +119,9 @@ impl ExecutorSource for PoolExecutors {
                 format!("tenant {tenant} has no catalog in this data center"),
             )
         })?;
+        if cluster.as_str() == crate::tenants::ENGINE_ONLY_CLUSTER {
+            return Ok(Arc::new(EngineOnlyExecutor));
+        }
         let pool = self.locator.pools().writer(&cluster).await?;
         Ok(Arc::new(MariaExecutor::new(pool)))
     }
@@ -134,6 +137,9 @@ impl ExecutorSource for PoolExecutors {
                 format!("tenant {tenant} has no catalog in this data center"),
             )
         })?;
+        if cluster.as_str() == crate::tenants::ENGINE_ONLY_CLUSTER {
+            return Ok(Arc::new(EngineOnlyExecutor));
+        }
         let pools = self.locator.pools();
         let mut routed = RoutedExecutor::new(MariaExecutor::new(pools.writer(&cluster).await?));
         for (schema, c) in shards {
@@ -142,6 +148,52 @@ impl ExecutorSource for PoolExecutors {
             routed = routed.route(*schema, c, MariaExecutor::new(pool));
         }
         Ok(Arc::new(routed))
+    }
+}
+
+/// The executor of a tenant placed with no MariaDB cluster
+/// (`engine-only`): every database and table of it is the engine's, which
+/// applies a DDL statement's physical change only once its catalog change
+/// is published. So a stuck job's physical side never happened: a
+/// creation or alteration is rolled back, a drop rolls forward, and a
+/// rename (whose sides can't be told apart) is left. Nothing is ever
+/// busy, no MariaDB schema or object exists, and running a statement
+/// (a drop's, a deleted tenant's `DROP DATABASE`) does nothing.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EngineOnlyExecutor;
+
+#[async_trait::async_trait]
+impl DdlExecutor for EngineOnlyExecutor {
+    async fn execute(&self, _stmt: &sprig_catalog::ddl::PhysicalDdl) -> Result<()> {
+        Ok(())
+    }
+
+    async fn schema(&self, _schema: &SchemaName) -> Result<Option<sprig_catalog::ddl::SchemaInfo>> {
+        Ok(None)
+    }
+
+    async fn show_create(
+        &self,
+        _schema: &SchemaName,
+        _kind: ObjectKind,
+        _name: &str,
+    ) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    async fn objects(
+        &self,
+        _schema: &SchemaName,
+    ) -> Result<Vec<sprig_catalog::ddl::PhysicalObject>> {
+        Ok(Vec::new())
+    }
+
+    async fn tenant_schemas(&self, _tenant: TenantId) -> Result<Vec<SchemaName>> {
+        Ok(Vec::new())
+    }
+
+    async fn busy(&self, _schema: &SchemaName) -> Result<bool> {
+        Ok(false)
     }
 }
 
@@ -411,6 +463,11 @@ impl GroupMaps for CatalogGroupMaps {
         use mysql_async::prelude::Queryable;
         use sprig_catalog::pool_wait::Bounded as _;
         let ep = self.locator.writer(tenant).await?;
+        // A catalog of engine records only has no table groups (they were
+        // MariaDB shard schemas).
+        if sprig_catalog::migrate::records_catalog(ep.store.schema()).await? {
+            return Ok(Some(BTreeSet::new()));
+        }
         let cat = sprig_common::names::quote(ep.store.schema());
         let mut c = ep.pool.get_conn_bounded().await.map_err(|e| {
             SprigError::new(

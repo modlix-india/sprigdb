@@ -43,9 +43,13 @@ fn batches(s: &Segment) -> io::Result<Vec<(Head, Vec<u8>)>> {
 pub fn compact(p: &Part, pol: &Policy, now_ms: i64, interval: u64) -> io::Result<bool> {
     // What to clean: rolled segments past `cleaned_to`.
     let (rolled, cleaned_to, files) = {
-        let st = p.lock();
+        let mut st = p.lock();
         if st.segments.len() < 2 {
             return Ok(false);
+        }
+        // The pass reads the files: pending batches go in first.
+        for s in &mut st.segments {
+            s.write_out()?;
         }
         let rolled = st.segments.len() - 1;
         let end = st.segments[rolled - 1].next;

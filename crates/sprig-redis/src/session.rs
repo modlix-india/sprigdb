@@ -759,6 +759,7 @@ impl Session {
                 Box::pin(self.eval(name, a, in_txn)).await
             }
             "fcall" | "fcall_ro" => Box::pin(self.fcall(name, a, in_txn)).await,
+            "sprig.query" => Ok(vec![Box::pin(self.sprig_query(a, in_txn)).await]),
             _ if name.starts_with("ft.") && !spec.has('x') => {
                 Ok(vec![Box::pin(self.ft(name, a, in_txn)).await])
             }
@@ -2370,6 +2371,35 @@ impl Session {
             },
         )
         .await
+    }
+
+    /// `SPRIG.QUERY <sql>` ([`crate::query`]): one read-only statement on the
+    /// login's own SQL session, in the session's read-only mode (its writes
+    /// fail with 1792).
+    async fn sprig_query(&mut self, a: &[Bytes], in_txn: bool) -> Frame {
+        if in_txn {
+            return Frame::err("SPRIG.QUERY isn't allowed inside MULTI or scripts");
+        }
+        let Ok(sql) = std::str::from_utf8(&a[1]) else {
+            return Frame::err("SPRIG.QUERY: the statement isn't UTF-8 text");
+        };
+        if let Err(why) = crate::query::read_only(sql) {
+            return Frame::err(&format!(
+                "SPRIG.QUERY runs one read-only SQL statement, not {why}"
+            ));
+        }
+        let Some(login) = self.login.as_mut() else {
+            return Frame::error("NOAUTH Authentication required.");
+        };
+        if let Err(e) = login.sql.exec("SET SESSION TRANSACTION READ ONLY").await {
+            return reply::backend(&e);
+        }
+        let r = login.sql.query_columns(sql).await;
+        let _ = login.sql.exec("SET SESSION TRANSACTION READ WRITE").await;
+        match r {
+            Ok(t) => crate::query::reply(&t),
+            Err(e) => reply::backend(&e),
+        }
     }
 
     /// `FCALL` of a logic-layer function, through the gateway's hook.

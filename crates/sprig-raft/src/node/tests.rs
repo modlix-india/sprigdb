@@ -207,6 +207,59 @@ fn elect_replicate_and_read() {
     assert!(st.lease_reads > 0, "{st:?}");
 }
 
+/// [`fast`] with the log written on its own thread.
+fn threaded() -> RaftConfig {
+    RaftConfig {
+        log_writer_thread: true,
+        ..fast()
+    }
+}
+
+#[test]
+fn a_log_writer_thread_replicates_and_keeps_writes_through_crashes() {
+    let mut c = Cluster::new(&[1, 2, 3], threaded());
+    for g in 10..14 {
+        c.create(g, &[1, 2, 3]);
+    }
+    for g in 10..14 {
+        for i in 0..20 {
+            c.put(g, i % 3, g * 1000 + i);
+        }
+        assert_eq!(c.get(g, 0), Some(g * 1000 + 18));
+    }
+    let syncs: u64 = c.members.values().map(|m| m.node.stats().syncs).sum();
+    assert!(syncs > 0);
+    for (n, id) in [1, 2, 3].into_iter().enumerate() {
+        c.crash_restart(id, 2000 + n as u64);
+    }
+    for g in 10..14 {
+        assert_eq!(c.get(g, 0), Some(g * 1000 + 18));
+        assert_eq!(c.get(g, 2), Some(g * 1000 + 17));
+        let s = c.converged(g);
+        assert_eq!(s.data()[&1].len(), 7);
+    }
+}
+
+#[test]
+fn a_log_writer_thread_installs_snapshots_on_a_lagging_follower() {
+    let cfg = RaftConfig {
+        compact_after: 10,
+        ..threaded()
+    };
+    let c = Cluster::new(&[1, 2, 3], cfg);
+    c.create(3, &[1, 2, 3]);
+    c.put(3, 0, 0);
+    let l = c.leader(3);
+    let lagging = c.members.keys().copied().find(|id| *id != l).expect("f");
+    c.net.isolate(lagging, true);
+    for i in 1..60 {
+        c.put(3, i % 5, i);
+    }
+    c.net.isolate(lagging, false);
+    let s = c.converged(3);
+    assert_eq!(s.data()[&4].last(), Some(&59));
+}
+
 #[test]
 fn an_isolated_leaders_proposal_is_dropped_definitely() {
     let c = Cluster::new(&[1, 2, 3], fast());

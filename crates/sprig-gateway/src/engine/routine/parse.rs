@@ -1440,6 +1440,11 @@ pub(crate) struct TrigCreate {
     pub before: bool,
     /// The event.
     pub event: Event,
+    /// MariaDB's `UPDATE OF c, ...`: the columns whose assignment fires it
+    /// (empty: any update).
+    pub of: Vec<String>,
+    /// The text from `OF` to the end, for MySQL's syntax error.
+    pub of_text: Option<String>,
     /// The table's database, when written.
     pub table_db: Option<String>,
     /// The table.
@@ -1499,8 +1504,17 @@ pub(crate) fn parse_trigger(text: &str) -> Result<TrigCreate> {
         p.want("DELETE")?;
         Event::Delete
     };
+    let mut of = Vec::new();
+    let mut of_text = None;
     if event == Event::Update && p.is("OF") {
-        return Err(super::not_on_engine("UPDATE OF column lists on triggers"));
+        of_text = Some(text[p.at()..].trim_end().trim_end_matches(';').to_owned());
+        p.i += 1;
+        loop {
+            of.push(p.name()?);
+            if !p.eat_op(",") {
+                break;
+            }
+        }
     }
     p.want("ON")?;
     let (table_db, table) = p.qualified()?;
@@ -1529,6 +1543,8 @@ pub(crate) fn parse_trigger(text: &str) -> Result<TrigCreate> {
         name,
         before,
         event,
+        of,
+        of_text,
         table_db,
         table,
         order,
@@ -1673,7 +1689,26 @@ pub(crate) fn parse_event(text: &str) -> Result<EvStmt> {
     if create && !(p.is("ON") && p.is_at(1, "SCHEDULE")) {
         return Err(p.err());
     }
+    // The clauses come in the servers' order, each at most once.
+    let mut last = -1i8;
     loop {
+        let rank = if p.is("ON") && p.is_at(1, "SCHEDULE") {
+            0
+        } else if p.is("ON") && p.is_at(1, "COMPLETION") {
+            1
+        } else if !create && p.is("RENAME") && p.is_at(1, "TO") {
+            2
+        } else if p.is("ENABLE") || p.is("DISABLE") {
+            3
+        } else if p.is("COMMENT") {
+            4
+        } else {
+            break;
+        };
+        if rank <= last {
+            return Err(p.err());
+        }
+        last = rank;
         if p.is("ON") && p.is_at(1, "SCHEDULE") {
             p.i += 2;
             if p.eat("AT") {
@@ -1792,13 +1827,24 @@ mod tests {
             e.body_text.as_deref(),
             Some("BEGIN INSERT INTO t VALUES (1); END")
         );
-        let a = parse_event("ALTER EVENT d.e1 RENAME TO e2 ENABLE").unwrap_or_else(|e| panic!("{e}"));
+        let a =
+            parse_event("ALTER EVENT d.e1 RENAME TO e2 ENABLE").unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(a.rename, Some((None, "e2".into())));
         assert_eq!(a.status, Some(EvStatus::Enabled));
         assert!(parse_event("ALTER EVENT e1").is_err());
         assert!(parse_event("CREATE EVENT e1 DO SELECT 1").is_err());
-        let at = parse_event("CREATE EVENT e ON SCHEDULE AT CURRENT_TIMESTAMP + INTERVAL 1 HOUR DO SET @a = 1")
-            .unwrap_or_else(|e| panic!("{e}"));
+        // Clauses out of the servers' order, or repeated, are refused.
+        assert!(parse_event("ALTER EVENT e1 COMMENT 'x' ON SCHEDULE EVERY 1 DAY").is_err());
+        assert!(parse_event("ALTER EVENT e1 ENABLE RENAME TO e2").is_err());
+        assert!(parse_event("ALTER EVENT e1 ENABLE DISABLE").is_err());
+        assert!(
+            parse_event("ALTER EVENT e1 ON COMPLETION PRESERVE RENAME TO e2 ENABLE COMMENT 'x'")
+                .is_ok()
+        );
+        let at = parse_event(
+            "CREATE EVENT e ON SCHEDULE AT CURRENT_TIMESTAMP + INTERVAL 1 HOUR DO SET @a = 1",
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(
             at.schedule,
             Some(Schedule::At("CURRENT_TIMESTAMP + INTERVAL 1 HOUR".into()))

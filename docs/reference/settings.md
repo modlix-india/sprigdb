@@ -9,7 +9,7 @@ source: the settings registry (sprig-settings)
 
 Every setting SprigDB declares, with its default, the scopes that may set it, hard bounds and when a change applies. Settings resolve from the most specific scope: object, database, tenant and its ancestors, cluster, data center, global, then the built-in default. Read them with `SHOW SPRIG SETTINGS`, change them with `ALTER TENANT|DATABASE|TABLE … SPRIG SET (key = value)` or `sprigctl settings`.
 
-763 settings in 62 groups.
+701 settings in 59 groups.
 
 ## `advisor`
 
@@ -106,7 +106,6 @@ Every setting SprigDB declares, with its default, the scopes that may set it, ha
 
 | Key | Type | Default | Scopes | Bounds | Applies | Description |
 |---|---|---|---|---|---|---|
-| `analytics.datafusion_memory_mb` | int | `1024` | tenant, dc, global | 16 to 65536 | live | Memory per DataFusion query |
 | `analytics.max_concurrent_per_gateway` | int | `8` | dc, global | 1 to 1024 | live | Queries per gateway |
 | `analytics.max_concurrent_per_tenant` | int | `2` | tenant, dc, global | 1 to 1024 | live | Queries per tenant per gateway |
 | `analytics.max_groups` | int | `1000000` | database, tenant, dc, global | 1 to 1000000000 | live | Groups held by one merge |
@@ -139,7 +138,6 @@ Every setting SprigDB declares, with its default, the scopes that may set it, ha
 | `approvals.escalate_after` | text | `off` | object, database, tenant, cluster, dc, global | - | live | Escalation timer: off, a duration (90m, 24h, 3d) or kind=duration,...,*=duration |
 | `approvals.ignore_once_days` | int | `1` | object, database, tenant, cluster, dc, global | 0 to 3650 | live | Suppression after ignore once |
 | `approvals.operator_emails` | text | `` | dc, global (operator only) | - | live | Comma list of platform (global) or DC (dc scope) operator addresses |
-| `approvals.platform_tenant` | text | `` | dc, global (operator only) | - | live | Tenant whose stream sprig_recommendations gets every event |
 | `approvals.reminder` | text | `daily` | object, database, tenant, cluster, dc, global | daily, off | live | Daily digest of waiting recommendations, or off |
 | `approvals.reraise_factor` | float | `2` | object, database, tenant, cluster, dc, global | 1 to 1000 | live | An ignored recommendation comes back when its score grows past this factor |
 | `approvals.retention_days` | int | `180` | object, database, tenant, cluster, dc, global | 1 to 3650 | live | Closed recommendations are purged after this |
@@ -147,7 +145,6 @@ Every setting SprigDB declares, with its default, the scopes that may set it, ha
 | `approvals.smtp_url` | text | `` | dc, global (operator only) | - | live | smtp://host[:25], smtp+starttls://host[:587] or smtps://host[:465]; empty disables email |
 | `approvals.smtp_username` | text | `` | dc, global (operator only) | - | live | SMTP user; the password is the file [controller] smtp_password_file |
 | `approvals.start_level` | text | `resolved` | object, database, tenant, cluster, dc, global | resolved, table, database, tenant, dc, platform | live | Level of a new recommendation: resolved (the mode's scope) or a fixed level |
-| `approvals.stream_database` | text | `` | tenant | - | live | Database whose stream sprig_recommendations gets the tenant's events |
 | `approvals.studio_url` | text | `` | dc, global (operator only) | - | live | Base URL of Studio for links in emails and events |
 | `approvals.tick_seconds` | int | `30` | dc, global (operator only) | 1 to 3600 | live | The approvals loop's period |
 | `approvals.webhook_connection` | text | `` | tenant | - | live | <database>.<connection> or platform:<name>: a webhook connection that gets the tenant's events |
@@ -203,57 +200,30 @@ Every setting SprigDB declares, with its default, the scopes that may set it, ha
 
 | Key | Type | Default | Scopes | Bounds | Applies | Description |
 |---|---|---|---|---|---|---|
-| `auto_index.abort_replica_lag_seconds` | int | `300` | object, database, tenant, cluster, dc, global | 1 to 86400 | live | Abort a build above this lag |
-| `auto_index.build_rate_mb_per_sec` | float | `20` | object, database, tenant, cluster, dc, global | 0.01 to 100000 | live | Build rate before one is measured |
-| `auto_index.build_window` | text | `auto` | object, database, tenant, cluster, dc, global | - | live | auto or HH:MM-HH:MM UTC |
-| `auto_index.canary_hours` | int | `24` | object, database, tenant, cluster, dc, global | 1 to 720 | live | Canary observation |
-| `auto_index.cooldown_hours` | int | `24` | object, database, tenant, cluster, dc, global | 0 to 8760 | live | Before re-deciding a fingerprint |
-| `auto_index.ddl_lock_wait_seconds` | int | `5` | object, database, tenant, cluster, dc, global | 1 to 3600 | live | Lock wait for index DDL |
-| `auto_index.estimate_margin` | float | `1.5` | object, database, tenant, cluster, dc, global | 1 to 10 | live | Stricter prediction without a replica |
-| `auto_index.eval_interval_minutes` | int | `60` | object, database, tenant, cluster, dc, global | 1 to 10080 | live | Evaluation period |
-| `auto_index.include_studio` | bool | `false` | object, database, tenant, cluster, dc, global | - | live | Count statements run from Studio toward triggers |
-| `auto_index.lookup_cost_factor` | float | `2` | object, database, tenant, cluster, dc, global | 0 to 100 | live | Extra cost of a primary-key lookup per entry |
+| `auto_index.build_batch_rows` | int | `1024` | object, database, tenant, cluster, dc, global | 1 to 100000 | live | Rows per backfill batch of an online build |
+| `auto_index.build_pause_ms` | int | `5` | object, database, tenant, cluster, dc, global | 0 to 60000 | live | Pause between backfill batches of an online build |
+| `auto_index.cooldown_hours` | int | `24` | object, database, tenant, cluster, dc, global | 0 to 8760 | live | Hours before a query pattern is decided again |
+| `auto_index.enabled` | bool | `true` | object, database, tenant, cluster, dc, global | - | live | Evaluate the workload and build or recommend indexes automatically |
+| `auto_index.eval_interval_minutes` | int | `60` | object, database, tenant, cluster, dc, global | 1 to 10080 | live | Minutes between evaluations of a tenant |
+| `auto_index.include_studio` | bool | `false` | object, database, tenant, cluster, dc, global | - | live | Count statements run from Studio toward the triggers |
 | `auto_index.lookup_scatter_pct` | float | `80` | object, database, tenant, cluster, dc, global | 0 to 100 | live | Scatter share for a lookup index |
-| `auto_index.maintenance_cost_ms` | float | `0.05` | object, database, tenant, cluster, dc, global | 0 to 1000 | live | Cost of one index entry change |
-| `auto_index.max_build_hours` | float | `6` | object, database, tenant, cluster, dc, global | 0.01 to 720 | live | Longest build |
+| `auto_index.maintenance_cost_ms` | float | `0.05` | object, database, tenant, cluster, dc, global | at least 0 | live | Estimated cost of one index entry change |
 | `auto_index.max_builds_per_cluster` | int | `1` | object, database, tenant, cluster, dc, global (operator only) | 1 to 64 | live | Concurrent index builds per cluster |
-| `auto_index.max_cover_columns` | int | `3` | object, database, tenant, cluster, dc, global | 0 to 16 | live | Columns added for covering |
-| `auto_index.max_key_bytes` | int | `512` | object, database, tenant, cluster, dc, global | 16 to 3072 | live | Longest automatic key |
-| `auto_index.max_new_per_day` | int | `5` | object, database, tenant, cluster, dc, global | 0 to 10000 | live | New indexes per tenant per day |
-| `auto_index.max_per_table` | int | `5` | object, database, tenant, cluster, dc, global | 1 to 64 | live | Automatic indexes per table |
-| `auto_index.max_regression_pct` | float | `10` | object, database, tenant, cluster, dc, global | 0 to 1000 | live | Largest slowdown of any sampled statement |
-| `auto_index.max_storage_pct` | float | `20` | object, database, tenant, cluster, dc, global | 0 to 1000 | live | Extra storage per table |
-| `auto_index.min_benefit_ratio` | float | `2` | object, database, tenant, cluster, dc, global | 0 to 1000 | live | Benefit over write cost |
-| `auto_index.min_examined_per_returned` | float | `100` | object, database, tenant, cluster, dc, global | 1 to 1000000000000 | live | ...while examining this many rows per row returned |
-| `auto_index.min_examined_samples` | int | `5` | object, database, tenant, cluster, dc, global | 1 to 1000000 | live | Probe samples needed for the second trigger |
-| `auto_index.min_improvement_pct` | float | `30` | object, database, tenant, cluster, dc, global | 1 to 99 | live | p95 improvement to accept |
-| `auto_index.min_net_ms_per_hour` | float | `100` | object, database, tenant, cluster, dc, global | 0 to 1000000000000 | live | Smallest net benefit |
-| `auto_index.min_runs` | int | `50` | object, database, tenant, cluster, dc, global | 1 to 1000000 | live | Runs needed in the window |
-| `auto_index.min_storage_budget_mb` | float | `64` | object, database, tenant, cluster, dc, global | 0 to 1048576 | live | Smallest storage budget per table, MB |
-| `auto_index.min_usage_ratio` | float | `0.05` | object, database, tenant, cluster, dc, global | 0 to 1 | live | Share of the reads an index must serve to be kept |
-| `auto_index.mode` | text | `on` | object, database, tenant, cluster, dc, global | on, approve, recommend, off | live | on, approve, recommend or off |
-| `auto_index.observe_days` | int | `7` | object, database, tenant, cluster, dc, global | 1 to 365 | live | Watch period after a build |
-| `auto_index.p95_threshold_ms` | float | `100` | object, database, tenant, cluster, dc, global | 1 to 3600000 | live | Slower than reasonable |
-| `auto_index.payback_hours` | float | `24` | object, database, tenant, cluster, dc, global | 0.1 to 87600 | live | Build must pay back within this |
-| `auto_index.recommend_ttl_days` | int | `14` | object, database, tenant, cluster, dc, global | 1 to 3650 | live | Recommendation lifetime |
-| `auto_index.recommend_validate` | bool | `true` | object, database, tenant, cluster, dc, global | - | live | Validate in recommend mode |
-| `auto_index.recreate_block_days` | int | `14` | object, database, tenant, cluster, dc, global | 0 to 3650 | live | Block on re-proposing a definition dropped as harmful |
-| `auto_index.regression_fingerprints` | int | `20` | object, database, tenant, cluster, dc, global | 0 to 1000 | live | Other fingerprints replayed |
-| `auto_index.replay_rounds` | int | `3` | object, database, tenant, cluster, dc, global | 1 to 50 | live | A/B rounds per sample |
-| `auto_index.replay_samples` | int | `20` | object, database, tenant, cluster, dc, global | 1 to 1000 | live | Samples per fingerprint |
-| `auto_index.replay_timeout_seconds` | int | `10` | object, database, tenant, cluster, dc, global | 1 to 3600 | live | Statement limit during replay |
-| `auto_index.retire_user_indexes` | text | `on` | object, database, tenant, cluster, dc, global | on, approve, recommend, off | live | on, recommend or off for user and migrated indexes |
-| `auto_index.rollout_pause_minutes` | int | `10` | object, database, tenant, cluster, dc, global | 0 to 1440 | live | Between shards |
-| `auto_index.scan_max_returned_ratio` | float | `0.01` | object, database, tenant, global | 0 to 1 | live | Fast trigger: rows returned per row examined, at most |
-| `auto_index.scan_min_examined` | int | `1000000` | object, database, tenant, global | 1 to 1000000000000 | live | Fast trigger: rows examined per run |
-| `auto_index.scan_min_runs` | int | `5` | object, database, tenant, global | 1 to 100000 | live | Fast trigger: large-scan runs needed in the window |
-| `auto_index.scan_min_sessions` | int | `2` | object, database, tenant, global | 1 to 8 | live | Fast trigger: distinct sessions among those runs |
-| `auto_index.scan_recommend_above_gb` | float | `100` | object, database, tenant, global | 0 to 1000000000 | live | Fast trigger only recommends on larger tables |
-| `auto_index.top_n` | int | `10` | object, database, tenant, cluster, dc, global | 0 to 1000 | live | Or among the top N by total time... |
-| `auto_index.usage_sample_reads` | int | `100000` | object, database, tenant, cluster, dc, global | 1 to 1000000000000 | live | Reads per usage judgement, and reads watched while IGNORED |
-| `auto_index.vector_ann` | text | `recommend` | object, database, tenant, cluster, dc, global | on, approve, recommend, off | live | on, recommend or off for ANN indexes |
-| `auto_index.vector_min_recall` | float | `0.95` | object, database, tenant, cluster, dc, global | 0 to 1 | live | Recall@k to accept an ANN index |
-| `auto_index.window_hours` | int | `24` | object, database, tenant, cluster, dc, global | 1 to 720 | live | Trigger window |
+| `auto_index.max_new_per_day` | int | `5` | object, database, tenant, cluster, dc, global | 0 to 1000 | live | Automatic indexes built per tenant per 24 hours |
+| `auto_index.max_per_table` | int | `5` | object, database, tenant, cluster, dc, global | 0 to 64 | live | Automatic indexes per table |
+| `auto_index.max_regression_pct` | float | `10` | object, database, tenant, cluster, dc, global | 0 to 100 | live | Largest slowdown of any replayed statement |
+| `auto_index.min_examined_per_returned` | float | `100` | object, database, tenant, cluster, dc, global | at least 0 | live | Rows examined per row returned that make a top pattern qualify |
+| `auto_index.min_improvement_pct` | float | `30` | object, database, tenant, cluster, dc, global | 0 to 100 | live | Improvement a pattern needs, in validation and after the build |
+| `auto_index.min_net_ms_per_hour` | float | `100` | object, database, tenant, cluster, dc, global | at least 0 | live | Smallest estimated time saved per hour, net of write cost |
+| `auto_index.min_runs` | int | `50` | object, database, tenant, cluster, dc, global | 1 to 1000000 | live | Runs of a query pattern needed in the window |
+| `auto_index.mode` | text | `auto` | object, database, tenant, cluster, dc, global | auto, recommend | live | auto: build indexes; recommend: ask for approval first |
+| `auto_index.observe_days` | int | `7` | object, database, tenant, cluster, dc, global | 1 to 365 | live | Days an automatic index is watched; unused ones are dropped |
+| `auto_index.p95_threshold_ms` | float | `100` | object, database, tenant, cluster, dc, global | at least 0 | live | A pattern slower than this at p95 qualifies |
+| `auto_index.recommend_ttl_days` | int | `14` | object, database, tenant, cluster, dc, global | 1 to 365 | live | Days a recommendation waits for approval |
+| `auto_index.recreate_block_days` | int | `14` | object, database, tenant, cluster, dc, global | 0 to 365 | live | Days a dropped or rejected definition can't be proposed again |
+| `auto_index.replay_samples` | int | `20` | object, database, tenant, cluster, dc, global | 1 to 1000 | live | Recent statements of a pattern planned in validation |
+| `auto_index.top_n` | int | `10` | object, database, tenant, cluster, dc, global | 0 to 1000 | live | Patterns among the top N by total time qualify when they read too many rows |
+| `auto_index.window_hours` | int | `24` | object, database, tenant, cluster, dc, global | 1 to 720 | live | Workload window the triggers read |
 
 ## `backend`
 
@@ -324,7 +294,6 @@ Every setting SprigDB declares, with its default, the scopes that may set it, ha
 |---|---|---|---|---|---|---|
 | `bolt.advertise_address` | text | `` | dc, global | - | live | Address in Bolt ROUTE answers; empty: the one the driver used |
 | `bolt.default_graph` | text | `neo4j` | database, tenant, global | - | live | Graph of Bolt requests without db |
-| `bolt.isolation` | text | `read_committed` | tenant, global | read_committed, repeatable_read | live | Isolation level of Bolt transactions |
 | `bolt.logical_database` | text | `graph` | tenant, global | - | live | Logical database of Bolt graphs named without a database |
 | `bolt.max_buffered_result_mb` | int | `64` | tenant, global | 1 to 4096 | live | Buffered Bolt result size, in MiB |
 | `bolt.max_version` | text | `5.8` | dc, global | 5.0, 5.1, 5.2, 5.3, 5.4, 5.5, 5.6, 5.7, 5.8 | live | Highest Bolt version offered |
@@ -391,12 +360,6 @@ Every setting SprigDB declares, with its default, the scopes that may set it, ha
 | `control.resync_seconds` | int | `300` | dc, global (operator only) | 1 to 86400 | live | Full resync period of every loop |
 | `control.tenant_jobs_per_hour` | int | `12` | dc, global (operator only) | 1 to 10000 | live | Automatic jobs a tenant may start per hour |
 
-## `ddl`
-
-| Key | Type | Default | Scopes | Bounds | Applies | Description |
-|---|---|---|---|---|---|---|
-| `ddl.mover_wait_minutes` | int | `120` | tenant, dc, global (operator only) | 0 to 1440 | live | How long DDL waits for mover jobs |
-
 ## `decisions`
 
 | Key | Type | Default | Scopes | Bounds | Applies | Description |
@@ -456,12 +419,6 @@ Every setting SprigDB declares, with its default, the scopes that may set it, ha
 | `failover.watchdog_ms` | int | `1000` | dc, global (operator only) | 50 to 60000 | live | Stall that triggers a direct fence |
 | `failover.writer_lease_seconds` | int | `10` | cluster, dc, global (operator only) | 2 to 600 | live | Writer lease TTL |
 
-## `fk`
-
-| Key | Type | Default | Scopes | Bounds | Applies | Description |
-|---|---|---|---|---|---|---|
-| `fk.lock_wait_seconds` | int | `5` | object, database, tenant, global | 0 to 31536000 | live | Lock wait for foreign-key checks |
-
 ## `gateway`
 
 | Key | Type | Default | Scopes | Bounds | Applies | Description |
@@ -497,15 +454,8 @@ Every setting SprigDB declares, with its default, the scopes that may set it, ha
 | `graph.max_memory_mb` | int | `256` | tenant, dc, global | 1 to 1048576 | live | Gateway memory of one graph statement, in MiB |
 | `graph.max_rows` | int | `1000000` | object, database, tenant, global | 1 to 1000000000 | live | Rows or paths one graph pattern may produce |
 | `graph.max_time_ms` | int | `30000` | object, database, tenant, global | 1 to 86400000 | live | Wall time of one graph statement, in milliseconds |
-| `graph.mirror` | text | `async` | object, database, tenant, global | off, async, sync | live | Mirrors of incoming relationships: off, async or sync |
-| `graph.mirror_max_wait_ms` | int | `1000` | object, database, tenant, global | 0 to 60000 | live | Wait for the mirror applier to reach the session's causal target before scattering |
-| `graph.session_pool` | int | `96` | dc, global | 4 to 4096 | live | Connections per cluster that a gateway's Bolt sessions take from |
 | `graph.slot_wait_ms` | int | `250` | dc, global | 0 to 60000 | live | How long a graph statement waits for a graph slot before it runs without one, in milliseconds |
 | `graph.slots` | int | `0` | dc, global | 0 to 4096 | live | Graph statements one gateway runs at once (0: three per CPU, at least 12); more wait graph.slot_wait_ms |
-| `graph.spare_wait_ms` | int | `50` | dc, global | 0 to 10000 | live | How long a graph read waits for a spare connection before it reads its shards one after another, in milliseconds |
-| `graph.spares` | int | `32` | dc, global | 0 to 4096 | live | Spare connections all auto-commit graph reads of one gateway hold at once, per cluster |
-| `graph.spares_per_read` | int | `3` | dc, global | 0 to 64 | live | Spare connections one auto-commit graph read takes per cluster |
-| `graph.storage` | text | `json` | object, database, tenant, global | json, typed | live | How new native graphs store their elements: json or typed (a table per label set and relationship type) |
 | `graph.traversal_tier` | text | `auto` | object, database, tenant, cluster, dc, global | auto, cte, gateway, plugin | live | Traversal tier: auto, cte, gateway or plugin |
 
 ## `hierarchy`
@@ -526,12 +476,10 @@ Every setting SprigDB declares, with its default, the scopes that may set it, ha
 | `inherit.broadcast_retention_hours` | int | `168` | object, tenant, global | 1 to 87600 | live | How long broadcasts stay in the broadcast log |
 | `inherit.broadcasts_per_hour` | int | `60` | object, tenant, global | 1 to 100000 | live | Broadcasts one definition may take per hour |
 | `inherit.drop_grace_hours` | int | `168` | object, tenant, global | 0 to 87600 | live | How long instances of a dropped definition drain before removal |
-| `inherit.fan_in_sql_max_tenants` | int | `100` | tenant, global | 1 to 100000 | live | Members one fan-in SELECT may read |
 | `inherit.instance_create_wait_ms` | int | `5000` | tenant, global | 100 to 600000 | live | How long a publish or consumer waits for an instance being created (39899 after) |
 | `inherit.max_definitions_per_tenant` | int | `200` | tenant, global | 1 to 100000 | live | FOR EACH TENANT definitions one tenant may declare |
 | `inherit.max_depth` | int | `16` | tenant, global | 1 to 64 | live | Longest share chain of one object |
 | `inherit.max_instances_per_tenant` | int | `1000` | tenant, global | 1 to 1000000 | live | Inherited instances one member may hold |
-| `inherit.member_publish` | text | `on` | object, tenant, global | on, off | live | Whether a member may publish into its own instance; off leaves publishing to ancestors |
 | `inherit.merge` | text | `auto` | object, database, tenant, global | auto, read_through, materialized, federated | live | auto, read_through, materialized or federated (federated isn't offered in this release) |
 | `inherit.orphan_sink_sweep_seconds` | int | `600` | dc, global | 0 to 86400 | live | How often each gateway looks for members' inherited sinks that no FOR EACH TENANT definition reaches any more (0: never); one found in two passes in a row is dropped |
 | `inherit.outbox_drain_seconds` | int | `30` | object, database, tenant, global | 0 to 3600 | live | How long DROP DATABASE waits for its cross-tenant outbox to be forwarded (39245 after) |
@@ -648,6 +596,7 @@ Every setting SprigDB declares, with its default, the scopes that may set it, ha
 | `logic.trigger_max_attempts` | int | `10` | object, database, tenant, global | 1 to 1000000 | live | Before a dead letter |
 | `logic.trigger_retry_initial_ms` | int | `1000` | object, database, tenant, global | 1 to 3600000 | live | First backoff |
 | `logic.trigger_retry_max_ms` | int | `300000` | object, database, tenant, global | 1 to 86400000 | live | Backoff cap |
+| `logic.validation_budget_ms` | int | `50` | object, database, tenant, global | 1 to 3600000 | live | Wall time of one validation on one row |
 
 ## `lookup`
 
@@ -837,22 +786,6 @@ Every setting SprigDB declares, with its default, the scopes that may set it, ha
 | `rls.backend_enforcement` | text | `views` | database, tenant, global | views, triggers, off | live | views (write checks and policy views), triggers (write checks only) or off (the gateway's rewrite alone) |
 | `rls.inline_subtree_max` | int | `1000` | tenant, dc, global | 1 to 100000 | live | Tenant ids inlined for SPRIG_TENANT_IN_SUBTREE and SPRIG_TENANT_MANAGED |
 
-## `router`
-
-| Key | Type | Default | Scopes | Bounds | Applies | Description |
-|---|---|---|---|---|---|---|
-| `router.analytics.max_rows` | int | `50000000` | tenant, dc, global | 1 to 10000000000 | live | Rows an analytic read may read from the shards |
-| `router.analytics.mode` | text | `fallback` | tenant, dc, global | off, fallback, prefer | live | off, fallback or prefer |
-| `router.analytics.spill_mb` | int | `4096` | tenant, dc, global | 0 to 1048576 | live | Disk an analytic read may spill to (0: none) |
-| `router.gather.max_concurrent` | int | `4` | dc, global | 1 to 1024 | live | Gathered reads per gateway at once |
-| `router.gather.max_rows` | int | `100000` | tenant, dc, global | 0 to 100000000 | live | Rows a gathered read may copy (0: off) |
-| `router.lookup_batch_size` | int | `256` | tenant, dc, global | 1 to 65536 | live | Keys per IN list in a lookup join |
-| `router.max_parallel_shards` | int | `32` | tenant, dc, global | 1 to 1024 | live | Shard queries one statement runs at once |
-| `router.max_route_values` | int | `1024` | tenant, dc, global | 1 to 1000000 | live | Key combinations routed before scattering |
-| `router.max_statement_memory_mb` | int | `256` | tenant, dc, global | 1 to 65536 | live | Gateway memory for one statement |
-| `router.plan_cache_entries` | int | `10000` | dc, global | 0 to 10000000 | live | Cached plans per gateway |
-| `router.stale_map_retries` | int | `2` | dc, global | 0 to 10 | live | Retries after a stale shard map |
-
 ## `routing`
 
 | Key | Type | Default | Scopes | Bounds | Applies | Description |
@@ -955,18 +888,8 @@ Every setting SprigDB declares, with its default, the scopes that may set it, ha
 
 | Key | Type | Default | Scopes | Bounds | Applies | Description |
 |---|---|---|---|---|---|---|
-| `stream.change_topic` | bool | `false` | object, database, tenant | - | live | Keep a change topic for the object |
-| `stream.compaction_lag_minutes` | int | `60` | object, database, tenant, global | 0 to 525600 | live | Minimum age of a record before compaction |
-| `stream.descendant_key` | text | `origin` | object, database, tenant, global | origin, any | live | origin: a descendant's record is keyed by its own tenant name (39957 otherwise); any: its own key |
-| `stream.descendant_publish` | text | `off` | object, database, tenant, global | on, off | live | on: descendants' own sessions may publish into this stream (IN TENANT); the owner's consent |
-| `stream.max_message_bytes` | int | `1048576` | object, database, tenant, global | 1 to 1073741824 | live | Largest record of a stream |
 | `stream.partitions_default` | int | `12` | database, tenant, global | 1 to 10000 | live | Partitions of a new stream |
 | `stream.produce_wait_ms` | int | `2000` | tenant, global | 0 to 600000 | live | How long a Kafka produce waits for its records' offsets |
-| `stream.retention_bytes` | int | `0` | object, database, tenant, global | 0 to 9223372036854776000 | live | Size retention per partition; 0 = none |
-| `stream.retention_hours` | int | `168` | object, database, tenant, global | 1 to 87600 | live | Time retention of a stream's records |
-| `stream.sequencer_batch_ms` | int | `10` | dc, global | 0 to 10000 | live | Batching window of a stream sequencer |
-| `stream.sequencer_lag_alert_seconds` | int | `60` | dc, global | 1 to 86400 | live | Lag past which a stream sequencer counts as lagging |
-| `stream.tombstone_hours` | int | `24` | object, database, tenant, global | 0 to 87600 | live | How long tombstones stay on compacted streams |
 
 ## `studio`
 

@@ -71,6 +71,7 @@ impl PassSession {
             Ok(v) => v,
             Err(e) => return Ok(Some(self.fail(out, &e).await?)),
         };
+        let persona = self.persona;
         let rewritten: Result<String> = async {
             let Some(ts) = self.tenant.as_deref() else {
                 return Err(SprigError::internal("no tenant"));
@@ -92,7 +93,11 @@ impl PassSession {
                     .await?;
                 let rows: Vec<Vec<sprig_graph::graph_table::GraphLit>> =
                     o.rows.iter().map(|r| r.iter().map(lit).collect()).collect();
-                let body = sprig_graph::graph_table::rows_sql(&c.columns, &rows);
+                let body = sprig_graph::graph_table::rows_sql_in(
+                    &c.columns,
+                    &rows,
+                    persona == sprig_proto_mysql::Persona::MySql84,
+                );
                 if body.len() > sprig_graph::pgq::MAX_INLINE_BYTES {
                     return Err(sprig_graph::exec::budget_error(
                         "rows",

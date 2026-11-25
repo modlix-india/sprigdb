@@ -608,6 +608,24 @@ impl LogicStore {
         Ok(v)
     }
 
+    /// When each live module was created (milliseconds since the epoch),
+    /// by module id: `information_schema.ROUTINES` shows it.
+    ///
+    /// # Errors
+    /// The record store's.
+    pub async fn created_times(
+        &self,
+        c: &mut dyn RecordTx,
+    ) -> Result<std::collections::HashMap<u64, u64>> {
+        Ok(MODULES
+            .rows::<ModRec>(c, &Pk::new())
+            .await?
+            .into_iter()
+            .filter(|m| m.state != "dropped")
+            .map(|m| (m.module_id, m.created_ms))
+            .collect())
+    }
+
     /// Inserts a module (its id already allocated).
     ///
     /// # Errors
@@ -1100,6 +1118,27 @@ impl LogicStore {
             .filter(|b| b.timing == "after_commit" && b.state == "active" && b.module_id != 0)
             .map(BindRec::row)
             .collect())
+    }
+
+    /// Every active validation checked in the write path of an engine
+    /// table (a `before_write` binding enforced as a step), by binding id:
+    /// the order they were created in.
+    ///
+    /// # Errors
+    /// The record store's.
+    pub async fn step_validations(&self, c: &mut dyn RecordTx) -> Result<Vec<BindingRow>> {
+        let mut v: Vec<BindingRow> = Self::all_bindings(c)
+            .await?
+            .iter()
+            .filter(|b| {
+                b.timing == "before_write"
+                    && b.state == "active"
+                    && b.enforcement.as_deref() == Some("step")
+            })
+            .map(BindRec::row)
+            .collect();
+        v.sort_by_key(|b| b.binding_id);
+        Ok(v)
     }
 
     /// Every active `CHECK` validation: its binding, the module's active

@@ -436,6 +436,152 @@ pub(crate) fn uuid(env: Env<'_>) -> Node {
     })
 }
 
+/// `UUID_SHORT()`: an unsigned 64-bit number that grows by one per call,
+/// MariaDB's layout: the server id's low byte, the process's start in
+/// seconds, then a counter (`(id & 255) << 56 | start << 24`, plus one
+/// per call).
+pub(crate) fn uuid_short() -> Node {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static BASE: OnceLock<u64> = OnceLock::new();
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    Node::new(ExprType::int(21, true), "uuid_short()", |_, _| {
+        let base = *BASE.get_or_init(|| {
+            let start = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            (1u64 << 56) | ((start & 0xff_ffff_ffff) << 24)
+        });
+        Ok(Value::UInt(
+            base.wrapping_add(SEQ.fetch_add(1, Ordering::Relaxed)),
+        ))
+    })
+}
+
+/// `ADDTIME(t, d)` and `SUBTIME(t, d)`: the duration `d` (a time) added
+/// to or taken from `t`. A `DATETIME`, `TIMESTAMP` or `DATE` gives a
+/// `DATETIME`, a `TIME` a `TIME`; anything else is read as a datetime
+/// when its text has a date and a time, else as a time, and answered as
+/// text. `NULL` when `d` has a date part or a datetime leaves years 1 to
+/// 9999; a time past 838:59:59 is cut to it with 1292.
+pub(crate) fn addtime(a: Node, b: Node, sub: bool, env: Env<'_>) -> Node {
+    use crate::types::Kind;
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Out {
+        DateTime,
+        Time,
+        Text,
+    }
+    // A string literal brings the digits it writes (`'1:00:01.5'`: one).
+    let fsp = temporal::fsp_of(&a, env)
+        .max(temporal::fsp_of(&b, env))
+        .min(6);
+    let out = match a.ty.kind {
+        Kind::DateTime | Kind::Timestamp | Kind::Date => Out::DateTime,
+        Kind::Time => Out::Time,
+        _ => Out::Text,
+    };
+    let ty = match out {
+        Out::DateTime => ExprType::datetime(fsp),
+        Out::Time => ExprType::time(fsp),
+        Out::Text => {
+            let mut t = ExprType::string(
+                if env.maria() { 26 } else { 29 },
+                env.conn(),
+                Derivation::Coercible,
+            );
+            t.dec = env.s.persona.not_fixed_dec();
+            t.fixed = true;
+            t
+        }
+    }
+    .nullable();
+    let name = if sub { "subtime" } else { "addtime" };
+    Node::new(ty, name, move |ctx, row| {
+        let (x, y) = (a.temporal(ctx, row)?, b.temporal(ctx, row)?);
+        if matches!(x, Value::Null) || matches!(y, Value::Null) {
+            return Ok(Value::Null);
+        }
+        // The duration: a time, never a date.
+        let dur_dated = match &y {
+            Value::Date(_) | Value::DateTime(_) => true,
+            Value::Str(t) | Value::Bytes(t) => {
+                temporal::parse_datetime_mode(ctx, t, temporal::DateMode::Fuzzy)
+                    .is_some_and(|(tm, _)| tm.has_date && tm.has_time)
+            }
+            _ => false,
+        };
+        if dur_dated {
+            return Ok(Value::Null);
+        }
+        let Some(d) = temporal::to_time(ctx, &y) else {
+            return Ok(Value::Null);
+        };
+        let mut micros = tm_micros(&d);
+        if sub {
+            micros = -micros;
+        }
+        let fraction = |v: &Value| match v {
+            Value::Str(t) | Value::Bytes(t) => t.contains(&b'.'),
+            _ => false,
+        };
+        let digits = if fsp > 0 || fraction(&x) || fraction(&y) {
+            6
+        } else {
+            0
+        };
+        let dated = match out {
+            Out::DateTime => true,
+            Out::Time => false,
+            Out::Text => match &x {
+                Value::Date(_) | Value::DateTime(_) => true,
+                Value::Str(t) | Value::Bytes(t) => {
+                    temporal::parse_datetime_mode(ctx, t, temporal::DateMode::Fuzzy)
+                        .is_some_and(|(tm, _)| tm.has_date && tm.has_time)
+                }
+                _ => false,
+            },
+        };
+        if dated {
+            let Some(t) = temporal::to_datetime_mode(ctx, &x, temporal::DateMode::Fuzzy) else {
+                return Ok(Value::Null);
+            };
+            let iv = super::datetime::Interval { months: 0, micros };
+            let Some(r) = super::datetime::add_interval(&t, iv, false) else {
+                return Ok(Value::Null);
+            };
+            if r.year == 0 {
+                return Ok(Value::Null);
+            }
+            return Ok(match out {
+                Out::Text => Value::str(&temporal::fmt_datetime(
+                    r.datetime(),
+                    if r.micros != 0 { 6 } else { digits },
+                )),
+                _ => temporal::tm_value(ctx, r, Kind::DateTime, fsp),
+            });
+        }
+        let Some(t) = temporal::to_time(ctx, &x) else {
+            return Ok(Value::Null);
+        };
+        let total = tm_micros(&t) + micros;
+        let max = Time::MAX_MICROS;
+        let c = total.clamp(-max, max);
+        if c != total {
+            ctx.warn(1292, "Truncated incorrect time value".to_owned());
+        }
+        let v = Time::from_micros(c).unwrap_or_default();
+        Ok(match out {
+            Out::Text => Value::str(&temporal::fmt_time(
+                v,
+                if c % 1_000_000 != 0 { 6 } else { digits },
+            )),
+            _ => Value::Time(v),
+        })
+    })
+}
+
 /// The session values a statement's functions read.
 #[derive(Debug, Clone, Default)]
 pub struct SessionInfo {
@@ -473,6 +619,8 @@ pub(crate) fn session_value(name: &str, env: Env<'_>) -> Result<Node> {
             "connection_id()",
         ),
         "LAST_INSERT_ID" => (ExprType::int(21, true), "last_insert_id()"),
+        "ROW_COUNT" => (ExprType::int(21, false), "row_count()"),
+        "FOUND_ROWS" => (ExprType::int(21, true), "found_rows()"),
         "USER" | "SESSION_USER" | "SYSTEM_USER" => {
             (s(if env.maria() { 384 } else { 288 }), "user()")
         }
@@ -494,9 +642,73 @@ pub(crate) fn session_value(name: &str, env: Env<'_>) -> Result<Node> {
             "user()" => st(&info.user),
             "current_user()" => st(&info.current_user),
             "version()" => st(&info.version),
-            _ => Value::UInt(info.last_insert_id),
+            "row_count()" => Value::Int(info.row_count),
+            "found_rows()" => {
+                // MySQL notes the deprecation once per statement.
+                const DEPRECATED: &str = "FOUND_ROWS() is deprecated and will be removed in a future release. Consider using COUNT(*) instead.";
+                if !ctx.maria() && !ctx.warnings().iter().any(|w| w.message == DEPRECATED) {
+                    ctx.warn(1287, DEPRECATED);
+                }
+                Value::UInt(ctx.session.info.found_rows)
+            }
+            _ => Value::UInt(set_insert_id(info.connection_id).unwrap_or(info.last_insert_id)),
         })
     }))
+}
+
+/// `LAST_INSERT_ID(expr)` values set by the statements running now, by
+/// connection: the session takes its value when the statement ends
+/// ([`take_set_insert_id`]).
+fn set_insert_ids() -> &'static std::sync::Mutex<std::collections::HashMap<u64, u64>> {
+    static M: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u64, u64>>> =
+        std::sync::OnceLock::new();
+    M.get_or_init(Default::default)
+}
+
+fn set_insert_id(conn: u64) -> Option<u64> {
+    if conn == 0 {
+        return None;
+    }
+    set_insert_ids()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&conn)
+        .copied()
+}
+
+/// The value the running statement of connection `conn` gave
+/// `LAST_INSERT_ID(expr)`, if any, forgotten here: the session's
+/// `LAST_INSERT_ID()` from now on.
+#[must_use]
+pub fn take_set_insert_id(conn: u64) -> Option<u64> {
+    set_insert_ids()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&conn)
+}
+
+/// `LAST_INSERT_ID(expr)`: `expr` as an integer (`NULL` stays `NULL`),
+/// which becomes the session's `LAST_INSERT_ID()` (0 for `NULL`), also for
+/// the rest of the statement. It is kept by the session's connection id;
+/// with none (a statement run as the system) only the value is returned.
+pub(crate) fn set_last_insert_id(a: Node, _env: Env<'_>) -> Result<Node> {
+    Ok(Node::new(
+        ExprType::int(21, true).nullable(),
+        "last_insert_id",
+        move |ctx, row| {
+            let v = a.int_arg(ctx, row)?;
+            #[allow(clippy::cast_sign_loss)] // the servers keep the bits
+            let id = v.map_or(0, |x| x as u64);
+            let conn = ctx.session.info.connection_id;
+            if conn != 0 {
+                set_insert_ids()
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(conn, id);
+            }
+            Ok(v.map_or(Value::Null, |_| Value::UInt(id)))
+        },
+    ))
 }
 
 /// A time's signed microseconds.

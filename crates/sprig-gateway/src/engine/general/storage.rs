@@ -47,6 +47,8 @@ use crate::engine::row::{self, Datum};
 use crate::engine::store::Tx;
 use crate::engine::table::{ColType, TableDef};
 
+mod coll;
+
 /// Entries a scan reads per store call, at most (it starts smaller: many
 /// scans want one row).
 const SCAN_BATCH: usize = 256;
@@ -75,6 +77,8 @@ pub(super) struct Bound {
     /// read is locked in this mode, waiting as the clause says, and read as
     /// it is now.
     lock: Option<(LockMode, Wait)>,
+    /// A MongoDB collection read as a table (`coll`).
+    coll: Option<coll::CollBound>,
 }
 
 impl Bound {
@@ -86,6 +90,7 @@ impl Bound {
             sp,
             all: t.read.iter().all(|r| *r),
             read: t.read.clone(),
+            coll: t.coll.clone().map(coll::CollBound::new),
         }
     }
 
@@ -482,15 +487,19 @@ fn integer_span(range: &KeyRange) -> Option<u64> {
 
 impl Storage for TxStorage {
     fn table_rows(&self, table: &PlanTable) -> u64 {
-        self.inner
-            .bound(table)
-            .map_or(0, |b| self.inner.table_rows(b))
+        self.inner.bound(table).map_or(0, |b| match &b.coll {
+            Some(c) => coll::table_rows(&self.inner, b, c),
+            None => self.inner.table_rows(b),
+        })
     }
 
     fn rows_in_range(&self, table: &PlanTable, key: KeyId, range: &KeyRange) -> u64 {
         let Ok(b) = self.inner.bound(table) else {
             return 0;
         };
+        if let Some(c) = &b.coll {
+            return coll::rows_in_range(&self.inner, b, c, key, range);
+        }
         let Ok(Some(r)) = byte_range(b, key, range) else {
             return 0;
         };
@@ -514,6 +523,9 @@ impl Storage for TxStorage {
 
     fn rows_per_key(&self, table: &PlanTable, key: KeyId, parts: usize) -> Option<f64> {
         let b = self.inner.bound(table).ok()?;
+        if b.coll.is_some() {
+            return coll::rows_per_key(key);
+        }
         let ff = b.sp.first_format;
         let (cols, index_id, unique) = match key {
             KeyId::Primary => (b.def.pk_key(ff), b.sp.layout.row_gen, false),
@@ -591,6 +603,9 @@ impl Storage for TxStorage {
         counters: &Counters,
     ) -> Result<Option<Row>, SqlError> {
         let b = self.inner.bound(table)?;
+        if b.coll.is_some() {
+            return Err(internal("a MongoDB collection has no primary key"));
+        }
         let parts = b.def.pk_key(b.sp.first_format);
         if key.len() != parts.len() {
             return Err(internal("a point lookup needs every primary-key part"));
@@ -632,6 +647,9 @@ impl Storage for TxStorage {
     ) -> Result<Box<dyn RowCursor>, SqlError> {
         let at = self.inner.bound_at(table)?;
         let b = &self.inner.tables[at];
+        if b.coll.is_some() {
+            return coll::scan(&self.inner, at, key, &ranges, reverse, counters);
+        }
         let prefix_len = key_prefix(b, key)?.len();
         let mut bytes = Vec::with_capacity(ranges.len());
         for r in &ranges {

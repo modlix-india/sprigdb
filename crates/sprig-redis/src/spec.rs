@@ -320,6 +320,8 @@ pub const ALL: &[Spec] = specs! {
     "xinfo" -2 "rx" 0 0 0;
     "xsetid" -3 "wx" 1 1 1;
     // RediSearch, on SprigDB's search indexes (crate::search).
+    // SprigDB's query command (crate::query).
+    "sprig.query" 2 "rs" 0 0 0;
     "ft.create" -5 "ws" 0 0 0;
     "ft.alter" -6 "ws" 0 0 0;
     "ft.dropindex" -2 "ws" 0 0 0;

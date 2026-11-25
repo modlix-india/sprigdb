@@ -52,14 +52,37 @@ pub struct InheritSession {
     pub generated: bool,
 }
 
-/// The record-hierarchy locks the session's transaction holds: each a
-/// provisioning connection inside a transaction holding a row
-/// of `__sprig_hlock` `FOR UPDATE`, so the system takes them whatever the
-/// user's grants. Released when the session's transaction ends
-/// ([`PassSession::release_hier_locks`]) or the session goes.
+/// The record-hierarchy locks the session's transaction holds, taken by
+/// the system whatever the user's grants, released when the session's
+/// transaction ends ([`PassSession::release_hier_locks`]) or the session
+/// goes. Each is either a provisioning connection inside a transaction
+/// holding a row of `__sprig_hlock` `FOR UPDATE` (a tenant with MariaDB
+/// databases), or an engine transaction holding the exclusive lock of a
+/// key in the tenant's catalog records (a tenant whose databases are all
+/// the engine's: [`super::inherit_tree::engine_hier_lock`]).
 #[derive(Default)]
 pub struct HierLocks {
-    held: Vec<((u64, String, u64), mysql_async::Conn)>,
+    held: Vec<((u64, String, u64), HeldLock)>,
+}
+
+/// One held record-hierarchy lock.
+enum HeldLock {
+    /// A provisioning connection inside its transaction.
+    Maria(mysql_async::Conn),
+    /// An engine transaction holding the lock (dropping it rolls back).
+    Engine(Box<sprig_engine::txn::Txn>),
+}
+
+impl HeldLock {
+    async fn end(self) {
+        match self {
+            HeldLock::Maria(mut c) => {
+                let _ = c.query_drop("ROLLBACK").await;
+                let _ = c.disconnect().await;
+            }
+            HeldLock::Engine(t) => (*t).rollback(),
+        }
+    }
 }
 
 impl std::fmt::Debug for HierLocks {
@@ -77,12 +100,11 @@ impl HierLocks {
         self.held.is_empty()
     }
 
-    /// Ends every held lock's transaction and closes its connection.
+    /// Ends every held lock's transaction (and closes its connection).
     pub async fn release(&mut self) {
         let n = self.held.len();
-        for (_, mut c) in self.held.drain(..) {
-            let _ = c.query_drop("ROLLBACK").await;
-            let _ = c.disconnect().await;
+        for (_, h) in self.held.drain(..) {
+            h.end().await;
         }
         if n > 0 {
             metrics::counter!("sprig_inherit_hierarchy_locks_released_total").increment(n as u64);
@@ -93,13 +115,15 @@ impl HierLocks {
 impl Drop for HierLocks {
     fn drop(&mut self) {
         // A connection dropped inside its transaction is reset when the
-        // pool takes it back; end it first where a runtime is at hand.
-        if let Ok(rt) = tokio::runtime::Handle::try_current() {
-            for (_, mut c) in self.held.drain(..) {
-                rt.spawn(async move {
-                    let _ = c.query_drop("ROLLBACK").await;
-                    let _ = c.disconnect().await;
-                });
+        // pool takes it back; end it first where a runtime is at hand. An
+        // engine transaction rolls back when dropped.
+        let rt = tokio::runtime::Handle::try_current().ok();
+        for (_, h) in self.held.drain(..) {
+            match (h, &rt) {
+                (HeldLock::Maria(c), Some(rt)) => {
+                    rt.spawn(HeldLock::Maria(c).end());
+                }
+                (h, _) => drop(h),
             }
         }
     }
@@ -215,6 +239,18 @@ async fn copy_states(
     }
     let mut out = sprig_inherit::copy::CopyStates::default();
     let svc = Arc::clone(ts.services());
+    // A tenant whose databases are all the engine's keeps its copies'
+    // states in its catalog records (the gateway's copy pass writes them),
+    // and its copies need no backend grants.
+    if super::inherit_tree::all_engine(cat) {
+        if let Ok(rows) = super::inherit_tree::engine_copy_states(&svc, cat.tenant).await {
+            out = super::inherit_tree::copy_infos(rows);
+        }
+        if let Ok(mut c) = cache.lock() {
+            c.insert(cat.tenant.0, (Instant::now(), cat.version, out.clone()));
+        }
+        return out;
+    }
     let cluster = ts.principal.backend.cluster.clone();
     if let Ok(pool) = svc.locator.ctl_pool(&cluster).await
         && let Ok(mut conn) = pool.get_conn_bounded().await
@@ -672,6 +708,17 @@ impl sprig_inherit::Runner for InhRunner<'_, '_, '_> {
         Ok(())
     }
 
+    fn engine_shares(&self) -> bool {
+        // Every database of a tenant with engine databases is the engine's:
+        // shares are read in process, with no MariaDB view or account.
+        self.gw
+            .sess
+            .tenant
+            .as_deref()
+            .and_then(|ts| ts.catalog())
+            .is_some_and(|c| crate::engine::catalog::of(c).is_some())
+    }
+
     async fn child_tenant(&mut self, name: &str) -> Result<Option<TenantId>> {
         let Some(ts) = self.gw.sess.tenant.as_deref() else {
             return Err(SprigError::internal("no tenant"));
@@ -699,15 +746,20 @@ impl sprig_inherit::Runner for InhRunner<'_, '_, '_> {
             return Err(SprigError::internal("no tenant"));
         };
         let svc = Arc::clone(ts.services());
-        super::inherit_tree::ctl_query(&svc, t, sql).await
+        let lctn = ts.lower_case_table_names();
+        super::inherit_tree::ctl_query(&svc, t, sql, lctn).await
     }
 
-    async fn refs(&mut self, root: TenantId, sql: &str) -> Result<sprig_inherit::RawRows> {
+    async fn refs(
+        &mut self,
+        root: TenantId,
+        op: &sprig_inherit::refs::RefsOp<'_>,
+    ) -> Result<sprig_inherit::RawRows> {
         let Some(ts) = self.gw.sess.tenant.as_deref() else {
             return Err(SprigError::internal("no tenant"));
         };
         let svc = Arc::clone(ts.services());
-        super::inherit_tree::refs(&svc, root, sql).await
+        super::inherit_tree::refs(&svc, root, op).await
     }
 
     async fn tenant_catalog(&mut self, t: TenantId) -> Result<Arc<TenantCatalog>> {
@@ -759,6 +811,12 @@ impl sprig_inherit::Runner for InhRunner<'_, '_, '_> {
         super::inherit_tree::tree_tables(&svc, root, db, table, lctn).await
     }
 
+    async fn tenant_label(&mut self, t: TenantId) -> Option<String> {
+        let svc = Arc::clone(self.gw.sess.tenant.as_deref()?.services());
+        crate::inherited::tenant_name(&svc, t).await.ok()
+    }
+
+    #[allow(clippy::too_many_lines)] // the engine's lock, then MariaDB's, in order
     async fn hier_lock(&mut self, t: TenantId, schema: &str, object: u64) -> Result<()> {
         let key = (t.0, schema.to_owned(), object);
         let wait = self
@@ -781,6 +839,33 @@ impl sprig_inherit::Runner for InhRunner<'_, '_, '_> {
             return Ok(());
         }
         let svc = Arc::clone(ts.services());
+        // A tenant whose databases are all the engine's: the lock is the
+        // engine's, on a key of the tenant's catalog records, with the
+        // engine session's lock wait.
+        let cat = svc.cache.get(t, Freshness::Latest).await?;
+        if super::inherit_tree::all_engine(&cat) {
+            let wait = self
+                .gw
+                .sess
+                .eng
+                .lock_wait_secs()
+                .unwrap_or(wait)
+                .clamp(1, 3600);
+            let txn = super::inherit_tree::engine_hier_lock(
+                t,
+                schema,
+                object,
+                std::time::Duration::from_secs(wait),
+            )
+            .await?;
+            metrics::counter!("sprig_inherit_hierarchy_locks_total").increment(1);
+            if let Some(ts) = self.gw.sess.tenant.as_deref_mut() {
+                ts.hier_locks
+                    .held
+                    .push((key, HeldLock::Engine(Box::new(txn))));
+            }
+            return Ok(());
+        }
         let cluster = svc.locator.cluster(t).await?;
         // Its own connection: held until the transaction ends, it can't
         // take a slot of the shared pool another holder waits for. For a
@@ -842,12 +927,18 @@ impl sprig_inherit::Runner for InhRunner<'_, '_, '_> {
         }
         metrics::counter!("sprig_inherit_hierarchy_locks_total").increment(1);
         if let Some(ts) = self.gw.sess.tenant.as_deref_mut() {
-            ts.hier_locks.held.push((key, conn));
+            ts.hier_locks.held.push((key, HeldLock::Maria(conn)));
         }
         Ok(())
     }
 
     async fn subscribe(&mut self) -> Result<()> {
+        // Engine databases: the gateway hosting them keeps orphans across
+        // tenants from the node's change log (`inherit_orphans`), with no
+        // feed subscription or worker job.
+        if self.engine_shares() {
+            return Ok(());
+        }
         let Some(ts) = self.gw.sess.tenant.as_deref() else {
             return Err(SprigError::internal("no tenant"));
         };

@@ -190,8 +190,8 @@ pub struct Ctx<'a> {
     pub session: &'a Session,
     /// The values of the statement's `?` parameters.
     pub params: &'a [Value],
-    warnings: Vec<Warning>,
-    warning_count: usize,
+    pub(crate) warnings: Vec<Warning>,
+    pub(crate) warning_count: usize,
     /// While above zero, conditions are dropped: some conversions are
     /// silent on the servers.
     pub(crate) mute: u32,

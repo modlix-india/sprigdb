@@ -1090,9 +1090,31 @@ impl Engine {
                             let mut both: Vec<Datum> = old[..ncols.min(old.len())].to_vec();
                             both.extend_from_slice(&row[..ncols.min(row.len())]);
                             let mut new = old.clone();
+                            // Left to right, as both servers assign: a later
+                            // assignment reads the values earlier ones stored.
                             for (ci, e) in sets {
+                                if def.columns[*ci].generated.is_some() {
+                                    generated_given(plan, &def.columns[*ci], a, cx.conds)?;
+                                    continue;
+                                }
                                 let v = expr::eval(e, &both, a)?;
                                 new[*ci] = assign::store(&mut cx, &def.columns[*ci], v)?;
+                                both[*ci] = new[*ci].clone();
+                            }
+                            // Generated columns follow the columns they read.
+                            for &ci in &def.generated_cols {
+                                let c = &def.columns[ci];
+                                if let Some(g) = &c.generated {
+                                    let v = expr::eval(&g.expr, &new, a)?;
+                                    new[ci] = assign::store(&mut cx, c, v)?;
+                                }
+                            }
+                            if new != old {
+                                for (ci, c) in def.columns.iter().enumerate() {
+                                    if c.on_update_now && !sets.iter().any(|(s, _)| *s == ci) {
+                                        new[ci] = now_value(c, a)?;
+                                    }
+                                }
                             }
                             if new == old {
                                 if found_rows {

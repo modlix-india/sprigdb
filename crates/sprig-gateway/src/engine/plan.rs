@@ -70,6 +70,11 @@ pub(crate) trait Names {
     fn referencing(&self, _db: DbId, _name: &str) -> Vec<(Arc<TableDef>, usize)> {
         Vec::new()
     }
+    /// The MongoDB collection `name` of the MongoDB database of `db`'s
+    /// name, read as a table (`engine::collection`), if any.
+    fn collection(&self, _db: DbId, _name: &str) -> Option<Arc<super::collection::CollTable>> {
+        None
+    }
 }
 
 /// [`Names`] over a catalog snapshot.
@@ -123,6 +128,17 @@ impl Names for CatalogNames<'_> {
     }
     fn sequence(&self, db: DbId, name: &str) -> Option<Arc<super::sequence::SeqEntry>> {
         self.eng.sequence(db, name, self.lower_case).cloned()
+    }
+    fn collection(&self, db: DbId, name: &str) -> Option<Arc<super::collection::CollTable>> {
+        let eng = crate::node_engine::engine().ok()?;
+        super::collection::find(
+            &eng,
+            self.cat.tenant.0,
+            db,
+            &self.db_name(db),
+            name,
+            self.lower_case,
+        )
     }
     fn referencing(&self, db: DbId, name: &str) -> Vec<(Arc<TableDef>, usize)> {
         if self.eng.refs.is_empty() {
@@ -362,6 +378,13 @@ pub(crate) fn resolve(cx: &BindCtx<'_>, name: &ObjectName) -> Result<Resolved> {
         if cx.names.other_relation(db, table) {
             return Err(not_on_engine("a view or another relation kind"));
         }
+        // A collection is read by the planner's path (a `SELECT`); every
+        // other statement on one is refused.
+        if cx.names.collection(db, table).is_some() {
+            return Err(not_on_engine(
+                "this statement on a MongoDB collection (collections are read-only from SQL)",
+            ));
+        }
         return Err(SprigError::standard(
             1146,
             *b"42S02",
@@ -396,7 +419,12 @@ pub(crate) fn names_engine_table(cx: &BindCtx<'_>, stmt: &Statement) -> bool {
             _ => return ControlFlow::Continue(()),
         };
         match db.filter(|d| cx.names.engine_db(*d)) {
-            Some(db) if cx.names.table(db, table).is_some() => ControlFlow::Break(()),
+            Some(db)
+                if cx.names.table(db, table).is_some()
+                    || cx.names.collection(db, table).is_some() =>
+            {
+                ControlFlow::Break(())
+            }
             _ => ControlFlow::Continue(()),
         }
     })
@@ -990,6 +1018,11 @@ fn check_plain_select(s: &Select) -> Result<()> {
         || s.prewhere.is_some()
         || !s.sort_by.is_empty()
         || !s.named_window.is_empty()
+        // `SQL_CALC_FOUND_ROWS` counts past the `LIMIT`: the planner's.
+        || s
+            .select_modifiers
+            .as_ref()
+            .is_some_and(|m| m.sql_calc_found_rows)
     {
         return Err(not_on_engine("this SELECT form"));
     }
@@ -1059,8 +1092,15 @@ fn dup_key_sets(
         let mut e = a.value.clone();
         let mut bad = false;
         let _ = visit_expressions_mut(&mut e, |x| {
+            // `VALUE(c)`: MariaDB's name, and what the MySQL port's row
+            // alias (`new.c`) arrives as; not the deprecated spelling.
+            let fname = match x {
+                Expr::Function(f) => f.name.to_string(),
+                _ => String::new(),
+            };
+            let value = fname.eq_ignore_ascii_case("VALUE");
             if let Expr::Function(f) = x
-                && f.name.to_string().eq_ignore_ascii_case("VALUES")
+                && (value || fname.eq_ignore_ascii_case("VALUES"))
             {
                 let arg = match &f.args {
                     sqlparser::ast::FunctionArguments::List(l) if l.args.len() == 1 => {
@@ -1078,7 +1118,9 @@ fn dup_key_sets(
                 };
                 match arg {
                     Some(col) => {
-                        uses += 1;
+                        if !value {
+                            uses += 1;
+                        }
                         *x = Expr::Identifier(Ident::new(format!("\u{1}{col}")));
                     }
                     None => bad = true,
@@ -1089,11 +1131,206 @@ fn dup_key_sets(
         if bad {
             return Err(not_on_engine("this use of VALUES()"));
         }
-        let x = c.compile(&e)?;
+        let x = match c.compile(&e) {
+            Ok(x) => x,
+            // What the single-table compiler doesn't have (a function
+            // call): the expression engine's, over the old and new rows.
+            Err(err) if err.code() == Some(sprig_common::SprigCode::NotOnEngine) => {
+                super::table::row_expr(&wide, &e).map_err(|_| err)?
+            }
+            Err(err) => return Err(err),
+        };
         super::expr::now_into(&x, &def.columns[ci])?;
         out.push((ci, x));
     }
     Ok((out, c.params, uses))
+}
+
+/// MySQL's row alias (`INSERT ... VALUES (...) AS new [(m, ...)] ON
+/// DUPLICATE KEY UPDATE c = new.c`): `ON DUPLICATE KEY UPDATE`'s
+/// assignments with each reference to the new row (`new.c`, or a column
+/// alias `m` written alone) made `new_row(column)`. `cols`: the column of
+/// each value the statement gives. `None` without an alias or without
+/// `ON DUPLICATE KEY UPDATE`.
+///
+/// # Errors
+/// MySQL's: 1066 (the alias is the table's name), 1353 (not one column
+/// alias per value), 1054 (`new.x` of a column the new row hasn't), 1052
+/// (a name written alone that both the table and the new row have).
+#[allow(clippy::too_many_lines)] // the alias checks, then one walk per assignment
+pub(crate) fn row_alias_sets(
+    def: &TableDef,
+    ins: &sqlparser::ast::Insert,
+    cols: &[usize],
+    new_row: &dyn Fn(usize) -> Expr,
+) -> Result<Option<Vec<sqlparser::ast::Assignment>>> {
+    use sqlparser::ast::visit_expressions_mut;
+    use std::ops::ControlFlow;
+    let Some(al) = &ins.insert_alias else {
+        return Ok(None);
+    };
+    let [ObjectNamePart::Identifier(alias)] = al.row_alias.0.as_slice() else {
+        return Err(not_on_engine("this row alias"));
+    };
+    let alias = alias.value.as_str();
+    let written = match &ins.table {
+        TableObject::TableName(n) => ident_parts(n).and_then(|p| p.last().map(|i| i.value.clone())),
+        _ => None,
+    };
+    if alias == def.name || written.as_deref() == Some(alias) {
+        return Err(SprigError::standard(
+            1066,
+            *b"42000",
+            format!("Not unique table/alias: '{alias}'"),
+        ));
+    }
+    // The new row's columns, by the names the statement gives them.
+    let names: Vec<(String, usize)> = match &al.col_aliases {
+        Some(v) if !v.is_empty() => {
+            if v.len() != cols.len() {
+                return Err(SprigError::standard(
+                    1353,
+                    *b"HY000",
+                    "In definition of view, derived table or common table expression, SELECT \
+                     list and column names list have different column counts",
+                ));
+            }
+            v.iter()
+                .zip(cols)
+                .map(|(i, &c)| (i.value.clone(), c))
+                .collect()
+        }
+        _ => cols
+            .iter()
+            .map(|&c| (def.columns[c].name.clone(), c))
+            .collect(),
+    };
+    let find = |n: &str| {
+        names
+            .iter()
+            .find(|(x, _)| x.eq_ignore_ascii_case(n))
+            .map(|(_, c)| *c)
+    };
+    let Some(sqlparser::ast::OnInsert::DuplicateKeyUpdate(sets)) = &ins.on else {
+        return Ok(None);
+    };
+    let mut out = sets.clone();
+    for a in &mut out {
+        // `VALUES(c)` keeps reading the table's column names: set aside
+        // first, put back after.
+        let mut kept: Vec<Expr> = Vec::new();
+        let _ = visit_expressions_mut(&mut a.value, |x| {
+            if let Expr::Function(f) = x
+                && f.name.to_string().eq_ignore_ascii_case("VALUES")
+            {
+                let mark = Expr::Identifier(Ident::new(format!("\u{2}{}", kept.len())));
+                kept.push(std::mem::replace(x, mark));
+            }
+            ControlFlow::<()>::Continue(())
+        });
+        let mut err = None;
+        let _ = visit_expressions_mut(&mut a.value, |x| {
+            match x {
+                Expr::Identifier(i) if !i.value.starts_with('\u{2}') => {
+                    if let Some(c) = find(&i.value) {
+                        if def.column(&i.value).is_some() {
+                            err = Some(SprigError::standard(
+                                1052,
+                                *b"23000",
+                                format!("Column '{}' in field list is ambiguous", i.value),
+                            ));
+                            return ControlFlow::Break(());
+                        }
+                        *x = new_row(c);
+                    }
+                }
+                Expr::CompoundIdentifier(v)
+                    if v.len() == 2 && v[0].value.eq_ignore_ascii_case(alias) =>
+                {
+                    // Aliases compare case-sensitively: `N.a` after `AS n`
+                    // names no table.
+                    if v[0].value != alias {
+                        err = Some(SprigError::standard(
+                            1054,
+                            *b"42S22",
+                            format!(
+                                "Unknown column '{}.{}' in 'field list'",
+                                v[0].value, v[1].value
+                            ),
+                        ));
+                        return ControlFlow::Break(());
+                    }
+                    let Some(c) = find(&v[1].value) else {
+                        err = Some(SprigError::standard(
+                            1054,
+                            *b"42S22",
+                            format!("Unknown column '{alias}.{}' in 'field list'", v[1].value),
+                        ));
+                        return ControlFlow::Break(());
+                    };
+                    *x = new_row(c);
+                }
+                _ => {}
+            }
+            ControlFlow::Continue(())
+        });
+        if let Some(e) = err {
+            return Err(e);
+        }
+        if !kept.is_empty() {
+            let _ = visit_expressions_mut(&mut a.value, |x| {
+                if let Expr::Identifier(i) = x
+                    && let Some(k) = i.value.strip_prefix('\u{2}')
+                    && let Ok(k) = k.parse::<usize>()
+                    && let Some(e) = kept.get(k)
+                {
+                    *x = e.clone();
+                }
+                ControlFlow::<()>::Continue(())
+            });
+        }
+    }
+    Ok(Some(out))
+}
+
+/// MySQL's errors for an `INSERT`'s row alias (see [`row_alias_sets`]),
+/// checked on the client's text: the MySQL port hands the engine the
+/// statement with the alias already written as `VALUE(c)`.
+///
+/// # Errors
+/// As [`row_alias_sets`].
+pub(crate) fn check_row_alias(cx: &BindCtx<'_>, ins: &sqlparser::ast::Insert) -> Result<()> {
+    if ins.insert_alias.is_none() {
+        return Ok(());
+    }
+    let TableObject::TableName(name) = &ins.table else {
+        return Ok(());
+    };
+    let Resolved::Engine(def, _) = resolve(cx, name)? else {
+        return Ok(());
+    };
+    let listed: Vec<&ObjectName> = if ins.assignments.is_empty() {
+        ins.columns.iter().collect()
+    } else {
+        ins.assignments
+            .iter()
+            .filter_map(|a| match &a.target {
+                sqlparser::ast::AssignmentTarget::ColumnName(n) => Some(n),
+                sqlparser::ast::AssignmentTarget::Tuple(_) => None,
+            })
+            .collect()
+    };
+    let cols: Vec<usize> = if listed.is_empty() {
+        (0..def.columns.len())
+            .filter(|&i| !def.columns[i].invisible)
+            .collect()
+    } else {
+        listed
+            .iter()
+            .filter_map(|n| ident_parts(n)?.last().and_then(|i| def.column(&i.value)))
+            .collect()
+    };
+    row_alias_sets(&def, ins, &cols, &|_| Expr::Value(SqlValue::Null.into())).map(|_| ())
 }
 
 /// Whether `ins` is `INSERT ... SELECT` (a query as its rows).
@@ -1142,11 +1379,7 @@ fn bind_insert(
         }
         Resolved::Engine(def, db) => (def, db),
     };
-    if ins.returning.is_some()
-        || ins.partitioned.is_some()
-        || ins.insert_alias.is_some()
-        || (ins.ignore && ins.on.is_some())
-    {
+    if ins.returning.is_some() || ins.partitioned.is_some() || (ins.ignore && ins.on.is_some()) {
         return Err(not_on_engine("this INSERT form"));
     }
     let dup_sets = match &ins.on {
@@ -1261,6 +1494,14 @@ fn bind_insert(
     for &ci in &cols {
         written[ci] = true;
     }
+    // MySQL's row alias: its references made the new row's columns.
+    let aliased = row_alias_sets(&def, ins, &cols, &|ci| {
+        Expr::Identifier(Ident::new(format!("\u{1}{}", def.columns[ci].name)))
+    })?;
+    let dup_sets = match &aliased {
+        Some(sets) => Some(sets),
+        None => dup_sets,
+    };
     let on_dup = match dup_sets {
         Some(sets) => {
             let (sets, params, uses) = dup_key_sets(cx, &def, name, sets, c.params)?;

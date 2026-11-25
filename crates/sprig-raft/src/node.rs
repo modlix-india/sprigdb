@@ -294,6 +294,47 @@ struct Inbox {
     created: Vec<Slot<Result<(), RaftError>>>,
 }
 
+/// One log write handed to the log writer thread.
+struct LogJob {
+    seq: u64,
+    batch: WriteBatch,
+    sync: bool,
+}
+
+/// A log write the writer thread hasn't finished, and what waits on it:
+/// the readies to mark persisted, the messages that may leave only once
+/// it is durable, and groups whose creation it makes durable.
+struct InFlight {
+    seq: u64,
+    done: Vec<Collected>,
+    out: BTreeMap<NodeId, Vec<Item>>,
+    created: Vec<Slot<Result<(), RaftError>>>,
+}
+
+#[derive(Default)]
+struct WriterState {
+    /// The last job written (and synced, if any job in its group asked).
+    persisted: u64,
+    failed: Option<RaftError>,
+}
+
+/// Log writes on a thread of their own ([`RaftConfig::log_writer_thread`]):
+/// the loop hands each pass's batch over and goes on stepping groups while
+/// the write and sync run; jobs queued meanwhile go out together, with one
+/// sync.
+#[derive(Default)]
+struct Writer {
+    tx: Mutex<Option<std::sync::mpsc::Sender<LogJob>>>,
+    /// Joined by the driver thread when it stops, so nothing is written
+    /// after it returned.
+    thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// The last job handed over.
+    next: AtomicU64,
+    state: Mutex<WriterState>,
+    cv: Condvar,
+    in_flight: Mutex<VecDeque<InFlight>>,
+}
+
 struct Inner {
     id: NodeId,
     cfg: RaftConfig,
@@ -315,6 +356,7 @@ struct Inner {
     next_ctx: AtomicU64,
     peers: Mutex<BTreeMap<NodeId, Peer>>,
     counters: Counters,
+    writer: Writer,
 }
 
 /// A node hosting Raft groups. Clones share the node.
@@ -337,6 +379,8 @@ struct Collected {
     number: u64,
     committed: Vec<Entry>,
     snapshot_index: Option<u64>,
+    /// The group was removed from this node while applying.
+    removed: bool,
 }
 
 fn is_conf(e: &Entry) -> bool {
@@ -416,6 +460,7 @@ impl Node {
             next_ctx: AtomicU64::new(1),
             peers: Mutex::new(BTreeMap::new()),
             counters: Counters::default(),
+            writer: Writer::default(),
         });
         let node = Node { inner };
         for rg in node.inner.store.recover()? {
@@ -1112,6 +1157,15 @@ impl Node {
         for s in ib.created.drain(..) {
             s.set(Err(RaftError::Closed));
         }
+        drop(ib);
+        // The writer thread finishes what it was handed, then exits.
+        drop(lock(&self.inner.writer.tx).take());
+        for f in lock(&self.inner.writer.in_flight).drain(..) {
+            for s in f.created {
+                s.set(Err(RaftError::Closed));
+            }
+        }
+        self.inner.writer.cv.notify_all();
     }
 
     /// Runs the driver on a thread of its own (with its own current-thread
@@ -1120,6 +1174,9 @@ impl Node {
     /// # Errors
     /// The thread could not be started.
     pub fn spawn(&self) -> std::io::Result<std::thread::JoinHandle<()>> {
+        if self.inner.cfg.log_writer_thread {
+            self.start_writer()?;
+        }
         let node = self.clone();
         std::thread::Builder::new()
             .name(format!("sprig-raft-{}", self.inner.id))
@@ -1134,12 +1191,131 @@ impl Node {
                         node.close();
                     }
                 }
+                // The node is closed: the writer thread finishes what it
+                // was handed and exits.
+                let writer = lock(&node.inner.writer.thread).take();
+                if let Some(t) = writer {
+                    let _ = t.join();
+                }
             })
     }
 
     fn has_work(&self) -> bool {
-        let ib = lock(&self.inner.inbox);
-        !ib.frames.is_empty() || !ib.dirty.is_empty() || !ib.writes.is_empty()
+        let work = {
+            let ib = lock(&self.inner.inbox);
+            !ib.frames.is_empty() || !ib.dirty.is_empty() || !ib.writes.is_empty()
+        };
+        work || self.persisted_waiting()
+    }
+
+    /// Starts the log writer thread ([`RaftConfig::log_writer_thread`]).
+    fn start_writer(&self) -> std::io::Result<()> {
+        let (tx, rx) = std::sync::mpsc::channel::<LogJob>();
+        let node = self.clone();
+        let t = std::thread::Builder::new()
+            .name(format!("sprig-raft-log-{}", self.inner.id))
+            .spawn(move || node.write_loop(&rx))?;
+        *lock(&self.inner.writer.tx) = Some(tx);
+        *lock(&self.inner.writer.thread) = Some(t);
+        Ok(())
+    }
+
+    /// The log writer thread: writes jobs in order; jobs that queued up
+    /// while the last write ran go out together, synced once.
+    fn write_loop(&self, rx: &std::sync::mpsc::Receiver<LogJob>) {
+        while let Ok(first) = rx.recv() {
+            let mut jobs = vec![first];
+            while let Ok(j) = rx.try_recv() {
+                jobs.push(j);
+            }
+            let sync = jobs.iter().any(|j| j.sync);
+            let n = jobs.len();
+            let mut res = Ok(());
+            for (i, j) in jobs.iter().enumerate() {
+                res = self.inner.store.write(&j.batch, sync && i + 1 == n);
+                if res.is_err() {
+                    break;
+                }
+                bump(&self.inner.counters.writes, 1);
+            }
+            if sync && res.is_ok() {
+                bump(&self.inner.counters.syncs, 1);
+            }
+            let failed = res.is_err();
+            {
+                let mut st = lock(&self.inner.writer.state);
+                match res {
+                    Ok(()) => st.persisted = jobs[n - 1].seq,
+                    Err(e) => st.failed = Some(e),
+                }
+            }
+            self.inner.writer.cv.notify_all();
+            self.inner.wake.notify_one();
+            if failed {
+                return;
+            }
+        }
+    }
+
+    /// Whether a write handed to the writer thread is done and waits for
+    /// the loop.
+    fn persisted_waiting(&self) -> bool {
+        let st = lock(&self.inner.writer.state);
+        st.failed.is_some()
+            || lock(&self.inner.writer.in_flight)
+                .front()
+                .is_some_and(|f| f.seq <= st.persisted)
+    }
+
+    /// Blocks until the writer thread wrote job `seq` (or failed, or the
+    /// node closed).
+    fn wait_persisted(&self, seq: u64) {
+        let mut st = lock(&self.inner.writer.state);
+        while st.persisted < seq && st.failed.is_none() && !self.is_closed() {
+            st = self
+                .inner
+                .writer
+                .cv
+                .wait_timeout(st, Duration::from_millis(100))
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+    }
+
+    /// Step 4 for the writes the writer thread finished: groups created,
+    /// messages that waited for durability sent, readies marked persisted.
+    fn take_persisted(
+        &self,
+        now: Instant,
+        writes: &mut Vec<GroupWrite>,
+        dirty: &mut BTreeSet<GroupId>,
+    ) -> Result<(), RaftError> {
+        let persisted = {
+            let st = lock(&self.inner.writer.state);
+            if let Some(e) = &st.failed {
+                return Err(e.clone());
+            }
+            st.persisted
+        };
+        loop {
+            let f = {
+                let mut q = lock(&self.inner.writer.in_flight);
+                if q.front().is_some_and(|f| f.seq <= persisted) {
+                    q.pop_front()
+                } else {
+                    None
+                }
+            };
+            let Some(mut f) = f else { break };
+            for s in f.created.drain(..) {
+                s.set(Ok(()));
+            }
+            self.flush(&mut f.out, &mut BTreeMap::new(), now);
+            for c in f.done {
+                self.finish(c, writes, dirty)?;
+            }
+        }
+        Ok(())
     }
 
     /// The driver loop. Returns after [`Node::close`].
@@ -1186,35 +1362,40 @@ impl Node {
 
     async fn turn(&self, now: Instant, ticks: u32, live: bool) -> Result<(), RaftError> {
         bump(&self.inner.counters.turns, 1);
-        let (frames, mut dirty, mut writes, mut created) = {
-            let mut ib = lock(&self.inner.inbox);
-            (
-                std::mem::take(&mut ib.frames),
-                std::mem::take(&mut ib.dirty),
-                std::mem::take(&mut ib.writes),
-                std::mem::take(&mut ib.created),
-            )
-        };
+        let Inbox {
+            frames,
+            mut dirty,
+            mut writes,
+            mut created,
+        } = std::mem::take(&mut *lock(&self.inner.inbox));
         let mut out: BTreeMap<NodeId, Vec<Item>> = BTreeMap::new();
         let mut early: BTreeMap<NodeId, Vec<Item>> = BTreeMap::new();
         let mut ctrl: BTreeMap<NodeId, Vec<Item>> = BTreeMap::new();
+        let threaded = lock(&self.inner.writer.tx).is_some();
+        if threaded {
+            self.take_persisted(now, &mut writes, &mut dirty)?;
+        }
         bump(&self.inner.counters.frames_received, frames.len() as u64);
         for f in &frames {
             self.on_frame(f, now, &mut dirty, &mut out);
         }
+        // Groups the frames created: their first state goes in this turn's
+        // batch, ahead of anything the frames made them write.
         {
-            // Groups the frames created: their first state goes in this
-            // turn's batch, ahead of anything the frames made them write.
             let mut ib = lock(&self.inner.inbox);
             writes.append(&mut ib.writes);
             created.append(&mut ib.created);
-            dirty.extend(std::mem::take(&mut ib.dirty));
+            dirty.append(&mut ib.dirty);
         }
         if live {
             self.check_liveness(now, &mut dirty);
         }
         if ticks > 0 {
             self.tick_groups(ticks, &mut dirty, &mut ctrl);
+        }
+        if threaded {
+            // What the frames answered doesn't wait for a log write.
+            self.flush(&mut out, &mut BTreeMap::new(), now);
         }
         for _ in 0..8 {
             if dirty.is_empty() && writes.is_empty() {
@@ -1235,21 +1416,35 @@ impl Node {
             }
             // The leader's appends go out while its own sync runs.
             self.flush(&mut early, &mut BTreeMap::new(), now);
-            if !batch.is_empty() {
-                if need_sync {
-                    // A slow disk (simulation): a crash meanwhile loses
-                    // the batch, and nothing waiting on it was answered.
-                    let d = self.inner.store.sync_delay();
-                    if !d.is_zero() {
-                        tokio::time::sleep(d).await;
-                    }
-                    if self.is_closed() {
-                        return Ok(());
-                    }
-                    bump(&self.inner.counters.syncs, 1);
+            // Committed entries are applied (and their proposers answered)
+            // before this pass's write: a ready's committed entries are
+            // already durable here (raft-rs hands out only those at or
+            // below the persisted index), so they need not wait a sync for
+            // entries that came after them. A snapshot's group keeps the
+            // old order: everything after its write.
+            for c in &mut done {
+                if c.snapshot_index.is_none() {
+                    self.apply_committed(c, &mut writes)?;
                 }
-                self.inner.store.write(&batch, need_sync)?;
-                bump(&self.inner.counters.writes, 1);
+            }
+            if threaded {
+                self.hand_over(
+                    now,
+                    batch,
+                    need_sync,
+                    done,
+                    &mut out,
+                    &mut created,
+                    &mut writes,
+                    &mut dirty,
+                )?;
+                self.flush(&mut BTreeMap::new(), &mut ctrl, now);
+                // The next pass starts when the write is done (or new
+                // work arrives): the loop doesn't wait for the sync.
+                break;
+            }
+            if !self.write_on_loop(&batch, need_sync).await? {
+                return Ok(());
             }
             for s in created.drain(..) {
                 s.set(Ok(()));
@@ -1272,6 +1467,75 @@ impl Node {
             p.acks.clear();
         }
         Ok(())
+    }
+
+    /// Step 3 on the loop itself: writes the batch, synced if asked.
+    /// False when the node closed during a simulated slow sync.
+    async fn write_on_loop(&self, batch: &WriteBatch, need_sync: bool) -> Result<bool, RaftError> {
+        if batch.is_empty() {
+            return Ok(true);
+        }
+        if need_sync {
+            // A slow disk (simulation): a crash meanwhile loses the batch,
+            // and nothing waiting on it was answered.
+            let d = self.inner.store.sync_delay();
+            if !d.is_zero() {
+                tokio::time::sleep(d).await;
+            }
+            if self.is_closed() {
+                return Ok(false);
+            }
+            bump(&self.inner.counters.syncs, 1);
+        }
+        self.inner.store.write(batch, need_sync)?;
+        bump(&self.inner.counters.writes, 1);
+        Ok(true)
+    }
+
+    /// Hands a pass's write to the writer thread. Readies whose writes are
+    /// all done (nothing to write, nothing in flight) finish at once. A
+    /// snapshot's group applies only after its write, as on the loop.
+    #[allow(clippy::too_many_arguments)]
+    fn hand_over(
+        &self,
+        now: Instant,
+        batch: WriteBatch,
+        need_sync: bool,
+        done: Vec<Collected>,
+        out: &mut BTreeMap<NodeId, Vec<Item>>,
+        created: &mut Vec<Slot<Result<(), RaftError>>>,
+        writes: &mut Vec<GroupWrite>,
+        dirty: &mut BTreeSet<GroupId>,
+    ) -> Result<(), RaftError> {
+        let w = &self.inner.writer;
+        let snapshot = done.iter().any(|c| c.snapshot_index.is_some());
+        let seq = if batch.is_empty() {
+            w.next.load(Ordering::Acquire)
+        } else {
+            let seq = w.next.fetch_add(1, Ordering::AcqRel) + 1;
+            let sent = lock(&w.tx).as_ref().is_some_and(|tx| {
+                tx.send(LogJob {
+                    seq,
+                    batch,
+                    sync: need_sync,
+                })
+                .is_ok()
+            });
+            if !sent {
+                return Err(RaftError::Closed);
+            }
+            seq
+        };
+        lock(&w.in_flight).push_back(InFlight {
+            seq,
+            done,
+            out: std::mem::take(out),
+            created: std::mem::take(created),
+        });
+        if snapshot {
+            self.wait_persisted(seq);
+        }
+        self.take_persisted(now, writes, dirty)
     }
 
     fn on_frame(
@@ -1774,27 +2038,54 @@ impl Node {
             number,
             committed,
             snapshot_index,
+            removed: false,
         })
     }
 
-    /// Step 4 for one group.
+    /// Step 4 for one group: after the write, the ready is persisted; a
+    /// snapshot's group applies its committed entries only now.
     fn finish(
         &self,
-        c: Collected,
+        mut c: Collected,
         writes: &mut Vec<GroupWrite>,
         dirty: &mut BTreeSet<GroupId>,
     ) -> Result<(), RaftError> {
+        if c.snapshot_index.is_some() {
+            {
+                let mut g = lock(&c.cell.g);
+                g.raw.on_persist_ready(c.number);
+                if let Some(i) = c.snapshot_index
+                    && g.raw.raft.raft_log.applied < i
+                {
+                    g.raw.advance_apply_to(i);
+                }
+            }
+            self.apply_committed(&mut c, writes)?;
+        } else if !c.removed {
+            lock(&c.cell.g).raw.on_persist_ready(c.number);
+        }
+        if c.removed {
+            return Ok(());
+        }
+        let g = lock(&c.cell.g);
+        if g.raw.has_ready() {
+            dirty.insert(g.id);
+        }
+        Ok(())
+    }
+
+    /// Applies a ready's committed entries (they are durable here), answers
+    /// reads waiting on them and handles this replica's removal.
+    fn apply_committed(
+        &self,
+        c: &mut Collected,
+        writes: &mut Vec<GroupWrite>,
+    ) -> Result<(), RaftError> {
         let mut g = lock(&c.cell.g);
         let gid = g.id;
-        g.raw.on_persist_ready(c.number);
-        if let Some(i) = c.snapshot_index
-            && g.raw.raft.raft_log.applied < i
-        {
-            g.raw.advance_apply_to(i);
-        }
         let mut run: Vec<Entry> = Vec::new();
         let mut removed = None;
-        for e in c.committed {
+        for e in std::mem::take(&mut c.committed) {
             if e.index <= g.applied {
                 continue;
             }
@@ -1861,6 +2152,7 @@ impl Node {
                 ..GroupWrite::default()
             });
             c.cell.progress.close();
+            c.removed = true;
             return Ok(());
         }
         // Volatile state machines: keep a snapshot in the log and trim it.
@@ -1878,9 +2170,6 @@ impl Node {
         if g.raw.store().take_wanted() {
             let snap = make_snapshot(&g)?;
             g.raw.mut_store().set_cached(snap);
-        }
-        if g.raw.has_ready() {
-            dirty.insert(gid);
         }
         Ok(())
     }

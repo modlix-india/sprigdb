@@ -293,7 +293,7 @@ impl PassSession {
         let td = parsed.as_ref().as_ref().ok()?;
         let text = eng.texts.get(&td.object)?;
         let def = match define::parse_stored(text) {
-            Ok(d) => d,
+            Ok(d) => show::visible(d, show_auto_indexes(ts, self.persona)),
             Err(e) => return Some(Err(e)),
         };
         let e = match engine::engine() {
@@ -323,6 +323,16 @@ impl PassSession {
             },
         })
     }
+}
+
+/// Whether the session shows automatic indexes in metadata
+/// (`@sprig_show_auto_indexes = 1`, or `@sprig_show_internal`).
+fn show_auto_indexes(
+    ts: &crate::tenant::session::TenantSession,
+    persona: sprig_proto_mysql::packets::Persona,
+) -> bool {
+    let v = ts.visibility(persona);
+    v.auto_indexes || v.internal
 }
 
 /// `SHOW [FULL] TABLES` and `SHOW CREATE TABLE` as MySQL 8.4 describes
@@ -750,18 +760,122 @@ impl PassSession {
                 counters.insert(td.object.0, n);
             }
         }
+        let logic = if text.to_ascii_lowercase().contains("routines")
+            || text.to_ascii_lowercase().contains("parameters")
+        {
+            logic_routines(ts).await
+        } else {
+            Vec::new()
+        };
         let src = crate::engine::infoschema::Source {
             eng,
             tenant: ts.tenant.0,
             counters: &counters,
+            logic: &logic,
+            show_auto_indexes: show_auto_indexes(ts, self.persona),
         };
         let mysql = self.persona == sprig_proto_mysql::packets::Persona::MySql84;
         crate::engine::infoschema::answer(text, &src, mysql).map(Ok)
     }
 }
 
+/// `secs` since the Unix epoch as `YYYY-MM-DD hh:mm:ss` (UTC).
+fn utc_text(secs: u64) -> String {
+    let days = i64::try_from(secs / 86_400).unwrap_or(0);
+    let rest = secs % 86_400;
+    // Days to a civil date (proleptic Gregorian).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!(
+        "{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02}",
+        rest / 3600,
+        rest / 60 % 60,
+        rest % 60
+    )
+}
+
+/// The tenant's live logic functions and procedures (engine-tier code,
+/// `CREATE FUNCTION ... LANGUAGE kirun | javascript | lua`), as
+/// `information_schema.ROUTINES` lists them; none when the logic catalog
+/// can't be read.
+async fn logic_routines(
+    ts: &crate::tenant::session::TenantSession,
+) -> Vec<crate::engine::infoschema::LogicRoutine> {
+    use crate::engine::infoschema::{LogicRoutine, logic_sql_type};
+    let svc = Arc::clone(ts.services());
+    let Ok(mut conn) = svc.records.begin(ts.tenant).await else {
+        return Vec::new();
+    };
+    let store = sprig_logic::LogicStore::default();
+    let Ok(modules) = store.modules(&mut *conn, None).await else {
+        return Vec::new();
+    };
+    let created = store.created_times(&mut *conn).await.unwrap_or_default();
+    let mut out = Vec::new();
+    for m in modules {
+        let function = match m.kind.as_str() {
+            "function" => true,
+            "procedure" => false,
+            _ => continue,
+        };
+        if m.state != "active" || m.runtime == "sql" {
+            continue;
+        }
+        let Some(v) = m.active_version else { continue };
+        let Ok((sig, _)) = store.version_signature(&mut *conn, m.module_id, v).await else {
+            continue;
+        };
+        let params = sig["params"]
+            .as_array()
+            .map(|ps| {
+                ps.iter()
+                    .map(|p| {
+                        let name = p["name"].as_str().unwrap_or_default().to_owned();
+                        let ty = p["sql"].as_str().map_or_else(
+                            || logic_sql_type(p["type"].as_str().unwrap_or_default()).to_owned(),
+                            str::to_owned,
+                        );
+                        (name, ty)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let definer = ts
+            .auth()
+            .and_then(|a| a.user(sprig_common::ids::UserId(m.created_by)).cloned())
+            .map_or_else(String::new, |u| format!("{}@{}", u.row.name, u.row.host));
+        out.push(LogicRoutine {
+            db: sprig_common::ids::DbId(m.db_id),
+            name: m.name,
+            function,
+            runtime: m.runtime,
+            invoker: m.security == "invoker",
+            deterministic: sig["deterministic"].as_bool().unwrap_or(false),
+            params,
+            returns: sig["returns"].as_str().map(str::to_owned),
+            definer,
+            created: utc_text(created.get(&m.module_id).copied().unwrap_or(0) / 1000),
+        });
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn creation_times_print_in_utc() {
+        assert_eq!(super::utc_text(0), "1970-01-01 00:00:00");
+        assert_eq!(super::utc_text(1_795_550_501), "2026-11-24 20:01:41");
+        assert_eq!(super::utc_text(951_782_400), "2000-02-29 00:00:00");
+    }
+
     use bytes::Bytes;
     use futures::StreamExt;
     use sprig_proto_mysql::packets::Persona;

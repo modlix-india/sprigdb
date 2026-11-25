@@ -46,6 +46,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, Weak};
 use std::time::Duration;
 
@@ -62,6 +63,8 @@ pub use self::part::PartKey as Key;
 /// The engine's name for this log's floor.
 pub const FLOOR: &str = "streams";
 const MANIFEST: &str = "manifest.json";
+/// How often the writer moves pending segment batches into their files.
+const WRITE_EVERY: Duration = Duration::from_millis(20);
 
 /// Settings.
 #[derive(Debug, Clone)]
@@ -255,6 +258,10 @@ struct Inner {
     results: Mutex<Results>,
     changed: tokio::sync::watch::Sender<u64>,
     flushing: Mutex<()>,
+    /// One background write pass at a time.
+    writing: Mutex<()>,
+    /// Appends happened since the last write pass began.
+    unwritten: AtomicBool,
     policies: Mutex<HashMap<(u64, u64), Policy>>,
 }
 
@@ -464,7 +471,12 @@ impl Inner {
             let mut metas = Vec::with_capacity(parts.len());
             let mut segs: Vec<(Arc<fs::File>, u64)> = Vec::new();
             for (k, p) in parts {
-                let st = p.lock();
+                let mut st = p.lock();
+                // The snapshot reads the files: pending batches go in first.
+                for s in &mut st.segments {
+                    s.write_out()
+                        .map_err(|e| io_err("snapshot: write segment", &e))?;
+                }
                 metas.push(meta_of(k, &st));
                 // An open handle reads what the segment held now, even if a
                 // compaction or retention replaces or removes the file.
@@ -751,6 +763,7 @@ impl Inner {
         });
         if appended {
             lock(&self.results).extend(outs);
+            self.unwritten.store(true, Ordering::Release);
         }
         a.applied.insert(unit, done.max(last.index));
         drop(a);
@@ -875,6 +888,8 @@ impl SegLog {
             results: Mutex::new(Results::new(RESULTS_KEPT)),
             changed: tx,
             flushing: Mutex::new(()),
+            writing: Mutex::new(()),
+            unwritten: AtomicBool::new(false),
             policies: Mutex::new(HashMap::new()),
         });
         // Where each unit's catch-up starts: the manifest's floors, raised
@@ -1492,6 +1507,9 @@ impl SegLog {
     /// A sync or the manifest write failed.
     #[allow(clippy::too_many_lines)]
     pub fn flush(&self) -> Result<()> {
+        // Most pending batches go out here, outside the partition locks;
+        // what was appended since is written below, under them.
+        self.write_behind();
         let _one = lock(&self.inner.flushing);
         // What this pass takes from the in-memory state, to give back if a
         // sync or the manifest write fails: the next pass must redo it, and
@@ -1530,6 +1548,17 @@ impl SegLog {
             for (k, p) in &parts {
                 let mut st = p.lock();
                 let mut synced = Vec::new();
+                // The manifest names lengths the sync below covers.
+                let wrote = st
+                    .segments
+                    .iter_mut()
+                    .try_for_each(segment::Segment::write_out);
+                if let Err(e) = wrote {
+                    drop(st);
+                    a.dirty = true;
+                    give_back(taken);
+                    return Err(io_err("write segment", &e));
+                }
                 for s in &mut st.segments {
                     if s.synced < s.len {
                         files.push(s.handle());
@@ -1594,16 +1623,7 @@ impl SegLog {
         });
         if let Err(e) = durable {
             lock(&self.inner.apply).dirty = true;
-            for (p, synced, new_files) in taken {
-                let mut st = p.lock();
-                st.dirty = true;
-                st.new_files |= new_files;
-                for (base, old) in synced {
-                    if let Some(s) = st.segments.iter_mut().find(|s| s.base == base) {
-                        s.synced = s.synced.min(old);
-                    }
-                }
-            }
+            give_back(taken);
             return Err(e);
         }
         let set: Vec<(sprig_engine::UnitId, u64)> = all_floors
@@ -1612,6 +1632,40 @@ impl SegLog {
             .collect();
         self.inner.engine.set_log_floors(FLOOR, &set)?;
         Ok(())
+    }
+
+    /// Moves pending segment batches into their files (no sync), each
+    /// segment's in one write outside its partition's lock. A failed write
+    /// is logged; the batches stay pending for the next pass or the flush.
+    pub fn write_behind(&self) {
+        let _one = lock(&self.inner.writing);
+        self.inner.unwritten.store(false, Ordering::Release);
+        let parts: Vec<Arc<Part>> = self
+            .inner
+            .parts
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .cloned()
+            .collect();
+        for p in parts {
+            let jobs: Vec<segment::PendingWrite> = p
+                .lock()
+                .segments
+                .iter()
+                .filter_map(segment::Segment::pending_write)
+                .collect();
+            for w in jobs {
+                if let Err(e) = w.write() {
+                    tracing::warn!(error = %e, "stream log: writing pending batches failed; kept for the next pass");
+                    continue;
+                }
+                let mut st = p.lock();
+                if let Some(s) = st.segments.iter_mut().find(|s| s.base == w.base) {
+                    s.written_through(w.at, w.end());
+                }
+            }
+        }
     }
 
     /// One pass of retention, compaction and producer expiry.
@@ -1672,8 +1726,24 @@ impl SegLog {
     }
 
     /// Starts the flusher and the maintenance pass on the current tokio
-    /// runtime; both end when the log is dropped.
+    /// runtime, and the writer of pending segment batches on a thread of
+    /// its own; all end when the log is dropped.
     pub fn spawn_background(&self) {
+        let w = Arc::downgrade(&self.inner);
+        let spawned = std::thread::Builder::new()
+            .name("stream-log-writer".into())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(WRITE_EVERY);
+                    let Some(inner) = w.upgrade() else { return };
+                    if inner.unwritten.load(Ordering::Acquire) {
+                        SegLog { inner }.write_behind();
+                    }
+                }
+            });
+        if let Err(e) = spawned {
+            tracing::warn!(error = %e, "stream log: no writer thread; the flusher writes pending batches");
+        }
         let w = Arc::downgrade(&self.inner);
         let every = self.inner.cfg.flush_every;
         let maintain = self.inner.cfg.maintain_every;
@@ -1698,6 +1768,21 @@ impl SegLog {
                 }
             }
         });
+    }
+}
+
+/// Gives what a failed flush took back to the partitions, for the next
+/// pass to redo.
+fn give_back(taken: Vec<(Arc<Part>, Vec<(i64, u64)>, bool)>) {
+    for (p, synced, new_files) in taken {
+        let mut st = p.lock();
+        st.dirty = true;
+        st.new_files |= new_files;
+        for (base, old) in synced {
+            if let Some(s) = st.segments.iter_mut().find(|s| s.base == base) {
+                s.synced = s.synced.min(old);
+            }
+        }
     }
 }
 

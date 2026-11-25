@@ -91,7 +91,7 @@ pub(crate) struct DepSpec {
     pub(crate) session: Session,
     pub(crate) options: PlanOptions,
     pub(crate) memory: Arc<Memory>,
-    pub(crate) ctes: Vec<Rc<ast::Cte>>,
+    pub(crate) ctes: Vec<Rc<crate::recursive::CteDef>>,
     pub(crate) parent: Option<Rc<BoundOuter>>,
 }
 

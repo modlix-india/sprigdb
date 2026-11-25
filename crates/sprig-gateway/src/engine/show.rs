@@ -184,6 +184,24 @@ pub(crate) fn with_counter(def: &Def, next: Option<u64>) -> String {
     define::render(&d)
 }
 
+/// The definition as metadata shows it: automatic indexes (`sprig_auto_*`)
+/// left out unless `show_auto` (`@sprig_show_auto_indexes = 1`), so schema
+/// tools never see them. Plans still read them; `EXPLAIN` names them.
+pub(crate) fn visible(def: Def, show_auto: bool) -> Def {
+    if show_auto
+        || !def
+            .keys
+            .iter()
+            .any(|k| sprig_common::names::is_auto_index(&k.name))
+    {
+        return def;
+    }
+    let mut d = def;
+    d.keys
+        .retain(|k| !sprig_common::names::is_auto_index(&k.name));
+    d
+}
+
 /// `KEY` of `SHOW COLUMNS`: `PRI`, `UNI`, `MUL` or empty.
 fn key_of(def: &Def, col: &str) -> &'static str {
     let first = |k: &define::Key| {
@@ -223,6 +241,25 @@ fn default_text(c: &define::Col) -> Option<String> {
             format!("current_timestamp({p})")
         }),
     }
+}
+
+/// The `SHOW CREATE TABLE` text of engine table `table` of database `db`
+/// in `cat` (without an `AUTO_INCREMENT` counter): what a child tenant
+/// adopting the table compares and copies. Automatic indexes are left out:
+/// each tenant's loop decides its own.
+pub(crate) fn stored_create(
+    cat: &sprig_catalog::TenantCatalog,
+    db: sprig_common::ids::DbId,
+    table: &str,
+) -> Option<String> {
+    let eng = super::catalog::of(cat)?;
+    let p = eng
+        .table(db, table, false)
+        .or_else(|| eng.table(db, table, true))?;
+    let td = p.as_ref().as_ref().ok()?;
+    let text = eng.texts.get(&td.object)?;
+    let def = visible(define::parse_stored(text).ok()?, false);
+    Some(with_counter(&def, None))
 }
 
 pub(crate) fn unquote(l: &str) -> String {
@@ -569,5 +606,21 @@ pub(crate) fn tables_typed(
         defs,
         rows,
         no_index: true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{define, visible, with_counter};
+
+    #[test]
+    fn automatic_indexes_are_hidden_unless_shown() {
+        let text = "CREATE TABLE `t` (\n  `id` int(11) NOT NULL,\n  `a` int(11) DEFAULT NULL,\n  `b` int(11) DEFAULT NULL,\n  PRIMARY KEY (`id`),\n  KEY `ka` (`a`),\n  KEY `SPRIG_AUTO_00c0ffee` (`b`) IGNORED\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci";
+        let def = define::parse_stored(text).expect("parses");
+        let hidden = with_counter(&visible(def.clone(), false), None);
+        assert!(!hidden.to_lowercase().contains("sprig_auto_"), "{hidden}");
+        assert!(hidden.contains("KEY `ka` (`a`)"), "{hidden}");
+        let shown = with_counter(&visible(def, true), None);
+        assert!(shown.contains("SPRIG_AUTO_00c0ffee"), "{shown}");
     }
 }

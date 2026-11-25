@@ -57,6 +57,11 @@ fn needs_reprepare() -> SprigError {
 
 /// Whether `g`'s tables are still the ones `cat` holds.
 fn current(cat: &TenantCatalog, g: &General) -> bool {
+    // A share read in process is planned again each time: the parent's
+    // definitions and the share's query aren't in `cat`.
+    if !g.views.foreign.is_empty() {
+        return false;
+    }
     if cat.version == g.catalog_version {
         return true;
     }
@@ -64,10 +69,12 @@ fn current(cat: &TenantCatalog, g: &General) -> bool {
         return false;
     };
     g.tables.iter().all(|t| {
-        matches!(
-            eng.tables.get(&t.def.object).map(AsRef::as_ref),
-            Some(Ok(d)) if d.version == t.def.version && d.indexes.len() == t.def.indexes.len()
-        )
+        // A MongoDB collection is found by name again at each run.
+        t.coll.is_some()
+            || matches!(
+                eng.tables.get(&t.def.object).map(AsRef::as_ref),
+                Some(Ok(d)) if d.version == t.def.version && d.indexes.len() == t.def.indexes.len()
+            )
     })
 }
 
@@ -98,10 +105,11 @@ impl PassSession {
             bound.extend(
                 g.tables
                     .iter()
+                    .filter(|t| t.tenant.is_none())
                     .map(|t| t.def.object)
                     .filter(|o| rls.tables.contains_key(o)),
             );
-            for t in &g.tables {
+            for t in g.tables.iter().filter(|t| t.tenant.is_none()) {
                 if rls.tables.contains_key(&t.def.object) && !ts.rls.covered.contains(&t.def.object)
                 {
                     return Err(not_on_engine(&format!(
@@ -124,8 +132,9 @@ impl PassSession {
         self.view_definer_checks(cat, g)?;
         for t in &g.tables {
             // A table only a view's definer reads is checked as that
-            // definer (above).
-            if !g.views.invoker_reads(t.def.db, &t.def.name) {
+            // definer (above); a parent's table, read through a share,
+            // is the share's to allow.
+            if t.tenant.is_some() || !g.views.invoker_reads(t.def.db, &t.def.name) {
                 continue;
             }
             let db_key = database_key(&t.db_name, ts.lower_case_table_names());
@@ -353,6 +362,7 @@ impl PassSession {
             let beyond = usize::from(rows.warnings).saturating_sub(area.len());
             self.diag_set(area, extra.max(beyond));
         }
+        self.eng.calc_found = rows.found;
         let Layout { shapes, defs } = results::layout(g, &rows.columns, sv.results);
         let mut s = status;
         if rows.no_index || results::set_operation_scans(&g.stmt) {

@@ -63,6 +63,9 @@ pub(crate) struct Env {
     pub no_fk_checks: bool,
     /// The session's `LAST_INSERT_ID()`.
     pub last_insert_id: u64,
+    /// The session's connection id (0: none), which keeps what a
+    /// statement's `LAST_INSERT_ID(expr)` sets.
+    pub conn: u64,
 }
 
 impl Env {
@@ -79,6 +82,7 @@ impl Env {
         tz: Some(0),
         no_fk_checks: false,
         last_insert_id: 0,
+        conn: 0,
     };
 
     /// The session's rules from its `sql_mode` (as the backend spells it;
@@ -97,6 +101,7 @@ impl Env {
             tz: time_zone.map_or(Some(0), zone_offset),
             no_fk_checks: false,
             last_insert_id: 0,
+            conn: 0,
         };
         if let Some(m) = sql_mode {
             let has = |f: &str| m.split(',').any(|x| x.trim().eq_ignore_ascii_case(f));

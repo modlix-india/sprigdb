@@ -217,8 +217,10 @@ pub(crate) fn column_text(name: &str, ty: &sprig_exec::ExprType, mysql: bool) ->
         F::Time => frac("time"),
         F::DateTime => frac("datetime"),
         F::Timestamp => frac("timestamp"),
+        // A JSON value (MySQL): a JSON column, which takes no collation.
+        F::Json => "json".to_owned(),
     };
-    let coll = if text {
+    let coll = if text && m.field != F::Json {
         format!(" COLLATE {}", ty.coll.name())
     } else {
         String::new()

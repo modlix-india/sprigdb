@@ -4,6 +4,8 @@
 //! m/autoindex/idx/<name>                 IndexRecord (JSON)
 //! m/autoindex/events/<µs u64><seq u32>   Event (JSON)
 //! m/autoindex/cool/<fingerprint u64>     when the pattern was last decided (µs, 8 bytes)
+//! m/autoindex/req/<name>                 OperatorRequest (JSON): pending drop, pin, unpin, restore
+//! m/autoindex/stats/<db.table>           TableStats (JSON): the generator's last figures of a table
 //! ```
 //!
 //! Each loop write is a short engine transaction of its own and never
@@ -15,7 +17,7 @@
 use sprig_catalog::records::{Pk, RecordTx, RowTable, prefix_end, scan_all};
 use sprig_common::{Result, SprigError};
 
-use super::model::{Event, IndexRecord};
+use super::model::{Event, IndexRecord, OperatorRequest, TableStats};
 use super::policy::DAY_US;
 
 /// The module name.
@@ -26,6 +28,10 @@ pub const IDX: RowTable = RowTable::new(MODULE, "idx");
 pub const EVENTS: RowTable = RowTable::new(MODULE, "events");
 /// Last decision per pattern.
 pub const COOL: RowTable = RowTable::new(MODULE, "cool");
+/// Operators' pending requests, by index name.
+pub const REQ: RowTable = RowTable::new(MODULE, "req");
+/// Tables' figures, by `db.table`.
+pub const STATS: RowTable = RowTable::new(MODULE, "stats");
 /// Days events are kept.
 pub const EVENT_RETENTION_DAYS: u64 = 30;
 
@@ -70,6 +76,63 @@ impl AutoIndexStore {
     pub async fn put_index(rec: &mut dyn RecordTx, r: &IndexRecord) -> Result<()> {
         let key = IDX.key(&Pk::new().bytes(r.name.to_lowercase().as_bytes()));
         let v = serde_json::to_vec(r).map_err(|e| SprigError::internal(e.to_string()))?;
+        rec.put(&key, &v).await
+    }
+
+    /// Every pending operator request, by index name.
+    ///
+    /// # Errors
+    /// As [`AutoIndexStore::indexes`].
+    pub async fn requests(rec: &mut dyn RecordTx) -> Result<Vec<OperatorRequest>> {
+        let lo = REQ.prefix();
+        let mut out = Vec::new();
+        for (_, v) in scan_all(rec, &lo, &prefix_end(&lo)).await? {
+            out.push(serde_json::from_slice(&v).map_err(|e| bad("req", e))?);
+        }
+        Ok(out)
+    }
+
+    /// Writes an operator request (a newer one for the same index replaces
+    /// the pending one).
+    ///
+    /// # Errors
+    /// The record store's.
+    pub async fn put_request(rec: &mut dyn RecordTx, r: &OperatorRequest) -> Result<()> {
+        let key = REQ.key(&Pk::new().bytes(r.index.to_lowercase().as_bytes()));
+        let v = serde_json::to_vec(r).map_err(|e| SprigError::internal(e.to_string()))?;
+        rec.put(&key, &v).await
+    }
+
+    /// Deletes the request for index `name`.
+    ///
+    /// # Errors
+    /// The record store's.
+    pub async fn delete_request(rec: &mut dyn RecordTx, name: &str) -> Result<()> {
+        let key = REQ.key(&Pk::new().bytes(name.to_lowercase().as_bytes()));
+        rec.delete(&key).await
+    }
+
+    /// The figures last taken of table `table_key` (`db.table`).
+    ///
+    /// # Errors
+    /// As [`AutoIndexStore::indexes`].
+    pub async fn stats(rec: &mut dyn RecordTx, table_key: &str) -> Result<Option<TableStats>> {
+        let key = STATS.key(&Pk::new().bytes(table_key.to_lowercase().as_bytes()));
+        match rec.get(&key).await? {
+            Some(v) => Ok(Some(
+                serde_json::from_slice(&v).map_err(|e| bad("stats", e))?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    /// Keeps a table's figures.
+    ///
+    /// # Errors
+    /// The record store's.
+    pub async fn put_stats(rec: &mut dyn RecordTx, st: &TableStats) -> Result<()> {
+        let key = STATS.key(&Pk::new().bytes(st.table.to_lowercase().as_bytes()));
+        let v = serde_json::to_vec(st).map_err(|e| SprigError::internal(e.to_string()))?;
         rec.put(&key, &v).await
     }
 
@@ -221,5 +284,47 @@ mod tests {
             AutoIndexStore::events(&mut *tx, 0, 10).await.unwrap().len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn requests_round_trip() {
+        use crate::autoindex::model::{Action, OperatorRequest};
+        let store = MemRecords::new();
+        let t = TenantId(5);
+        let mut tx = store.begin(t).await.unwrap();
+        let mut r = OperatorRequest {
+            index: "SPRIG_AUTO_0000000A".into(),
+            action: Action::Pin,
+            actor: "op:kiran".into(),
+            reason: String::new(),
+            at_us: 1,
+        };
+        AutoIndexStore::put_request(&mut *tx, &r).await.unwrap();
+        r.action = Action::Drop;
+        AutoIndexStore::put_request(&mut *tx, &r).await.unwrap();
+        let all = AutoIndexStore::requests(&mut *tx).await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].action, Action::Drop);
+        AutoIndexStore::delete_request(&mut *tx, "sprig_auto_0000000a")
+            .await
+            .unwrap();
+        let st = crate::autoindex::model::TableStats {
+            table: "App.T".into(),
+            version: 3,
+            rows: 10,
+            distinct: vec![("a".into(), 4.0)],
+            at_us: 9,
+        };
+        AutoIndexStore::put_stats(&mut *tx, &st).await.unwrap();
+        assert_eq!(
+            AutoIndexStore::stats(&mut *tx, "app.t").await.unwrap(),
+            Some(st)
+        );
+        assert_eq!(
+            AutoIndexStore::stats(&mut *tx, "app.u").await.unwrap(),
+            None
+        );
+        assert!(AutoIndexStore::requests(&mut *tx).await.unwrap().is_empty());
+        tx.commit().await.unwrap();
     }
 }

@@ -207,6 +207,39 @@ pub fn column_def(show_create: &str, col: &str) -> Option<String> {
         .map(|l| l.trim().trim_end_matches(',').to_owned())
 }
 
+/// Column `col`'s type (`COLUMN_TYPE`'s form, `unsigned` included) and
+/// collation (when the line names one) in a `SHOW CREATE TABLE` text: what
+/// a copy table's column takes ([`crate::copy::copy_ddl`]).
+#[must_use]
+pub fn column_type(show_create: &str, col: &str) -> Option<(String, Option<String>)> {
+    let def = column_def(show_create, col)?;
+    let (ty, _) = def_type(&def)?;
+    let mut words = def.split_whitespace();
+    let mut coll = None;
+    while let Some(w) = words.next() {
+        if w.eq_ignore_ascii_case("COLLATE") {
+            coll = words.next().map(|c| c.trim_end_matches(',').to_owned());
+        }
+    }
+    Some((ty, coll))
+}
+
+/// The table options of a `SHOW CREATE TABLE` text that set its character
+/// set and collation (`DEFAULT CHARSET=x COLLATE=y`), when it shows them.
+#[must_use]
+pub fn charset_options(show_create: &str) -> Option<String> {
+    let last = show_create.lines().last()?.trim();
+    let tail = last.strip_prefix(')')?;
+    let mut out = Vec::new();
+    for w in tail.split_whitespace() {
+        let up = w.to_ascii_uppercase();
+        if up.starts_with("CHARSET=") || up.starts_with("COLLATE=") {
+            out.push(w.to_owned());
+        }
+    }
+    (!out.is_empty()).then(|| format!("DEFAULT {}", out.join(" ")))
+}
+
 /// The type and nullability of a `SHOW CREATE TABLE` column line
 /// (`` `name` varchar(40) DEFAULT NULL ``): `("varchar(40)", true)`.
 fn def_type(def: &str) -> Option<(String, bool)> {
@@ -268,6 +301,32 @@ pub fn widened(parent_show: &str, child_show: &str, columns: &[String]) -> Vec<S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copy_columns_take_the_childs_types_and_collations() {
+        let t = "CREATE TABLE `t1` (\n  `id` int(10) unsigned NOT NULL,\n  `name` varchar(40) \
+                 CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL,\n  `e` enum('a b','c') \
+                 DEFAULT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 \
+                 COLLATE=utf8mb4_general_ci";
+        assert_eq!(
+            column_type(t, "id"),
+            Some(("int(10) unsigned".into(), None))
+        );
+        assert_eq!(
+            column_type(t, "NAME"),
+            Some(("varchar(40)".into(), Some("utf8mb4_bin".into())))
+        );
+        assert_eq!(column_type(t, "e"), Some(("enum('a b','c')".into(), None)));
+        assert_eq!(column_type(t, "nope"), None);
+        assert_eq!(
+            charset_options(t).as_deref(),
+            Some("DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci")
+        );
+        assert_eq!(
+            charset_options("CREATE TABLE `x` (\n  `a` int\n) ENGINE=InnoDB"),
+            None
+        );
+    }
 
     #[test]
     fn widened_types_reach_the_child() {

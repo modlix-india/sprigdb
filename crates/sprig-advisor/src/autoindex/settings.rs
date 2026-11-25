@@ -186,6 +186,13 @@ key!(
     RECOMMEND_TTL_DAYS: u32 = "auto_index.recommend_ttl_days", 14, HardBounds::range(1, 365),
     "Days a recommendation waits for approval"
 );
+key!(
+    /// `auto_index.include_studio`: whether statements run from Studio
+    /// count toward the triggers. Off by default, so people exploring data
+    /// don't cause indexes to be built.
+    INCLUDE_STUDIO: bool = "auto_index.include_studio", false, HardBounds::NONE,
+    "Count statements run from Studio toward the triggers"
+);
 
 /// Whether the loop builds or asks first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -241,6 +248,8 @@ pub struct AutoIndexSettings {
     pub build_pause_ms: u32,
     /// `auto_index.recommend_ttl_days`.
     pub recommend_ttl_days: u32,
+    /// `auto_index.include_studio`.
+    pub include_studio: bool,
 }
 
 impl Default for AutoIndexSettings {
@@ -267,6 +276,7 @@ impl Default for AutoIndexSettings {
             build_batch_rows: BUILD_BATCH_ROWS.default,
             build_pause_ms: BUILD_PAUSE_MS.default,
             recommend_ttl_days: RECOMMEND_TTL_DAYS.default,
+            include_studio: INCLUDE_STUDIO.default,
         }
     }
 }
@@ -306,6 +316,7 @@ impl AutoIndexSettings {
             build_batch_rows: get_u32(&BUILD_BATCH_ROWS),
             build_pause_ms: get_u32(&BUILD_PAUSE_MS),
             recommend_ttl_days: get_u32(&RECOMMEND_TTL_DAYS),
+            include_studio: get_bool(&INCLUDE_STUDIO),
         }
     }
 }
@@ -331,6 +342,7 @@ mod tests {
             OBSERVE_DAYS.key,
             COOLDOWN_HOURS.key,
             BUILD_BATCH_ROWS.key,
+            INCLUDE_STUDIO.key,
         ] {
             assert_eq!(reg.get(k).unwrap().owner(), 13, "{k}");
         }
@@ -340,6 +352,7 @@ mod tests {
         assert_eq!(d.mode, Mode::Auto);
         assert_eq!(d.observe_days, 7);
         assert_eq!(d.cooldown_hours, 24);
+        assert!(!d.include_studio);
     }
 
     #[test]

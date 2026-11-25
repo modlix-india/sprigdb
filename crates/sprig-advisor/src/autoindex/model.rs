@@ -239,9 +239,13 @@ pub struct IndexRecord {
     #[serde(default)]
     pub approval: Option<String>,
     /// Why it ended (`unused`, `no_gain`, `rejected`, `expired`,
-    /// `table_gone`, a build error).
+    /// `table_gone`, `operator`, `unexplained`, a build error).
     #[serde(default)]
     pub end_reason: Option<String>,
+    /// Pinned by an operator (`sprigctl index pin`, or a restore): the
+    /// watch never drops it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pinned: bool,
 }
 
 impl IndexRecord {
@@ -268,8 +272,109 @@ impl IndexRecord {
             reads_total: 0,
             approval: None,
             end_reason: None,
+            pinned: false,
         }
     }
+}
+
+/// What an operator asks of an automatic index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Action {
+    /// Drop it now; its definition is then blocked like a refused one.
+    Drop,
+    /// Keep it whatever the watch finds.
+    Pin,
+    /// Let the watch judge it again.
+    Unpin,
+    /// Build a dropped (or failed) index again, pinned.
+    Restore,
+}
+
+impl Action {
+    /// The action called `s`: `drop`, `pin` (`freeze`), `unpin`
+    /// (`unfreeze`), `restore`; any case.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "drop" => Some(Self::Drop),
+            "pin" | "freeze" => Some(Self::Pin),
+            "unpin" | "unfreeze" => Some(Self::Unpin),
+            "restore" => Some(Self::Restore),
+            _ => None,
+        }
+    }
+
+    /// The name `sprigctl index` and the records use.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Drop => "drop",
+            Self::Pin => "pin",
+            Self::Unpin => "unpin",
+            Self::Restore => "restore",
+        }
+    }
+
+    /// Whether the action applies to `rec` as it stands: `Err` with why
+    /// not.
+    ///
+    /// # Errors
+    /// A short reason when the record's state doesn't allow it.
+    pub fn allowed(self, rec: &IndexRecord) -> Result<(), String> {
+        let state = rec.state.name();
+        match self {
+            Self::Drop | Self::Pin if rec.state.terminal() => {
+                Err(format!("{} is {state}", rec.name))
+            }
+            Self::Pin if rec.pinned => Err(format!("{} is pinned already", rec.name)),
+            Self::Unpin if !rec.pinned => Err(format!("{} isn't pinned", rec.name)),
+            Self::Restore if !matches!(rec.state, State::Dropped | State::Failed) => Err(format!(
+                "{} is {state}: only a dropped or failed index is restored",
+                rec.name
+            )),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// A table's figures as the generator last measured them:
+/// `m/autoindex/stats/<db.table>`. Kept across restarts and reused while
+/// fresh, so a table is sampled at most every [`STATS_MAX_AGE_US`] (or when
+/// its definition changes).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TableStats {
+    /// `db.table`, lower case.
+    pub table: String,
+    /// The table's schema version the figures were taken at.
+    pub version: u64,
+    /// Rows counted (at most the sample's size when the table is larger).
+    pub rows: u64,
+    /// Distinct values per column (estimated beyond the sample).
+    pub distinct: Vec<(String, f64)>,
+    /// When, µs since the epoch.
+    pub at_us: u64,
+}
+
+/// How long a table's figures are reused: 6 hours.
+pub const STATS_MAX_AGE_US: u64 = 6 * 3_600_000_000;
+
+/// An operator's pending request: `m/autoindex/req/<name>`. The node that
+/// runs the tenant's loop applies it within a minute and deletes it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorRequest {
+    /// The index's name.
+    pub index: String,
+    /// What to do.
+    pub action: Action,
+    /// Who asked (`op:<name>`, as the Admin API's guard sets it).
+    #[serde(default)]
+    pub actor: String,
+    /// Why, as given.
+    #[serde(default)]
+    pub reason: String,
+    /// When, µs since the epoch.
+    pub at_us: u64,
 }
 
 /// One decision of the loop, for `sprigctl index` and Studio:
@@ -330,6 +435,26 @@ mod tests {
         assert_eq!(d.canonical(), "secondary(customer_id,created_at desc)");
         assert_ne!(a.name(), d.name());
         assert!(!is_auto_name("k_customer"));
+    }
+
+    #[test]
+    fn operator_actions_follow_the_state() {
+        let mut r = IndexRecord::new(spec(&["a"]), State::Active, "slow_p95", 1);
+        assert_eq!(Action::parse("FREEZE"), Some(Action::Pin));
+        assert_eq!(Action::parse("unfreeze"), Some(Action::Unpin));
+        assert_eq!(Action::parse("approve"), None);
+        assert!(Action::Drop.allowed(&r).is_ok());
+        assert!(Action::Pin.allowed(&r).is_ok());
+        assert!(Action::Unpin.allowed(&r).is_err());
+        assert!(Action::Restore.allowed(&r).is_err());
+        r.pinned = true;
+        assert!(Action::Pin.allowed(&r).is_err());
+        assert!(Action::Unpin.allowed(&r).is_ok());
+        r.state = State::Dropped;
+        assert!(Action::Drop.allowed(&r).is_err());
+        assert!(Action::Restore.allowed(&r).is_ok());
+        r.state = State::Rejected;
+        assert!(Action::Restore.allowed(&r).is_err());
     }
 
     #[test]

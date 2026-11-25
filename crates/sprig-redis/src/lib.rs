@@ -63,6 +63,7 @@ pub mod keyspace;
 pub mod logic;
 pub mod lua;
 pub mod pubsub;
+pub mod query;
 pub mod reply;
 pub mod search;
 pub mod session;

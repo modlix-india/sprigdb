@@ -466,6 +466,13 @@ pub fn sql_string(s: &str) -> String {
 /// per row), or an empty one.
 #[must_use]
 pub fn rows_sql(columns: &[String], rows: &[Vec<GraphLit>]) -> String {
+    rows_sql_in(columns, rows, false)
+}
+
+/// [`rows_sql`] for a server whose table value constructor writes each
+/// row as `ROW(…)` (`row_kw`: MySQL, which refuses a bare `VALUES (…)`).
+#[must_use]
+pub fn rows_sql_in(columns: &[String], rows: &[Vec<GraphLit>], row_kw: bool) -> String {
     let Some((first, rest)) = rows.split_first() else {
         let cols: Vec<String> = columns
             .iter()
@@ -486,7 +493,12 @@ pub fn rows_sql(columns: &[String], rows: &[Vec<GraphLit>]) -> String {
         );
     }
     for (i, r) in rest.iter().enumerate() {
-        s.push_str(if i == 0 { " UNION ALL VALUES (" } else { ", (" });
+        s.push_str(match (i == 0, row_kw) {
+            (true, false) => " UNION ALL VALUES (",
+            (true, true) => " UNION ALL VALUES ROW(",
+            (false, false) => ", (",
+            (false, true) => ", ROW(",
+        });
         for (k, v) in r.iter().enumerate() {
             if k > 0 {
                 s.push_str(", ");

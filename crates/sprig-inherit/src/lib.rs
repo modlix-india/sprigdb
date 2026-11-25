@@ -19,7 +19,8 @@
 //!   tenants, kept by one worker per tenant tree from the change feed
 //!   (the job is `sprig-worker::inherit`);
 //! - [`links`]: foreign keys between inheritable tables, checked against
-//!   merged views, and refused deletes of referenced rows;
+//!   merged views, and refused deletes of referenced rows; [`refs`]: their
+//!   reference index;
 //! - [`ids`]: one id sequence per table for the whole tree;
 //! - [`adopt`]: what a child tenant must create or change so it holds
 //!   every table its parent shares to it;
@@ -60,9 +61,11 @@ pub mod links;
 pub mod model;
 pub mod moves;
 pub mod msg;
+pub mod orphan_refs;
 pub mod plan;
 pub mod probe;
 pub mod reference;
+pub mod refs;
 pub mod rewrite;
 pub mod settings;
 pub mod show;
@@ -108,6 +111,13 @@ pub trait Runner: sprig_types::Runner {
     /// The backend's.
     async fn ctl(&mut self, sql: &str) -> Result<()>;
 
+    /// Whether cross-tenant shares are read in process (engine databases):
+    /// [`upstream::ensure`] then keeps each share's query
+    /// ([`upstream::engine_share`]) instead of making MariaDB views.
+    fn engine_shares(&self) -> bool {
+        false
+    }
+
     /// The id of tenant `name` when it is a direct child of this one.
     ///
     /// # Errors
@@ -141,14 +151,15 @@ pub trait Runner: sprig_types::Runner {
         ))
     }
 
-    /// Runs `sql` on `inherit_refs` in tenant `root`'s catalog (`{refs}`
-    /// stands for the table, created when missing), as the provisioning
-    /// account, autocommitted ([`links`]).
+    /// Runs `op` on the reference index of tree root `root` ([`links`]),
+    /// in its own short transaction: its catalog records ([`refs`]), or the
+    /// `inherit_refs` table of its catalog schema ([`refs::RefsOp::sql`];
+    /// created when missing, as the provisioning account, autocommitted).
     ///
     /// # Errors
     /// The catalog's.
-    async fn refs(&mut self, root: TenantId, sql: &str) -> Result<RawRows> {
-        let _ = (root, sql);
+    async fn refs(&mut self, root: TenantId, op: &refs::RefsOp<'_>) -> Result<RawRows> {
+        let _ = (root, op);
         Err(SprigError::internal("no reference index in this runner"))
     }
 
@@ -159,6 +170,13 @@ pub trait Runner: sprig_types::Runner {
     async fn tenant_catalog(&mut self, t: TenantId) -> Result<Arc<TenantCatalog>> {
         let _ = t;
         Err(SprigError::internal("no catalog cache in this runner"))
+    }
+
+    /// Tenant `t`'s name from the directory (`None`: this runner can't
+    /// tell), for a tenant whose catalog has no root-space row to name it.
+    async fn tenant_label(&mut self, t: TenantId) -> Option<String> {
+        let _ = t;
+        None
     }
 
     /// `n` values of `seq` (the first and the step), after moving it past

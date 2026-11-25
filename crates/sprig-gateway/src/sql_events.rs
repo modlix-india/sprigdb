@@ -139,13 +139,20 @@ pub(crate) fn spawn(
                         continue;
                     };
                     // A one-time event not run yet runs even when overdue.
-                    let start = if def.at.is_some() { i64::MIN } else { now - GRACE };
+                    let start = if def.at.is_some() {
+                        i64::MIN
+                    } else {
+                        now - GRACE
+                    };
                     let from = *last.entry(key.clone()).or_insert(start);
                     let runs = event::due(def, from, now);
                     if let Some(at) = runs {
                         last.insert(key.clone(), at);
                     }
-                    let ran_once = def.at.as_ref().is_none_or(|a| runs.is_some() || from >= a.1);
+                    let ran_once = def
+                        .at
+                        .as_ref()
+                        .is_none_or(|a| runs.is_some() || from >= a.1);
                     let done =
                         def.status == EvStatus::Enabled && event::finished(def, now) && ran_once;
                     let complete = done && completing.insert(key.clone());
@@ -195,7 +202,10 @@ impl Job {
         };
         if body {
             metrics::counter!("sprig_sql_event_runs_total").increment(1);
-            if let Err(e) = self.statement(&caller, statement(&self.db, &self.name)).await {
+            if let Err(e) = self
+                .statement(&caller, statement(&self.db, &self.name))
+                .await
+            {
                 metrics::counter!("sprig_sql_event_failures_total").increment(1);
                 tracing::warn!(tenant = %self.tenant, db = %self.db, event = %self.name,
                     error = %e, "event run failed");

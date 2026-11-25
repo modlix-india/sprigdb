@@ -2076,11 +2076,14 @@ pub(crate) fn parse_stored(text: &str) -> Result<Def, SprigError> {
 }
 
 /// `CREATE TABLE new LIKE src`: the source's definition under the new
-/// name (foreign keys aren't copied, as on the servers).
+/// name (foreign keys aren't copied, as on the servers; nor are automatic
+/// indexes, which the new table's own workload decides).
 pub(crate) fn like(src: &Def, name: &str) -> Def {
     let mut d = src.clone();
     name.clone_into(&mut d.name);
     d.fks.clear();
+    d.keys
+        .retain(|k| !sprig_common::names::is_auto_index(&k.name));
     d
 }
 

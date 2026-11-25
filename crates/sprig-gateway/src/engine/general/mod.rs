@@ -205,19 +205,52 @@ pub(crate) fn bind_tableless(
         }),
         _ => false,
     };
-    if !derived_values && !matches!(&*q.body, SetExpr::Values(_) | SetExpr::SetOperation { .. }) {
+    // Or common table expressions alone (`WITH RECURSIVE` number series).
+    if !derived_values
+        && q.with.is_none()
+        && !matches!(&*q.body, SetExpr::Values(_) | SetExpr::SetOperation { .. })
+    {
         return Ok(None);
     }
     // Any table at all (`information_schema`'s too) leaves it where it was.
-    let mut names_table = false;
-    let _ = sqlparser::ast::visit_relations(stmt, |_| {
-        names_table = true;
-        std::ops::ControlFlow::<()>::Break(())
-    });
-    if names_table {
+    if names_table(stmt) {
         return Ok(None);
     }
     bind_in(cx, stmt, text, None, true)
+}
+
+/// Whether a statement names a table: any name in a `FROM` other than a
+/// common table expression the statement defines.
+fn names_table(stmt: &Statement) -> bool {
+    struct Ctes(std::collections::HashSet<String>);
+    impl sqlparser::ast::Visitor for Ctes {
+        type Break = ();
+        fn pre_visit_query(&mut self, q: &sqlparser::ast::Query) -> std::ops::ControlFlow<()> {
+            if let Some(w) = &q.with {
+                for c in &w.cte_tables {
+                    self.0.insert(c.alias.name.value.to_lowercase());
+                }
+            }
+            std::ops::ControlFlow::Continue(())
+        }
+    }
+    let mut ctes = Ctes(std::collections::HashSet::new());
+    let _ = sqlparser::ast::Visit::visit(stmt, &mut ctes);
+    let mut found = false;
+    let _ = sqlparser::ast::visit_relations(stmt, |n: &sqlparser::ast::ObjectName| {
+        let cte = match n.0.as_slice() {
+            [sqlparser::ast::ObjectNamePart::Identifier(i)] => {
+                ctes.0.contains(&i.value.to_lowercase())
+            }
+            _ => false,
+        };
+        if cte {
+            return std::ops::ControlFlow::Continue(());
+        }
+        found = true;
+        std::ops::ControlFlow::<()>::Break(())
+    });
+    found
 }
 
 /// [`bind`] for any query that names no table at all (not even
@@ -235,12 +268,7 @@ pub(crate) fn bind_no_tables(
     if !matches!(stmt, Statement::Query(_)) {
         return Ok(None);
     }
-    let mut names_table = false;
-    let _ = sqlparser::ast::visit_relations(stmt, |_| {
-        names_table = true;
-        std::ops::ControlFlow::<()>::Break(())
-    });
-    if names_table {
+    if names_table(stmt) {
         return Ok(None);
     }
     bind_in(cx, stmt, text, None, true)
@@ -370,6 +398,9 @@ pub(crate) struct Seed {
     pub session: Session,
     /// `ONLY_FULL_GROUP_BY`.
     pub only_full_group_by: bool,
+    /// `WITH RECURSIVE`'s limit: `cte_max_recursion_depth` (3306),
+    /// `max_recursive_iterations` (3307).
+    pub max_recursion: u64,
 }
 
 impl Seed {
@@ -454,9 +485,18 @@ impl Seed {
             s.default_week_format = u8::try_from(n.min(7)).unwrap_or(0);
         }
         s.time_zone_offset = env.tz.unwrap_or(0);
+        // The MySQL port's `SET cte_max_recursion_depth` reaches the
+        // session under MariaDB's name for it.
+        let max_recursion = (if mysql {
+            num("cte_max_recursion_depth").or_else(|| num("max_recursive_iterations"))
+        } else {
+            num("max_recursive_iterations")
+        })
+        .unwrap_or(1000);
         Self {
             session: s,
             only_full_group_by,
+            max_recursion,
         }
     }
 
@@ -497,6 +537,8 @@ pub(crate) struct Rows {
     /// Some table was read whole, by a key or not: what a write reports
     /// as "no index used".
     pub full_scan: bool,
+    /// `SQL_CALC_FOUND_ROWS`: the rows found without the `LIMIT`.
+    pub found: Option<u64>,
 }
 
 /// An executor error as the gateway's.
@@ -579,11 +621,18 @@ impl Engine {
     ) -> Result<Vec<Space>> {
         let mut out = Vec::with_capacity(g.tables.len());
         for t in &g.tables {
+            // A MongoDB collection has no table keyspace: storage reads its
+            // documents (`storage::coll`).
+            if t.coll.is_some() {
+                out.push(storage::unread_space(&t.def));
+                continue;
+            }
             let held = tx.as_ref().and_then(|x| x.held(&t.def));
             let sp = if let Some(sp) = held {
                 sp
             } else {
-                let sp = self.space(tenant, &t.def).await?;
+                // A parent's table read through a share: its own keyspace.
+                let sp = self.space(t.tenant.unwrap_or(tenant), &t.def).await?;
                 if let Some(x) = tx.as_mut() {
                     x.hold(&t.def, &sp);
                 }
@@ -659,6 +708,7 @@ impl Engine {
             planner.options = PlanOptions {
                 only_full_group_by: a.seed.only_full_group_by,
                 memory_limit: Some(MEMORY_LIMIT),
+                max_recursion: a.seed.max_recursion,
                 ..PlanOptions::for_persona(session.persona)
             };
             let mut plan = planner.plan(&g.stmt, a.params)?;
@@ -709,6 +759,10 @@ impl Engine {
                     .explain
                     .iter()
                     .any(|r| matches!(r.access.as_deref(), Some("ALL" | "index"))),
+                found: plan
+                    .found_rows
+                    .as_ref()
+                    .map(|f| f.load(std::sync::atomic::Ordering::Relaxed)),
             })
         };
         let r = if off_worker {
@@ -864,6 +918,7 @@ impl Engine {
         let options = PlanOptions {
             only_full_group_by: seed.only_full_group_by,
             memory_limit: Some(MEMORY_LIMIT),
+            max_recursion: seed.max_recursion,
             ..PlanOptions::for_persona(session.persona)
         };
         let base = estimate(

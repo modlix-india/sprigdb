@@ -70,6 +70,35 @@ fn interval(parser: &mut Parser<'_>) -> Result<Expr, ParserError> {
     }))
 }
 
+/// `EXPLAIN EXTENDED <statement>` (MariaDB's, and what the MySQL port
+/// sends for a plain `EXPLAIN`): the plain `EXPLAIN` with `verbose` set,
+/// which asks for the `filtered` column. `None` (nothing consumed)
+/// otherwise.
+fn explain_extended(parser: &mut Parser<'_>) -> Option<Result<ast::Statement, ParserError>> {
+    let word = |t: &Token, w: &str| matches!(t, Token::Word(x) if x.quote_style.is_none() && x.value.eq_ignore_ascii_case(w));
+    if !word(&parser.peek_nth_token(0).token, "EXPLAIN")
+        || !word(&parser.peek_nth_token(1).token, "EXTENDED")
+    {
+        return None;
+    }
+    parser.advance_token();
+    parser.advance_token();
+    Some(
+        parser
+            .parse_statement()
+            .map(|statement| ast::Statement::Explain {
+                describe_alias: ast::DescribeAlias::Explain,
+                analyze: false,
+                verbose: true,
+                query_plan: false,
+                estimate: false,
+                statement: Box::new(statement),
+                format: None,
+                options: None,
+            }),
+    )
+}
+
 /// A plain call of `name` with `args`.
 fn call(name: &str, args: Vec<Expr>) -> Expr {
     Expr::Function(ast::Function {
@@ -209,6 +238,9 @@ impl Dialect for SprigMySql {
         &self,
         parser: &mut Parser<'_>,
     ) -> Option<Result<ast::Statement, ParserError>> {
+        if let Some(r) = explain_extended(parser) {
+            return Some(r);
+        }
         M.parse_statement(parser)
     }
     fn require_interval_qualifier(&self) -> bool {
@@ -301,5 +333,20 @@ mod tests {
         // MySQL's own rules still apply.
         assert!(one("SELECT 7 DIV 2").contains("DIV"));
         assert!(one("SELECT a FROM t LIMIT 1, 2").contains("LIMIT"));
+    }
+
+    #[test]
+    fn explain_extended_is_a_verbose_explain() {
+        let v =
+            Parser::parse_sql(&SprigMySql, "EXPLAIN EXTENDED SELECT a FROM t WHERE b = 1").unwrap();
+        assert!(matches!(
+            &v[..],
+            [ast::Statement::Explain { verbose: true, analyze: false, statement, .. }]
+                if matches!(**statement, ast::Statement::Query(_))
+        ));
+        assert!(matches!(
+            &Parser::parse_sql(&SprigMySql, "EXPLAIN SELECT 1").unwrap()[..],
+            [ast::Statement::Explain { verbose: false, .. }]
+        ));
     }
 }

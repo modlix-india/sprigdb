@@ -139,8 +139,17 @@ pub(super) struct EngineState {
     pub(super) txn: SessionTxn,
     /// The session's variables as last read; `None`: read them again.
     vars: Option<SessVars>,
-    /// The session's `LAST_INSERT_ID()` from the engine's inserts.
+    /// The session's `LAST_INSERT_ID()` from the engine's inserts (and
+    /// `LAST_INSERT_ID(expr)`).
     last_insert_id: u64,
+    /// `ROW_COUNT()`: the last client statement's affected rows, -1 after
+    /// a result set or an error.
+    row_count: i64,
+    /// `FOUND_ROWS()`: the rows of the last client statement's result set.
+    found_rows: u64,
+    /// The running statement's `SQL_CALC_FOUND_ROWS` count (the rows
+    /// without its `LIMIT`): its `FOUND_ROWS()` instead of the rows sent.
+    pub(super) calc_found: Option<u64>,
     /// `innodb_lock_wait_timeout` as the session last set it, in seconds
     /// (`None`: the default).
     lock_wait: Option<u64>,
@@ -193,6 +202,37 @@ impl EngineState {
     /// database ran (or runs now): they are read again when next needed.
     pub(super) fn stale(&mut self) {
         self.vars = None;
+    }
+
+    /// `innodb_lock_wait_timeout` as the session last set it, in seconds
+    /// (`None`: the default).
+    pub(super) fn lock_wait_secs(&self) -> Option<u64> {
+        self.lock_wait
+    }
+
+    /// Notes what a client statement answered, for `ROW_COUNT()`,
+    /// `FOUND_ROWS()` and `LAST_INSERT_ID()` (a value its
+    /// `LAST_INSERT_ID(expr)` set).
+    pub(super) fn after_statement(&mut self, got: diag::Answered, set_id: Option<u64>) {
+        let calc = self.calc_found.take();
+        // A `SHOW` answers rows but leaves `FOUND_ROWS()` as it was.
+        let show = self.entry.as_deref().is_some_and(|t| {
+            let t = t.trim_ascii_start();
+            t.len() >= 4 && t[..4].eq_ignore_ascii_case(b"SHOW")
+        });
+        match got {
+            diag::Answered::Ok(n) => self.row_count = i64::try_from(n).unwrap_or(i64::MAX),
+            diag::Answered::Rows(_) if show => self.row_count = -1,
+            diag::Answered::Rows(n) => {
+                self.row_count = -1;
+                self.found_rows = calc.unwrap_or(n);
+            }
+            diag::Answered::Error => self.row_count = -1,
+            diag::Answered::Nothing => {}
+        }
+        if let Some(v) = set_id {
+            self.last_insert_id = v;
+        }
     }
 }
 
@@ -287,6 +327,40 @@ fn opaque(stmt: &Statement) -> bool {
             | Statement::Merge { .. }
             | Statement::Prepare { .. }
             | Statement::Execute { .. }
+    )
+}
+
+/// MariaDB's 1064 for an `INSERT`'s row alias (MySQL's `... VALUES (...)
+/// AS new`), near its `AS`.
+fn row_alias_syntax(text: &str, al: &sqlparser::ast::InsertAliases) -> SprigError {
+    let at = match al.row_alias.0.first() {
+        Some(sqlparser::ast::ObjectNamePart::Identifier(i)) => {
+            crate::engine::routine::subst::offset(text, i.span.start.line, i.span.start.column)
+        }
+        _ => None,
+    };
+    let at = at.map_or(0, |at| {
+        let before = text.get(..at).unwrap_or("").trim_end();
+        let n = before.len().saturating_sub(2);
+        if before
+            .get(n..)
+            .is_some_and(|w| w.eq_ignore_ascii_case("AS"))
+        {
+            n
+        } else {
+            at
+        }
+    });
+    let rest = text.get(at..).unwrap_or("").trim_end();
+    let rest = rest.trim_end_matches(';').trim_end();
+    let shown: String = rest.chars().take(80).collect();
+    SprigError::standard(
+        1064,
+        *b"42000",
+        format!(
+            "You have an error in your SQL syntax; check the manual that corresponds to your \
+             MariaDB server version for the right syntax to use near '{shown}' at line 1"
+        ),
     )
 }
 
@@ -474,12 +548,24 @@ impl PassSession {
     fn engine_scope_base(&self) -> Option<(Arc<TenantCatalog>, Option<DbId>)> {
         let ts = self.tenant.as_deref()?;
         let cat = Arc::clone(ts.catalog()?);
-        catalog::of(&cat)?;
+        if catalog::of(&cat).is_none() && !self.no_database_no_maria(&cat) {
+            return None;
+        }
         let current = self
             .current_logical()
             .and_then(|n| cat.database(&database_key(&n, ts.lower_case_table_names())))
             .map(|d| d.db_id);
         Some((cat, current))
+    }
+
+    /// Whether the session's tenant has no database at all and no MariaDB
+    /// cluster: every statement it can run is the engine's (one that
+    /// reads no table, transaction control).
+    fn no_database_no_maria(&self, cat: &TenantCatalog) -> bool {
+        cat.databases.is_empty()
+            && self.tenant.as_deref().is_some_and(|ts| {
+                ts.principal.backend.cluster.as_str() == crate::tenant::locator::ENGINE_ONLY_CLUSTER
+            })
     }
 
     /// The session's catalog snapshot when its tenant has engine databases
@@ -502,8 +588,11 @@ impl PassSession {
         let mut v = self.engine_vars_read(cx);
         // The session's own values, as of this statement.
         v.env.last_insert_id = self.eng.last_insert_id;
+        v.env.conn = u64::from(cx.session.id.0);
         let info = &mut v.general.session.info;
         info.last_insert_id = self.eng.last_insert_id;
+        info.row_count = self.eng.row_count;
+        info.found_rows = self.eng.found_rows;
         info.database = self.current_logical();
         info.connection_id = u64::from(cx.session.id.0);
         if let Some(ts) = self.tenant.as_deref() {
@@ -694,7 +783,9 @@ impl PassSession {
         current: Option<DbId>,
         text: &[u8],
     ) -> Result<Bound> {
-        let Some(eng) = catalog::of(cat) else {
+        let Some(eng) =
+            catalog::of(cat).or_else(|| self.no_database_no_maria(cat).then(catalog::empty))
+        else {
             return Ok(Bound::Elsewhere { tables: true });
         };
         let tenant = cat.tenant;
@@ -769,6 +860,27 @@ impl PassSession {
             && let Some(e) = whole.and_then(bare_values)
         {
             return Err(e);
+        }
+        // MySQL's row alias of an INSERT is a syntax error to MariaDB.
+        if self.persona != sprig_proto_mysql::Persona::MySql84
+            && let Statement::Insert(ins) = &stmt
+            && let Some(al) = &ins.insert_alias
+            && let Some(t) = plain
+        {
+            return Err(row_alias_syntax(t, al));
+        }
+        // The MySQL port: the row alias arrives already written as
+        // `VALUE(c)`; MySQL's errors for it are read off the client's text.
+        if self.persona == sprig_proto_mysql::Persona::MySql84
+            && matches!(stmt, Statement::Insert(_))
+            && let Some(entry) = self.eng.entry.as_deref()
+            && entry.windows(2).any(|w| w.eq_ignore_ascii_case(b"AS"))
+            && let Ok(t) = std::str::from_utf8(entry)
+            && let Ok(mut v) = Parser::parse_sql(&sprig_plan::dialect::SprigMySql, t)
+            && v.len() == 1
+            && let Some(Statement::Insert(ins)) = v.pop()
+        {
+            plan::check_row_alias(&cx, &ins)?;
         }
         if opaque(&stmt) {
             return if mentions() {
@@ -1491,10 +1603,13 @@ impl PassSession {
         let backend_txn = self.backend_in_txn();
         let commit = matches!(ctl, Control::Commit { .. });
         let mut rollback_notes = Vec::new();
-        // Outside any transaction, the current database's side answers.
+        // Outside any transaction, the current database's side answers; a
+        // tenant whose every database is the engine's, with or without a
+        // current database.
         let here = open
             || (!backend_txn
-                && current.is_some_and(|c| catalog::of(cat).is_some_and(|e| e.dbs.contains(&c))));
+                && (current.is_some_and(|c| catalog::of(cat).is_some_and(|e| e.dbs.contains(&c)))
+                    || sessvars::all_engine(cat)));
         macro_rules! fail {
             ($e:expr) => {
                 return self.fail(out, &$e).await.map(Some)
@@ -1533,8 +1648,9 @@ impl PassSession {
                     fail!(e);
                 }
                 let here = !backend_txn
-                    && current
-                        .is_some_and(|c| catalog::of(cat).is_some_and(|e| e.dbs.contains(&c)));
+                    && (current
+                        .is_some_and(|c| catalog::of(cat).is_some_and(|e| e.dbs.contains(&c)))
+                        || sessvars::all_engine(cat));
                 if !here {
                     return Ok(None);
                 }
@@ -2418,6 +2534,13 @@ impl PassSession {
                 Control::SetTransaction { .. } | Control::UnlockTables => {}
             }
         }
+        // A `CALL` of a SQL procedure: kept as the client's text, run at
+        // each execute with the bound values written in (`routine`).
+        if self.engine_call_prepares(client) {
+            let results = self.engine_vars(cx).results;
+            let marked = self.engine_call_mark_outs(client);
+            return Ok(Some(self.write_prepare(&marked, results, &[])));
+        }
         let plan = match self.engine_bind(&cat, current, rewritten)? {
             Bound::Engine(plan) => plan,
             Bound::General(g) => {
@@ -2506,8 +2629,25 @@ impl PassSession {
             ts.warnings = None;
             self.eng.diag.bypass(!engine);
         }
-        let r = Box::pin(self.engine_execute_in(cx, stmt, raw, params, out)).await;
-        if engine && let Err(e) = &r {
+        if !engine {
+            return Box::pin(self.engine_execute_in(cx, stmt, raw, params, out)).await;
+        }
+        // What the execute answers is the session's `ROW_COUNT()` and
+        // `FOUND_ROWS()` afterwards, as for a text statement.
+        let conn = u64::from(cx.session.id.0);
+        let mut counted = diag::CountSink::new(out, conn);
+        self.eng.calc_found = None;
+        let r = Box::pin(self.engine_execute_in(cx, stmt, raw, params, &mut counted)).await;
+        let (got, set_id) = counted.finish();
+        let got = match &r {
+            Err(_) => diag::Answered::Error,
+            Ok(_) => got,
+        };
+        // (The last text statement is no part of the execute.)
+        let text = self.eng.entry.take();
+        self.eng.after_statement(got, set_id);
+        self.eng.entry = text;
+        if let Err(e) = &r {
             self.diag_set(self.diag_error(e), 0);
         }
         r
@@ -2539,10 +2679,10 @@ impl PassSession {
             }
             (Arc::clone(&e.plan), s.recheck.clone(), s.logical.clone())
         };
-        // A table with SQL triggers: its changes run row by row, from text
-        // only (`routine::trigger`).
+        // A table with SQL triggers or validations: its changes run row by
+        // row, from text only (`routine::trigger`).
         if let Some(l) = &logical
-            && self.engine_prepared_fires(l)
+            && self.engine_prepared_fires(l).await
         {
             // The bound values as literals, then the text path.
             let values: Vec<String> = self

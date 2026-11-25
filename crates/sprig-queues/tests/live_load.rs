@@ -11,7 +11,9 @@
 //!   acknowledgements on one durable queue (`SPRIG_AMQP_PUBLISHERS`,
 //!   `SPRIG_AMQP_CONSUMERS`, `SPRIG_AMQP_SECS`, 1 KiB bodies, a confirm
 //!   window of 1,000 per publisher, prefetch 1,000): rates and the
-//!   consumers' latency from publish to delivery.
+//!   consumers' latency from publish to delivery. `SPRIG_AMQP_CONSUME_AFTER`
+//!   (seconds) holds the consumers back so a backlog builds first; the
+//!   received rate while it drains is the delivery ceiling.
 //! - `failover_loses_nothing`: one publisher at `SPRIG_AMQP_RATE` messages a
 //!   second with confirms and one consumer, both reconnecting through the
 //!   listed gateways, while `SPRIG_AMQP_FAILOVER` (a command that kills the
@@ -153,6 +155,8 @@ async fn throughput() {
     for i in 0..nc {
         let (q, stop, got, lat) = (q.clone(), stop.clone(), got.clone(), lat.clone());
         tasks.push(tokio::spawn(async move {
+            // A backlog first measures how fast delivery drains it.
+            tokio::time::sleep(Duration::from_secs(num("SPRIG_AMQP_CONSUME_AFTER", 0))).await;
             let c = connect(i as usize).await;
             let ch = c.create_channel().await.unwrap();
             ch.basic_qos(1000, BasicQosOptions::default())

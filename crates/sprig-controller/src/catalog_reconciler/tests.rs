@@ -706,3 +706,74 @@ async fn a_job_whose_gateway_process_ended_goes_before_the_stuck_age() {
     let r = rec.pass(env.tenant).await.unwrap();
     assert_eq!((r.jobs_waiting, r.gateway_jobs_waiting), (1, 0), "{r:?}");
 }
+
+/// A tenant placed with no MariaDB cluster: the engine applies a
+/// statement's physical side only once it is published, so a stuck
+/// creation or alteration is rolled back and a drop rolls forward, with
+/// no cluster to ask (the executor of `engine-only` tenants).
+#[tokio::test]
+async fn an_engine_only_tenants_stuck_jobs_are_resolved_without_a_cluster() {
+    let env = billing().await;
+    env.crash(
+        DdlStep::Applied,
+        create_db("sales"),
+        "CREATE DATABASE sales",
+    )
+    .await;
+    env.crash(
+        DdlStep::Applied,
+        create_table("items"),
+        "CREATE TABLE items (id INT)",
+    )
+    .await;
+    env.crash(
+        DdlStep::Applied,
+        alter("orders"),
+        "ALTER TABLE orders ADD c INT",
+    )
+    .await;
+    let rec = CatalogReconciler::new(
+        env.engine(),
+        env.dir.clone(),
+        Arc::new(FixedExecutor(Arc::new(EngineOnlyExecutor))),
+        Arc::new(LogDecisions),
+        dc(),
+        None,
+        Arc::new(SystemClock),
+    )
+    .with_config(now_cfg());
+    let r = rec.pass(env.tenant).await.unwrap();
+    let labels: Vec<&str> = r.resolved.iter().map(|(_, r)| r.label()).collect();
+    assert_eq!(labels, ["rolled_back"; 3], "{:?}", r.resolved);
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    assert!(env.live("items").is_none());
+    assert_eq!(env.live("orders").unwrap().pending_job_id, None);
+    assert!(
+        env.snapshot()
+            .databases
+            .iter()
+            .all(|d| d.name != "sales" || d.state == DbState::Dropped),
+        "the half-made database is gone"
+    );
+    // A drop cut off after its physical step rolls forward.
+    env.crash(
+        DdlStep::Applied,
+        DdlStatement::DropObjects {
+            kind: ObjectKind::Table,
+            names: vec![ObjectName::bare("orders")],
+            if_exists: false,
+        },
+        "DROP TABLE orders",
+    )
+    .await;
+    let r = rec.pass(env.tenant).await.unwrap();
+    let labels: Vec<&str> = r.resolved.iter().map(|(_, r)| r.label()).collect();
+    assert_eq!(labels, ["rolled_forward"], "{:?}", r.resolved);
+    assert!(env.live("orders").is_none());
+    assert!(
+        env.snapshot()
+            .settings
+            .iter()
+            .all(|s| !s.key.starts_with("sprig.ddl."))
+    );
+}

@@ -882,7 +882,19 @@ pub(crate) fn value_expr(
     e: &sqlparser::ast::Expr,
     seqs: &SeqLookup<'_>,
 ) -> std::result::Result<CExpr, String> {
-    exec_expr_with(def, e, true, Some(seqs))
+    exec_expr_with(def, e, true, true, Some(seqs))
+}
+
+/// `e`, an expression of a row's columns that the single-table compiler
+/// doesn't have (a function call, `CASE`, date arithmetic), compiled by
+/// the expression engine and evaluated at the statement's time in the
+/// session's time zone and `sql_mode`: an `ON DUPLICATE KEY UPDATE`
+/// assignment, over the old row and the new one (`def` lists both).
+pub(crate) fn row_expr(
+    def: &TableDef,
+    e: &sqlparser::ast::Expr,
+) -> std::result::Result<CExpr, String> {
+    exec_expr_with(def, e, false, true, None)
 }
 
 /// Resolves a sequence's name (`schema` empty: the current database) to
@@ -924,13 +936,14 @@ fn exec_expr_in(
     e: &sqlparser::ast::Expr,
     value: bool,
 ) -> std::result::Result<CExpr, String> {
-    exec_expr_with(def, e, value, None)
+    exec_expr_with(def, e, value, value, None)
 }
 
 fn exec_expr_with(
     def: &TableDef,
     e: &sqlparser::ast::Expr,
     value: bool,
+    clock: bool,
     seqs: Option<&SeqLookup<'_>>,
 ) -> std::result::Result<CExpr, String> {
     let table = super::general::names::plan_table(def, "");
@@ -970,7 +983,7 @@ fn exec_expr_with(
     Ok(CExpr::Exec(Arc::new(super::expr::ExecExpr {
         maria,
         mysql,
-        session_clock: value,
+        session_clock: clock,
     })))
 }
 

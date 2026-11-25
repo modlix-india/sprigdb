@@ -11,6 +11,26 @@ use async_trait::async_trait;
 /// One result row, text protocol: `None` is SQL `NULL`.
 pub type Row = Vec<Option<Vec<u8>>>;
 
+/// One result column of [`SqlRunner::query_columns`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Column {
+    /// The column's name in the result.
+    pub name: String,
+    /// The protocol's type code (`MYSQL_TYPE_LONGLONG` is 8, ...).
+    pub ty: u8,
+    /// `UNSIGNED`.
+    pub unsigned: bool,
+}
+
+/// A statement's result with its columns.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Table {
+    /// The columns.
+    pub columns: Vec<Column>,
+    /// The rows, text protocol.
+    pub rows: Vec<Row>,
+}
+
 /// A failed statement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SqlError {
@@ -90,6 +110,15 @@ pub trait SqlRunner: Send {
         Err(SqlError {
             errno: None,
             message: "this runner doesn't prepare statements".into(),
+        })
+    }
+    /// A client's own statement (no internal names allowed, the session's
+    /// privileges and row-level security as for any client): its columns
+    /// and rows. By default an error.
+    async fn query_columns(&mut self, _sql: &str) -> Result<Table, SqlError> {
+        Err(SqlError {
+            errno: None,
+            message: "this runner doesn't run client statements".into(),
         })
     }
 }

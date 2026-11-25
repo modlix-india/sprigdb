@@ -51,6 +51,19 @@ fn rows_are_one_flat_value_list() {
         rows_sql(&cols, &[]),
         "SELECT NULL AS `a`, NULL AS `b` FROM DUAL WHERE FALSE"
     );
+    // MySQL's table value constructor names each row.
+    assert_eq!(
+        rows_sql_in(
+            &cols,
+            &[
+                vec![GraphLit::Int(1), GraphLit::Int(2)],
+                vec![GraphLit::Int(3), GraphLit::Int(4)],
+                vec![GraphLit::Int(5), GraphLit::Null],
+            ],
+            true,
+        ),
+        "SELECT 1 AS `a`, 2 AS `b` UNION ALL VALUES ROW(3, 4), ROW(5, NULL)"
+    );
 }
 
 /// A prepared statement's values go in as SQL literals

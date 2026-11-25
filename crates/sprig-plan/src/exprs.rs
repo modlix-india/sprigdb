@@ -190,6 +190,8 @@ pub(crate) fn slot_type(ty: &ExprType) -> ColumnType {
         }
         Kind::Double => ColumnType::Double,
         Kind::Float => ColumnType::Float,
+        // A JSON value stays one through the slot.
+        Kind::Str if ty.json => ColumnType::Json,
         Kind::Str => {
             if ty.coll == Collation::Binary {
                 ColumnType::VarBinary { bytes: ty.len }

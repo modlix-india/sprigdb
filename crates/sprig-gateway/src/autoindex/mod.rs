@@ -11,13 +11,25 @@
 //!     time, and one per node)
 //! GatewayEnv:
 //!   window     the workload records (WorkloadTables::window)
-//!   table      the engine definition, a sample for distinct counts
+//!   table      the engine definition, distinct counts from a sample, kept
+//!              in m/autoindex/stats and reused for 6 hours (or until the
+//!              definition changes), across restarts
 //!   replay     replay::statements + replay::replay_one (what-if plans)
 //!   build/drop ddl::build / ddl::drop (the catalog's DDL path)
-//!   reads      usage::reads (plans that read the index since start)
+//!   reads      usage::reads (plans that read the index since start),
+//!              usage::last_read_us
+//!   auto_indexes  every sprig_auto_* index in the tenant's engine catalog
+//!              (the pass's reconciler)
 //!   propose    the approvals inbox (kind index.create, mode approve)
 //!   paused     the tenant's unit has no known leader (an election or a
 //!              failover is running)
+//! every minute, besides the passes:
+//!   usage      tenants whose automatic indexes were read: pass::note_usage
+//!              writes the counts into the records (and once more when the
+//!              loop stops), so a restart forgets at most a minute of them
+//!   requests   tenants with index records: pass::apply_requests (an
+//!              operator's drop, pin, unpin or restore, written by the
+//!              controller's Admin API)
 //! ```
 //!
 //! `SPRIGDB_AUTOINDEX_TICK_MS` shortens the minute between checks (tests
@@ -42,10 +54,11 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sprig_advisor::autoindex::candidates::TableInfo;
-use sprig_advisor::autoindex::model::{BuildReport, IndexRecord, IndexSpec};
+use sprig_advisor::autoindex::model::{BuildReport, IndexRecord, IndexSpec, KeyCol, is_auto_name};
 use sprig_advisor::autoindex::pass::{self, Approval, Env};
 use sprig_advisor::autoindex::policy::Replay;
 use sprig_advisor::autoindex::settings::{AutoIndexSettings, EVAL_INTERVAL_MINUTES};
+use sprig_advisor::autoindex::store::AutoIndexStore;
 use sprig_approvals::model::{
     Action, Kind, Level, Mode as ApMode, Proposal, RecId, State, Subject,
 };
@@ -59,6 +72,7 @@ use sprig_workload::keyring::TenantKeyring;
 use sprig_workload::store::WorkloadTables;
 use sprig_workload::window::FpWindowStats;
 
+use crate::engine::catalog;
 use crate::node_engine::{self, UnitLeader};
 use crate::tenant::TenantServices;
 
@@ -157,7 +171,23 @@ impl Env for GatewayEnv {
         let Some(def) = ddl::table_def(&self.svc, &cat, db, table) else {
             return Ok(None);
         };
-        replay::table_info(self.tenant, db, &def).await.map(Some)
+        // The figures kept in the records while fresh, else a sample (kept
+        // for the next passes, and across a restart).
+        let key = format!("{db}.{table}").to_lowercase();
+        let cached = {
+            let mut tx = self.svc.records.begin(self.tenant).await?;
+            let st = AutoIndexStore::stats(&mut *tx, &key).await?;
+            tx.commit().await?;
+            st
+        };
+        let (info, taken) =
+            replay::table_info(self.tenant, db, &def, cached.as_ref(), self.now_us()).await?;
+        if let Some(st) = taken {
+            let mut tx = self.svc.records.begin(self.tenant).await?;
+            AutoIndexStore::put_stats(&mut *tx, &st).await?;
+            tx.commit().await?;
+        }
+        Ok(Some(info))
     }
 
     async fn replay(
@@ -226,6 +256,47 @@ impl Env for GatewayEnv {
             .map_or(0, |o| usage::reads(self.tenant.0, o, name))
     }
 
+    fn last_read_us(&self, spec: &IndexSpec, name: &str) -> Option<u64> {
+        usage::last_read_us(self.tenant.0, self.object(spec)?, name)
+    }
+
+    async fn auto_indexes(&self) -> Result<Vec<(IndexSpec, String)>> {
+        let cat = self.svc.cache.get(self.tenant, Freshness::Latest).await?;
+        let Some(eng) = catalog::of(&cat) else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::new();
+        for p in eng.tables.values() {
+            let Ok(td) = p.as_ref().as_ref() else {
+                continue;
+            };
+            let Some(db) = cat.databases.get(td.db) else {
+                continue;
+            };
+            for x in td.indexes.iter().filter(|x| is_auto_name(&x.name)) {
+                let cols = x
+                    .cols
+                    .iter()
+                    .zip(&x.parts)
+                    .filter_map(|(&c, kc)| {
+                        Some(KeyCol {
+                            column: td.columns.get(c)?.name.clone(),
+                            desc: kc.desc,
+                        })
+                    })
+                    .collect();
+                let spec = IndexSpec {
+                    db: db.name.clone(),
+                    table: td.name.clone(),
+                    cols,
+                };
+                out.push((spec, x.name.clone()));
+            }
+        }
+        out.sort_by(|a, b| a.1.cmp(&b.1));
+        Ok(out)
+    }
+
     async fn propose(&self, rec: &IndexRecord) -> Result<String> {
         let mut subject = Subject::tenant(self.tenant, self.svc.dc.clone());
         subject.db_name = Some(rec.spec.db.clone());
@@ -285,6 +356,57 @@ impl Env for GatewayEnv {
     }
 }
 
+/// Writes the reads counted in memory into the index records of every
+/// tenant read since the last call (`pass::note_usage`).
+async fn flush_usage(
+    svc: &Arc<TenantServices>,
+    keyring: &Arc<dyn TenantKeyring>,
+    approvals: &Arc<Approvals>,
+    tenants: &BTreeSet<u64>,
+) {
+    for t in usage::take_dirty() {
+        if !tenants.contains(&t) || matches!(node_engine::tenant_leader(t), UnitLeader::Node(_)) {
+            continue;
+        }
+        let r = match GatewayEnv::new(svc, keyring, approvals, TenantId(t)).await {
+            Ok(env) => pass::note_usage(&env).await,
+            Err(e) => Err(e),
+        };
+        if let Err(e) = r {
+            tracing::debug!(tenant = t, error = %e, "automatic indexing: usage not written");
+        }
+    }
+}
+
+/// Applies operators' pending requests for every tenant in `known`
+/// (`pass::apply_requests`).
+async fn apply_requests(
+    svc: &Arc<TenantServices>,
+    keyring: &Arc<dyn TenantKeyring>,
+    approvals: &Arc<Approvals>,
+    known: &BTreeSet<u64>,
+) {
+    for &t in known {
+        if matches!(node_engine::tenant_leader(t), UnitLeader::Node(_)) {
+            continue;
+        }
+        let Ok(env) = GatewayEnv::new(svc, keyring, approvals, TenantId(t)).await else {
+            continue;
+        };
+        match pass::apply_requests(&env).await {
+            Ok(done) => {
+                for a in done {
+                    tracing::info!(tenant = t, index = %a.index, action = a.action.name(),
+                        outcome = %a.outcome, "automatic indexing: operator request");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(tenant = t, error = %e, "automatic indexing: operator requests failed");
+            }
+        }
+    }
+}
+
 /// Starts the loop; it ends with `stop`.
 pub(crate) fn spawn(
     svc: Arc<TenantServices>,
@@ -302,11 +424,19 @@ pub(crate) fn spawn(
     let mut loads = svc.cache.loads();
     tokio::spawn(async move {
         let mut tenants: BTreeSet<u64> = BTreeSet::new();
+        // Tenants with index records: the ones an operator's request can
+        // name.
+        let mut known: BTreeSet<u64> = BTreeSet::new();
         let mut last: HashMap<u64, Instant> = HashMap::new();
         let mut timer = tokio::time::interval(tick);
         loop {
             tokio::select! {
-                () = stop.cancelled() => return,
+                () = stop.cancelled() => {
+                    // The reads counted since the last minute.
+                    let flush = flush_usage(&svc, &keyring, &approvals, &tenants);
+                    let _ = tokio::time::timeout(Duration::from_secs(5), flush).await;
+                    return;
+                }
                 l = loads.recv() => {
                     if let Ok(l) = l {
                         tenants.insert(l.tenant.0);
@@ -315,6 +445,8 @@ pub(crate) fn spawn(
                 }
                 _ = timer.tick() => {}
             }
+            flush_usage(&svc, &keyring, &approvals, &tenants).await;
+            apply_requests(&svc, &keyring, &approvals, &known).await;
             for &t in &tenants {
                 let tenant = TenantId(t);
                 if matches!(node_engine::tenant_leader(t), UnitLeader::Node(_)) {
@@ -346,6 +478,9 @@ pub(crate) fn spawn(
                 metrics::counter!("sprig_advisor_autoindex_runs_total").increment(1);
                 match pass::run(&env).await {
                     Ok(r) => {
+                        if r.records > 0 {
+                            known.insert(t);
+                        }
                         if !(r.built.is_empty() && r.dropped.is_empty() && r.recommended.is_empty())
                         {
                             tracing::info!(tenant = t, built = ?r.built, dropped = ?r.dropped,

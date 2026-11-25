@@ -849,7 +849,7 @@ impl DdlExecutor for GatewayDdl<'_> {
 /// `utf8mb4` default when neither is named. 1115 for a character set and
 /// 1273 for a collation the engine doesn't have, 1253 when they don't go
 /// together.
-fn database_charset(sql: &str) -> Result<SchemaInfo> {
+pub(crate) fn database_charset(sql: &str) -> Result<SchemaInfo> {
     use crate::engine::define::{charset_name, collation, default_collation};
     let word_after = |key: &str| {
         let at = sql.find(key)? + key.len();

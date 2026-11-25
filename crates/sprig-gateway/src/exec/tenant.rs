@@ -577,11 +577,27 @@ impl PassSession {
         // database: the engine path reads them again.
         self.eng.stale();
         let saved = self.fast_enter();
-        let r = Box::pin(self.tenant_text_one(cx, text, attrs, more, format, out)).await;
-        self.fast_leave(saved);
-        if client {
-            self.release_hier_locks().await;
+        if !client {
+            // A plan's statement: its answer is the layer's, and a
+            // `LAST_INSERT_ID(expr)` it ran is the client statement's.
+            let r = Box::pin(self.tenant_text_one(cx, text, attrs, more, format, out)).await;
+            self.fast_leave(saved);
+            return r;
         }
+        // What a client statement answers is the session's `ROW_COUNT()`
+        // and `FOUND_ROWS()` afterwards.
+        let conn = u64::from(cx.session.id.0);
+        let mut counted = super::engine_seam::diag::CountSink::new(out, conn);
+        let r = Box::pin(self.tenant_text_one(cx, text, attrs, more, format, &mut counted)).await;
+        let (got, set_id) = counted.finish();
+        self.fast_leave(saved);
+        let got = if r.is_err() {
+            super::engine_seam::diag::Answered::Error
+        } else {
+            got
+        };
+        self.eng.after_statement(got, set_id);
+        self.release_hier_locks().await;
         r
     }
 
