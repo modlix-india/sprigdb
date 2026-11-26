@@ -644,6 +644,9 @@ pub(crate) fn bind(cx: &BindCtx<'_>, stmt: &Statement) -> Result<Option<Plan>> {
             else {
                 return Ok(None);
             };
+            if assigns_user_vars(stmt) {
+                return Err(not_on_engine("a user variable assigned inside UPDATE"));
+            }
             if u.from.is_some() || !u.order_by.is_empty() || u.returning.is_some() {
                 return Err(not_on_engine("this UPDATE form"));
             }
@@ -1005,6 +1008,45 @@ fn bind_query(cx: &BindCtx<'_>, q: &Query) -> Result<Option<Plan>> {
     }))
 }
 
+/// Whether a statement assigns a user variable inside an expression
+/// (`@v := e`).
+fn assigns_user_vars(stmt: &Statement) -> bool {
+    use sqlparser::ast::{BinaryOperator, visit_expressions};
+    let mut found = false;
+    let _ = visit_expressions(stmt, |e| {
+        if let Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Assignment,
+            ..
+        } = e
+            && matches!(&**left, Expr::Identifier(i) if i.value.starts_with('@'))
+        {
+            found = true;
+            return std::ops::ControlFlow::Break(());
+        }
+        std::ops::ControlFlow::Continue(())
+    });
+    found
+}
+
+/// Whether a `SELECT` names a user variable (`@v`): the gateway writes
+/// their values in before binding, unless the statement also assigns one.
+fn reads_user_vars(s: &Select) -> bool {
+    use sqlparser::ast::visit_expressions;
+    let mut found = false;
+    let _ = visit_expressions(s, |e| {
+        if let Expr::Identifier(i) = e
+            && i.value.starts_with('@')
+            && !i.value.starts_with("@@")
+        {
+            found = true;
+            return std::ops::ControlFlow::Break(());
+        }
+        std::ops::ControlFlow::Continue(())
+    });
+    found
+}
+
 fn check_plain_select(s: &Select) -> Result<()> {
     let grouped =
         !matches!(&s.group_by, GroupByExpr::Expressions(e, m) if e.is_empty() && m.is_empty());
@@ -1023,6 +1065,8 @@ fn check_plain_select(s: &Select) -> Result<()> {
             .select_modifiers
             .as_ref()
             .is_some_and(|m| m.sql_calc_found_rows)
+        // User variables read or assigned per row: the planner's.
+        || reads_user_vars(s)
     {
         return Err(not_on_engine("this SELECT form"));
     }

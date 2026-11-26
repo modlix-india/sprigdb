@@ -165,3 +165,37 @@ fn recorded_corpus_matches_when_given() {
     }
     println!("corpus: {} of {total} match", total - failed);
 }
+
+/// A character set named without a collation, or a database's default,
+/// gets each port's own default: MySQL 8.4's on the MySQL port.
+#[test]
+fn each_port_gives_its_own_default_collation() {
+    let on = |mysql: bool, sql: &str| match create(sql, &Ctx { mysql, ..cx() }) {
+        Ok(Created::Def(d)) => render(&d),
+        _ => "ERROR".into(),
+    };
+    let sql = "CREATE TABLE t (a varchar(5), b varchar(5) character set utf8mb3)";
+    let my = on(true, sql);
+    assert!(
+        my.ends_with("DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"),
+        "{my}"
+    );
+    assert!(
+        my.contains("CHARACTER SET utf8mb3 COLLATE utf8mb3_general_ci"),
+        "{my}"
+    );
+    let maria = on(false, sql);
+    assert!(maria.ends_with("COLLATE=utf8mb4_uca1400_ai_ci"), "{maria}");
+    assert!(maria.contains("COLLATE utf8mb3_uca1400_ai_ci"), "{maria}");
+    // A collation the statement names is kept on both ports.
+    let named = on(
+        true,
+        "CREATE TABLE t (a varchar(5)) COLLATE utf8mb4_uca1400_ai_ci",
+    );
+    assert!(named.ends_with("COLLATE=utf8mb4_uca1400_ai_ci"), "{named}");
+    let cs = on(true, "CREATE TABLE t (a varchar(5)) CHARSET utf8mb3");
+    assert!(
+        cs.ends_with("DEFAULT CHARSET=utf8mb3 COLLATE=utf8mb3_general_ci"),
+        "{cs}"
+    );
+}

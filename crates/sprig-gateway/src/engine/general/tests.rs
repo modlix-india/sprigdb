@@ -671,7 +671,7 @@ async fn what_the_planner_does_not_run_is_refused() {
         "SELECT o.id FROM orders o JOIN v_orders v ON v.id = o.id",
         "SELECT o.id FROM orders o WHERE o.id IN (SELECT id FROM legacy.old)",
         "SELECT status, COUNT(*) FROM orders GROUP BY status FOR UPDATE",
-        "EXPLAIN ANALYZE SELECT COUNT(*) FROM orders",
+        "EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM orders",
     ] {
         let (code, msg) = refused(&f, sql);
         assert_eq!(code, NOT_ON_ENGINE, "{sql}: {msg}");
@@ -699,7 +699,8 @@ async fn what_the_planner_does_not_run_is_refused() {
             .is_none()
     );
     // An ENUM passes through as a plain column of the outermost select
-    // list; computed with, it is refused.
+    // list, and as its member text in a set operation; computed with, it
+    // is refused.
     assert!(
         general(
             &f,
@@ -718,13 +719,17 @@ async fn what_the_planner_does_not_run_is_refused() {
         // (`tier = 'gold'` runs: a member-number comparison.)
         "SELECT id FROM customers WHERE tier > 'gold' ORDER BY name",
         "SELECT CONCAT(tier, '!') FROM customers",
-        "SELECT d.tier FROM (SELECT tier FROM customers) d",
-        "SELECT tier FROM customers UNION SELECT status FROM orders",
     ] {
         let (code, msg) = refused(&f, sql);
         assert_eq!(code, NOT_ON_ENGINE, "{sql}: {msg}");
         assert!(msg.contains("ENUM"), "{msg}");
     }
+    // Read through a derived table, it is the member text.
+    assert!(
+        general(&f, "SELECT d.tier FROM (SELECT tier FROM customers) d")
+            .unwrap()
+            .is_some()
+    );
     // What the planner itself doesn't cover yet is the engine's refusal
     // too, with the planner's words.
     let (e, f2, _d) = shop().await;
@@ -1424,4 +1429,202 @@ async fn sql_calc_found_rows_counts_past_the_limit() {
     .await
     .unwrap_err();
     assert_eq!(err.protocol().mysql_errno, 1234);
+}
+
+#[tokio::test]
+async fn json_table_runs_on_the_engine() {
+    let (e, f, _d) = shop().await;
+    let s = seed();
+    let run = |sql: &'static str| {
+        let (e, f, s) = (&e, &f, &s);
+        async move { select_with(e, f, s, sql).await.map(|(rows, _)| rows) }
+    };
+    let got = run(r#"SELECT * FROM JSON_TABLE('[{"a":1,"b":"x"},{"a":2},{"c":3}]', '$[*]' COLUMNS (rn FOR ORDINALITY, a INT PATH '$.a', b VARCHAR(5) PATH '$.b', e INT EXISTS PATH '$.c')) AS jt"#).await.unwrap();
+    assert_eq!(got, ["1|1|x|0", "2|2|NULL|0", "3|NULL|NULL|1"]);
+    let got = run(r#"SELECT * FROM JSON_TABLE('{"x":[1,2],"y":[{"z":5}]}', '$' COLUMNS (NESTED PATH '$.x[*]' COLUMNS (x INT PATH '$'), NESTED PATH '$.y[*]' COLUMNS (z INT PATH '$.z'))) jt"#).await.unwrap();
+    assert_eq!(got, ["1|NULL", "2|NULL", "NULL|5"]);
+    // Lateral: the document reads the item before it.
+    let got = run("SELECT c.id, j.v FROM customers c, JSON_TABLE(CONCAT('[', c.id, ',', c.id + 100, ']'), '$[*]' COLUMNS (v INT PATH '$')) AS j WHERE c.id <= 2 ORDER BY c.id, j.v").await.unwrap();
+    assert_eq!(got, ["1|1", "1|101", "2|2", "2|102"]);
+    let got = run("SELECT c.id, j.v FROM customers c LEFT JOIN JSON_TABLE(IF(c.id = 1, '[7]', '[]'), '$[*]' COLUMNS (v INT PATH '$')) AS j ON 1 WHERE c.id <= 2 ORDER BY c.id").await.unwrap();
+    assert_eq!(got, ["1|7", "2|NULL"]);
+    let err = run("SELECT * FROM JSON_TABLE('[1]', '$[*]' COLUMNS (a INT PATH '$'))")
+        .await
+        .unwrap_err();
+    assert_eq!(err.protocol().mysql_errno, 4177);
+}
+
+/// The session's user variables for a test: a plain map.
+#[derive(Debug, Default)]
+struct TestVars(
+    std::sync::Mutex<HashMap<String, (sprig_engine::row::Value, sprig_exec::ExprType)>>,
+    std::sync::atomic::AtomicBool,
+);
+
+impl sprig_exec::UserVars for TestVars {
+    fn get(&self, name: &str) -> Option<(sprig_engine::row::Value, sprig_exec::ExprType)> {
+        self.0.lock().unwrap().get(name).cloned()
+    }
+
+    fn set(&self, name: &str, value: sprig_engine::row::Value, ty: sprig_exec::ExprType) {
+        self.0.lock().unwrap().insert(name.to_owned(), (value, ty));
+    }
+
+    fn first_assignment(&self) -> bool {
+        !self.1.swap(true, Ordering::Relaxed)
+    }
+}
+
+#[tokio::test]
+async fn user_variables_are_read_and_assigned_per_row() {
+    use sprig_engine::row::Value;
+    let (e, f, _d) = shop().await;
+    let mut s = seed();
+    let vars = Arc::new(TestVars::default());
+    sprig_exec::UserVars::set(
+        &*vars,
+        "r",
+        Value::Int(0),
+        sprig_exec::ExprType::int(21, false),
+    );
+    s.session.info.user_vars = Some(vars.clone());
+    let (got, _) = select_with(
+        &e,
+        &f,
+        &s,
+        "SELECT c.id, @r := @r + 1 AS rn FROM customers c WHERE c.id <= 3 ORDER BY c.id",
+    )
+    .await
+    .unwrap();
+    assert_eq!(got, ["1|1", "2|2", "3|3"]);
+    assert_eq!(
+        sprig_exec::UserVars::get(&*vars, "r").unwrap().0,
+        Value::Int(3)
+    );
+    // A read has the type the variable had when the statement was planned.
+    let (got, _) = select_with(&e, &f, &s, "SELECT @r := 'x', @r")
+        .await
+        .unwrap();
+    assert_eq!(got, ["x|0"]);
+    // A variable never set reads as NULL.
+    let (got, _) = select_with(
+        &e,
+        &f,
+        &s,
+        "SELECT c.id FROM customers c WHERE c.id = @nope",
+    )
+    .await
+    .unwrap();
+    assert!(got.is_empty());
+}
+
+/// Shapes the change streams' inheritance probes use: an `ENUM` column
+/// in a set operation (its member text), `FROM DUAL` inside a union and a
+/// subquery, and a `JSON_TABLE` whose document reads the outer row.
+#[tokio::test]
+async fn enum_set_operations_dual_and_outer_json_table_run_on_the_engine() {
+    let (e, f, _d) = shop().await;
+    let run = |sql: &'static str| {
+        let (e, f) = (&e, &f);
+        async move { select(e, f, sql, &[]).await }
+    };
+    // `tier` is ENUM('gold', 'silver', 'none').
+    let got = run("SELECT tier FROM customers WHERE id IN (1, 3) UNION ALL SELECT 'x' ORDER BY 1")
+        .await
+        .unwrap();
+    assert_eq!(got, ["gold", "silver", "x"]);
+    let got = run("SELECT id FROM customers WHERE id = 1 UNION ALL SELECT 7 FROM DUAL")
+        .await
+        .unwrap();
+    assert_eq!(got, ["1", "7"]);
+    let got = run("SELECT id FROM customers WHERE id IN (SELECT 2 FROM DUAL)")
+        .await
+        .unwrap();
+    assert_eq!(got, ["2"]);
+    let got = run(
+        "SELECT c.id FROM customers c WHERE c.id <= 3 AND EXISTS (SELECT 1 FROM \
+         JSON_TABLE(CONCAT('[', c.id, ']'), '$[*]' COLUMNS (v INT PATH '$')) AS j WHERE j.v = 2)",
+    )
+    .await
+    .unwrap();
+    assert_eq!(got, ["2"]);
+}
+
+/// An `ENUM` column a derived table or a common table expression reads,
+/// computed with outside it, is read as its member text.
+#[tokio::test]
+async fn enum_columns_read_through_derived_tables_compare_as_text() {
+    let (e, f, _d) = shop().await;
+    let run = |sql: &'static str| {
+        let (e, f) = (&e, &f);
+        async move { select(e, f, sql, &[]).await }
+    };
+    // `tier` is ENUM('gold', 'silver', 'none'): ids 1..6 are silver,
+    // none, gold, silver, none, gold.
+    let got = run(
+        "SELECT x.id FROM (SELECT id, tier FROM customers WHERE id <= 6) x \
+         WHERE x.tier <> 'gold' ORDER BY x.id",
+    )
+    .await
+    .unwrap();
+    assert_eq!(got, ["1", "2", "4", "5"]);
+    let got = run(
+        "WITH c AS (SELECT c.id, c.tier FROM customers c WHERE c.id <= 6) \
+         SELECT c.id FROM c WHERE c.tier IN ('none') ORDER BY 1",
+    )
+    .await
+    .unwrap();
+    assert_eq!(got, ["2", "5"]);
+    // The derived table takes the name of the base table inside it.
+    let got = run(
+        "SELECT COUNT(*) FROM (SELECT c.id, c.tier FROM customers AS c WHERE c.id <= 6 \
+         UNION ALL SELECT 99, 'ovr') c WHERE c.tier IS NULL OR c.tier <> 'silver'",
+    )
+    .await
+    .unwrap();
+    assert_eq!(got, ["5"]);
+    // Passed straight through, the column is still the table's.
+    let got = run("SELECT x.tier FROM (SELECT id, tier FROM customers) x WHERE x.id = 3")
+        .await
+        .unwrap();
+    assert_eq!(got, ["gold"]);
+    // Unqualified in a `FROM` of base tables, the name is the table's
+    // even when a derived table elsewhere names a column the same.
+    let got = run(
+        "SELECT x.id FROM (SELECT id FROM customers WHERE tier <> 'gold' AND id <= 6) x \
+         JOIN (SELECT id, tier FROM customers) y ON y.id = x.id ORDER BY x.id",
+    )
+    .await
+    .unwrap();
+    assert_eq!(got, ["1", "2", "4", "5"]);
+}
+
+/// `ANALYZE` runs the statement and answers its plan with what it read.
+#[tokio::test]
+async fn analyze_answers_the_plan_with_the_rows_read() {
+    let (e, f, _d) = shop().await;
+    let got = select(
+        &e,
+        &f,
+        "EXPLAIN ANALYZE SELECT * FROM customers WHERE id <= 3",
+        &[],
+    )
+    .await
+    .unwrap();
+    assert_eq!(got.len(), 1, "{got:?}");
+    let cols: Vec<&str> = got[0].split('|').collect();
+    assert_eq!(cols.len(), 13, "{got:?}");
+    // `rows`, `r_rows`, `filtered`, `r_filtered`.
+    assert_eq!(cols[9], "3.00", "{got:?}");
+    assert_eq!(cols[11], "100.00", "{got:?}");
+    let got = select(
+        &e,
+        &f,
+        "EXPLAIN ANALYZE FORMAT=JSON SELECT * FROM customers WHERE id <= 3",
+        &[],
+    )
+    .await
+    .unwrap();
+    assert!(got[0].contains("\"r_rows\": 3"), "{got:?}");
+    assert!(got[0].starts_with("{\n  \"query_optimization\""), "{got:?}");
 }

@@ -166,6 +166,7 @@ impl Spec {
                     ty: c.ty,
                     nullable: c.nullable,
                     invisible: false,
+                    mb3: false,
                 })
                 .collect(),
             primary: (!self.pk.is_empty()).then(|| {

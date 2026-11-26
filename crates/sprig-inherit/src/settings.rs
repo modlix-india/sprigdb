@@ -1,8 +1,9 @@
 //! The `inherit.*` keys this crate reads.
 //! The gateway resolves them at tenant scope for each statement
-//! ([`crate::Limits`]). The `copy_*`, `federated_*` keys belong to the
-//! materialized and federated modes, which are not built, and are not
-//! registered.
+//! ([`crate::Limits`]). `copy_wait_ms` is read by the gateway's exact
+//! reads of copies on engine databases. The other `copy_*` and the
+//! `federated_*` keys belong to parts of the materialized and federated
+//! modes that are not built, and are not registered.
 
 use std::borrow::Cow;
 
@@ -90,3 +91,18 @@ pub static SYNC_ORPHAN_MAX_ROWS: Setting<u64> = Setting {
     doc: "Rows per key orphaned in the deleting transaction",
 };
 sprig_settings::register!(SYNC_ORPHAN_MAX_ROWS);
+
+/// `inherit.copy_wait_ms`: how long a statement on engine databases waits
+/// for a materialized copy to apply every commit it can see before it
+/// reads through the levels above instead (0: never wait).
+pub static COPY_WAIT_MS: Setting<u64> = Setting {
+    key: "inherit.copy_wait_ms",
+    default: 100,
+    scopes: Scopes::DATA,
+    hard: HardBounds::range(0, 10_000),
+    apply: Apply::Live,
+    operator_only: false,
+    owner: 42,
+    doc: "Milliseconds a statement waits for a lagging materialized copy before reading through",
+};
+sprig_settings::register!(COPY_WAIT_MS);

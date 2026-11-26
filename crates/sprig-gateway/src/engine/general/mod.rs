@@ -39,6 +39,7 @@
 //!   single-table path does; such a statement runs off the runtime's
 //!   worker, since a lock wait blocks its thread.
 
+pub(crate) mod expanded;
 pub(crate) mod names;
 pub(crate) mod results;
 pub(crate) mod storage;
@@ -78,6 +79,14 @@ pub(crate) struct General {
     pub stmt: Statement,
     /// `EXPLAIN SELECT`: the plan is the answer.
     pub explain: bool,
+    /// The `EXPLAIN` is answered with MySQL's Note 1003 on the MySQL port
+    /// (its traditional and JSON forms; not the tree the MySQL port draws
+    /// from a JSON plan, which `sprig_sql::compat::explain` marks).
+    pub explain_note: bool,
+    /// `ANALYZE` (MariaDB's; the MySQL port's `EXPLAIN ANALYZE` arrives
+    /// as `ANALYZE FORMAT=JSON`): the statement runs, and the plan with
+    /// what it measured is the answer; `Some(true)` for the JSON form.
+    pub analyze: Option<bool>,
     /// Every table the statement reads, with the columns it may read.
     pub tables: Vec<TableUse>,
     /// Where each result column comes from, when the select list says so
@@ -197,11 +206,15 @@ pub(crate) fn bind_tableless(
     let Statement::Query(q) = stmt else {
         return Ok(None);
     };
-    // A set operation or VALUES, alone or as a derived table.
+    // A set operation or VALUES, alone or as a derived table; or a
+    // `JSON_TABLE` (MariaDB, which would run it, types it its way).
     let derived_values = match &*q.body {
         SetExpr::Select(s) => s.from.iter().any(|t| {
             matches!(&t.relation, sqlparser::ast::TableFactor::Derived { subquery, .. }
                 if matches!(&*subquery.body, SetExpr::Values(_) | SetExpr::SetOperation { .. }))
+                || std::iter::once(&t.relation)
+                    .chain(t.joins.iter().map(|j| &j.relation))
+                    .any(|f| matches!(f, sqlparser::ast::TableFactor::JsonTable { .. }))
         }),
         _ => false,
     };
@@ -265,10 +278,15 @@ pub(crate) fn bind_no_tables(
     stmt: &Statement,
     text: Option<&str>,
 ) -> Result<Option<General>> {
-    if !matches!(stmt, Statement::Query(_)) {
-        return Ok(None);
-    }
-    if names_table(stmt) {
+    // The query, or the query an `EXPLAIN` describes.
+    let inner = match stmt {
+        Statement::Query(_) => stmt,
+        Statement::Explain { statement, .. } if matches!(**statement, Statement::Query(_)) => {
+            statement
+        }
+        _ => return Ok(None),
+    };
+    if names_table(inner) {
         return Ok(None);
     }
     bind_in(cx, stmt, text, None, true)
@@ -281,6 +299,7 @@ fn bind_in(
     lock: Option<crate::engine::plan::RowLock>,
     tableless: bool,
 ) -> Result<Option<General>> {
+    let mut analyze_json = None;
     let explain = match stmt {
         Statement::Query(_) => false,
         Statement::Explain {
@@ -292,8 +311,21 @@ fn bind_in(
             options,
             ..
         } if matches!(**statement, Statement::Query(_)) => {
-            if *analyze || format.is_some() || *query_plan || *estimate || options.is_some() {
-                // Only the plain tabular form is the planner's; the other
+            use sqlparser::ast::{AnalyzeFormat as F, AnalyzeFormatKind as K};
+            let planner_form = matches!(
+                format,
+                None | Some(
+                    K::Keyword(F::JSON | F::TRADITIONAL) | K::Assignment(F::JSON | F::TRADITIONAL)
+                )
+            );
+            if *analyze {
+                analyze_json = Some(matches!(
+                    format,
+                    Some(K::Keyword(F::JSON) | K::Assignment(F::JSON))
+                ));
+            }
+            if !planner_form || *query_plan || *estimate || options.is_some() {
+                // The tabular and JSON forms are the planner's; the other
                 // forms would be answered from MariaDB's empty copy.
                 return match names::analyze(cx, stmt, None, false)? {
                     Some(_) => Err(not_on_engine(
@@ -316,6 +348,10 @@ fn bind_in(
     Ok(Some(General {
         stmt: a.stmt,
         explain,
+        explain_note: explain
+            && analyze_json.is_none()
+            && text.is_none_or(|t| !t.contains(sprig_sql::compat::explain::TREE_MARK)),
+        analyze: analyze_json,
         tables: a.tables,
         origins: a.origins,
         written: a.written,
@@ -469,6 +505,8 @@ impl Seed {
             };
             if let Some(n) = named {
                 s.collation_connection = n;
+                let l = c.to_ascii_lowercase();
+                s.connection_mb3 = l.starts_with("utf8mb3_") || l.starts_with("utf8_");
             }
         }
         let num = |k: &str| get(k).and_then(|v| v.trim().parse::<u64>().ok());
@@ -711,11 +749,23 @@ impl Engine {
                 max_recursion: a.seed.max_recursion,
                 ..PlanOptions::for_persona(session.persona)
             };
-            let mut plan = planner.plan(&g.stmt, a.params)?;
+            let started = std::time::Instant::now();
+            let stmt = match (&g.analyze, &g.stmt) {
+                (Some(_), Statement::Explain { statement, .. }) => &**statement,
+                _ => &g.stmt,
+            };
+            let mut plan = planner.plan(stmt, a.params)?;
             if !g.explain && !dry {
                 crate::autoindex::usage::note_plan(a.tenant, g, &plan.explain);
             }
             let mut ctx = Ctx::with_params(&session, a.params);
+            if g.explain_note
+                && session.persona == sprig_exec::Persona::MySql
+                && let Some(text) =
+                    expanded::expanded(&g.stmt, &g.tables, g.current.as_deref(), &g.written)
+            {
+                ctx.note(1003, text);
+            }
             let mut rows = Vec::new();
             let mut done = dry;
             // The first stretch runs where it is; a statement that is
@@ -743,6 +793,18 @@ impl Engine {
                 } else {
                     rest()?;
                 }
+            }
+            // `ANALYZE`: the rows go; the plan with what it measured is
+            // the answer.
+            if let Some(json) = g.analyze {
+                let micros = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+                let steps = sprig_plan::analyzed(&plan.explain, &plan.accesses, micros);
+                let (mut src, columns) = sprig_plan::analyze_answer(&steps, micros, &session, json);
+                rows.clear();
+                while let Some(r) = src.next(&mut ctx)? {
+                    rows.push(r);
+                }
+                plan.columns = columns;
             }
             let no_index = plan
                 .explain

@@ -661,6 +661,7 @@ pub(crate) fn substr(args: Vec<Node>, env: Env<'_>) -> Result<Node> {
     let dtc = crate::types::Dtc {
         coll: f.coll,
         deriv: f.s.ty.deriv,
+        mb3: f.s.ty.mb3 && f.coll == f.s.ty.coll,
     };
     let ty = str_type(u64::from(f.s.ty.len), dtc, true);
     let cs = f.coll.charset();
@@ -779,6 +780,7 @@ pub(crate) fn replace(args: Vec<Node>, env: Env<'_>) -> Result<Node> {
     let dtc = crate::types::Dtc {
         coll: f.coll,
         deriv: f.s.ty.deriv,
+        mb3: f.s.ty.mb3 && f.coll == f.s.ty.coll,
     };
     // Both servers leave room for max_allowed_packet.
     let chars = unknown_chars(env, u64::from(mb_max_len(f.coll)));

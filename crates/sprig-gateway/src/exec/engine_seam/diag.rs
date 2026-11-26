@@ -836,9 +836,161 @@ impl ResultSink for DiagSink<'_> {
     }
 }
 
+impl PassSession {
+    /// The warnings MySQL 8.4 gives while it parses a statement that names
+    /// the `utf8mb3` character set (`sprig_sql::compat::utf8mb3`), for a
+    /// tenant whose statements all run in the gateway; empty otherwise.
+    pub(in crate::exec) fn utf8mb3_warnings(&self, original: &[u8]) -> Vec<LocalWarning> {
+        if self.persona != Persona::MySql84 {
+            return Vec::new();
+        }
+        let Some(cat) = self.tenant.as_deref().and_then(|ts| ts.catalog()) else {
+            return Vec::new();
+        };
+        if !super::sessvars::all_engine(cat) {
+            return Vec::new();
+        }
+        let (lex, _) = self.lex_opts();
+        sprig_sql::compat::utf8mb3::warnings(original, &lex)
+            .into_iter()
+            .map(|(code, message)| LocalWarning {
+                level: "Warning",
+                code,
+                message,
+            })
+            .collect()
+    }
+
+    /// Puts `first` ahead of what the statement left in the area (its
+    /// parse-time warnings come first).
+    pub(in crate::exec) fn diag_prepend(&mut self, first: Vec<LocalWarning>) {
+        if first.is_empty() {
+            return;
+        }
+        if let Some(ts) = self.tenant.as_deref_mut() {
+            let mut area = first;
+            if let Some(mut rest) = ts.warnings.take() {
+                area.append(&mut rest);
+            }
+            ts.warnings = Some(area);
+            self.eng.diag.backend = false;
+        }
+    }
+}
+
+/// A sink that counts `extra` more warnings in every OK and end-of-rows
+/// packet (warnings the gateway raised before the statement ran).
+pub(in crate::exec) struct ExtraWarnings<'a> {
+    inner: &'a mut dyn ResultSink,
+    extra: u16,
+}
+
+impl<'a> ExtraWarnings<'a> {
+    /// A sink over `inner` adding `extra`.
+    pub(in crate::exec) fn new(inner: &'a mut dyn ResultSink, extra: usize) -> Self {
+        Self {
+            inner,
+            extra: u16::try_from(extra).unwrap_or(u16::MAX),
+        }
+    }
+}
+
+#[async_trait]
+impl ResultSink for ExtraWarnings<'_> {
+    fn wire(&self) -> Wire {
+        self.inner.wire()
+    }
+
+    async fn begin_rows(&mut self, columns: &[ColumnDef], format: RowFormat) -> Result<()> {
+        self.inner.begin_rows(columns, format).await
+    }
+
+    async fn begin_rows_raw(&mut self, defs: &[Bytes], format: RowFormat) -> Result<()> {
+        self.inner.begin_rows_raw(defs, format).await
+    }
+
+    async fn cursor_opened(&mut self, columns: &[ColumnDef], mut end: EndOfRows) -> Result<()> {
+        end.warnings = end.warnings.saturating_add(self.extra);
+        self.inner.cursor_opened(columns, end).await
+    }
+
+    async fn row(&mut self, values: RowValues<'_>) -> Result<()> {
+        self.inner.row(values).await
+    }
+
+    async fn raw_row(&mut self, payload: Bytes) -> Result<()> {
+        self.inner.raw_row(payload).await
+    }
+
+    fn try_raw_row(&mut self, payload: Bytes) -> std::result::Result<Result<()>, Bytes> {
+        self.inner.try_raw_row(payload)
+    }
+
+    async fn end_rows(&mut self, mut end: EndOfRows) -> Result<()> {
+        end.warnings = end.warnings.saturating_add(self.extra);
+        self.inner.end_rows(end).await
+    }
+
+    async fn ok(&mut self, mut ok: OkPacket) -> Result<()> {
+        ok.warnings = ok.warnings.saturating_add(self.extra);
+        // An `ALTER`'s `Records: .. Warnings: n` counts them too.
+        if let Some(info) = more_warnings(&ok.info, self.extra) {
+            ok.info = info;
+        }
+        self.inner.ok(ok).await
+    }
+
+    async fn error(&mut self, err: &SprigError) -> Result<()> {
+        self.inner.error(err).await
+    }
+
+    async fn column_list(&mut self, columns: &[ColumnDef], end: EndOfRows) -> Result<()> {
+        self.inner.column_list(columns, end).await
+    }
+
+    async fn local_infile_request(&mut self, file_name: &[u8]) -> Result<()> {
+        self.inner.local_infile_request(file_name).await
+    }
+
+    async fn local_infile_read(&mut self) -> Result<Bytes> {
+        self.inner.local_infile_read().await
+    }
+
+    async fn flush(&mut self) -> Result<()> {
+        self.inner.flush().await
+    }
+
+    fn finished(&self) -> bool {
+        self.inner.finished()
+    }
+}
+
+/// An OK packet's info text with `extra` more in its `Warnings: n`.
+fn more_warnings(info: &[u8], extra: u16) -> Option<Bytes> {
+    let text = std::str::from_utf8(info).ok()?;
+    let at = text.rfind("Warnings: ")? + "Warnings: ".len();
+    let digits = text[at..].bytes().take_while(u8::is_ascii_digit).count();
+    let n: u64 = text[at..at + digits].parse().ok()?;
+    Some(Bytes::from(format!(
+        "{}{}{}",
+        &text[..at],
+        n + u64::from(extra),
+        &text[at + digits..]
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_alter_counts_the_parse_warnings() {
+        assert_eq!(
+            more_warnings(b"Records: 0  Duplicates: 0  Warnings: 0", 1).as_deref(),
+            Some(&b"Records: 0  Duplicates: 0  Warnings: 1"[..])
+        );
+        assert_eq!(more_warnings(b"", 1), None);
+    }
 
     #[test]
     fn diagnostic_shows() {

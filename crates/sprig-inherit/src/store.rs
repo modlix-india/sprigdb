@@ -45,6 +45,11 @@ pub const OBJECTS: RowTable = RowTable::new(MODULE, "objects");
 pub const SHARES: RowTable = RowTable::new(MODULE, "shares");
 /// Users' home spaces.
 pub const HOMES: RowTable = RowTable::new(MODULE, "homes");
+/// The highest share id handed out (one row): a dropped share's id is
+/// never given to a new share, so what was kept for the old share (a
+/// child's copy, its narrowing, a change stream's handover) is never taken
+/// for the new one.
+pub const SHARE_IDS: RowTable = RowTable::new(MODULE, "share_ids");
 
 const GRANTED: u8 = 1;
 const RECEIVED: u8 = 2;
@@ -422,6 +427,16 @@ impl InheritStore {
         Ok(max.max(1) + 1)
     }
 
+    /// The id of a new share: above every share row and every id handed
+    /// out before ([`SHARE_IDS`]; purged shares' rows are gone).
+    async fn next_share_id(rec: &mut dyn RecordTx) -> Result<u64> {
+        let pk = Pk::new().u64(0);
+        let last = SHARE_IDS.get::<u64>(rec, &pk).await?.unwrap_or(0);
+        let id = Self::next_id(rec, SHARES).await?.max(last + 1);
+        SHARE_IDS.put(rec, &pk, &id).await?;
+        Ok(id)
+    }
+
     /// Applies `change` to the records of a catalog change at catalog
     /// version `version`.
     ///
@@ -538,7 +553,7 @@ impl InheritStore {
         }
         for s in &change.upsert_shares {
             let id = if s.id == 0 {
-                Self::next_id(rec, SHARES).await?
+                Self::next_share_id(rec).await?
             } else {
                 s.id
             };

@@ -31,7 +31,7 @@ use sqlparser::ast;
 
 use crate::access::{Counters, Fetch, KeyRange, Storage, key_holds};
 use crate::catalog::{Catalog, KeyId, TableDef};
-use crate::explain::{ExplainRow, key_len};
+use crate::explain::{ExplainRow, key_len, part_names};
 use crate::exprs::{self, slot_ref};
 use crate::keyval::{key_usable, lookup_exact};
 use crate::range::{KeyCtx, RangeSet};
@@ -342,17 +342,29 @@ impl<'a> Planner<'a> {
             bound_outer: None,
             recording: Vec::new(),
         };
+        let mut json = false;
         let (query, explain, extended) = match &statement {
             ast::Statement::Query(q) => (q, false, false),
             ast::Statement::Explain {
                 statement,
                 analyze,
                 verbose,
+                format,
                 ..
-            } => match &**statement {
-                ast::Statement::Query(q) if !analyze => (q, true, *verbose),
-                _ => return Err(unsupported("EXPLAIN of this statement")),
-            },
+            } => {
+                use ast::{AnalyzeFormat as F, AnalyzeFormatKind as K};
+                json = match format {
+                    None | Some(K::Keyword(F::TRADITIONAL) | K::Assignment(F::TRADITIONAL)) => {
+                        false
+                    }
+                    Some(K::Keyword(F::JSON) | K::Assignment(F::JSON)) => true,
+                    Some(_) => return Err(unsupported("EXPLAIN in this format")),
+                };
+                match &**statement {
+                    ast::Statement::Query(q) if !analyze => (q, true, *verbose),
+                    _ => return Err(unsupported("EXPLAIN of this statement")),
+                }
+            }
             _ => return Err(unsupported("this statement")),
         };
         let calc = calc_found_rows(query)? && !explain;
@@ -393,7 +405,11 @@ impl<'a> Planner<'a> {
             }
         }
         if explain {
-            let (source, columns) = crate::explain::as_rows(&rows, &cx.session, extended);
+            let (source, columns) = if json {
+                crate::explain::as_json(&rows, &cx.session)
+            } else {
+                crate::explain::as_rows(&rows, &cx.session, extended)
+            };
             return Ok(Plan {
                 source,
                 columns,
@@ -471,7 +487,7 @@ impl Planner<'_> {
             .enumerate()
             .map(|(i, c)| RelCol {
                 name: c.name.clone(),
-                expr: crate::resolve::table_col(0, i, &c.name, c.ty, c.nullable),
+                expr: crate::resolve::table_col(0, i, c),
             })
             .collect();
         let rel = Rel {
@@ -677,6 +693,9 @@ enum Method {
     Hash(Vec<(Expr, Expr)>),
     /// Its rows are read once and replayed for every earlier row.
     Replay,
+    /// A table function that reads the earlier items: its rows made again
+    /// for each earlier row.
+    Lateral,
 }
 
 #[derive(Debug, Clone)]
@@ -745,7 +764,7 @@ fn rejects_nulls(e: &Expr, rel: &Rel) -> bool {
             | Expr::BitNot(a)
             | Expr::Not(a)
             | Expr::Cast(a, _)
-            | Expr::Collate(a, _) => strict(&[a]),
+            | Expr::Collate(a, ..) => strict(&[a]),
             Expr::Like(a, p, _, _) => strict(&[a, p]),
             Expr::Between(a, _, _, _) | Expr::In(a, _, _) => strict(&[a]),
             Expr::IsNull(a, true) => {
@@ -1641,6 +1660,10 @@ impl<'a> Cx<'a> {
                     }
                 }
             }
+            // A table function comes after the items its document reads.
+            if let RelKind::JsonTable(jt) = &rel.kind {
+                deps |= mask(&jt.doc) & !(1 << i);
+            }
             let needed: BTreeSet<usize> = used
                 .iter()
                 .filter(|s| **s >= rel.base && **s < rel.base + rel.width)
@@ -1651,6 +1674,19 @@ impl<'a> Cx<'a> {
                 RelKind::Table(t) => (
                     self.table_paths(rel.base, t, &local, &needed, &mut possible),
                     self.storage.table_rows(t) as f64,
+                ),
+                RelKind::JsonTable(_) => (
+                    vec![Path {
+                        key: KeyId::Primary,
+                        ranges: Vec::new(),
+                        full: true,
+                        set: None,
+                        rows: 10.0,
+                        cost: 2.0,
+                        covering: false,
+                        kept: (0..local.len()).collect(),
+                    }],
+                    10.0,
                 ),
                 RelKind::Derived(d) => {
                     self.ready_derived(d, Some((rel, &local)), "DERIVED")?;
@@ -1953,6 +1989,17 @@ impl<'a> Cx<'a> {
                         row.rows = Some(d.est_rows.get().max(1.0) as u64);
                         Box::new(DerivedSource::new(d.clone()))
                     }
+                    RelKind::JsonTable(jt) => {
+                        row.access = Some("ALL".into());
+                        row.rows = Some(2);
+                        row.extra
+                            .push("Table function: json_table; Using temporary".into());
+                        Box::new(crate::jsontable::JsonTableSource {
+                            table: jt.clone(),
+                            doc: compile(&jt.doc, &cx.session)?,
+                            rows: None,
+                        })
+                    }
                 };
                 if let Some(cond) = kept.and_then(exprs::and_all) {
                     *using_where = true;
@@ -2030,6 +2077,7 @@ impl<'a> Cx<'a> {
                     }
                     row.key_len =
                         Some(key_len(table, &def.parts[..lookup.exprs.len()]).to_string());
+                    row.key_parts = part_names(table, &def.parts[..lookup.exprs.len()]);
                     row.r#ref = Some(
                         lookup
                             .exprs
@@ -2103,6 +2151,25 @@ impl<'a> Cx<'a> {
                         &self.session,
                         self.memory.clone(),
                     )?)
+                }
+                (Method::Lateral, Some(outer)) => {
+                    let RelKind::JsonTable(jt) = &rel.kind else {
+                        return Err(unsupported("a lateral join of this item"));
+                    };
+                    row.access = Some("ALL".into());
+                    row.rows = Some(2);
+                    row.extra
+                        .push("Table function: json_table; Using temporary".into());
+                    let inner = Box::new(crate::jsontable::JsonTableInner {
+                        table: jt.clone(),
+                        doc: self.compile_at(&jt.doc, &prefix_map)?,
+                        rows: Vec::new().into_iter(),
+                    });
+                    let on = match &on_cond {
+                        Some(c) => Some(self.compile_at(c, &joined_map)?),
+                        None => None,
+                    };
+                    Box::new(NestedLoopJoin::new(outer, inner, on, kind))
                 }
                 (Method::Replay, Some(outer)) => {
                     let right = own_scan(self, &best_path, &mut row, false, &mut using_where)?;
@@ -2773,6 +2840,7 @@ impl<'a> Cx<'a> {
                         row.possible_keys = Some(def.name.clone());
                         row.key_len =
                             Some(key_len(&simple.table, &def.parts[..bound.len()]).to_string());
+                        row.key_parts = part_names(&simple.table, &def.parts[..bound.len()]);
                     }
                     row.r#ref = Some(vec!["func"; bound.len()].join(","));
                     row.rows = Some(rows.max(1.0).round() as u64);
@@ -2918,6 +2986,7 @@ impl<'a> Cx<'a> {
                     row.key = Some(def.name.clone());
                     row.possible_keys = Some(def.name.clone());
                     row.key_len = Some(key_len(table, &def.parts[..bound.len()]).to_string());
+                    row.key_parts = part_names(table, &def.parts[..bound.len()]);
                 }
                 row.r#ref = Some(vec!["func"; bound.len()].join(","));
                 row.rows = Some(rows.max(1.0).round() as u64);
@@ -3103,6 +3172,12 @@ impl<'a> Cx<'a> {
     ) -> Result<(Method, f64, f64)> {
         let rel = &rels[r];
         let info = &infos[r];
+        if let RelKind::JsonTable(jt) = &rel.kind {
+            if jt.lateral() {
+                let fan = info.out_rows.max(1.0);
+                return Ok((Method::Lateral, prefix_rows * fan * 0.3, fan));
+            }
+        }
         let me = 1u64 << r;
         let conds: Vec<&Expr> = match &rel.outer_on {
             Some(on) => on.iter().collect(),

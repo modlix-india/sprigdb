@@ -14,15 +14,20 @@
 //!   and after any catalog change this process loads)
 //!   are watched: their table's changes in the change log since the last
 //!   look (a reader per tenant and family, from where the task first saw it)
-//!   the keys of the changed rows are gathered; a family seen for the first
+//!   the keys of the changed rows are gathered; a catalog change makes a
+//!   pass due (over no keys: copies to seed, such as those of a share made
+//!   again, are seeded, others left as they are); a family seen for the first
 //!   time, a reader whose place the log no longer holds, a key whose text
 //!   can't stand for it, or a failed pass makes the next pass a full one
 //!   a pass, as the system, in transactions of its own:
 //!     the orphan pass (sprig_inherit::unshare::orphan_pass) over the
 //!     gathered keys' overrides, or all of them
 //!     the copy pass (crate::inherit_copies) when the family has a
-//!     materialized share: copies seeded or brought up to their sources for
-//!     the gathered keys, or all of them
+//!     materialized share, or had copy states after its last pass (or the
+//!     task hasn't run one yet): copies seeded or brought up to their
+//!     sources for the gathered keys, or all of them; the states of copies
+//!     whose edge is gone (a share dropped, or made read-through) removed
+//!     with their rows
 //! ```
 //!
 //! Both passes recompute from the current state, so a change seen twice is
@@ -32,6 +37,12 @@
 //! passes only act where something is out of date). No feed subscription
 //! and no worker job are involved: the gateway that hosts the tenants'
 //! engine runs it.
+//!
+//! After each look that leaves nothing to do (no change, or the passes
+//! ran), the family's place in each tenant's change log is published for
+//! exact reads ([`crate::inherit_lag`]); a statement whose copy is behind
+//! wakes the task at once, which first waits (briefly) for the change log
+//! to reach what the statement can see.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
@@ -56,8 +67,16 @@ const TICK_VAR: &str = "SPRIGDB_INHERIT_ORPHANS_TICK_MS";
 /// How long a family's list of tenants is kept before it is looked up again.
 const TREE_TTL: Duration = Duration::from_secs(30);
 
+/// How long a look asked for by a statement waits for the change log to
+/// reach what the statement can see.
+const WANTED_WAIT: Duration = Duration::from_millis(300);
+
+/// Change-log pages one look reads per tenant at most (the rest waits for
+/// the next look, and the family's place isn't published meanwhile).
+const MAX_PAGES: usize = 64;
+
 /// A family: the tree root, the logical database and the table.
-type Family = (u64, String, String);
+type Family = crate::inherit_lag::Family;
 
 /// What the task knows of one family.
 struct Known {
@@ -73,6 +92,11 @@ struct Known {
     /// The keys of the rows changed since the last pass, as SQL literals
     /// of the key's columns.
     keys: BTreeSet<Vec<String>>,
+    /// The family may have copy states (true until a copy pass found none):
+    /// the copy pass runs even without a materialized share, so the copies
+    /// of a share made read-through are removed rather than left serving
+    /// with the changes this look takes from them.
+    copy_states: bool,
 }
 
 /// Starts the task.
@@ -109,10 +133,17 @@ pub(crate) fn spawn(
                     last_load = Instant::now();
                     continue;
                 }
+                () = crate::inherit_lag::nudged() => wait_wanted().await,
                 _ = timer.tick() => {}
             }
             let families = families(&svc, &tenants);
-            known.retain(|f, _| families.contains(f));
+            known.retain(|f, _| {
+                let keep = families.contains(f);
+                if !keep {
+                    crate::inherit_lag::forget(f);
+                }
+                keep
+            });
             for f in families {
                 if let Err(e) = Box::pin(look(&svc, &f, &mut known, epoch, last_load)).await {
                     tracing::warn!(tenant = f.0, db = %f.1, table = %f.2, error = %e, "orphans and copies across tenants not kept up this time");
@@ -124,6 +155,42 @@ pub(crate) fn spawn(
             }
         }
     })
+}
+
+/// Waits, at most [`WANTED_WAIT`], for the change log to hold the log
+/// indexes waiting statements can see.
+async fn wait_wanted() {
+    let wanted = crate::inherit_lag::take_wanted();
+    let Some(log) = crate::changelog::changes() else {
+        return;
+    };
+    let until = tokio::time::Instant::now() + WANTED_WAIT;
+    for (unit, idx) in wanted {
+        let mut w = log.watch(unit);
+        let reached = async {
+            while *w.borrow_and_update() < idx {
+                if w.changed().await.is_err() {
+                    break;
+                }
+            }
+        };
+        if tokio::time::timeout_at(until, reached).await.is_err() {
+            tracing::debug!(
+                unit,
+                index = idx,
+                "change log behind what a waiting statement sees"
+            );
+        }
+    }
+}
+
+/// The index of the last log entry wholly read before place `p`.
+fn applied_of(p: sprig_streams::changes::Pos) -> u64 {
+    if p.seq == u32::MAX {
+        p.index
+    } else {
+        p.index.saturating_sub(1)
+    }
 }
 
 /// The families of the loaded tenants led here.
@@ -181,6 +248,9 @@ async fn look(
         .get(root, Freshness::Cached { min_version: 0 })
         .await?;
     let lctn = crate::inherited::lctn(svc, &root_cat);
+    // A catalog changed since the last look: a share may have been made
+    // (again), so the copy pass runs even without a change of the table.
+    let catalog_changed = known.get(f).is_some_and(|k| k.looked < last_load);
     let stale = known
         .get(f)
         .is_none_or(|k| k.looked.elapsed() >= TREE_TTL || k.looked < last_load);
@@ -193,13 +263,21 @@ async fn look(
             dirty: true,
             full: true,
             keys: BTreeSet::new(),
+            copy_states: true,
         });
         k.tree = tree;
         k.looked = Instant::now();
+        if catalog_changed {
+            k.dirty = true;
+        }
     }
     let Some(k) = known.get_mut(f) else {
         return Ok(());
     };
+    // For exact reads: each tenant's object of the table, and the change-log
+    // index this look read it up to.
+    let mut objects: Vec<(TenantId, ObjectId)> = Vec::new();
+    let mut places: Vec<(u64, u64)> = Vec::new();
     if let (Some(log), Ok(eng)) = (crate::changelog::changes(), crate::engine::engine()) {
         let now_ms = i64::try_from(
             std::time::SystemTime::now()
@@ -215,45 +293,61 @@ async fn look(
                 continue;
             };
             let key_cols = key_columns(&cat, &w.1, &f.1, &f.2, lctn);
+            if let Some(o) = object_of(&cat, &f.1, &f.2, lctn) {
+                objects.push((tt.tenant, o));
+            }
             let tables: HashMap<u32, Watched> = std::iter::once(w).collect();
-            let token = k.tokens.get(&tt.tenant.0).cloned();
+            let mut token = k.tokens.get(&tt.tenant.0).cloned();
             // A tenant first seen starts at now: the full pass due for a new
             // family (or tenant) covers what came before.
-            if token.is_none() {
+            let from_ms = if token.is_none() {
                 k.dirty = true;
                 k.full = true;
-            }
+                now_ms
+            } else {
+                0
+            };
             let consumer = format!("inherit-orphans:{}:{}:{}:{}", f.0, f.1, f.2, tt.tenant.0);
-            let batch = crate::table_changes::read(
-                eng,
-                &log,
-                tt.tenant.0,
-                &tables,
-                token.as_deref(),
-                if token.is_none() { now_ms } else { 0 },
-                crate::table_changes::PAGE_BYTES,
-                Duration::ZERO,
-                &consumer,
-            )
-            .await;
-            match batch {
-                Ok(b) => {
-                    for e in &b.events {
-                        k.dirty = true;
-                        match key_columns_of(key_cols.as_deref(), e) {
-                            Some(lits) => k.keys.extend(lits),
-                            None => k.full = true,
+            // Read to the end of what the log holds (a bounded number of
+            // pages), so the place published covers every change read.
+            for page in 0..MAX_PAGES {
+                let batch = crate::table_changes::read(
+                    eng,
+                    &log,
+                    tt.tenant.0,
+                    &tables,
+                    token.as_deref(),
+                    if page == 0 { from_ms } else { 0 },
+                    crate::table_changes::PAGE_BYTES,
+                    Duration::ZERO,
+                    &consumer,
+                )
+                .await;
+                match batch {
+                    Ok(b) => {
+                        for e in &b.events {
+                            k.dirty = true;
+                            match key_columns_of(key_cols.as_deref(), e) {
+                                Some(lits) => k.keys.extend(lits),
+                                None => k.full = true,
+                            }
+                        }
+                        k.tokens.insert(tt.tenant.0, b.next.clone());
+                        token = Some(b.next);
+                        if b.at_end {
+                            places.push((tt.tenant.0, applied_of(b.pos)));
+                            break;
                         }
                     }
-                    k.tokens.insert(tt.tenant.0, b.next);
-                }
-                Err(e) => {
-                    // A place the log no longer holds: start again from now,
-                    // with a full pass.
-                    tracing::debug!(tenant = %tt.tenant, error = %e, "change log place lost");
-                    k.tokens.remove(&tt.tenant.0);
-                    k.dirty = true;
-                    k.full = true;
+                    Err(e) => {
+                        // A place the log no longer holds: start again from
+                        // now, with a full pass.
+                        tracing::debug!(tenant = %tt.tenant, error = %e, "change log place lost");
+                        k.tokens.remove(&tt.tenant.0);
+                        k.dirty = true;
+                        k.full = true;
+                        break;
+                    }
                 }
             }
         }
@@ -263,17 +357,19 @@ async fn look(
         k.full = true;
     }
     if !k.dirty {
+        crate::inherit_lag::publish(f, &objects, &places);
         return Ok(());
     }
     let keys: Option<Vec<Vec<String>>> = (!k.full).then(|| k.keys.iter().cloned().collect());
     tracing::debug!(root = f.0, db = %f.1, table = %f.2, full = k.full, keys = k.keys.len(), "inheritance passes due");
     let mut tenants: Vec<TreeTable> = k.tree.clone();
     tenants.sort_by_key(|t| t.ancestors.len());
-    let copies = tenants.iter().any(|tt| {
+    let materialized_now = tenants.iter().any(|tt| {
         svc.cache
             .cached(tt.tenant)
             .is_some_and(|cat| materialized(&cat, &f.1, &f.2, lctn))
     });
+    let copies = materialized_now || k.copy_states;
     let mut r = SysRunner {
         svc: Arc::clone(svc),
         lctn,
@@ -301,13 +397,25 @@ async fn look(
         if c.seeds > 0 {
             tracing::debug!(root = %root, db = %f.1, table = %f.2, seeds = c.seeds, upserts = c.upserts, tombstones = c.tombstones, "copies kept");
         }
+        if let Some(k) = known.get_mut(f) {
+            k.copy_states = materialized_now || c.states > 0;
+        }
     }
     if let Some(k) = known.get_mut(f) {
         k.dirty = false;
         k.full = false;
         k.keys.clear();
     }
+    // Everything read before the passes is now in the copies.
+    crate::inherit_lag::publish(f, &objects, &places);
     Ok(())
+}
+
+/// Tenant `cat`'s object of inheritable table `db.table`.
+fn object_of(cat: &TenantCatalog, db: &str, table: &str, lctn: bool) -> Option<ObjectId> {
+    let st = sprig_inherit::plan::state_of(cat)?;
+    let d = cat.database(&sprig_catalog::ddl::database_key(db, lctn))?;
+    Some(st.object_named(d.db_id, table, lctn)?.object_id)
 }
 
 /// Whether `cat`'s tenant shares its object `db.table` materialized (to a

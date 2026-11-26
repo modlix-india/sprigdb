@@ -148,6 +148,9 @@ pub struct ColumnRef {
     pub nullable: bool,
     /// The name, for SQL text and messages.
     pub name: String,
+    /// A character column of character set `utf8mb3` (see
+    /// [`ExprType::mb3`]).
+    pub mb3: bool,
 }
 
 /// A resolved expression. Names are already bound: a column is a slot, a
@@ -201,8 +204,9 @@ pub enum Expr {
     },
     /// `CAST(expr AS target)`
     Cast(Box<Expr>, CastTarget),
-    /// `expr COLLATE collation`
-    Collate(Box<Expr>, Collation),
+    /// `expr COLLATE collation`; the flag: the collation is named as a
+    /// `utf8mb3` one.
+    Collate(Box<Expr>, Collation, bool),
     /// A built-in function call: upper-case name and arguments.
     Func(String, Vec<Expr>),
     /// A keyword argument of a function, printed bare: an interval unit, a
@@ -238,6 +242,7 @@ impl Expr {
             ty,
             nullable,
             name: name.to_owned(),
+            mb3: false,
         })
     }
 
@@ -398,10 +403,10 @@ impl Expr {
                 }
                 out.push(')');
             }
-            Expr::Collate(e, c) => {
+            Expr::Collate(e, c, mb3) => {
                 out.push('(');
                 e.write_sql(out);
-                let _ = write!(out, " COLLATE {})", c.name());
+                let _ = write!(out, " COLLATE {})", crate::types::collation_name(*c, *mb3));
             }
             Expr::Func(name, args) => crate::func::write_sql(out, name, args),
             Expr::Keyword(k) => out.push_str(k),
@@ -701,6 +706,11 @@ impl Env<'_> {
         self.s.collation_connection
     }
 
+    /// Whether `collation_connection` is a `utf8mb3` collation.
+    pub(crate) fn conn_mb3(&self) -> bool {
+        self.s.connection_mb3 && self.s.collation_connection.charset() == Charset::Utf8mb4
+    }
+
     /// The most digits after the point a `DECIMAL` has: 38 on MariaDB, 30
     /// on MySQL.
     pub(crate) fn max_scale(&self) -> u32 {
@@ -851,6 +861,8 @@ const VOLATILE: &[&str] = &[
     "LASTVAL",
     "SETVAL",
     "SPRIG_SEQUENCE_STATE",
+    "SPRIG_USER_VAR",
+    "SPRIG_SET_USER_VAR",
 ];
 
 /// Whether an expression reads no row: its value is the same for every row
@@ -874,7 +886,7 @@ pub(crate) fn is_const(e: &Expr) -> bool {
         | Expr::IsNull(a, _)
         | Expr::IsTruth(a, _, _)
         | Expr::Cast(a, _)
-        | Expr::Collate(a, _) => is_const(a),
+        | Expr::Collate(a, ..) => is_const(a),
         Expr::Binary(_, a, b) => is_const(a) && is_const(b),
         Expr::In(a, list, _) => is_const(a) && list.iter().all(is_const),
         Expr::Between(a, b, c, _) => is_const(a) && is_const(b) && is_const(c),
@@ -904,7 +916,7 @@ fn has_sized_cast(e: &Expr) -> bool {
         | Expr::IsNull(a, _)
         | Expr::IsTruth(a, _, _)
         | Expr::Cast(a, _)
-        | Expr::Collate(a, _) => has_sized_cast(a),
+        | Expr::Collate(a, ..) => has_sized_cast(a),
         Expr::Binary(_, a, b) => has_sized_cast(a) || has_sized_cast(b),
         Expr::In(a, list, _) => has_sized_cast(a) || list.iter().any(has_sized_cast),
         Expr::Between(a, b, c, _) => has_sized_cast(a) || has_sized_cast(b) || has_sized_cast(c),
@@ -1084,6 +1096,7 @@ fn build_inner(expr: &Expr, env: Env<'_>) -> Result<Node> {
             let coll = env.conn();
             let ty = ExprType {
                 ascii: s.is_ascii(),
+                mb3: env.conn_mb3(),
                 ..ExprType::string(s.chars().count() as u32, coll, Derivation::Coercible)
             };
             let v = match coll.charset() {
@@ -1115,7 +1128,10 @@ fn build_inner(expr: &Expr, env: Env<'_>) -> Result<Node> {
             let i = *i;
             // A parameter is typed as a nullable string of unknown length;
             // its value decides how it converts at run time.
-            let ty = ExprType::string(1 << 20, env.conn(), Derivation::Coercible).nullable();
+            let ty = ExprType {
+                mb3: env.conn_mb3(),
+                ..ExprType::string(1 << 20, env.conn(), Derivation::Coercible).nullable()
+            };
             Ok(Node::new(ty, "?", move |ctx, _| {
                 Ok(ctx.params.get(i).cloned().unwrap_or(Value::Null))
             }))
@@ -1262,19 +1278,21 @@ fn build_inner(expr: &Expr, env: Env<'_>) -> Result<Node> {
             control::case(operand, pairs, otherwise, env)
         }
         Expr::Cast(e, target) => cast::cast(build(e, env)?, *target, env),
-        Expr::Collate(e, coll) => {
+        Expr::Collate(e, coll, mb3) => {
             let a = build(e, env)?;
             // MariaDB lets `NULL` take any collation; MySQL doesn't.
             let from_null = a.ty.kind == crate::types::Kind::Null && env.maria();
             let a = string_node(a, env);
-            if !from_null && a.ty.coll.charset() != coll.charset() {
+            let a_mb3 = a.ty.mb3 && a.ty.coll.charset() == Charset::Utf8mb4;
+            if !from_null && (a.ty.coll.charset() != coll.charset() || a_mb3 != *mb3) {
+                let d = crate::types::Dtc::of(&a.ty, env.conn());
                 return Err(SqlError::new(
                     1253,
                     "42000",
                     format!(
                         "COLLATION '{}' is not valid for CHARACTER SET '{}'",
-                        coll.name(),
-                        charset_name(a.ty.coll.charset())
+                        crate::types::collation_name(*coll, *mb3),
+                        d.charset_name()
                     ),
                 ));
             }
@@ -1294,6 +1312,7 @@ fn build_inner(expr: &Expr, env: Env<'_>) -> Result<Node> {
                 }
             }
             n.ty.coll = *coll;
+            n.ty.mb3 = *mb3;
             n.ty.deriv = Derivation::Explicit;
             n.ty.dec = crate::types::NOT_FIXED;
             n.ty.column = false;
@@ -1323,7 +1342,10 @@ pub(crate) fn charset_name(c: Charset) -> &'static str {
 }
 
 fn column(c: &ColumnRef, env: Env<'_>) -> Node {
-    let ty = ExprType::of_column(&c.ty, c.nullable);
+    let ty = ExprType {
+        mb3: c.mb3,
+        ..ExprType::of_column(&c.ty, c.nullable)
+    };
     let slot = c.slot;
     let text = format!("`{}`", c.name);
     let _ = env;

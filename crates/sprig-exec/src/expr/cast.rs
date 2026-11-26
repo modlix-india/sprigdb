@@ -306,6 +306,7 @@ pub(crate) fn agg_result_type(types: &[ExprType], op: &str, env: Env<'_>) -> Res
             unsigned: all_hex,
             dec: if all_hex || empty { 0 } else { NOT_FIXED },
             json: all_json,
+            mb3: dtc.mb3,
             ..ExprType::string(
                 if any_json && (env.maria() || !all_json) {
                     crate::types::JSON_TEXT_LEN

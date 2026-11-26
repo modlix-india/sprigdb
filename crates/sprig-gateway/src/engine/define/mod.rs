@@ -55,6 +55,10 @@ pub(crate) enum Fail {
     /// A syntax error at token index `usize` (1064, quoting the statement
     /// from there).
     Syntax(usize),
+    /// A functional key part at token index `usize`: MariaDB has none
+    /// (1064 there); the MySQL port turns the forms it reads into hidden
+    /// generated columns first, so one left here is refused.
+    Functional(usize),
     /// A definition error.
     Err(SprigError),
 }
@@ -244,7 +248,8 @@ pub(crate) fn syntax_error(sql: &str, toks: &[Tok], at: usize, mysql: bool) -> S
 /// `Fail` as the statement's error.
 pub(crate) fn to_error(f: Fail, sql: &str, toks: &[Tok], mysql: bool) -> SprigError {
     match f {
-        Fail::Syntax(at) => syntax_error(sql, toks, at, mysql),
+        Fail::Functional(_) if mysql => super::not_on_engine("functional key parts"),
+        Fail::Syntax(at) | Fail::Functional(at) => syntax_error(sql, toks, at, mysql),
         Fail::Err(e) => e,
     }
 }
@@ -715,7 +720,7 @@ pub(crate) fn key_body(p: &mut P<'_>, kind: KeyKind, named: bool) -> Result<Key,
     p.want_op("(")?;
     loop {
         if p.op("(") {
-            return Err(refuse("functional key parts"));
+            return Err(Fail::Functional(p.i));
         }
         let col = p.ident()?;
         let len = if p.eat_op("(") {
@@ -1089,7 +1094,7 @@ pub(crate) fn finish(name: String, raw: Raw, cx: &Ctx) -> Result<Def, Fail> {
         checks: rchecks,
         opts,
     } = raw;
-    let cs = table_cs(&opts, &cx.db_cs)?;
+    let cs = table_cs(&opts, &types::port_db_cs(&cx.db_cs, cx.mysql), cx.mysql)?;
     if let Some(e) = &opts.engine
         && !e.eq_ignore_ascii_case("InnoDB")
     {
@@ -1110,7 +1115,7 @@ pub(crate) fn finish(name: String, raw: Raw, cx: &Ctx) -> Result<Def, Fail> {
     };
     let mut keys = Vec::new();
     for rc in rcols {
-        add_column(&mut def, rc, &mut keys, None)?;
+        add_column(&mut def, rc, &mut keys, None, cx.mysql)?;
     }
     keys.extend(rkeys);
     for k in keys {
@@ -1127,7 +1132,7 @@ pub(crate) fn finish(name: String, raw: Raw, cx: &Ctx) -> Result<Def, Fail> {
 }
 
 /// The table's character set and collation.
-fn table_cs(o: &Opts, db: &(String, String)) -> Result<(String, String), Fail> {
+fn table_cs(o: &Opts, db: &(String, String), mysql: bool) -> Result<(String, String), Fail> {
     let spec = CsSpec {
         charset: o.charset.clone(),
         collate: o.collate.clone(),
@@ -1136,7 +1141,7 @@ fn table_cs(o: &Opts, db: &(String, String)) -> Result<(String, String), Fail> {
     if spec.charset.is_none() && spec.collate.is_none() {
         return Ok(db.clone());
     }
-    let (cs, co) = types::resolve_cs(&spec, (&db.0, &db.1))?;
+    let (cs, co) = types::resolve_cs(&spec, (&db.0, &db.1), mysql)?;
     Ok((cs, co))
 }
 
@@ -1148,6 +1153,7 @@ pub(crate) fn add_column(
     rc: RawCol,
     keys: &mut Vec<Key>,
     place: Option<Option<&str>>,
+    mysql: bool,
 ) -> Result<(), Fail> {
     let RawCol {
         mut col,
@@ -1171,7 +1177,7 @@ pub(crate) fn add_column(
         let resolved = if col.ty.json {
             ("utf8mb4".to_owned(), "utf8mb4_bin".to_owned())
         } else {
-            types::resolve_cs(&cs, (&def.cs.0, &def.cs.1))?
+            types::resolve_cs(&cs, (&def.cs.0, &def.cs.1), mysql)?
         };
         // `CHARACTER SET binary` makes byte types.
         if resolved.0 == "binary" {

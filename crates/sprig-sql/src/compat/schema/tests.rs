@@ -459,3 +459,29 @@ fn create_database_in_mysqls_spelling() {
     assert_eq!(mysql_collation_value("utf8mb4_bin"), "utf8mb4_bin");
     assert_eq!(mysql_collation_value("A"), "A");
 }
+
+/// MySQL leaves out a table's default collation, except for `utf8mb4`.
+#[test]
+fn mysql_tables_leave_out_their_default_collation() {
+    let t = |opts: &str| {
+        mysql_create_table(&format!(
+            "CREATE TABLE `t` (\n  `a` int(11) DEFAULT NULL\n) ENGINE=InnoDB {opts}"
+        ))
+    };
+    assert!(
+        t("DEFAULT CHARSET=utf8mb3 COLLATE=utf8mb3_general_ci")
+            .ends_with("DEFAULT CHARSET=utf8mb3")
+    );
+    assert!(
+        t("DEFAULT CHARSET=latin1 COLLATE=latin1_swedish_ci").ends_with("DEFAULT CHARSET=latin1")
+    );
+    assert!(t("DEFAULT CHARSET=latin1 COLLATE=latin1_bin").ends_with("COLLATE=latin1_bin"));
+    assert!(
+        t("DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
+            .ends_with("COLLATE=utf8mb4_0900_ai_ci")
+    );
+    assert!(
+        t("DEFAULT CHARSET=utf8mb3 COLLATE=utf8mb3_general_ci COMMENT='x'")
+            .ends_with("DEFAULT CHARSET=utf8mb3 COMMENT='x'")
+    );
+}

@@ -267,6 +267,11 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
             .map(sprig_catalog::records::remote::PeerPems::from_config)
             .transpose()?,
     );
+    // Jobs' tenant-scope settings (`logic.trigger_*`, `mover.*`) are the
+    // same records, read through the controller crate's tenant scopes.
+    if !sprig_controller::set_catalog_records(sinks::catalog_records()) {
+        tracing::warn!("tenant settings records were read before the worker set them");
+    }
     // Migrations run here keep each tenant's catalog format in its
     // records too (EC-90).
     sprig_catalog::migrate::mirror_formats(sinks::catalog_records());

@@ -225,10 +225,13 @@ pub(crate) fn is_open(consumer: &str, tenant: u64, token: Option<&str>) -> bool 
 }
 
 /// A change of one of the watched tables, with its before-image.
-struct Raw {
-    change: Change,
-    object: u32,
-    before: Option<Vec<u8>>,
+pub(crate) struct Raw {
+    /// The change.
+    pub change: Change,
+    /// Its table.
+    pub object: u32,
+    /// The row just before it.
+    pub before: Option<Vec<u8>>,
 }
 
 /// Reads the next changes of `tables` (by object number) of `tenant`
@@ -404,7 +407,7 @@ fn page(
 
 /// The row generation of table `object` as of commit timestamp `at`: its
 /// layout record's (generation 0 without one).
-fn gen_at(log: &ChangeLog, tenant: u64, object: u32, at: u64) -> Result<u16> {
+pub(crate) fn gen_at(log: &ChangeLog, tenant: u64, object: u32, at: u64) -> Result<u16> {
     let key = crate::engine::keys::layout_key(tenant, object);
     let store = log.engine().store();
     let v = sprig_engine::txn::mvcc::read_at(store.as_ref(), &key, sprig_engine::Ts(at))?;
@@ -415,7 +418,7 @@ fn gen_at(log: &ChangeLog, tenant: u64, object: u32, at: u64) -> Result<u16> {
 
 /// The event of `r`, `None` when its row doesn't decode with the table's
 /// current definition (logged).
-async fn event(
+pub(crate) async fn event(
     eng: &crate::engine::Engine,
     tenant: u64,
     w: &Watched,

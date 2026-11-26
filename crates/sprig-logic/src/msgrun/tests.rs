@@ -156,6 +156,8 @@ fn template(binding: u64) -> Template {
             instance_tenant: 0,
             instance_stream: 0,
             replay: None,
+            lanes: 0,
+            lane: 0,
         },
         version: Arc::new(AtomicU64::new(1)),
         budget: None,

@@ -79,8 +79,12 @@ mod fast;
 // General SELECTs (joins, grouping, subqueries) through the planner.
 mod general;
 // `SET` of session variables kept in the gateway.
+/// `LOAD DATA LOCAL INFILE` into engine tables.
+mod loaddata;
 mod routine;
 mod setvars;
+/// `PREPARE`, `EXECUTE` and `DEALLOCATE PREPARE` as statements.
+mod sqlprep;
 // Reads of system and user variables, and `SET @x`, kept in the gateway.
 mod sessvars;
 // `GET_LOCK` and its kin, kept in the gateway.
@@ -195,6 +199,11 @@ pub(super) struct EngineState {
     /// The running `CREATE` / `ALTER EVENT`'s schedule, as evaluated
     /// before the catalog's DDL path stores it.
     pub(super) event_eval: Option<crate::engine::routine::event::Eval>,
+    /// The statements the session prepared with `PREPARE`.
+    pub(super) sql_prep: sqlprep::SqlPrepared,
+    /// The running statement's handle on the session's user variables,
+    /// when it assigns one inside a query (`@v := e`).
+    user_vars: Option<Arc<sessvars::StatementVars>>,
 }
 
 impl EngineState {
@@ -600,6 +609,11 @@ impl PassSession {
             info.current_user = format!("{}@{}", ts.principal.user, ts.principal.host);
         }
         info.version = self.settings.persona_version(self.persona);
+        info.user_vars = self
+            .eng
+            .user_vars
+            .clone()
+            .map(|h| h as Arc<dyn sprig_exec::UserVars>);
         // MariaDB's sequences, read through the session's catalog.
         info.sequences = None;
         if self.persona != sprig_proto_mysql::Persona::MySql84
@@ -803,8 +817,22 @@ impl PassSession {
             Some((rest, clause)) => (Some(rest), Some(clause)),
             None => (whole, None),
         };
+        // MariaDB's `ANALYZE <query>` (and the MySQL port's `EXPLAIN
+        // ANALYZE`, which arrives as `ANALYZE FORMAT=JSON <query>`) reads
+        // as `EXPLAIN ANALYZE`.
+        let analyzed = plain.and_then(analyze_as_explain);
+        let plain = analyzed.as_deref().or(plain);
         let parsed = plain
-            .and_then(|t| Parser::parse_sql(&sprig_plan::dialect::SprigMySql, t).ok())
+            .and_then(|t| {
+                Parser::parse_sql(&sprig_plan::dialect::SprigMySql, t)
+                    .ok()
+                    .or_else(|| {
+                        // `JSON_TABLE` columns with `CHARACTER SET` or
+                        // `COLLATE`, which the parser doesn't read there.
+                        let q = sprig_plan::quote_column_charsets(t)?;
+                        Parser::parse_sql(&sprig_plan::dialect::SprigMySql, &q).ok()
+                    })
+            })
             .filter(|v| v.len() == 1);
         let names = CatalogNames {
             cat,
@@ -1048,9 +1076,7 @@ impl PassSession {
             Op::Update { .. } => cmd::UPDATE,
             Op::Select { .. } | Op::Delete => return Ok(None),
         };
-        if crate::tenant::rls::is_exempt(cx.session.id) {
-            return Ok(None);
-        }
+        let exempt = crate::tenant::rls::is_exempt(cx.session.id);
         let lex = self.lex_opts().0;
         let Some(ts) = self.tenant.as_deref() else {
             return Ok(None);
@@ -1062,11 +1088,17 @@ impl PassSession {
         if !rls.tables.contains_key(&plan.table.object) {
             return Ok(None);
         }
-        let mut values = crate::tenant::rls::SessionValues::of(ts, cat);
-        Box::pin(crate::tenant::rls::bind_tree(ts, cat, &rls, &mut values)).await?;
         let alias = String::from_utf8_lossy(&plan.alias).into_owned();
-        // The resolver isn't `Send`: it ends before anything is awaited.
-        let text = {
+        // A statement of the session's own internal work exempt from
+        // row-level security (a record hierarchy's paths follow rows the
+        // user can't see): every row passes, as on MariaDB, where those
+        // statements bypass the policies.
+        let text = if exempt {
+            "TRUE".to_owned()
+        } else {
+            let mut values = crate::tenant::rls::SessionValues::of(ts, cat);
+            Box::pin(crate::tenant::rls::bind_tree(ts, cat, &rls, &mut values)).await?;
+            // The resolver isn't `Send`: it ends before anything is awaited.
             let none = std::collections::HashSet::new();
             let temp = |_: Option<&str>, _: &str| false;
             let r = crate::tenant::rls::Resolve::new(
@@ -2162,9 +2194,15 @@ impl PassSession {
                 _ => None,
             };
         }
+        // `@v := e` inside a query: the statement reads and assigns the
+        // session's variables through a handle, kept afterwards.
+        self.eng.user_vars = self.statement_vars(cx, sql);
         let r = self
             .engine_text_in(cx, &cat, current, sql, logical, more, format, out)
             .await;
+        if let Some(h) = self.eng.user_vars.take() {
+            self.statement_vars_end(cx, &h);
+        }
         if matches!(r, Ok(None)) {
             // MariaDB runs it: it may change a variable or the database.
             self.eng.stale();
@@ -2206,6 +2244,18 @@ impl PassSession {
         }
         // `SET @x = ...`, and reads of variables, kept in the gateway.
         if let Some(step) = Box::pin(self.engine_user_set(cx, cat, current, sql, more, out)).await?
+        {
+            return Ok(Some(step));
+        }
+        // `PREPARE`, `EXECUTE` and `DEALLOCATE PREPARE` as statements.
+        if let Some(step) =
+            Box::pin(self.engine_sql_prepared(cx, cat, current, sql, more, format, out)).await?
+        {
+            return Ok(Some(step));
+        }
+        // `LOAD DATA LOCAL INFILE` into an engine table.
+        if let Some(step) =
+            Box::pin(self.engine_load_data(cx, cat, current, sql, more, out)).await?
         {
             return Ok(Some(step));
         }
@@ -3374,4 +3424,53 @@ fn write_param_types(
         })
         .collect();
     crate::engine::paramtype::infer(&stmt, &named)
+}
+
+/// `ANALYZE [FORMAT=JSON] <query>` as `EXPLAIN ANALYZE [FORMAT=JSON]
+/// <query>`; `None` for any other statement (`ANALYZE TABLE`, or
+/// `ANALYZE` of a write, among them).
+fn analyze_as_explain(t: &str) -> Option<String> {
+    fn word(s: &str) -> (String, &str) {
+        let s = s.trim_start();
+        let n = s.chars().take_while(char::is_ascii_alphabetic).count();
+        (s[..n].to_ascii_uppercase(), &s[n..])
+    }
+    let rest = t.trim_start();
+    let (w, mut after) = word(rest);
+    if w != "ANALYZE" {
+        return None;
+    }
+    let (mut next, mut tail) = word(after);
+    if next == "FORMAT" {
+        after = tail.trim_start().strip_prefix('=')?;
+        let (f, t2) = word(after);
+        if f != "JSON" {
+            return None;
+        }
+        after = t2;
+        (next, tail) = word(after);
+    }
+    let _ = tail;
+    let query = matches!(next.as_str(), "SELECT" | "WITH" | "VALUES")
+        || (next.is_empty() && after.trim_start().starts_with('('));
+    query.then(|| format!("EXPLAIN {rest}"))
+}
+
+#[cfg(test)]
+mod analyze_tests {
+    #[test]
+    fn analyze_of_a_query_reads_as_explain_analyze() {
+        use super::analyze_as_explain as a;
+        assert_eq!(
+            a("ANALYZE SELECT 1").as_deref(),
+            Some("EXPLAIN ANALYZE SELECT 1")
+        );
+        assert_eq!(
+            a("analyze format = json (select 1)").as_deref(),
+            Some("EXPLAIN analyze format = json (select 1)")
+        );
+        assert_eq!(a("ANALYZE TABLE t"), None);
+        assert_eq!(a("ANALYZE FORMAT=JSON UPDATE t SET a = 1"), None);
+        assert_eq!(a("ANALYZEX SELECT 1"), None);
+    }
 }

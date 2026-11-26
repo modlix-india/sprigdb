@@ -604,6 +604,9 @@ pub struct SessionInfo {
     /// The sequences `NEXTVAL()` and its kin read; `None` where none are
     /// served.
     pub sequences: Option<std::sync::Arc<dyn super::sequence::Sequences>>,
+    /// The user variables a statement reads and assigns (`@v`, `@v :=
+    /// e`); `None` where none are served.
+    pub user_vars: Option<std::sync::Arc<dyn super::uservar::UserVars>>,
 }
 
 /// The session's own values: `DATABASE()`, `USER()`, ... (none takes an

@@ -1009,7 +1009,7 @@ pub fn walk(e: &Expr, f: &mut dyn FnMut(&Expr)) {
         | Expr::IsNull(a, _)
         | Expr::IsTruth(a, _, _)
         | Expr::Cast(a, _)
-        | Expr::Collate(a, _) => walk(a, f),
+        | Expr::Collate(a, ..) => walk(a, f),
         Expr::Binary(_, a, b) => {
             walk(a, f);
             walk(b, f);

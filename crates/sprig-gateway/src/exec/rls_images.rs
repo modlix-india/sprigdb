@@ -165,7 +165,7 @@ impl PassSession {
 
     /// `(table, image, visible)` for every image of `req`.
     #[allow(clippy::too_many_lines)] // one pass per table, in order
-    async fn check_images(
+    pub(super) async fn check_images(
         &mut self,
         cx: &mut ExecCtx<'_>,
         req: &ImagesRequest,
@@ -226,7 +226,9 @@ impl PassSession {
                     continue;
                 }
                 let bound = !g.unrestricted() && g.row_filter(on, Action::Select).is_some();
-                let slot = if bound {
+                let slot = if bound && engine_table(&cat, obj.object_id) {
+                    None
+                } else if bound {
                     ts.schema_of(Some(&db.name))
                         .map(|tm| (tm, self.target.cluster.clone()))
                 } else {
@@ -238,6 +240,17 @@ impl PassSession {
                 for i in 0..t.images.len() {
                     out.push((ti, i, true));
                 }
+                continue;
+            }
+            if engine_table(&cat, obj.object_id) {
+                let seen = self
+                    .engine_images(cx, req, t, &cat, &db.name, obj.object_id, lex)
+                    .await;
+                for (i, v) in seen.iter().enumerate() {
+                    out.push((ti, i, *v));
+                }
+                metrics::counter!("sprig_rls_feed_events_filtered_total", "protocol" => "images")
+                    .increment(seen.iter().filter(|v| !**v).count() as u64);
                 continue;
             }
             let Some((schema, cluster)) = slot else {
@@ -336,6 +349,194 @@ impl PassSession {
                 .increment(seen.iter().filter(|v| !**v).count() as u64);
         }
         Ok(out)
+    }
+}
+
+/// Whether `object` is a table of the storage engine (its rows' images
+/// come from the change log, in the engine's JSON forms).
+fn engine_table(cat: &sprig_catalog::TenantCatalog, object: sprig_common::ids::ObjectId) -> bool {
+    crate::engine::catalog::of(cat).is_some_and(|e| e.tables.contains_key(&object))
+}
+
+/// The `JSON_TABLE` columns that read an engine table's change images
+/// (`table_changes`' JSON forms), from its `information_schema.COLUMNS`
+/// row: `ENUM` and `SET` values are their members' text, so they read as
+/// text; a string type's character set is left to the session's (the
+/// engine's `JSON_TABLE` takes none); otherwise as on MariaDB.
+fn engine_filter_column(
+    name: String,
+    data_type: &str,
+    column_type: &str,
+) -> crate::tenant::rls_streams::FilterColumn {
+    use crate::tenant::rls_streams::{Carried, FilterColumn, json_table_type};
+    let dt = data_type.to_ascii_lowercase();
+    let odd = name.contains(['"', '\\', '\'']);
+    let (ty, opaque) = match dt.as_str() {
+        "enum" | "set" => ("varchar(1024)".to_owned(), false),
+        _ => json_table_type(data_type, column_type, None, None),
+    };
+    let binary = matches!(
+        dt.as_str(),
+        "binary" | "varbinary" | "tinyblob" | "blob" | "mediumblob" | "longblob"
+    );
+    FilterColumn {
+        plain: (binary && !odd).then(|| column_type.to_ascii_lowercase()),
+        carried: if dt == "timestamp" {
+            Carried::Utc
+        } else {
+            Carried::AsIs
+        },
+        ty,
+        opaque: opaque || odd,
+        name,
+    }
+}
+
+impl PassSession {
+    /// Which of table `t`'s images (an engine table whose row policies bind
+    /// the session) the session's `SELECT` policies show: one statement on
+    /// the engine, each image a `JSON_TABLE` of its own literal JSON
+    /// (`EXISTS (... WHERE <policies>)`), as the engine's `JSON_TABLE`
+    /// doesn't read another table's columns. Null images are the privilege
+    /// alone. Fails closed: any failure shows none (logged).
+    #[allow(clippy::too_many_arguments)] // one table's check
+    async fn engine_images(
+        &mut self,
+        cx: &mut ExecCtx<'_>,
+        req: &ImagesRequest,
+        t: &TableImages,
+        cat: &sprig_catalog::TenantCatalog,
+        db: &str,
+        object: sprig_common::ids::ObjectId,
+        lex: sprig_sql::lex::LexOptions,
+    ) -> Vec<bool> {
+        let mut seen: Vec<bool> = t.images.iter().map(Option::is_none).collect();
+        if t.images.iter().all(Option::is_none) {
+            return seen;
+        }
+        match self
+            .engine_images_run(cx, req, t, cat, db, object, lex)
+            .await
+        {
+            Ok(v) => {
+                for (i, x) in v {
+                    if let Some(s) = seen.get_mut(i) {
+                        *s = x;
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(table = %t.table, error = %e, "row policies over engine change images failed; the images are hidden");
+            }
+        }
+        seen
+    }
+
+    #[allow(clippy::too_many_arguments)] // as engine_images
+    async fn engine_images_run(
+        &mut self,
+        cx: &mut ExecCtx<'_>,
+        req: &ImagesRequest,
+        t: &TableImages,
+        cat: &sprig_catalog::TenantCatalog,
+        db: &str,
+        object: sprig_common::ids::ObjectId,
+        lex: sprig_sql::lex::LexOptions,
+    ) -> Result<Vec<(usize, bool)>> {
+        let lit = |v: &str| sprig_sql::rls::sql_string(v, lex.no_backslash_escapes);
+        let Some(obj) = cat.objects.get(object) else {
+            return Ok(Vec::new());
+        };
+        let info = self
+            .run_checked(
+                cx,
+                &format!(
+                    "SELECT COLUMN_NAME, DATA_TYPE, COLUMN_TYPE FROM information_schema.COLUMNS \
+                     WHERE TABLE_SCHEMA = {} AND TABLE_NAME = {} ORDER BY ORDINAL_POSITION",
+                    lit(db),
+                    lit(&obj.name)
+                ),
+                true,
+            )
+            .await?;
+        let text = |b: &Option<Vec<u8>>| {
+            b.as_deref()
+                .map(|x| String::from_utf8_lossy(x).into_owned())
+                .unwrap_or_default()
+        };
+        let columns: Vec<_> = info
+            .rows
+            .iter()
+            .filter_map(|r| {
+                let name = text(r.first()?);
+                let (dt, ct) = (text(r.get(1)?), text(r.get(2)?));
+                (!name.starts_with("_sprig") && !name.starts_with("__sprig")).then(|| {
+                    let col = engine_filter_column(name, &dt, &ct);
+                    match (&col.plain, req.plain_binary) {
+                        (Some(ty), true) => crate::tenant::rls_streams::FilterColumn {
+                            ty: ty.clone(),
+                            opaque: false,
+                            ..col.clone()
+                        },
+                        _ => col,
+                    }
+                })
+            })
+            .collect();
+        if columns.is_empty() {
+            return Err(SprigError::internal(format!(
+                "table {} has no columns in information_schema",
+                obj.name
+            )));
+        }
+        let current = self.current_logical();
+        let filter = {
+            let ts = self
+                .tenant
+                .as_deref()
+                .ok_or_else(|| SprigError::internal("no tenant"))?;
+            crate::tenant::rls_streams::record_filter(
+                ts,
+                cat,
+                db,
+                object,
+                &columns,
+                lex,
+                current.as_deref(),
+            )
+            .await?
+        };
+        let Some(filter) = filter else {
+            return Ok((0..t.images.len()).map(|i| (i, true)).collect());
+        };
+        let parts: Vec<String> = t
+            .images
+            .iter()
+            .enumerate()
+            .filter_map(|(i, img)| {
+                let m = img.as_ref()?;
+                let v = serde_json::Value::Object(m.clone()).to_string();
+                Some(format!(
+                    "SELECT {i} AS i, EXISTS (SELECT 1 FROM JSON_TABLE({}, '$' COLUMNS ({})) AS {} \
+                     WHERE {}) AS v",
+                    lit(&v),
+                    filter.columns,
+                    sprig_streams::read::FILTER_QUAL,
+                    filter.predicate
+                ))
+            })
+            .collect();
+        let answer = self
+            .run_checked(cx, &parts.join(" UNION ALL "), false)
+            .await?;
+        Ok(answer
+            .rows
+            .iter()
+            .filter_map(|r| {
+                let i = text(r.first()?).parse::<usize>().ok()?;
+                Some((i, text(r.get(1)?) == "1"))
+            })
+            .collect())
     }
 }
 

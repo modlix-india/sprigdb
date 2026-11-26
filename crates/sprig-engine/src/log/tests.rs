@@ -64,6 +64,10 @@ fn propose_wait_apply_and_replay() {
         }
         assert_eq!(log.applied_index(UnitId(1)), 34);
         assert_eq!(log.durable_index(UnitId(2)), 33);
+        // Every index handed out is covered; a unit never written has none.
+        assert_eq!(log.proposed_index(UnitId(1)), 34);
+        assert_eq!(log.proposed_index(UnitId(3)), 33);
+        assert_eq!(log.proposed_index(UnitId(9)), 0);
     }
     // A fresh state machine gets every entry back on reopen.
     let fresh = Arc::new(Recorder::default());
@@ -75,6 +79,8 @@ fn propose_wait_apply_and_replay() {
         .propose(UnitId(1), b"next".to_vec(), Durability::Local)
         .unwrap();
     assert_eq!(t.index(), 35);
+    assert_eq!(log.proposed_index(UnitId(1)), 35);
+    assert_eq!(log.proposed_index(UnitId(2)), 33);
     t.wait_applied().unwrap();
 }
 

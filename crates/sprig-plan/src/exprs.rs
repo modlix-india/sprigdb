@@ -21,7 +21,7 @@ pub(crate) fn for_children<'a>(e: &'a Expr, f: &mut dyn FnMut(&'a Expr)) {
         | Expr::IsNull(a, _)
         | Expr::IsTruth(a, _, _)
         | Expr::Cast(a, _)
-        | Expr::Collate(a, _) => f(a),
+        | Expr::Collate(a, ..) => f(a),
         Expr::Binary(_, a, b) => {
             f(a);
             f(b);
@@ -78,7 +78,7 @@ pub(crate) fn rewrite(e: &Expr, f: &mut dyn FnMut(&Expr) -> Option<Expr>) -> Exp
         Expr::IsNull(a, n) => Expr::IsNull(b(a), *n),
         Expr::IsTruth(a, t, n) => Expr::IsTruth(b(a), *t, *n),
         Expr::Cast(a, t) => Expr::Cast(b(a), *t),
-        Expr::Collate(a, c) => Expr::Collate(b(a), *c),
+        Expr::Collate(a, c, m) => Expr::Collate(b(a), *c, *m),
         Expr::Binary(op, x, y) => Expr::Binary(*op, b(x), b(y)),
         Expr::In(a, list, n) => {
             let a = b(a);
@@ -216,5 +216,6 @@ pub(crate) fn slot_ref(slot: usize, name: &str, ty: &ExprType) -> Expr {
         ty: slot_type(ty),
         nullable: ty.nullable,
         name: name.to_owned(),
+        mb3: ty.mb3,
     })
 }

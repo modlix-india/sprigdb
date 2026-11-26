@@ -85,6 +85,9 @@ pub struct Session {
     /// `collation_connection`: the collation of string literals and of
     /// numbers turned into strings.
     pub collation_connection: Collation,
+    /// `collation_connection` is a `utf8mb3` collation (held under its
+    /// `utf8mb4` twin above).
+    pub connection_mb3: bool,
     /// `div_precision_increment` (4 by default).
     pub div_precision_increment: u8,
     /// The session time zone as seconds east of UTC.
@@ -133,6 +136,7 @@ impl Session {
             } else {
                 Collation::Utf8mb4Mysql0900AiCi
             },
+            connection_mb3: false,
             div_precision_increment: 4,
             time_zone_offset: 0,
             time_zone_name: None,

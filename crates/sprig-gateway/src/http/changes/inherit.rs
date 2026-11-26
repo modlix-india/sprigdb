@@ -415,6 +415,60 @@ impl Mapper {
         out
     }
 
+    /// [`Self::handovers`] for copies on engine databases: their state rows
+    /// in the child tenants' catalog records (`m/inherit/copies/`), whose
+    /// handover is a pair of engine commit timestamps in the form the
+    /// handover rules compare engine changes in (`0-0-<cts>`: one clock for
+    /// every unit of the node).
+    pub(super) async fn engine_handovers(
+        &self,
+        svc: &crate::tenant::TenantServices,
+        db: &str,
+        table: &str,
+    ) -> Vec<Option<Handover>> {
+        let mut out = vec![None; self.line.len()];
+        for (k, pair) in self.line.windows(2).enumerate() {
+            let k = k + 1;
+            let (parent, child) = (&pair[0], &pair[1]);
+            let materialized = matches!(
+                sprig_inherit::plan::tenant_edge(parent, child, db, table, false),
+                Ok(Some(up)) if up.share.mode == sprig_inherit::model::MergeMode::Materialized
+            );
+            if !materialized {
+                continue;
+            }
+            let Some(st) = child.ext.get::<InheritState>(sprig_inherit::MODULE) else {
+                continue;
+            };
+            let Some(o) = child
+                .database(&sprig_catalog::ddl::database_key(db, false))
+                .and_then(|d| st.object_named_ci(d.db_id, table))
+            else {
+                continue;
+            };
+            match crate::exec::inherit_tree::engine_copy_states(svc, child.tenant).await {
+                Ok(rows) => {
+                    // A copy seeded from another share (one dropped and
+                    // made again) isn't this edge's yet.
+                    out[k] = crate::exec::inherit_tree::current_copies(rows, child, Some(parent))
+                        .into_iter()
+                        .find(|(key, _)| {
+                            key.object == o.object_id && key.share == sprig_inherit::copy::UPSTREAM
+                        })
+                        .map(|(_, row)| row.handover());
+                }
+                Err(e) => {
+                    tracing::warn!(tenant = %child.tenant, error = %e, "a copy's handover wasn't read for a change stream");
+                    out[k] = Some(Handover::At {
+                        source: String::new(),
+                        child: String::new(),
+                    });
+                }
+            }
+        }
+        out
+    }
+
     /// Whether `m`'s change counts, given [`Self::handovers`] of its table;
     /// `None` for a change inside the tenant (what the view reads now
     /// decides).
@@ -620,17 +674,19 @@ pub(super) async fn read(
 
 /// The event an inheritable object's change is to the subscriber, given
 /// its merged record now (`None`: not in its view) and whether the record
-/// was visible to it just before the change. `None`: nothing to send.
+/// was visible to it just before the change (`None`: the stream doesn't
+/// know; taken as not visible). `false`: nothing to send.
 pub(super) fn decide(
     mapper: &Mapper,
     e: &ChangeEvent,
     m: &Mapped,
     rec: Option<&Record>,
-    was_visible: bool,
+    was: Option<bool>,
     full: bool,
     out: &mut super::WatchEvent,
 ) -> bool {
     out.key = Value::Object(m.key.clone()).to_string();
+    let was_visible = was.unwrap_or(false);
     let Some((row, origins)) = rec else {
         if was_visible {
             out.op = "delete".into();
@@ -649,6 +705,15 @@ pub(super) fn decide(
         .as_ref()
         .map(|d| d.iter().filter(|c| row.contains_key(*c)).cloned().collect())
         .unwrap_or_default();
+    // A record the stream last knew as gone (it sent its delete, or never
+    // showed it) that is back: an insert. A cross-tenant override is out
+    // of the view from its parent's delete until the orphan pass turns it
+    // into an orphan, and the orphan's own change brings it back.
+    if was == Some(false) && matches!(e.op, Op::Update | Op::Delete) {
+        out.op = "insert".into();
+        out.after = Value::Object(row.clone()).to_string();
+        return true;
+    }
     match e.op {
         Op::Update => {
             if visible.is_empty() {
@@ -697,11 +762,26 @@ pub(super) fn decide(
                 out.after = Value::Object(row.clone()).to_string();
             }
         }
-        // An override, hide or own row gone while the record stays: its
-        // values may have changed.
+        // A row gone while the record stays: the fields that now come from
+        // another level may have changed. Fields a level nearer to the
+        // subscriber supplies didn't: a parent's delete that leaves the
+        // child's override as an orphan (which keeps the values the child
+        // saw) sends nothing. A row of the subscriber's own space (an
+        // override, hide or own row) has no nearer level: every field.
+        // The key's columns name the record (`key`), as in an update.
         Op::Delete => {
+            let nearer = mapper.nearer(m.space);
+            let changed: Map<String, Value> = row
+                .iter()
+                .filter(|(f, _)| !m.key.contains_key(*f))
+                .filter(|(f, _)| !origin(f).is_some_and(|o| nearer.contains(&o)))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            if changed.is_empty() {
+                return false;
+            }
             out.op = "update".into();
-            out.update = Value::Object(row.clone()).to_string();
+            out.update = Value::Object(changed).to_string();
             if full {
                 out.after = Value::Object(row.clone()).to_string();
             }
@@ -930,5 +1010,171 @@ pub(super) async fn next(
             i = tail.next() => (true, i),
             Some(i) = rx.recv() => (false, i),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use sprig_common::ids::{ClusterId, DbId, GroupId, ShardId};
+    use sprig_settings::Registry;
+
+    /// A child tenant `child` whose subscriber reads its root space.
+    fn mapper() -> Mapper {
+        let mut c = TenantCatalog::empty(Registry::global().unwrap(), TenantId(2));
+        c.ext = c.ext.with(vec![(
+            sprig_inherit::MODULE,
+            Arc::new(InheritState::default()) as Arc<_>,
+        )]);
+        let cat = Arc::new(c);
+        Mapper {
+            cat: Arc::clone(&cat),
+            space: sprig_inherit::ROOT_SPACE,
+            tenant_name: "child".into(),
+            line: vec![cat],
+        }
+    }
+
+    fn event(op: Op, delta: Option<&[&str]>) -> ChangeEvent {
+        let gtid = sprig_binlog::Gtid {
+            domain: 0,
+            server: 0,
+            seq: 1,
+        };
+        let cluster = ClusterId::new("engine").unwrap();
+        ChangeEvent {
+            id: sprig_feed::EventId {
+                cluster: cluster.clone(),
+                gtid,
+                row: 0,
+            },
+            token: sprig_feed::ResumeToken {
+                tenant: TenantId(1),
+                clamp: 0,
+                cluster,
+                segment: 0,
+                pos: sprig_binlog::GtidPos::default(),
+                until: None,
+                progress: true,
+            },
+            tenant: TenantId(1),
+            db: DbId(1),
+            db_name: "shop".into(),
+            object: 1,
+            table: "products".into(),
+            shard: sprig_feed::ShardRef {
+                group: GroupId(0),
+                shard: ShardId(0),
+            },
+            key: sprig_feed::Image(Vec::new()),
+            op,
+            before: None,
+            after: None,
+            delta: delta.map(|d| d.iter().map(|s| (*s).to_owned()).collect()),
+            hlc: 1,
+            txn: gtid,
+            ddl: None,
+            hint: None,
+        }
+    }
+
+    fn mapped(space: Option<SpaceId>) -> Mapped {
+        Mapped {
+            key: json!({"id": 3}).as_object().unwrap().clone(),
+            space,
+            share: None,
+            origin: Origin::Above(0),
+            gtid: (0, 0, 1),
+        }
+    }
+
+    /// Record 3 as the child reads it: `price` from `price_from`, the rest
+    /// from `rest_from`.
+    fn record(price_from: &str, rest_from: &str) -> Record {
+        let row = json!({"id": 3, "name": "n3", "price": 999});
+        let origins = json!({"id": rest_from, "name": rest_from, "price": price_from});
+        (
+            row.as_object().unwrap().clone(),
+            origins.as_object().unwrap().clone(),
+        )
+    }
+
+    fn run(
+        op: Op,
+        space: Option<SpaceId>,
+        rec: Option<&Record>,
+        was: Option<bool>,
+    ) -> Option<WatchEventView> {
+        let mut out = super::super::WatchEvent::default();
+        let e = event(op, Some(&["price"]));
+        decide(&mapper(), &e, &mapped(space), rec, was, true, &mut out).then(|| WatchEventView {
+            op: out.op.clone(),
+            update: out.update.clone(),
+        })
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct WatchEventView {
+        op: String,
+        update: String,
+    }
+
+    #[test]
+    fn a_parent_delete_that_leaves_an_orphan_sends_nothing() {
+        // The child's override is now an orphan: every field is its own.
+        let rec = record("child (orphaned)", "child (orphaned)");
+        assert_eq!(run(Op::Delete, None, Some(&rec), Some(true)), None);
+    }
+
+    #[test]
+    fn a_delete_sends_the_fields_that_now_come_from_another_level() {
+        // An ancestor's override of `price` gone: `price` comes from the
+        // parent again, `name` stays the child's own.
+        let rec = record("parent", "child");
+        let got = run(Op::Delete, None, Some(&rec), Some(true)).unwrap();
+        assert_eq!(got.op, "update");
+        assert_eq!(got.update, json!({"price": 999}).to_string());
+        // The subscriber's own override gone: every field but the key.
+        let got = run(
+            Op::Delete,
+            Some(sprig_inherit::ROOT_SPACE),
+            Some(&rec),
+            Some(true),
+        )
+        .unwrap();
+        assert_eq!(got.update, json!({"name": "n3", "price": 999}).to_string());
+    }
+
+    #[test]
+    fn a_record_known_gone_that_is_back_is_an_insert() {
+        let rec = record("child (orphaned)", "child (orphaned)");
+        // The orphan pass's change after the stream sent the parent's delete.
+        let got = run(
+            Op::Update,
+            Some(sprig_inherit::ROOT_SPACE),
+            Some(&rec),
+            Some(false),
+        )
+        .unwrap();
+        assert_eq!(got.op, "insert");
+        // Unknown before: as before (nothing visible changed).
+        let e = event(Op::Update, Some(&["_sprig_state"]));
+        let mut out = super::super::WatchEvent::default();
+        assert!(!decide(
+            &mapper(),
+            &e,
+            &mapped(Some(sprig_inherit::ROOT_SPACE)),
+            Some(&rec),
+            None,
+            true,
+            &mut out
+        ));
+        // Gone now: a delete only when it was visible.
+        assert_eq!(
+            run(Op::Delete, None, None, Some(true)).map(|v| v.op),
+            Some("delete".into())
+        );
+        assert_eq!(run(Op::Delete, None, None, None), None);
     }
 }

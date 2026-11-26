@@ -1362,6 +1362,18 @@ pub struct RunRequest {
     /// consumer group's position.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replay: Option<ReplayRun>,
+    /// After-commit triggers on engine tables: how many key lanes the
+    /// worker runs (`logic.trigger_lanes`; 0 for one).
+    #[serde(default, skip_serializing_if = "is_zero32")]
+    pub lanes: u32,
+    /// With `lanes`: the worker's lane this run is for (0-based).
+    #[serde(default, skip_serializing_if = "is_zero32")]
+    pub lane: u32,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero32(v: &u32) -> bool {
+    *v == 0
 }
 
 /// A dead letter's replay run: the stored event, run once with

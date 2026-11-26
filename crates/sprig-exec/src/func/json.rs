@@ -207,6 +207,25 @@ pub(crate) fn parse(b: &[u8]) -> Option<J> {
     (p.i == b.len()).then_some(v)
 }
 
+/// Where reading `b` as a document stops (0-based): the position MySQL's
+/// "Invalid JSON text" names. Inside a literal (`nul`, `tru`) it is just
+/// past the characters that matched.
+pub(crate) fn parse_error_at(b: &[u8]) -> usize {
+    let mut p = P { b, i: 0 };
+    if p.value(0).is_some() {
+        p.ws();
+        return p.i;
+    }
+    let at = p.i;
+    for w in [&b"null"[..], b"true", b"false"] {
+        if b.get(at) == w.first() {
+            let n = b[at..].iter().zip(w).take_while(|(x, y)| x == y).count();
+            return at + n;
+        }
+    }
+    at
+}
+
 /// MySQL's form of a document: keys ordered, the last duplicate kept,
 /// numbers with a fraction or exponent as doubles.
 pub(crate) fn normalize(j: J) -> J {
@@ -489,14 +508,14 @@ pub(crate) fn key_text(j: &J) -> Bytes {
 // ---- paths ----
 
 #[derive(Debug, Clone, PartialEq)]
-enum Idx {
+pub(crate) enum Idx {
     N(usize),
     /// `last - n`.
     Last(usize),
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum Leg {
+pub(crate) enum Leg {
     Key(String),
     AnyKey,
     Index(Idx),
@@ -506,7 +525,7 @@ enum Leg {
 }
 
 /// A path; `None` when it isn't one.
-fn parse_path(s: &str) -> Option<Vec<Leg>> {
+pub(crate) fn parse_path(s: &str) -> Option<Vec<Leg>> {
     let b = s.trim().as_bytes();
     if b.first() != Some(&b'$') {
         return None;
@@ -589,7 +608,7 @@ fn wild(path: &[Leg]) -> bool {
 }
 
 /// The values `path` selects in `j`, in document order.
-fn select<'a>(j: &'a J, path: &[Leg], out: &mut Vec<&'a J>) {
+pub(crate) fn select<'a>(j: &'a J, path: &[Leg], out: &mut Vec<&'a J>) {
     select_in(j, path, out);
 }
 
@@ -770,7 +789,7 @@ fn as_json(ctx: &mut Ctx<'_>, a: &Node, row: &[Value]) -> Result<J> {
 }
 
 /// A JSON document result: MySQL's `JSON` type; MariaDB's long text.
-fn json_type(env: Env<'_>) -> ExprType {
+pub(crate) fn json_type(env: Env<'_>) -> ExprType {
     ExprType {
         json: !env.maria(),
         ..ExprType::string(u32::MAX / 4, env.conn(), Derivation::Implicit).nullable()
@@ -906,7 +925,7 @@ pub(crate) fn cast_json(a: Node, env: Env<'_>) -> Node {
     })
 }
 
-fn compact_into(j: &J, out: &mut String) {
+pub(crate) fn compact_into(j: &J, out: &mut String) {
     match j {
         J::Arr(a) => {
             out.push('[');
@@ -1122,7 +1141,7 @@ fn scalar_text(j: &J) -> String {
 
 /// The found value converted to `r`; `None` when it can't be (MySQL's
 /// `NULL ON ERROR`, the default: no warning).
-fn returned(ctx: &Ctx<'_>, j: &J, r: Returning) -> Option<Value> {
+pub(crate) fn returned(ctx: &Ctx<'_>, j: &J, r: Returning) -> Option<Value> {
     use crate::num::Round;
     if matches!(j, J::Null) {
         return None;

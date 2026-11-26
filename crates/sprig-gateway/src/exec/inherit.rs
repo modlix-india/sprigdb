@@ -206,19 +206,30 @@ fn limits(ts: &TenantSession, cat: &TenantCatalog) -> Limits {
 
 /// The copies of `cat`'s objects and their states, read as the
 /// provisioning account at most once a second per tenant and catalog
-/// version (a schema change that keeps a copy serving is seen by the next
-/// statement). `fresh`: read them now (a change stream's probe, which must
+/// version, and the parent tenant's (a schema change that keeps a copy
+/// serving is seen by the next statement; so is a share the parent made
+/// again). On engine databases, only copies seeded from the share and
+/// source object their edge is made from now count
+/// ([`super::inherit_tree::current_copies`]). `fresh`: read them now (a change stream's probe, which must
 /// see a copy that just started serving and its grants).
+///
+/// With them, each copy's source tenant, for a tenant whose databases are
+/// all the engine's (empty otherwise).
 async fn copy_states(
     ts: &TenantSession,
     cat: &TenantCatalog,
     ancestors: &[Arc<TenantCatalog>],
     fresh: bool,
-) -> sprig_inherit::copy::CopyStates {
+) -> (sprig_inherit::copy::CopyStates, CopySources) {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
     use std::time::{Duration, Instant};
-    type Cached = (Instant, u64, sprig_inherit::copy::CopyStates);
+    type Cached = (
+        Instant,
+        (u64, u64),
+        sprig_inherit::copy::CopyStates,
+        CopySources,
+    );
     static CACHE: OnceLock<Mutex<HashMap<u64, Cached>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let schemas = sprig_inherit::copy::copy_schemas(
@@ -227,15 +238,17 @@ async fn copy_states(
         ts.lower_case_table_names(),
     );
     if schemas.is_empty() {
-        return sprig_inherit::copy::CopyStates::default();
+        return Default::default();
     }
+    let parent = ancestors.last().map(AsRef::as_ref);
+    let versions = (cat.version, parent.map_or(0, |p: &TenantCatalog| p.version));
     if !fresh
         && let Ok(c) = cache.lock()
-        && let Some((at, v, st)) = c.get(&cat.tenant.0)
+        && let Some((at, v, st, src)) = c.get(&cat.tenant.0)
         && at.elapsed() < Duration::from_secs(1)
-        && *v == cat.version
+        && *v == versions
     {
-        return st.clone();
+        return (st.clone(), src.clone());
     }
     let mut out = sprig_inherit::copy::CopyStates::default();
     let svc = Arc::clone(ts.services());
@@ -243,13 +256,22 @@ async fn copy_states(
     // states in its catalog records (the gateway's copy pass writes them),
     // and its copies need no backend grants.
     if super::inherit_tree::all_engine(cat) {
+        let mut sources = CopySources::new();
         if let Ok(rows) = super::inherit_tree::engine_copy_states(&svc, cat.tenant).await {
+            let rows = super::inherit_tree::current_copies(rows, cat, parent);
+            sources = rows
+                .iter()
+                .map(|(k, r)| (*k, TenantId(r.source_tenant)))
+                .collect();
             out = super::inherit_tree::copy_infos(rows);
         }
         if let Ok(mut c) = cache.lock() {
-            c.insert(cat.tenant.0, (Instant::now(), cat.version, out.clone()));
+            c.insert(
+                cat.tenant.0,
+                (Instant::now(), versions, out.clone(), sources.clone()),
+            );
         }
-        return out;
+        return (out, sources);
     }
     let cluster = ts.principal.backend.cluster.clone();
     if let Ok(pool) = svc.locator.ctl_pool(&cluster).await
@@ -268,12 +290,15 @@ async fn copy_states(
     // missing took the grants back.
     let known = match cache.lock() {
         Ok(mut c) => {
-            let known = c.get(&cat.tenant.0).is_some_and(|(_, _, st)| {
+            let known = c.get(&cat.tenant.0).is_some_and(|(_, _, st, _)| {
                 out.0
                     .iter()
                     .all(|(k, i)| st.0.get(k).is_some_and(|was| was.seeded_ms == i.seeded_ms))
             });
-            c.insert(cat.tenant.0, (Instant::now(), cat.version, out.clone()));
+            c.insert(
+                cat.tenant.0,
+                (Instant::now(), versions, out.clone(), CopySources::new()),
+            );
             known
         }
         Err(_) => true,
@@ -284,7 +309,80 @@ async fn copy_states(
             tracing::warn!(tenant = %cat.tenant, error = %e, "backend grants after a new copy not reconciled yet");
         }
     }
-    out
+    (out, CopySources::new())
+}
+
+/// Each engine copy's source tenant.
+type CopySources = std::collections::HashMap<sprig_inherit::copy::CopyKey, TenantId>;
+
+/// The engine copies statement `sql` of tenant `cat` may read
+/// ([`crate::inherit_lag`]): of the objects it names, those that have
+/// applied every commit it can see, waiting up to `inherit.copy_wait_ms`;
+/// none inside the session's transaction. Statements that read no rows,
+/// and tenants with MariaDB databases, keep `copies` as they are.
+#[allow(clippy::too_many_arguments)] // the statement's parts, as the caller holds them
+async fn exact_copies(
+    ts: &TenantSession,
+    cat: &TenantCatalog,
+    state: &InheritState,
+    copies: sprig_inherit::copy::CopyStates,
+    sources: &CopySources,
+    sql: &str,
+    lex: sprig_sql::lex::LexOptions,
+    in_trans: bool,
+) -> sprig_inherit::copy::CopyStates {
+    if copies.is_empty()
+        || !super::inherit_tree::all_engine(cat)
+        || !crate::inherit_lag::reads_rows(sql)
+    {
+        return copies;
+    }
+    if in_trans {
+        let n = copies.0.values().filter(|i| i.serving).count();
+        if n > 0 {
+            metrics::counter!("sprig_inherit_copy_exact_reads_total", "outcome" => "read_through")
+                .increment(n as u64);
+        }
+        return sprig_inherit::copy::CopyStates::default();
+    }
+    let named: std::collections::HashSet<String> =
+        sprig_inherit::grammar::identifiers(sql.as_bytes(), &lex)
+            .into_iter()
+            .map(|i| i.to_lowercase())
+            .collect();
+    let mut needs = Vec::new();
+    for k in copies.0.keys() {
+        let Some(o) = state.object(k.object) else {
+            continue;
+        };
+        if !named.contains(&o.table.to_lowercase()) {
+            continue;
+        }
+        let Some(src) = sources.get(k) else {
+            continue;
+        };
+        // The source tenant and every tenant above it (ancestry is root
+        // first): their commits make the source's view.
+        let mut chain: Vec<TenantId> = if *src == cat.tenant {
+            let mut v: Vec<TenantId> = cat.ancestry.iter().map(|a| a.id).collect();
+            v.push(cat.tenant);
+            v
+        } else {
+            match cat.ancestry.iter().position(|a| a.id == *src) {
+                Some(p) => cat.ancestry[..=p].iter().map(|a| a.id).collect(),
+                None => continue,
+            }
+        };
+        chain.reverse();
+        needs.push(crate::inherit_lag::Need { key: *k, chain });
+    }
+    let svc = ts.services();
+    let wait = svc.settings.get(
+        &sprig_inherit::settings::COPY_WAIT_MS,
+        &cat.setting_ctx(&svc.dc),
+        Some(&cat.settings),
+    );
+    crate::inherit_lag::exact(copies, &needs, std::time::Duration::from_millis(wait)).await
 }
 
 /// Whether a statement to prepare names an inheritable object: refused
@@ -411,9 +509,15 @@ impl PassSession {
         let privileges = GwPrivileges(crate::tenant::authz::privileges(ts, cat));
         let lctn = ts.lower_case_table_names();
         let lim = limits(ts, cat);
-        let copies = copy_states(ts, cat, &ancestors, probe.is_some()).await;
+        let (copies, sources) = copy_states(ts, cat, &ancestors, probe.is_some()).await;
         let current = self.current_logical();
         let (lex, _) = self.lex_opts();
+        let copies = if probe.is_some() {
+            copies
+        } else {
+            let in_trans = self.status().contains(StatusFlags::IN_TRANS);
+            exact_copies(ts, cat, state, copies, &sources, sql, lex, in_trans).await
+        };
         let ctx = sprig_inherit::Ctx {
             cat,
             state,

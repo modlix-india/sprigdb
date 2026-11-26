@@ -453,8 +453,23 @@ pub(crate) async fn engine_ddl(
 ///
 /// ```text
 /// m/inherit/copies/<object u64><share key u64>
-///     {"serving", "object_version", "share_version", "epoch", "seeded_ms", "caught_up_ms", "source_tenant"}
+///     {"serving", "object_version", "share_version", "epoch", "seeded_ms", "caught_up_ms", "source_tenant",
+///      "handover_source", "handover_child", "source_share", "source_object"}
 /// ```
+///
+/// `handover_source` and `handover_child` are the engine commit timestamps
+/// of the copy's first seed (0: not recorded): every source change at or
+/// before `handover_source` is in the seed, every copy write after
+/// `handover_child` came after it, which change streams use to send each
+/// inherited change once (`sprig_inherit::handover`).
+///
+/// `source_share` and `source_object` name what the copy was seeded from:
+/// the share's id and the shared (source) object's id. A copy is its edge's
+/// only while they are what the edge is made from now ([`copy_source`]); a
+/// share dropped and made again (to switch between read-through and
+/// materialized, or with another filter) has a new id at the same versions,
+/// so its old copy is never read and is seeded again. Rows without them
+/// (0) were written before they were recorded and are seeded again once.
 pub(crate) const COPIES: sprig_catalog::records::RowTable =
     sprig_catalog::records::RowTable::new("inherit", "copies");
 
@@ -468,6 +483,40 @@ pub(crate) struct CopyRow {
     pub seeded_ms: u64,
     pub caught_up_ms: u64,
     pub source_tenant: u64,
+    #[serde(default)]
+    pub handover_source: u64,
+    #[serde(default)]
+    pub handover_child: u64,
+    #[serde(default)]
+    pub source_share: u64,
+    #[serde(default)]
+    pub source_object: u64,
+}
+
+impl CopyRow {
+    /// Whether the copy was seeded from `source` ([`copy_source`]: what its
+    /// edge is made from now).
+    pub(crate) fn made_from(&self, source: Option<(u64, u64)>) -> bool {
+        self.source_share > 0 && source == Some((self.source_share, self.source_object))
+    }
+
+    /// When the copy became its subscribers' source in change streams: at
+    /// its recorded seed timestamps (`0-0-<cts>`, the form the handover
+    /// rules compare engine changes in), else before every change once it
+    /// serves (a copy seeded before handovers were recorded), else not yet.
+    pub(crate) fn handover(&self) -> sprig_inherit::handover::Handover {
+        use sprig_inherit::handover::Handover;
+        if self.handover_source > 0 {
+            Handover::At {
+                source: format!("0-0-{}", self.handover_source),
+                child: format!("0-0-{}", self.handover_child),
+            }
+        } else if self.serving {
+            Handover::Always
+        } else {
+            Handover::Pending
+        }
+    }
 }
 
 fn copy_pk(object: ObjectId, share: u64) -> sprig_catalog::records::Pk {
@@ -524,16 +573,45 @@ pub(crate) fn copy_infos(
                         share_version: r.share_version,
                         caught_up_ms: r.caught_up_ms,
                         seeded_ms: r.seeded_ms,
-                        handover: if r.serving {
-                            sprig_inherit::handover::Handover::Always
-                        } else {
-                            sprig_inherit::handover::Handover::Pending
-                        },
+                        handover: r.handover(),
                     },
                 )
             })
             .collect(),
     )
+}
+
+/// What copy `k` of tenant `cat` is made from now: the share's id and the
+/// source object's id (the parent tenant's shared object for the edge from
+/// `parent`, else `k`'s own object). `None` when the edge is gone.
+pub(crate) fn copy_source(
+    cat: &TenantCatalog,
+    parent: Option<&TenantCatalog>,
+    k: sprig_inherit::copy::CopyKey,
+) -> Option<(u64, u64)> {
+    let st = sprig_inherit::plan::state_of(cat)?;
+    let o = st.object(k.object)?;
+    if k.share == sprig_inherit::copy::UPSTREAM {
+        let db = cat.databases.get(o.db)?.name.clone();
+        let up = sprig_inherit::plan::tenant_edge(parent?, cat, &db, &o.table, false).ok()??;
+        return Some((up.share.id, up.parent_obj.object_id.0));
+    }
+    st.shares_of(k.object)
+        .any(|s| s.id == k.share)
+        .then_some((k.share, k.object.0))
+}
+
+/// The rows of `rows` (tenant `cat`'s copy states) whose copy is made from
+/// what its edge is made from now ([`CopyRow::made_from`]); `parent`: the
+/// parent tenant's catalog. The others are no copy a reader may use.
+pub(crate) fn current_copies(
+    rows: Vec<(sprig_inherit::copy::CopyKey, CopyRow)>,
+    cat: &TenantCatalog,
+    parent: Option<&TenantCatalog>,
+) -> Vec<(sprig_inherit::copy::CopyKey, CopyRow)> {
+    rows.into_iter()
+        .filter(|(k, r)| r.made_from(copy_source(cat, parent, *k)))
+        .collect()
 }
 
 /// Writes (`Some`) or removes (`None`) copy `k`'s state row.
@@ -1519,5 +1597,28 @@ mod tests {
         let (s, l) = strip_lock("SELECT 'FOR UPDATE x' FROM t");
         assert_eq!(s, "SELECT 'FOR UPDATE x' FROM t");
         assert!(l.is_none());
+    }
+
+    #[test]
+    fn a_copy_counts_only_while_made_from_its_edges_share() {
+        // A row written before copies recorded their source reads as 0.
+        let old: super::CopyRow = serde_json::from_str(
+            r#"{"serving":true,"object_version":3,"share_version":1,"epoch":1,
+                "seeded_ms":1,"caught_up_ms":1,"source_tenant":7}"#,
+        )
+        .expect("an old row");
+        assert_eq!((old.source_share, old.source_object), (0, 0));
+        assert!(!old.made_from(Some((0, 0))));
+        let row = super::CopyRow {
+            source_share: 12,
+            source_object: 40,
+            ..old
+        };
+        assert!(row.made_from(Some((12, 40))));
+        // The share dropped and made again (a new id at the same versions),
+        // the parent's table made again, or the edge gone.
+        assert!(!row.made_from(Some((13, 40))));
+        assert!(!row.made_from(Some((12, 41))));
+        assert!(!row.made_from(None));
     }
 }

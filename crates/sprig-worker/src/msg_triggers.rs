@@ -632,6 +632,8 @@ impl MsgEnv {
                 instance_tenant: 0,
                 instance_stream: 0,
                 replay: None,
+                lanes: 0,
+                lane: 0,
             },
             version: Arc::new(AtomicU64::new(l.version)),
             budget: Some(self.settings.live_trigger_budget(scope)),
@@ -818,8 +820,9 @@ impl JobHandler for QueueTrigger {
 }
 
 /// The `logic_stream_trigger` job, for after-commit triggers on engine
-/// tables: one run at a time (the gateway picks the next change after the
-/// trigger's position, so changes run in commit order).
+/// tables: `logic.trigger_lanes` loops, each asking for its key lane's
+/// next change (the gateway picks it after that lane's position, so a
+/// row key's changes run in commit order).
 pub struct ChangeTrigger(pub MsgEnv);
 
 #[async_trait]
@@ -853,15 +856,18 @@ async fn run_job(env: &MsgEnv, cx: &JobCtx, changes: bool) -> std::result::Resul
         module_id: l.source.module_id,
         version: Arc::clone(&t.version),
     };
-    let mut opts = env.opts_for(tenant, &l);
+    let opts = env.opts_for(tenant, &l);
+    let mut t = t;
     let started = if changes {
-        // One run at a time, in commit order.
-        opts.lanes = 1;
+        // Key lanes: each loop asks for its lane's next change; a key's
+        // changes run in commit order.
+        t.req.lanes = u32::try_from(opts.lanes.max(1)).unwrap_or(1);
         format!(
-            "after-commit trigger on {}.{} started (job {})",
+            "after-commit trigger on {}.{} started (job {}, {} key lanes)",
             l.source.db_name,
             l.source.name.trim_end_matches(".changes"),
-            cx.job_id
+            cx.job_id,
+            t.req.lanes
         )
     } else {
         format!(

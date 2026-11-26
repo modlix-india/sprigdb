@@ -53,6 +53,7 @@ pub(crate) mod general;
 pub(crate) mod graphsql;
 pub(crate) mod indexes;
 pub(crate) mod infoschema;
+pub(crate) mod infoschema_mysql;
 pub(crate) mod keys;
 pub(crate) mod layout;
 pub(crate) mod locking;

@@ -156,10 +156,7 @@ pub(crate) fn like(a: Node, p: Node, esc: Option<Node>, not: bool, env: Env<'_>)
             let three = [
                 pair[0],
                 pair[1],
-                Dtc {
-                    coll: env.conn(),
-                    deriv: crate::types::Derivation::Coercible,
-                },
+                Dtc::new(env.conn(), crate::types::Derivation::Coercible),
             ];
             return Err(crate::types::illegal_mix(&three, "like"));
         }

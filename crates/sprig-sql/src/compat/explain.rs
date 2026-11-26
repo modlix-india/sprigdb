@@ -44,6 +44,10 @@ pub const EXPLAIN_EXTENDED_COLUMNS: [&str; 11] = [
     "Extra",
 ];
 
+/// The comment a tree request's JSON form carries, so the engine knows the
+/// client asked for a tree (MySQL gives no Note 1003 after one).
+pub const TREE_MARK: &str = "/* tree */";
+
 /// Where MySQL's `partitions` column goes.
 pub const PARTITIONS_AT: usize = 3;
 
@@ -101,6 +105,8 @@ pub fn rewrite(sql: &[u8], opts: &LexOptions) -> Option<Vec<u8>> {
             let at = t.get(v + 1)?.start as usize;
             let mut out = sql[..t[0].end as usize].to_vec();
             out.extend_from_slice(b" FORMAT=JSON ");
+            out.extend_from_slice(TREE_MARK.as_bytes());
+            out.push(b' ');
             out.extend_from_slice(&sql[at..]);
             return Some(out);
         }
@@ -281,6 +287,12 @@ fn cond(c: &str) -> String {
     format!("({c})")
 }
 
+/// Constant tables, read while the statement is prepared: MySQL's line
+/// gives the cost as the range `0..0`.
+fn fetched_before() -> Node {
+    Node::new("Rows fetched before execution  (cost=0..0 rows=1)")
+}
+
 /// One table access, with its filter on top.
 fn table_node(t: &serde_json::Value, analyze: bool) -> Node {
     let name = st(t, "table_name").unwrap_or("?").to_owned();
@@ -327,14 +339,28 @@ fn table_node(t: &serde_json::Value, analyze: bool) -> Node {
         Some(ic) => format!("{label}, with index condition: {}", cond(ic)),
         None => label,
     };
-    let rows = f(t, "rows").unwrap_or(1.0);
-    let cost = f(t, "cost").unwrap_or(0.0);
+    // MariaDB's numbers, else MySQL's JSON form's (the engine's plans on
+    // this port): rows per scan and the cost of the join so far.
+    let rows = f(t, "rows")
+        .or_else(|| f(t, "rows_examined_per_scan"))
+        .unwrap_or(1.0);
+    let cost = f(t, "cost")
+        .or_else(|| {
+            t.get("cost_info")
+                .and_then(|c| st(c, "prefix_cost"))
+                .and_then(|c| c.parse().ok())
+        })
+        .unwrap_or(0.0);
     let mut node = Node::new(label);
     node.est = Some((cost, rows));
     if analyze {
         node.actual = actual(t);
     }
-    if let Some(m) = t.get("materialized").and_then(|m| m.get("query_block")) {
+    if let Some(m) = t
+        .get("materialized")
+        .or_else(|| t.get("materialized_from_subquery"))
+        .and_then(|m| m.get("query_block"))
+    {
         node = node.with(Node::new("Materialize").with(block(m, analyze)));
     }
     match st(t, "attached_condition") {
@@ -431,9 +457,7 @@ fn nested(v: &serde_json::Value, analyze: bool) -> Node {
                 .is_some_and(|a| a == "const" || a == "system")
         });
     if all_const {
-        let mut n = Node::new("Rows fetched before execution");
-        n.est = Some((0.0, 1.0));
-        return n;
+        return fetched_before();
     }
     let mut acc: Option<Node> = None;
     for item in &items {
@@ -502,7 +526,12 @@ fn block(qb: &serde_json::Value, analyze: bool) -> Node {
     } else if qb.get("nested_loop").is_some() {
         nested(qb, analyze)
     } else if let Some(t) = qb.get("table") {
-        table_node(t, analyze)
+        // MySQL's JSON form names one table without a `nested_loop`.
+        if st(t, "access_type").is_some_and(|a| a == "const" || a == "system") {
+            fetched_before()
+        } else {
+            table_node(t, analyze)
+        }
     } else if let Some((n, _, _)) = ["filesort", "temporary_table", "read_sorted_file"]
         .iter()
         .find_map(|k| qb.get(*k).map(|x| serde_json::json!({ *k: x })))
@@ -611,7 +640,7 @@ mod tests {
     fn tree_formats_ask_for_json() {
         assert_eq!(
             rw("EXPLAIN FORMAT=TREE SELECT * FROM t").unwrap(),
-            "EXPLAIN FORMAT=JSON SELECT * FROM t"
+            "EXPLAIN FORMAT=JSON /* tree */ SELECT * FROM t"
         );
         assert_eq!(
             rw("explain analyze select 1").unwrap(),
@@ -653,7 +682,7 @@ mod tests {
         let konst = br#"{"query_block":{"select_id":1,"nested_loop":[{"table":{"table_name":"c","access_type":"const","rows":1,"filtered":100}}]}}"#;
         assert_eq!(
             tree(konst, false, None).unwrap(),
-            "-> Rows fetched before execution  (cost=0 rows=1)\n"
+            "-> Rows fetched before execution  (cost=0..0 rows=1)\n"
         );
         let analyzed = br#"{"query_optimization":{"r_total_time_ms":0.05},"query_block":{"select_id":1,"cost":0.00282078,"r_loops":1,"nested_loop":[{"table":{"table_name":"c","access_type":"ALL","loops":1,"r_loops":1,"rows":3,"r_rows":3,"cost":0.0028,"r_table_time_ms":0.008,"r_other_time_ms":0.0047,"filtered":100,"r_filtered":66.67,"attached_condition":"c.id > 1"}}]}}"#;
         assert_eq!(

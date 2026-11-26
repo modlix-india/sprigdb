@@ -163,7 +163,7 @@ impl Cx<'_> {
                     .enumerate()
                     .map(|(i, c)| RelCol {
                         name: c.name.clone(),
-                        expr: table_col(0, i, &c.name, c.ty, c.nullable),
+                        expr: table_col(0, i, c),
                     })
                     .collect();
                 let alias = alias_name.unwrap_or_else(|| table.clone());
@@ -341,6 +341,16 @@ impl Cx<'_> {
         tables: &[ast::TableWithJoins],
         outer: Option<&Scope<'_>>,
     ) -> Result<From> {
+        // `FROM DUAL` reads no table.
+        let dual = |t: &ast::TableWithJoins| {
+            t.joins.is_empty()
+                && matches!(&t.relation, ast::TableFactor::Table { name, alias: None, args: None, .. }
+                    if matches!(name.0.as_slice(), [p] if p.as_ident().is_some_and(|i| i.quote_style.is_none() && i.value.eq_ignore_ascii_case("dual"))))
+        };
+        let tables = match tables {
+            [t] if dual(t) => &[],
+            _ => tables,
+        };
         let flat;
         let tables = match flatten_nested(tables) {
             Some(f) => {
@@ -360,7 +370,18 @@ impl Cx<'_> {
                     ast::JoinOperator::Right(_) | ast::JoinOperator::RightOuter(_)
                 )
             });
-            let first = self.relation(&twj.relation, !any_right, false)?;
+            // A table function reads the items before it.
+            let first = if matches!(twj.relation, ast::TableFactor::JsonTable { .. }) {
+                let scope = Scope {
+                    rels: &from.rels,
+                    star: &from.star,
+                    visible: 0..from.rels.len(),
+                    outer,
+                };
+                self.json_table_rel(&twj.relation, &scope)?
+            } else {
+                self.relation(&twj.relation, !any_right, false)?
+            };
             let first = self.add_rel(&mut from, first)?;
             let pending = std::mem::take(&mut from.rels[first].pending);
             from.filters.extend(pending);
@@ -381,7 +402,18 @@ impl Cx<'_> {
                     J::Right(c) | J::RightOuter(c) => (c, false, true),
                     other => return Err(unsupported(&format!("{other:?}"))),
                 };
-                let rel = self.relation(&join.relation, true, left)?;
+                let rel = if matches!(join.relation, ast::TableFactor::JsonTable { .. }) {
+                    let star: Vec<StarCol> = from.star.iter().chain(&chain).copied().collect();
+                    let scope = Scope {
+                        rels: &from.rels,
+                        star: &star,
+                        visible: 0..from.rels.len(),
+                        outer,
+                    };
+                    self.json_table_rel(&join.relation, &scope)?
+                } else {
+                    self.relation(&join.relation, true, left)?
+                };
                 let r = self.add_rel(&mut from, rel)?;
                 let pending = std::mem::take(&mut from.rels[r].pending);
                 if right && r - chain_start != 1 {
@@ -624,7 +656,7 @@ impl Cx<'_> {
                     items: block.items.iter().map(|i| i.expr.clone()).collect(),
                     filters: block.filters.clone(),
                 }),
-                RelKind::Derived(_) => None,
+                RelKind::Derived(_) | RelKind::JsonTable(_) => None,
             })
             .flatten();
         let types = block
@@ -821,6 +853,17 @@ impl Cx<'_> {
                         ast::Expr::CompoundIdentifier(p) => {
                             let n = p.last().map(|i| i.value.clone()).unwrap_or_default();
                             (n.clone(), Some(n))
+                        }
+                        // `_cs 'text'`: named by its text, as a plain string is.
+                        ast::Expr::Prefixed { prefix, value } if prefix.value.starts_with('_') => {
+                            match &**value {
+                                ast::Expr::Value(v) => match &v.value {
+                                    SqlValue::SingleQuotedString(t)
+                                    | SqlValue::DoubleQuotedString(t) => (t.clone(), None),
+                                    _ => (e.to_string(), None),
+                                },
+                                _ => (e.to_string(), None),
+                            }
                         }
                         other => (other.to_string(), None),
                     };

@@ -1364,8 +1364,57 @@ pub fn mysql_create_table(text: &str) -> String {
             prev.pop();
         }
     }
+    // MySQL leaves out the table's collation when it is its character
+    // set's default, except for `utf8mb4`.
+    if let Some(last) = lines.last_mut()
+        && last.starts_with(')')
+    {
+        *last = without_default_collation(last);
+    }
     // Expressions printed the MySQL way.
     super::exprprint::mysql_expressions(&mysql_collations(&lines.join("\n")))
+}
+
+/// MySQL 8.4's default collation of a character set other than `utf8mb4`.
+fn mysql_default_collation(cs: &str) -> Option<&'static str> {
+    Some(match cs {
+        "utf8mb3" | "utf8" => "utf8mb3_general_ci",
+        "latin1" => "latin1_swedish_ci",
+        "ascii" => "ascii_general_ci",
+        "latin2" => "latin2_general_ci",
+        "cp1251" => "cp1251_general_ci",
+        "greek" => "greek_general_ci",
+        "ucs2" => "ucs2_general_ci",
+        "utf16" => "utf16_general_ci",
+        "utf16le" => "utf16le_general_ci",
+        "utf32" => "utf32_general_ci",
+        "binary" => "binary",
+        _ => return None,
+    })
+}
+
+/// A table options line without ` COLLATE=c` when `c` is MySQL's default
+/// of the line's `DEFAULT CHARSET=` (not `utf8mb4`).
+fn without_default_collation(line: &str) -> String {
+    let word_after = |key: &str| {
+        let at = line.find(key)? + key.len();
+        let n = line[at..]
+            .bytes()
+            .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_')
+            .count();
+        Some((at, &line[at..at + n]))
+    };
+    let (Some((_, cs)), Some((at, coll))) =
+        (word_after(" DEFAULT CHARSET="), word_after(" COLLATE="))
+    else {
+        return line.to_owned();
+    };
+    if mysql_default_collation(cs).is_some_and(|d| d.eq_ignore_ascii_case(coll)) {
+        let start = at - " COLLATE=".len();
+        format!("{}{}", &line[..start], &line[at + coll.len()..])
+    } else {
+        line.to_owned()
+    }
 }
 
 /// The column of a ``  CONSTRAINT `_sprignn_<c>` CHECK (...)`` line.

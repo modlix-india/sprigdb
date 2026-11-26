@@ -45,6 +45,7 @@ pub mod setvar;
 pub mod sqlmode;
 pub mod stored;
 pub mod trigger;
+pub mod utf8mb3;
 pub mod vars;
 
 use crate::lex::{self, LexOptions, TokenKind};

@@ -160,7 +160,7 @@ fn comparison_types() {
     both(
         &bin(
             BinOp::Eq,
-            Expr::Collate(b(s("a")), Collation::Utf8mb4Bin),
+            Expr::Collate(b(s("a")), Collation::Utf8mb4Bin, false),
             s("A"),
         ),
         "0",
@@ -179,8 +179,8 @@ fn comparison_types() {
     both(
         &bin(
             BinOp::Eq,
-            Expr::Collate(b(s("a")), Collation::Utf8mb4Bin),
-            Expr::Collate(b(s("a")), Collation::Utf8mb4GeneralCi),
+            Expr::Collate(b(s("a")), Collation::Utf8mb4Bin, false),
+            Expr::Collate(b(s("a")), Collation::Utf8mb4GeneralCi, false),
         ),
         "ERROR 1267",
     );

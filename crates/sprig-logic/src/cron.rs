@@ -189,6 +189,28 @@ impl Cron {
         None
     }
 
+    /// [`Self::next_after`] in Unix milliseconds, for callers without
+    /// `chrono`.
+    #[must_use]
+    pub fn next_after_ms(&self, after_ms: u64) -> Option<u64> {
+        let after = DateTime::<Utc>::from_timestamp_millis(i64::try_from(after_ms).ok()?)?;
+        self.next_after(after)
+            .and_then(|t| u64::try_from(t.timestamp_millis()).ok())
+    }
+
+    /// Unix milliseconds `ms` as `YYYY-MM-DD hh:mm:ss` in UTC and in the
+    /// schedule's zone.
+    #[must_use]
+    pub fn texts_ms(&self, ms: u64) -> (String, String) {
+        let t = DateTime::<Utc>::from_timestamp_millis(i64::try_from(ms).unwrap_or(0))
+            .unwrap_or_default();
+        let f = "%Y-%m-%d %H:%M:%S";
+        (
+            t.format(f).to_string(),
+            t.with_timezone(&self.tz).format(f).to_string(),
+        )
+    }
+
     /// A local time in UTC: the first of a repeated time, and for a time
     /// the clocks skip, the first valid minute after it.
     fn resolve(&self, t: NaiveDateTime) -> Option<DateTime<Utc>> {

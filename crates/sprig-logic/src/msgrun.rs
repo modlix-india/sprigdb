@@ -12,7 +12,9 @@
 //!   becomes a dead letter and the offset moves past it
 //! run_queue: logic.trigger_lanes loops, each asking for the next message;
 //!   Empty → wait (100 ms doubling to 1 s); Failed → wait backoff(the
-//!   message's failures) before asking again
+//!   message's failures) before asking again; a request whose `lanes` is
+//!   set (after-commit triggers on engine tables) names its loop's lane,
+//!   and the gateway runs only that lane's row keys
 //! ```
 //!
 //! Positions live only in `stream_offsets`, so a runner that dies is
@@ -488,7 +490,13 @@ pub async fn run_queue(
             let mut errs = 0u32;
             let seed = format!("lane{lane}");
             while !cancel.is_cancelled() {
-                let wait = match gw.run(&t.request(None)).await {
+                let mut req = t.request(None);
+                // Key lanes (after-commit triggers on engine tables): the
+                // gateway runs this lane's keys.
+                if req.lanes > 0 {
+                    req.lane = u32::try_from(lane).unwrap_or(0);
+                }
+                let wait = match gw.run(&req).await {
                     Err(e) => {
                         errs += 1;
                         tracing::debug!(error = %e, "queue trigger: no gateway answered");

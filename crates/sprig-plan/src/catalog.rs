@@ -17,6 +17,9 @@ pub struct ColumnDef {
     pub nullable: bool,
     /// `INVISIBLE`: not part of `*`.
     pub invisible: bool,
+    /// A character column whose character set is `utf8mb3` (its type
+    /// holds the collation's `utf8mb4` twin).
+    pub mb3: bool,
 }
 
 impl ColumnDef {
@@ -28,6 +31,7 @@ impl ColumnDef {
             ty,
             nullable: true,
             invisible: false,
+            mb3: false,
         }
     }
 

@@ -567,7 +567,74 @@ struct EnumLits<'a> {
     derived: HashSet<String>,
     backslash: bool,
     safe: HashSet<*const Expr>,
+    /// The `FROM` names of each `SELECT` being visited, innermost last.
+    scopes: Vec<Scope>,
+    /// The statement's common table expressions (lower case).
+    ctes: HashSet<String>,
+    /// Every query but the outermost one gives its `ENUM` select items as
+    /// their member text (see [`Self::member_text`]), so a derived table,
+    /// a common table expression or a subquery reads them as the servers
+    /// do: as strings.
+    texts: bool,
+    /// The outermost query.
+    top: Option<*const Query>,
     _cx: std::marker::PhantomData<&'a ()>,
+}
+
+/// The names one `SELECT`'s `FROM` gives its tables (lower case).
+#[derive(Default)]
+struct Scope {
+    /// A base table's.
+    base: HashSet<String>,
+    /// A derived table's, a common table expression's, or another row
+    /// source's.
+    derived: HashSet<String>,
+}
+
+impl Scope {
+    fn of(s: &Select, ctes: &HashSet<String>) -> Self {
+        fn factor(f: &TableFactor, ctes: &HashSet<String>, out: &mut Scope) {
+            match f {
+                TableFactor::Table { name, alias, .. } => {
+                    let last = name
+                        .0
+                        .last()
+                        .and_then(ident_of)
+                        .map(|i| i.value.to_lowercase());
+                    let cte = name.0.len() == 1 && last.as_ref().is_some_and(|n| ctes.contains(n));
+                    let q = alias.as_ref().map(|a| a.name.value.to_lowercase()).or(last);
+                    if let Some(q) = q {
+                        if cte {
+                            out.derived.insert(q);
+                        } else {
+                            out.base.insert(q);
+                        }
+                    }
+                }
+                TableFactor::NestedJoin {
+                    table_with_joins, ..
+                } => {
+                    factor(&table_with_joins.relation, ctes, out);
+                    for j in &table_with_joins.joins {
+                        factor(&j.relation, ctes, out);
+                    }
+                }
+                TableFactor::Derived { alias: Some(a), .. }
+                | TableFactor::JsonTable { alias: Some(a), .. } => {
+                    out.derived.insert(a.name.value.to_lowercase());
+                }
+                _ => {}
+            }
+        }
+        let mut out = Scope::default();
+        for t in &s.from {
+            factor(&t.relation, ctes, &mut out);
+            for j in &t.joins {
+                factor(&j.relation, ctes, &mut out);
+            }
+        }
+        out
+    }
 }
 
 impl EnumLits<'_> {
@@ -581,12 +648,40 @@ impl EnumLits<'_> {
             ),
             _ => return None,
         };
-        if qual.is_none() && self.derived.contains(&name) {
+        // An unqualified name a base table of the nearest `FROM` has is
+        // that table's, whatever a derived table elsewhere in the
+        // statement names a column; else it may be a derived table's.
+        let local: Option<&HashSet<String>> = match (&qual, self.scopes.last()) {
+            (None, Some(sc))
+                if self
+                    .tables
+                    .iter()
+                    .any(|(a, d)| sc.base.contains(a) && d.column(&name).is_some()) =>
+            {
+                Some(&sc.base)
+            }
+            _ => None,
+        };
+        if qual.is_none() && local.is_none() && self.derived.contains(&name) {
             return None;
+        }
+        // A qualifier the nearest `FROM` naming it gives a derived table
+        // (whatever base table elsewhere goes by the same name).
+        if let Some(q) = &qual {
+            for sc in self.scopes.iter().rev() {
+                if sc.derived.contains(q) {
+                    return None;
+                }
+                if sc.base.contains(q) {
+                    break;
+                }
+            }
         }
         let mut found: Option<crate::engine::table::Column> = None;
         for (alias, def) in &self.tables {
-            if qual.as_ref().is_some_and(|q| q != alias) {
+            if qual.as_ref().is_some_and(|q| q != alias)
+                || local.is_some_and(|l| !l.contains(alias))
+            {
                 continue;
             }
             let Some(c) = def.column(&name) else { continue };
@@ -643,6 +738,108 @@ impl EnumLits<'_> {
         Some(-1)
     }
 
+    /// A set operation's select item that is an `ENUM` column, as its
+    /// member text: `ELT(c + 1, '', 'a', 'b')`, named as the column (0 is
+    /// the servers' error value `''`, `NULL` stays `NULL`). The servers
+    /// give a set operation the members' text; the expression engine
+    /// holds the member number. `None`: no such column.
+    fn member_text(&mut self, e: &Expr, single: Option<&str>) -> Option<Expr> {
+        // An unqualified name in a branch that reads one table is that
+        // table's, even where a derived table names a column the same.
+        let lookup = match (e, single) {
+            (Expr::Identifier(i), Some(t)) => {
+                Expr::CompoundIdentifier(vec![Ident::new(t), i.clone()])
+            }
+            _ => e.clone(),
+        };
+        let (members, _) = self.column(&lookup)?;
+        let mut lits = vec!["''".to_owned()];
+        for m in members.iter() {
+            let t = std::str::from_utf8(m).ok()?;
+            // Read back by the parser, which always takes backslash
+            // escapes.
+            let t = t.replace('\\', "\\\\").replace('\'', "''");
+            lits.push(format!("'{t}'"));
+        }
+        let text = format!("ELT({e} + 1, {})", lits.join(", "));
+        let mut out = sqlparser::parser::Parser::new(&sprig_plan::dialect::SprigMySql)
+            .try_with_sql(&text)
+            .ok()?
+            .parse_expr()
+            .ok()?;
+        // The column inside: computing its number is what is wanted.
+        if let Expr::Function(f) = &mut out
+            && let FunctionArguments::List(l) = &mut f.args
+            && let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::BinaryOp {
+                left, ..
+            }))) = l.args.first_mut()
+        {
+            **left = e.clone();
+            self.safe.insert(std::ptr::from_ref(&**left));
+            return Some(out);
+        }
+        None
+    }
+
+    /// [`Self::member_text`] for each select item of a set operation's
+    /// branches.
+    fn set_branches(&mut self, b: &mut SetExpr) {
+        match b {
+            SetExpr::Select(s) => {
+                self.scopes.push(Scope::of(s, &self.ctes));
+                let single = match s.from.as_slice() {
+                    [
+                        TableWithJoins {
+                            relation: TableFactor::Table { name, alias, .. },
+                            joins,
+                        },
+                    ] if joins.is_empty() => alias
+                        .as_ref()
+                        .map(|a| a.name.value.to_lowercase())
+                        .or_else(|| {
+                            name.0
+                                .last()
+                                .and_then(ident_of)
+                                .map(|i| i.value.to_lowercase())
+                        }),
+                    _ => None,
+                };
+                for item in &mut s.projection {
+                    match item {
+                        SelectItem::UnnamedExpr(e) => {
+                            let name = match &*e {
+                                Expr::Identifier(i) => Some(i.clone()),
+                                Expr::CompoundIdentifier(p) => p.last().cloned(),
+                                _ => None,
+                            };
+                            if let Some(name) = name
+                                && let Some(t) = self.member_text(e, single.as_deref())
+                            {
+                                *item = SelectItem::ExprWithAlias {
+                                    expr: t,
+                                    alias: name,
+                                };
+                            }
+                        }
+                        SelectItem::ExprWithAlias { expr, .. } => {
+                            if let Some(t) = self.member_text(expr, single.as_deref()) {
+                                *expr = t;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                self.scopes.pop();
+            }
+            SetExpr::SetOperation { left, right, .. } => {
+                self.set_branches(left);
+                self.set_branches(right);
+            }
+            SetExpr::Query(q) => self.set_branches(&mut q.body),
+            _ => {}
+        }
+    }
+
     fn num(n: i64) -> Expr {
         Expr::Value(ValueWithSpan {
             value: SqlValue::Number(n.to_string(), false),
@@ -653,6 +850,24 @@ impl EnumLits<'_> {
 
 impl VisitorMut for EnumLits<'_> {
     type Break = ();
+
+    fn pre_visit_query(&mut self, q: &mut Query) -> ControlFlow<()> {
+        let inner = self.top != Some(std::ptr::from_ref::<Query>(q));
+        if matches!(&*q.body, SetExpr::SetOperation { .. }) || (self.texts && inner) {
+            self.set_branches(&mut q.body);
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_select(&mut self, s: &mut Select) -> ControlFlow<()> {
+        self.scopes.push(Scope::of(s, &self.ctes));
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_select(&mut self, _s: &mut Select) -> ControlFlow<()> {
+        self.scopes.pop();
+        ControlFlow::Continue(())
+    }
 
     fn post_visit_expr(&mut self, e: &mut Expr) -> ControlFlow<()> {
         use sqlparser::ast::BinaryOperator as B;
@@ -701,18 +916,21 @@ fn enum_literals(
     cx: &BindCtx<'_>,
     foreign: &[Arc<sprig_catalog::TenantCatalog>],
     stmt: &mut Statement,
+    texts: bool,
 ) -> HashSet<*const Expr> {
     struct Collect<'a, 'b> {
         cx: &'a BindCtx<'b>,
         foreign: &'a [Arc<sprig_catalog::TenantCatalog>],
         tables: Vec<(String, Arc<TableDef>)>,
         derived: HashSet<String>,
+        ctes: HashSet<String>,
     }
     impl Visitor for Collect<'_, '_> {
         type Break = ();
         fn pre_visit_query(&mut self, q: &Query) -> ControlFlow<()> {
             if let Some(w) = &q.with {
                 for c in &w.cte_tables {
+                    self.ctes.insert(c.alias.name.value.to_lowercase());
                     names_of(&c.query, &mut self.derived);
                     for col in &c.alias.columns {
                         self.derived.insert(col.name.value.to_lowercase());
@@ -816,16 +1034,22 @@ fn enum_literals(
         foreign,
         tables: Vec::new(),
         derived: HashSet::new(),
+        ctes: HashSet::new(),
     };
     let _ = Visit::visit(&*stmt, &mut c);
     if c.tables.is_empty() {
         return HashSet::new();
     }
+    let top = query_of(stmt).map(std::ptr::from_ref::<Query>);
     let mut e = EnumLits {
         tables: c.tables,
         derived: c.derived,
         backslash: cx.backslash,
         safe: HashSet::new(),
+        scopes: Vec::new(),
+        ctes: c.ctes,
+        texts,
+        top,
         _cx: std::marker::PhantomData,
     };
     let _ = VisitMut::visit(stmt, &mut e);
@@ -883,9 +1107,26 @@ struct Walk<'a, 'b> {
     safe: HashSet<*const Expr>,
     /// [`Views::foreign`].
     foreign: Vec<Arc<sprig_catalog::TenantCatalog>>,
+    /// The `FROM` names of each `SELECT` being visited, innermost last.
+    scopes: Vec<Scope>,
 }
 
 impl Walk<'_, '_> {
+    /// Whether qualifier `q` names a derived table or a common table
+    /// expression where it is read (its columns are that query's, marked
+    /// where that query names them).
+    fn derived_qual(&self, q: &str) -> bool {
+        for sc in self.scopes.iter().rev() {
+            if sc.derived.contains(q) {
+                return true;
+            }
+            if sc.base.contains(q) {
+                return false;
+            }
+        }
+        false
+    }
+
     fn fail(&mut self, e: SprigError) {
         if self.err.is_none() {
             self.err = Some(e);
@@ -1219,7 +1460,13 @@ impl Visitor for Walk<'_, '_> {
         ControlFlow::Continue(())
     }
 
+    fn post_visit_select(&mut self, _s: &Select) -> ControlFlow<()> {
+        self.scopes.pop();
+        ControlFlow::Continue(())
+    }
+
     fn pre_visit_select(&mut self, s: &Select) -> ControlFlow<()> {
+        self.scopes.push(Scope::of(s, &self.ctes));
         let top = self.top.is_some_and(|t| std::ptr::eq(t, s));
         let (factors, _) = self.read_from(s);
         for item in &s.projection {
@@ -1263,6 +1510,13 @@ impl Visitor for Walk<'_, '_> {
     }
 
     fn pre_visit_expr(&mut self, e: &Expr) -> ControlFlow<()> {
+        // A derived table's column: its own query marks what it reads.
+        if let Expr::CompoundIdentifier(p) = e
+            && let [.., q, _] = p.as_slice()
+            && self.derived_qual(&q.value.to_lowercase())
+        {
+            return ControlFlow::Continue(());
+        }
         let plain = self.plain.contains(&std::ptr::from_ref(e));
         if self.safe.contains(&std::ptr::from_ref(e)) {
             let (qual, name) = match e {
@@ -1377,6 +1631,7 @@ pub(crate) fn plan_table(def: &TableDef, db_name: &str) -> PlanTable {
             ty: c.ty,
             nullable: c.nullable,
             invisible: c.invisible,
+            mb3: c.mb3,
         })
         .collect();
     // A table keyed by a hidden row number shows it as one more invisible
@@ -1388,6 +1643,7 @@ pub(crate) fn plan_table(def: &TableDef, db_name: &str) -> PlanTable {
             ty: crate::engine::table::HIDDEN_TYPE,
             nullable: false,
             invisible: true,
+            mb3: false,
         });
     }
     PlanTable {
@@ -1451,12 +1707,31 @@ fn star_columns(def: &crate::engine::table::TableDef) -> impl Iterator<Item = us
     (0..def.columns.len()).filter(|&c| !def.columns[c].invisible)
 }
 
-#[allow(clippy::too_many_lines)] // one walk, then the marks and the origins
 pub(super) fn analyze(
     cx: &BindCtx<'_>,
     stmt: &Statement,
     text: Option<&str>,
     tableless: bool,
+) -> Result<Option<Analysis>> {
+    let mut enum_refused = false;
+    match analyze_in(cx, stmt, text, tableless, false, &mut enum_refused) {
+        // An `ENUM` column a derived table, a common table expression or
+        // a subquery reads and its outer query computes with: read again
+        // with those queries giving the member text, as the servers'
+        // derived tables do.
+        Err(_) if enum_refused => analyze_in(cx, stmt, text, tableless, true, &mut enum_refused),
+        r => r,
+    }
+}
+
+#[allow(clippy::too_many_lines)] // one walk, then the marks and the origins
+fn analyze_in(
+    cx: &BindCtx<'_>,
+    stmt: &Statement,
+    text: Option<&str>,
+    tableless: bool,
+    texts: bool,
+    enum_refused: &mut bool,
 ) -> Result<Option<Analysis>> {
     // The names of computed columns, from the statement as it was parsed
     // (the copy below loses nothing of it, but is read first for its
@@ -1466,7 +1741,7 @@ pub(super) fn analyze(
     let _ = VisitMut::visit(&mut stmt, &mut Logical { cx });
     let views = expand_views(cx, &mut stmt)?;
     let tableless = tableless || !views.uses.is_empty();
-    let safe = enum_literals(cx, &views.foreign, &mut stmt);
+    let safe = enum_literals(cx, &views.foreign, &mut stmt, texts);
     let Some(query) = query_of(&stmt) else {
         return Ok(None);
     };
@@ -1488,6 +1763,7 @@ pub(super) fn analyze(
         seq_calls: false,
         safe,
         foreign: views.foreign.clone(),
+        scopes: Vec::new(),
     };
     let _ = Visit::visit(&stmt, &mut w);
     // Sequence functions are the engine's: such a statement needs no table.
@@ -1605,6 +1881,7 @@ pub(super) fn analyze(
                 .flatten()
                 .any(|o| o.table == ti && o.column == ci);
             if computed[ti][ci] || (t.read[ci] && !passes) {
+                *enum_refused = matches!(c.ty, ColType::Enum { .. });
                 return Err(not_on_engine(&format!(
                     "a column of type {kind} (`{}`.`{}`) in a join, grouping, ordering, an \
                      expression, a subquery or a set operation; only a plain select-list \

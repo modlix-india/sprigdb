@@ -27,6 +27,10 @@ impl PassSession {
             .into_iter()
             .filter(|t| !t.kind.is_trivia())
             .collect();
+        // `ANALYZE`, `CHECK`, `OPTIMIZE` and `REPAIR TABLE`.
+        if let Some(a) = self.engine_table_admin(sql, &toks).await {
+            return Some(a);
+        }
         // `DESCRIBE t [col]` is `SHOW COLUMNS FROM t [LIKE 'col']` (the MySQL
         // port's comes here already rewritten as a query).
         let described = sprig_sql::compat::schema::describe_target(sql, &toks, false).map(|d| {
@@ -75,6 +79,7 @@ impl PassSession {
                 | ShowKind::Columns
                 | ShowKind::Index
                 | ShowKind::Tables
+                | ShowKind::TableStatus
         ) {
             return None;
         }
@@ -97,6 +102,173 @@ impl PassSession {
             return crate::engine::infoschema::filter_answer(answer, cond).map(Ok);
         }
         self.engine_show_of(&info).await
+    }
+
+    /// `ANALYZE`, `CHECK`, `OPTIMIZE` and `REPAIR TABLE` of engine tables,
+    /// with the servers' answers for InnoDB tables: the engine keeps no
+    /// statistics to refresh and has nothing to rebuild or repair; `CHECK`
+    /// reads every row. `None`: another statement, a form this doesn't
+    /// read, or a table of a database that isn't the engine's.
+    #[allow(clippy::too_many_lines)] // read the statement, find the tables, one answer per table
+    async fn engine_table_admin(
+        &self,
+        sql: &[u8],
+        toks: &[sprig_sql::lex::Token],
+    ) -> Option<Result<Answer>> {
+        use sprig_proto_mysql::resultset::encode_text_row;
+        use sprig_sql::lex::TokenKind;
+        let word = |i: usize| {
+            toks.get(i)
+                .filter(|t| t.kind == TokenKind::Word)
+                .map(|t| t.bytes(sql).to_ascii_uppercase())
+        };
+        let punct = |i: usize, c: &[u8]| {
+            toks.get(i)
+                .is_some_and(|t| t.kind == TokenKind::Punct && t.bytes(sql) == c)
+        };
+        let op = match word(0)?.as_slice() {
+            b"ANALYZE" => "analyze",
+            b"CHECK" => "check",
+            b"OPTIMIZE" => "optimize",
+            b"REPAIR" => "repair",
+            _ => return None,
+        };
+        let mut i = 1;
+        while matches!(word(i).as_deref(), Some(b"NO_WRITE_TO_BINLOG" | b"LOCAL")) {
+            i += 1;
+        }
+        if !matches!(word(i).as_deref(), Some(b"TABLE" | b"TABLES")) {
+            return None;
+        }
+        i += 1;
+        let mut names: Vec<(Option<String>, String)> = Vec::new();
+        loop {
+            let a = super::sqlprep::ident(toks.get(i)?, sql)?;
+            i += 1;
+            if punct(i, b".") {
+                let b = super::sqlprep::ident(toks.get(i + 1)?, sql)?;
+                i += 2;
+                names.push((Some(a), b));
+            } else {
+                names.push((None, a));
+            }
+            if !punct(i, b",") {
+                break;
+            }
+            i += 1;
+        }
+        // The options that change nothing here.
+        while let Some(w) = word(i) {
+            match (op, w.as_slice()) {
+                ("check", b"QUICK" | b"FAST" | b"MEDIUM" | b"EXTENDED" | b"CHANGED")
+                | ("repair", b"QUICK" | b"EXTENDED" | b"USE_FRM") => i += 1,
+                ("check", b"FOR") if word(i + 1).as_deref() == Some(b"UPGRADE") => i += 2,
+                _ => return None,
+            }
+        }
+        if toks.get(i).is_some_and(|_| !punct(i, b";")) {
+            return None;
+        }
+        let ts = self.tenant.as_deref()?;
+        let cat = self.eng.temps.overlay(ts.catalog()?);
+        let eng = catalog::of(&cat)?;
+        let lctn = ts.lower_case_table_names();
+        let mysql = self.persona == sprig_proto_mysql::packets::Persona::MySql84;
+        let current = match self.bs.as_ref().and_then(|b| b.vars().schema.clone()) {
+            Some(s) => Some(s),
+            None => ts.schema_of(self.current_logical().as_deref()),
+        };
+        // Every name must be in one of the tenant's engine databases.
+        let mut found = Vec::with_capacity(names.len());
+        for (db, t) in names {
+            let schema_name = match db {
+                Some(d) => d,
+                None => current.clone()?,
+            };
+            let schema: SchemaName = schema_name.parse().ok()?;
+            if schema.tenant() != ts.tenant {
+                return None;
+            }
+            let db: DbId = schema.db()?;
+            if !eng.dbs.contains(&db) {
+                return None;
+            }
+            found.push((schema_name, db, t));
+        }
+        let e = match engine::engine() {
+            Ok(e) => e,
+            Err(x) => return Some(Err(x)),
+        };
+        let mut rows = Vec::new();
+        let mut row = |name: &str, ty: &str, text: &str| {
+            rows.push(encode_text_row([
+                Some(name.as_bytes()),
+                Some(op.as_bytes()),
+                Some(ty.as_bytes()),
+                Some(text.as_bytes()),
+            ]));
+        };
+        for (schema_name, db, t) in found {
+            let shown = format!("{schema_name}.{t}");
+            if let Some(td) = eng.table(db, &t, lctn) {
+                let Ok(td) = td.as_ref().as_ref() else {
+                    row(&shown, "status", "OK");
+                    continue;
+                };
+                match op {
+                    "check" => match e.row_count(ts.tenant.0, td, u64::MAX).await {
+                        Ok(_) => row(&shown, "status", "OK"),
+                        Err(x) => {
+                            row(&shown, "Error", &x.to_string());
+                            row(&shown, "status", "Operation failed");
+                        }
+                    },
+                    "optimize" => {
+                        row(
+                            &shown,
+                            "note",
+                            "Table does not support optimize, doing recreate + analyze instead",
+                        );
+                        row(&shown, "status", "OK");
+                    }
+                    "repair" if mysql => row(
+                        &shown,
+                        "note",
+                        "The storage engine for the table doesn't support repair",
+                    ),
+                    _ => row(&shown, "status", "OK"),
+                }
+            } else if eng.view(db, &t, lctn).is_some() {
+                if op == "check" {
+                    row(&shown, "status", "OK");
+                } else {
+                    row(
+                        &shown,
+                        "Error",
+                        &if mysql {
+                            format!("'{shown}' is not BASE TABLE")
+                        } else {
+                            format!("'{shown}' is not of type 'BASE TABLE'")
+                        },
+                    );
+                    row(&shown, "status", "Operation failed");
+                }
+            } else {
+                row(&shown, "Error", &format!("Table '{shown}' doesn't exist"));
+                row(&shown, "status", "Operation failed");
+            }
+        }
+        let def = |n: &str, len: u32, ty: u8| show::coldef("", "", n, "", 224, len, ty, 0, 0x27);
+        Some(Ok(Answer {
+            defs: vec![
+                def("Table", 512, 0xfd),
+                def("Op", 40, 0xfd),
+                def("Msg_type", 40, 0xfd),
+                def("Msg_text", 1_572_864, 0xfa),
+            ],
+            rows,
+            no_index: false,
+        }))
     }
 
     /// `SHOW CREATE DATABASE` of an engine database, from its catalog row;
@@ -216,6 +388,11 @@ impl PassSession {
                 info.like.as_deref(),
             )));
         }
+        if info.kind == ShowKind::TableStatus {
+            let mysql = self.persona == sprig_proto_mysql::packets::Persona::MySql84;
+            let sql = table_status_query(&schema_name, info.like.as_deref(), mysql);
+            return self.engine_infoschema(sql.as_bytes()).await;
+        }
         let name = info.object.clone()?;
         // A sequence: its own text, or the table MariaDB keeps it in.
         if matches!(info.kind, ShowKind::CreateTable | ShowKind::CreateSequence)
@@ -289,7 +466,19 @@ impl PassSession {
                 },
             )));
         }
-        let parsed = eng.table(db, &name, lctn)?;
+        // Every table of an engine database is the engine's: one it doesn't
+        // have doesn't exist (MariaDB has no schema to ask).
+        let Some(parsed) = eng.table(db, &name, lctn) else {
+            let db_name = cat
+                .databases
+                .get(db)
+                .map_or_else(String::new, |d| d.name.clone());
+            return Some(Err(SprigError::standard(
+                1146,
+                *b"42S02",
+                format!("Table '{db_name}.{name}' doesn't exist"),
+            )));
+        };
         let td = parsed.as_ref().as_ref().ok()?;
         let text = eng.texts.get(&td.object)?;
         let def = match define::parse_stored(text) {
@@ -325,6 +514,49 @@ impl PassSession {
     }
 }
 
+/// `SHOW TABLE STATUS [LIKE p]` of database `schema` as a query over
+/// `information_schema.TABLES`, in the server's column names (MariaDB
+/// adds `Max_index_length` and `Temporary`).
+fn table_status_query(schema: &str, like: Option<&str>, mysql: bool) -> String {
+    let quote = |t: &str| sprig_sql::names::rewrite::sql_string(t, false);
+    let mut cols = vec![
+        ("TABLE_NAME", "Name"),
+        ("ENGINE", "Engine"),
+        ("VERSION", "Version"),
+        ("ROW_FORMAT", "Row_format"),
+        ("TABLE_ROWS", "Rows"),
+        ("AVG_ROW_LENGTH", "Avg_row_length"),
+        ("DATA_LENGTH", "Data_length"),
+        ("MAX_DATA_LENGTH", "Max_data_length"),
+        ("INDEX_LENGTH", "Index_length"),
+        ("DATA_FREE", "Data_free"),
+        ("AUTO_INCREMENT", "Auto_increment"),
+        ("CREATE_TIME", "Create_time"),
+        ("UPDATE_TIME", "Update_time"),
+        ("CHECK_TIME", "Check_time"),
+        ("TABLE_COLLATION", "Collation"),
+        ("CHECKSUM", "Checksum"),
+        ("CREATE_OPTIONS", "Create_options"),
+        ("TABLE_COMMENT", "Comment"),
+    ];
+    if !mysql {
+        cols.push(("MAX_INDEX_LENGTH", "Max_index_length"));
+        cols.push(("TEMPORARY", "Temporary"));
+    }
+    let list = cols
+        .iter()
+        .map(|(c, n)| format!("`{c}` AS `{n}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let like = like.map_or_else(String::new, |p| {
+        format!(" AND `TABLE_NAME` LIKE {}", quote(p))
+    });
+    format!(
+        "SELECT {list} FROM information_schema.TABLES WHERE `TABLE_SCHEMA` = {}{like} ORDER BY `TABLE_NAME`",
+        quote(schema)
+    )
+}
+
 /// Whether the session shows automatic indexes in metadata
 /// (`@sprig_show_auto_indexes = 1`, or `@sprig_show_internal`).
 fn show_auto_indexes(
@@ -348,6 +580,19 @@ fn mysql_show_meta(
 ) {
     let cs = results.map(|r| r.id);
     let caps = answer_caps(persona, client);
+    // `information_schema` columns described as MySQL 8.4 describes them
+    // carry their text columns' character set unset.
+    if answer.defs.iter().any(|d| {
+        sprig_proto_mysql::ColumnDef::decode(d, caps)
+            .is_ok_and(|c| c.charset == crate::engine::infoschema_mysql::TEXT)
+    }) {
+        for d in &mut answer.defs {
+            if let Ok(mut c) = sprig_proto_mysql::ColumnDef::decode(d, caps) {
+                crate::engine::infoschema_mysql::fill_text(&mut c, results);
+                *d = c.encode(caps);
+            }
+        }
+    }
     let Some(first) = answer
         .defs
         .first()
@@ -456,18 +701,50 @@ const MYSQL_SHOW_INDEX: &[FixedCol] = &[
     ("Expression", "", None, u32::MAX, 0xfc, 0x0090, false),
 ];
 
-/// The MySQL port's `SHOW COLUMNS` and `SHOW INDEX` answers (the engine's
-/// `information_schema` queries the name layer writes for them) with the
-/// column definitions MySQL 8.4 sends. `false`: not one of them.
+/// MySQL 8.4's `SHOW TABLE STATUS` columns (its view `TABLES`).
+const MYSQL_SHOW_TABLE_STATUS: &[FixedCol] = &[
+    ("Name", "tables", None, 64, 0xfd, 0x1081, false),
+    ("Engine", "", None, 64, 0xfd, 0x0000, false),
+    ("Version", "", None, 3, 0x03, 0x0000, true),
+    ("Row_format", "tables", None, 10, 0xfe, 0x0180, false),
+    ("Rows", "", None, 21, 0x08, 0x0020, true),
+    ("Avg_row_length", "", None, 21, 0x08, 0x0020, true),
+    ("Data_length", "", None, 21, 0x08, 0x0020, true),
+    ("Max_data_length", "", None, 21, 0x08, 0x0020, true),
+    ("Index_length", "", None, 21, 0x08, 0x0020, true),
+    ("Data_free", "", None, 21, 0x08, 0x0020, true),
+    ("Auto_increment", "", None, 21, 0x08, 0x0020, true),
+    ("Create_time", "tables", None, 19, 0x07, 0x1081, true),
+    ("Update_time", "", None, 19, 0x0c, 0x0080, true),
+    ("Check_time", "", None, 19, 0x0c, 0x0080, true),
+    ("Collation", "collations", None, 64, 0xfd, 0x1000, false),
+    ("Checksum", "", None, 21, 0x08, 0x0000, true),
+    ("Create_options", "", None, 256, 0xfd, 0x0000, false),
+    ("Comment", "", None, 6_144, 0xfc, 0x0010, false),
+];
+
+/// The MySQL port's `SHOW COLUMNS`, `SHOW INDEX` and `SHOW TABLE STATUS`
+/// answers (the engine's `information_schema` queries the name layer or
+/// the seam writes for them) with the column definitions MySQL 8.4 sends.
+/// `false`: not one of them.
 fn mysql_fixed_defs(
     answer: &mut Answer,
     first: &sprig_proto_mysql::ColumnDef,
     results: Option<crate::engine::meta::ResultsCs>,
     caps: sprig_proto_mysql::Caps,
 ) -> bool {
-    let (view, cols) = match (&first.table[..], &first.name[..]) {
-        (b"COLUMNS", b"Field") => ("COLUMNS", MYSQL_SHOW_COLUMNS),
-        (b"STATISTICS", b"Table") => ("SHOW_STATISTICS", MYSQL_SHOW_INDEX),
+    // Known by their first two names (the query's table may be named
+    // after a subquery's).
+    let second = answer
+        .defs
+        .get(1)
+        .and_then(|d| sprig_proto_mysql::ColumnDef::decode(d, caps).ok())
+        .map(|c| c.name.to_ascii_lowercase())
+        .unwrap_or_default();
+    let (view, cols) = match (&first.name[..], &second[..]) {
+        (b"Field", b"type") => ("COLUMNS", MYSQL_SHOW_COLUMNS),
+        (b"Table", b"non_unique") => ("SHOW_STATISTICS", MYSQL_SHOW_INDEX),
+        (b"Name", b"engine") => ("TABLES", MYSQL_SHOW_TABLE_STATUS),
         _ => return false,
     };
     // Each column of the answer must be one of the view's.
@@ -476,11 +753,13 @@ fn mysql_fixed_defs(
         let Ok(mut c) = sprig_proto_mysql::ColumnDef::decode(d, caps) else {
             return false;
         };
-        let Some(&(name, org_table, org_name, chars, ty, flags, number)) =
-            cols.iter().find(|x| x.0.as_bytes() == &c.name[..])
+        let Some(&(name, org_table, org_name, chars, ty, flags, number)) = cols
+            .iter()
+            .find(|x| x.0.as_bytes().eq_ignore_ascii_case(&c.name[..]))
         else {
             return false;
         };
+        c.name = bytes::Bytes::from_static(name.as_bytes());
         let (cs, mb) = match results {
             Some(r) => (r.id, r.mbmax),
             None => (c.charset, 4),
@@ -760,6 +1039,19 @@ impl PassSession {
                 counters.insert(td.object.0, n);
             }
         }
+        // Row counts when the query reads them (`TABLE_ROWS`, `SHOW TABLE
+        // STATUS`): each table counted up to a bound, as an estimate.
+        let lower = text.to_ascii_lowercase();
+        let mut rows = std::collections::HashMap::new();
+        if lower.contains("table_rows") || lower.contains("avg_row_length") {
+            for p in eng.tables.values() {
+                if let Ok(td) = p.as_ref().as_ref()
+                    && let Ok(n) = e.row_count(ts.tenant.0, td, ROW_COUNT_BOUND).await
+                {
+                    rows.insert(td.object.0, n);
+                }
+            }
+        }
         let logic = if text.to_ascii_lowercase().contains("routines")
             || text.to_ascii_lowercase().contains("parameters")
         {
@@ -771,6 +1063,7 @@ impl PassSession {
             eng,
             tenant: ts.tenant.0,
             counters: &counters,
+            rows: &rows,
             logic: &logic,
             show_auto_indexes: show_auto_indexes(ts, self.persona),
         };
@@ -779,26 +1072,14 @@ impl PassSession {
     }
 }
 
+/// The most rows `information_schema.TABLES` counts in one table for
+/// `TABLE_ROWS`; a larger table shows about this many (an estimate, as the
+/// servers' own figure is).
+const ROW_COUNT_BOUND: u64 = 100_000;
+
 /// `secs` since the Unix epoch as `YYYY-MM-DD hh:mm:ss` (UTC).
 fn utc_text(secs: u64) -> String {
-    let days = i64::try_from(secs / 86_400).unwrap_or(0);
-    let rest = secs % 86_400;
-    // Days to a civil date (proleptic Gregorian).
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = yoe + era * 400 + i64::from(m <= 2);
-    format!(
-        "{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02}",
-        rest / 3600,
-        rest / 60 % 60,
-        rest % 60
-    )
+    crate::engine::infoschema::utc_datetime(secs)
 }
 
 /// The tenant's live logic functions and procedures (engine-tier code,

@@ -13,7 +13,7 @@
 //! with any other result column, or one the planner can't run, is left to
 //! the backend as before.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -71,11 +71,6 @@ const COLS: &[(&str, &str, u16, u32, u8, u16)] = &[
     ("COLUMNS", "COLLATION_NAME", 224, 256, 0xfd, 0x1000),
     ("COLUMNS", "COLUMN_TYPE", 224, 786_420, 0xfc, 0x1011),
     ("COLUMNS", "COLUMN_KEY", 224, 12, 0xfd, 0x1001),
-    // The MySQL port's forms of three columns, computed here instead of by
-    // the name layer's regular expressions (see `simplify`); invisible.
-    ("COLUMNS", "_sprig_my_type", 224, 786_420, 0xfc, 0x1011),
-    ("COLUMNS", "_sprig_my_default", 224, 786_384, 0xfc, 0x1010),
-    ("COLUMNS", "_sprig_my_extra", 224, 320, 0xfd, 0x1001),
     ("COLUMNS", "EXTRA", 224, 320, 0xfd, 0x1001),
     ("COLUMNS", "PRIVILEGES", 224, 320, 0xfd, 0x1001),
     ("COLUMNS", "COLUMN_COMMENT", 224, 4096, 0xfd, 0x1001),
@@ -104,6 +99,12 @@ const COLS: &[(&str, &str, u16, u32, u8, u16)] = &[
         0xfd,
         0x1001,
     ),
+    // The MySQL port's forms of three columns, computed here instead of by
+    // the name layer's regular expressions (see `simplify`); invisible, and
+    // last, so `SELECT *` reads the visible ones in order.
+    ("COLUMNS", "_sprig_my_type", 224, 786_420, 0xfc, 0x1011),
+    ("COLUMNS", "_sprig_my_default", 224, 786_384, 0xfc, 0x1010),
+    ("COLUMNS", "_sprig_my_extra", 224, 320, 0xfd, 0x1001),
     ("STATISTICS", "TABLE_CATALOG", 224, 2048, 0xfd, 0x1001),
     ("STATISTICS", "TABLE_SCHEMA", 224, 256, 0xfd, 0x1001),
     ("STATISTICS", "TABLE_NAME", 224, 256, 0xfd, 0x1001),
@@ -576,6 +577,37 @@ fn cols_of(
     COLS.iter().filter(move |c| c.0 == t)
 }
 
+/// [`coldef`] with `table` (as the query writes it) apart from
+/// `org_table`.
+#[allow(clippy::too_many_arguments)] // a column definition's fields
+fn coldef_in(
+    schema: &str,
+    table: &str,
+    org_table: &str,
+    name: &str,
+    org: &str,
+    charset: u16,
+    len: u32,
+    ty: u8,
+    flags: u16,
+    decimals: u8,
+) -> Bytes {
+    let d = coldef(
+        schema, org_table, name, org, charset, len, ty, flags, decimals,
+    );
+    if table == org_table {
+        return d;
+    }
+    // Replace the first table field (after the catalog and the schema).
+    let mut out = bytes::BytesMut::with_capacity(d.len() + table.len());
+    let skip = 1 + 3 + 1 + schema.len();
+    out.extend_from_slice(&d[..skip]);
+    out.extend_from_slice(&[u8::try_from(table.len()).unwrap_or(0)]);
+    out.extend_from_slice(table.as_bytes());
+    out.extend_from_slice(&d[skip + 1 + org_table.len()..]);
+    out.freeze()
+}
+
 /// The planner's definition of table `t`.
 fn plan_def(t: &str) -> TableDef {
     let ci = collation_named("utf8mb4_general_ci");
@@ -937,9 +969,38 @@ fn mysql_extra(d: Option<&str>, extra: &str) -> String {
     out.trim_matches(' ').to_owned()
 }
 
+/// `secs` since the Unix epoch as `YYYY-MM-DD hh:mm:ss` (UTC).
+pub(crate) fn utc_datetime(secs: u64) -> String {
+    let days = i64::try_from(secs / 86_400).unwrap_or(0);
+    let rest = secs % 86_400;
+    // Days to a civil date (proleptic Gregorian).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!(
+        "{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02}",
+        rest / 3600,
+        rest / 60 % 60,
+        rest % 60
+    )
+}
+
 /// Adds every row one table contributes to the in-memory tables.
 #[allow(clippy::too_many_lines)] // one block per table built
-fn add_table(db: &mut MemDb, schema: &str, def: &Def, next: Option<u64>) {
+fn add_table(
+    db: &mut MemDb,
+    schema: &str,
+    def: &Def,
+    next: Option<u64>,
+    created: Option<String>,
+    rows: Option<u64>,
+) {
     let mut put = |t: &str, vals: HashMap<&str, V>| {
         if let Err(e) = db.insert(t, row_of(t, &vals)) {
             tracing::warn!(table = t, error = %e.message, "information_schema: a row doesn't fit its table");
@@ -956,8 +1017,14 @@ fn add_table(db: &mut MemDb, schema: &str, def: &Def, next: Option<u64>) {
     v.insert("ENGINE", s("InnoDB"));
     v.insert("VERSION", V::U(10));
     v.insert("ROW_FORMAT", s("Dynamic"));
-    v.insert("TABLE_ROWS", V::U(0));
-    v.insert("AVG_ROW_LENGTH", V::U(0));
+    // InnoDB's figures for a table in one page: the average row is the
+    // page shared by the rows.
+    let rows = rows.unwrap_or(0);
+    v.insert("TABLE_ROWS", V::U(rows));
+    v.insert(
+        "AVG_ROW_LENGTH",
+        V::U(16384_u64.checked_div(rows).unwrap_or(0)),
+    );
     v.insert("DATA_LENGTH", V::U(16384));
     v.insert("MAX_DATA_LENGTH", V::U(0));
     v.insert(
@@ -972,6 +1039,7 @@ fn add_table(db: &mut MemDb, schema: &str, def: &Def, next: Option<u64>) {
         ),
     );
     v.insert("DATA_FREE", V::U(0));
+    v.insert("CREATE_TIME", created.map_or(V::N, s));
     v.insert("AUTO_INCREMENT", next.map_or(V::N, V::U));
     v.insert("TABLE_COLLATION", s(def.cs.1.clone()));
     v.insert("CREATE_OPTIONS", s(""));
@@ -1629,24 +1697,15 @@ fn schemas_named(sql: &str, tenant: u64) -> Vec<(String, DbId)> {
 #[allow(clippy::too_many_lines)] // one pass per form the name layer writes
 fn simplify(sql: &str) -> String {
     // Functional key parts (the MySQL port's hidden `_sprig_fx_` columns)
-    // don't exist on the engine: their join and the columns it feeds go.
-    // Automatic indexes (`sprig_auto_`) are MariaDB-side too.
-    let mut owned = sql
-        .replace(" AND LEFT(`INDEX_NAME`, 11) <> 'sprig_auto_'", "")
-        .replace(
-            "IF(`_sprig_fc` IS NULL, `COLUMN_NAME`, NULL)",
-            "`COLUMN_NAME`",
-        )
-        .replace(
-            "REPLACE(REPLACE(`_sprig_fe`, 'lcase(', 'lower('), 'ucase(', 'upper(')",
-            "NULL",
-        );
-    if let Some(a) = owned.find(" LEFT JOIN (SELECT `TABLE_NAME` AS `_sprig_ft`") {
-        let tail_marker = "AND `_sprig_fc` = `COLUMN_NAME`";
-        if let Some(b) = owned[a..].find(tail_marker) {
-            owned.replace_range(a..a + b + tail_marker.len(), "");
-        }
-    }
+    // are engine columns too: their join stays and finds each one's
+    // expression. Automatic indexes (`sprig_auto_`) are MariaDB-side.
+    let mut owned = sql.replace(" AND LEFT(`INDEX_NAME`, 11) <> 'sprig_auto_'", "");
+    // A pair compared with a subquery's pairs (the MySQL port's hidden
+    // `json_valid` checks), which the planner reads as one value each.
+    owned = owned.replace(
+        "(`TABLE_NAME`, `CONSTRAINT_NAME`) IN (SELECT `TABLE_NAME`, `CONSTRAINT_NAME` FROM",
+        "CONCAT(`TABLE_NAME`, '`.`', `CONSTRAINT_NAME`) IN (SELECT CONCAT(`TABLE_NAME`, '`.`', `CONSTRAINT_NAME`) FROM",
+    );
     // The MySQL port's `COLUMN_TYPE`, `COLUMN_DEFAULT` and `EXTRA` forms
     // are computed with the rows (the `_sprig_my_` columns): no regular
     // expression runs for `SHOW COLUMNS` or the MySQL-shaped `COLUMNS`.
@@ -1854,6 +1913,8 @@ pub(crate) struct Source<'a> {
     pub tenant: u64,
     /// The next `AUTO_INCREMENT` value per table object.
     pub counters: &'a HashMap<u64, u64>,
+    /// Each table's row count (`TABLE_ROWS`), when the query asks for it.
+    pub rows: &'a HashMap<u64, u64>,
     /// The tenant's logic functions and procedures (engine-tier code).
     pub logic: &'a [LogicRoutine],
     /// `@sprig_show_auto_indexes = 1`: automatic indexes (`sprig_auto_*`)
@@ -1991,6 +2052,98 @@ fn add_logic_routine(db: &mut MemDb, schema: &str, r: &LogicRoutine, db_cs: &(St
 
 /// The answer to `sql`, or `None` when the engine leaves it to the
 /// backend.
+/// What the result metadata of a query over these tables depends on,
+/// from its outer `SELECT`.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct OuterShape {
+    /// MySQL 8.4 reads it through a temporary table: `DISTINCT`,
+    /// `GROUP BY`, or an `ORDER BY` on a column the `WHERE` doesn't fix
+    /// to one value.
+    temp: bool,
+    /// It has a `GROUP BY`.
+    grouped: bool,
+    /// Result names given by an alias, with the column each reads.
+    aliases: HashMap<String, String>,
+    /// Columns the select list reads as themselves (upper case).
+    plain: HashSet<String>,
+}
+
+fn outer_shape(stmt: &sqlparser::ast::Statement) -> OuterShape {
+    use sqlparser::ast::{
+        BinaryOperator, Distinct, Expr, GroupByExpr, OrderByKind, SelectItem, SetExpr, Statement,
+        Value,
+    };
+    let mut out = OuterShape::default();
+    let Statement::Query(q) = stmt else {
+        return out;
+    };
+    let SetExpr::Select(sel) = q.body.as_ref() else {
+        return out;
+    };
+    let column_of = |e: &Expr| match e {
+        Expr::Identifier(i) => Some(i.value.to_ascii_uppercase()),
+        Expr::CompoundIdentifier(p) => p.last().map(|i| i.value.to_ascii_uppercase()),
+        _ => None,
+    };
+    for item in &sel.projection {
+        match item {
+            SelectItem::ExprWithAlias { expr, alias } => {
+                if let Some(col) = column_of(expr) {
+                    out.aliases.insert(alias.value.clone(), col);
+                }
+            }
+            SelectItem::UnnamedExpr(e) => {
+                if let Some(col) = column_of(e) {
+                    out.plain.insert(col);
+                }
+            }
+            // `*` names every column as itself.
+            _ => {}
+        }
+    }
+    // Columns the WHERE fixes: `col = constant` conjuncts.
+    let mut fixed = Vec::new();
+    let mut stack: Vec<&Expr> = sel.selection.iter().collect();
+    while let Some(e) = stack.pop() {
+        match e {
+            Expr::BinaryOp {
+                left,
+                op: BinaryOperator::And,
+                right,
+            } => {
+                stack.push(left.as_ref());
+                stack.push(right.as_ref());
+            }
+            Expr::Nested(x) => stack.push(x.as_ref()),
+            Expr::BinaryOp {
+                left,
+                op: BinaryOperator::Eq,
+                right,
+            } => {
+                for (a, b) in [(left, right), (right, left)] {
+                    if let (Some(c), Expr::Value(_)) = (column_of(a), b.as_ref()) {
+                        fixed.push(c);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let grouped = matches!(&sel.group_by, GroupByExpr::Expressions(l, _) if !l.is_empty())
+        || matches!(&sel.group_by, GroupByExpr::All(_));
+    out.grouped = grouped;
+    let distinct = matches!(sel.distinct, Some(Distinct::Distinct));
+    let ordered = q.order_by.as_ref().is_some_and(|ob| match &ob.kind {
+        OrderByKind::Expressions(list) => list.iter().any(|o| match &o.expr {
+            Expr::Value(v) if matches!(v.value, Value::Null) => false,
+            x => column_of(x).is_none_or(|c| !fixed.contains(&c)),
+        }),
+        OrderByKind::All(_) => true,
+    });
+    out.temp = grouped || distinct || ordered;
+    out
+}
+
 pub(crate) fn answer(sql: &str, src: &Source<'_>, mysql: bool) -> Option<Answer> {
     match try_answer(sql, src, mysql) {
         Ok(a) => Some(a),
@@ -2038,7 +2191,20 @@ fn try_answer(sql: &str, src: &Source<'_>, mysql: bool) -> Result<Answer, String
                 continue;
             };
             let def = super::show::visible(def, src.show_auto_indexes);
-            add_table(&mut db, &schema, &def, src.counters.get(&o.0).copied());
+            let created = src.eng.created.get(o).map(|t| {
+                let secs = t
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs());
+                utc_datetime(secs)
+            });
+            add_table(
+                &mut db,
+                &schema,
+                &def,
+                src.counters.get(&o.0).copied(),
+                created,
+                src.rows.get(&o.0).copied(),
+            );
         }
         let mut views: Vec<_> = src
             .eng
@@ -2132,12 +2298,43 @@ fn try_answer(sql: &str, src: &Source<'_>, mysql: bool) -> Result<Answer, String
                 .find(|t| l.contains(&format!("information_schema.{}", t.to_ascii_lowercase())))
         })
         .ok_or("no table")?;
+    // The table as the query writes it: the servers name it so.
+    let written = [
+        format!(") as `{}`", table.to_ascii_lowercase()),
+        format!("information_schema.{}", table.to_ascii_lowercase()),
+    ]
+    .iter()
+    .find_map(|pat| {
+        let at = l.find(pat.as_str())?;
+        let from = at + pat.len() - table.len() - usize::from(pat.starts_with(')'));
+        sql.get(from..from + table.len()).map(str::to_owned)
+    })
+    .unwrap_or_else(|| (*table).to_owned());
+    let shape = outer_shape(stmt);
     let mut defs = Vec::new();
     for c in &plan.columns {
-        match cols_of(table).find(|x| x.1.eq_ignore_ascii_case(&c.name)) {
+        // A column under an alias is described as the column it reads.
+        let column = shape
+            .aliases
+            .get(&c.name)
+            .map_or(c.name.as_str(), String::as_str);
+        // The MySQL port: MySQL 8.4's view columns (`infoschema_mysql`).
+        if mysql {
+            // A column read as itself is named as the view names it.
+            let alias =
+                (!shape.plain.contains(&c.name.to_ascii_uppercase())).then_some(c.name.as_str());
+            if let Some(d) =
+                super::infoschema_mysql::coldef(table, &written, column, alias, shape.temp)
+            {
+                defs.push(d);
+                continue;
+            }
+        }
+        match cols_of(table).find(|x| x.1.eq_ignore_ascii_case(column)) {
             Some(&(_, org, cs, len, ty, flags)) => {
-                defs.push(coldef(
+                defs.push(coldef_in(
                     "information_schema",
+                    &written,
                     table,
                     &c.name,
                     org,
@@ -2163,7 +2360,13 @@ fn try_answer(sql: &str, src: &Source<'_>, mysql: bool) -> Result<Answer, String
                     d.charset,
                     d.length,
                     d.col_type,
-                    d.flags & !0x0080,
+                    // A grouped count is read back from the grouping's
+                    // temporary table, which drops `BINARY`.
+                    if shape.grouped {
+                        d.flags & !0x0080
+                    } else {
+                        d.flags
+                    },
                     d.decimals,
                 ));
             }
@@ -2225,6 +2428,7 @@ mod tests {
             eng: &eng,
             tenant: 7,
             counters: &counters,
+            rows: &counters,
             logic: &[],
             show_auto_indexes: false,
         };
@@ -2248,6 +2452,7 @@ mod tests {
             eng: &eng,
             tenant: 7,
             counters: &counters,
+            rows: &counters,
             logic: &[],
             show_auto_indexes: false,
         };
@@ -2283,6 +2488,7 @@ mod tests {
             eng: &eng,
             tenant: 61_306_000_000,
             counters: &counters,
+            rows: &counters,
             logic: &[],
             show_auto_indexes: false,
         };
@@ -2313,6 +2519,7 @@ mod tests {
                 eng: &eng,
                 tenant: 7,
                 counters: &counters,
+                rows: &counters,
                 logic: &[],
                 show_auto_indexes: shown,
             };

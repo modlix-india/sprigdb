@@ -107,11 +107,13 @@ pub(crate) mod table_changes;
 pub mod tenant;
 pub mod tls;
 // Workers' runs of triggers on streams and queues.
+pub(crate) mod engine_schedules;
 pub(crate) mod sql_events;
 pub mod triggers;
 // Orphans across tenants and materialized copies on engine databases,
 // from the change log.
 pub(crate) mod inherit_copies;
+pub(crate) mod inherit_lag;
 pub(crate) mod inherit_orphans;
 pub mod workload;
 
@@ -409,6 +411,13 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
     // SQL events of engine databases, run on the tenant's leader.
     if let Some(t) = &tenants {
         let _events = sql_events::spawn(
+            Arc::clone(t),
+            Arc::clone(&login),
+            Arc::clone(&engine),
+            stop.clone(),
+        );
+        // Logic schedules of engine databases, run on the tenant's leader.
+        let _schedules = engine_schedules::spawn(
             Arc::clone(t),
             Arc::clone(&login),
             Arc::clone(&engine),

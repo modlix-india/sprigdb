@@ -172,6 +172,11 @@ pub struct ExprType {
     /// JSON); MariaDB's JSON is text, so there it only marks where the
     /// value came from.
     pub json: bool,
+    /// Strings: the character set is `utf8mb3`. Its values are UTF-8 held
+    /// under the `utf8mb4` twin of the collation; the flag gives the
+    /// names (`utf8mb3_general_ci`) and the merging rules (a `utf8mb4`
+    /// side takes in a `utf8mb3` one held no more strongly).
+    pub mb3: bool,
 }
 
 impl ExprType {
@@ -192,6 +197,7 @@ impl ExprType {
         fixed: false,
         ascii: false,
         json: false,
+        mb3: false,
     };
 
     /// The type of the `NULL` literal.
@@ -499,11 +505,18 @@ impl ExprType {
                     4
                 };
                 let bytes = u64::from(self.len) * per;
+                // The type follows the value's own width: a utf8mb3 text
+                // of 21845 characters is still a VARCHAR.
+                let own = if self.mb3 && per == 4 {
+                    u64::from(self.len) * 3
+                } else {
+                    bytes
+                };
                 let field = if self.fixed {
                     FieldType::String
-                } else if bytes >= 1 << 24 {
+                } else if own >= 1 << 24 {
                     FieldType::LongBlob
-                } else if bytes >= 1 << 16 {
+                } else if own >= 1 << 16 {
                     FieldType::MediumBlob
                 } else {
                     FieldType::VarString
@@ -675,9 +688,48 @@ pub struct Dtc {
     pub coll: Collation,
     /// Its derivation.
     pub deriv: Derivation,
+    /// The character set is `utf8mb3` (see [`ExprType::mb3`]).
+    pub mb3: bool,
+}
+
+/// A collation's name, as a `utf8mb3` one when `mb3` is set
+/// (`utf8mb3_general_ci`, MariaDB's `utf8mb3_uca1400_ai_ci`).
+#[must_use]
+pub fn collation_name(coll: Collation, mb3: bool) -> std::borrow::Cow<'static, str> {
+    let n = coll.name();
+    match n.strip_prefix("utf8mb4_") {
+        Some(rest) if mb3 => std::borrow::Cow::Owned(format!("utf8mb3_{rest}")),
+        _ => std::borrow::Cow::Borrowed(n),
+    }
 }
 
 impl Dtc {
+    /// A collation of a `utf8mb4` (or other non-`utf8mb3`) value.
+    #[must_use]
+    pub fn new(coll: Collation, deriv: Derivation) -> Self {
+        Self {
+            coll,
+            deriv,
+            mb3: false,
+        }
+    }
+
+    /// The collation's name (`COLLATION()`, error texts).
+    #[must_use]
+    pub fn name(&self) -> std::borrow::Cow<'static, str> {
+        collation_name(self.coll, self.mb3)
+    }
+
+    /// The character set's name (`CHARSET()`).
+    #[must_use]
+    pub fn charset_name(&self) -> &'static str {
+        if self.mb3 && self.coll.charset() == Charset::Utf8mb4 {
+            "utf8mb3"
+        } else {
+            crate::expr::charset_name(self.coll.charset())
+        }
+    }
+
     /// The collation and derivation of a type used as a string: its own for
     /// strings; for numbers and temporals the connection collation with
     /// the `NUMERIC` derivation.
@@ -687,15 +739,10 @@ impl Dtc {
             Kind::Str => Dtc {
                 coll: ty.coll,
                 deriv: ty.deriv,
+                mb3: ty.mb3 && ty.coll.charset() == Charset::Utf8mb4,
             },
-            Kind::Null => Dtc {
-                coll: Collation::Binary,
-                deriv: Derivation::Ignorable,
-            },
-            _ => Dtc {
-                coll: connection,
-                deriv: Derivation::Numeric,
-            },
+            Kind::Null => Dtc::new(Collation::Binary, Derivation::Ignorable),
+            _ => Dtc::new(connection, Derivation::Numeric),
         }
     }
 }
@@ -709,6 +756,9 @@ pub fn aggregate2(a: Dtc, b: Dtc) -> Option<Dtc> {
     }
     if b.deriv == Derivation::Ignorable {
         return Some(a);
+    }
+    if let Some(m) = mb3_merge(a, b) {
+        return Some(m);
     }
     let (ca, cb) = (a.coll.charset(), b.coll.charset());
     if ca != cb {
@@ -762,9 +812,28 @@ pub fn aggregate2(a: Dtc, b: Dtc) -> Option<Dtc> {
         return Some(b);
     }
     Some(Dtc {
-        coll: bin_collation(a.coll),
-        deriv: Derivation::None,
+        mb3: a.mb3 && b.mb3,
+        ..Dtc::new(bin_collation(a.coll), Derivation::None)
     })
+}
+
+/// `utf8mb3` against `utf8mb4`: two character sets, the wider taking in
+/// the narrower unless the narrower is held strictly more strongly and
+/// the wider no more strongly than a literal. `None` when the sides
+/// don't differ that way.
+fn mb3_merge(a: Dtc, b: Dtc) -> Option<Dtc> {
+    let unicode = |d: Dtc| d.coll.charset() == Charset::Utf8mb4;
+    if !unicode(a) || !unicode(b) || a.mb3 == b.mb3 {
+        return None;
+    }
+    let (wide, narrow) = if a.mb3 { (b, a) } else { (a, b) };
+    Some(
+        if narrow.deriv < wide.deriv && wide.deriv >= Derivation::Coercible {
+            narrow
+        } else {
+            wide
+        },
+    )
 }
 
 /// Whether a type's strings are all ASCII (see [`ExprType::ascii`]):
@@ -790,6 +859,9 @@ pub fn aggregate2_rep(a: (Dtc, bool), b: (Dtc, bool)) -> Option<(Dtc, bool)> {
     }
     if db.deriv == Derivation::Ignorable {
         return Some(a);
+    }
+    if let Some(m) = mb3_merge(da, db) {
+        return Some((m, if m == da { ra } else { rb }));
     }
     if ca == cb || ca == Charset::Binary || cb == Charset::Binary {
         return aggregate2(da, db).map(|d| (d, ra && rb));
@@ -832,13 +904,10 @@ pub fn aggregate_types(
         .iter()
         .map(|t| (Dtc::of(t, connection), ascii_repertoire(t)))
         .collect();
-    let mut acc = items.first().copied().unwrap_or((
-        Dtc {
-            coll: Collation::Binary,
-            deriv: Derivation::Ignorable,
-        },
-        true,
-    ));
+    let mut acc = items
+        .first()
+        .copied()
+        .unwrap_or((Dtc::new(Collation::Binary, Derivation::Ignorable), true));
     let mut failed = false;
     for it in items.iter().skip(1) {
         match aggregate2_rep(acc, *it) {
@@ -860,10 +929,10 @@ pub fn aggregate_types(
 /// result of derivation `NONE` is an error too, since nothing can be
 /// compared under it.
 pub fn aggregate(items: &[Dtc], op: &str, for_compare: bool) -> Result<Dtc> {
-    let mut acc = items.first().copied().unwrap_or(Dtc {
-        coll: Collation::Binary,
-        deriv: Derivation::Ignorable,
-    });
+    let mut acc = items
+        .first()
+        .copied()
+        .unwrap_or(Dtc::new(Collation::Binary, Derivation::Ignorable));
     let mut failed = false;
     for d in items.iter().skip(1) {
         match aggregate2(acc, *d) {
@@ -881,7 +950,7 @@ pub fn aggregate(items: &[Dtc], op: &str, for_compare: bool) -> Result<Dtc> {
 }
 
 pub(crate) fn illegal_mix(items: &[Dtc], op: &str) -> SqlError {
-    let one = |d: &Dtc| format!("({},{})", d.coll.name(), d.deriv.name());
+    let one = |d: &Dtc| format!("({},{})", d.name(), d.deriv.name());
     match items {
         [a, b] => SqlError::new(
             1267,
@@ -915,7 +984,29 @@ mod tests {
     use super::*;
 
     fn dtc(coll: Collation, deriv: Derivation) -> Dtc {
-        Dtc { coll, deriv }
+        Dtc::new(coll, deriv)
+    }
+
+    #[test]
+    fn utf8mb4_takes_in_utf8mb3_held_no_more_strongly() {
+        let mb3 = |coll, deriv| Dtc {
+            mb3: true,
+            ..dtc(coll, deriv)
+        };
+        let col3 = mb3(Collation::Utf8mb4GeneralCi, Derivation::Implicit);
+        let col4 = dtc(Collation::Utf8mb4Mysql0900AiCi, Derivation::Implicit);
+        let lit4 = dtc(Collation::Utf8mb4Mysql0900AiCi, Derivation::Coercible);
+        assert_eq!(aggregate2(col3, col4), Some(col4));
+        assert_eq!(aggregate2(col4, col3), Some(col4));
+        assert_eq!(aggregate2(col3, lit4), Some(col3));
+        let sys = mb3(Collation::Utf8mb4GeneralCi, Derivation::SysConst);
+        assert_eq!(aggregate2(lit4, sys), Some(sys));
+        assert_eq!(col3.name(), "utf8mb3_general_ci");
+        assert_eq!(col3.charset_name(), "utf8mb3");
+        assert_eq!(
+            collation_name(Collation::Utf8mb4Uca1400AiCi, true),
+            "utf8mb3_uca1400_ai_ci"
+        );
     }
 
     #[test]

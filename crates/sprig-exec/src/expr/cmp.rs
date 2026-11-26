@@ -313,10 +313,7 @@ fn merged_collation(all: &[&ExprType], op: &str, extra: usize, env: Env<'_>) -> 
             let mut every: Vec<Dtc> = all.iter().map(|t| Dtc::of(t, env.conn())).collect();
             // Operands that are counted but not compared (MySQL's ESCAPE).
             for _ in 0..extra {
-                every.push(Dtc {
-                    coll: env.conn(),
-                    deriv: crate::types::Derivation::Coercible,
-                });
+                every.push(Dtc::new(env.conn(), crate::types::Derivation::Coercible));
             }
             if every.len() == strings.len() {
                 Err(e)

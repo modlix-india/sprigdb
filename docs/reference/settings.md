@@ -9,7 +9,7 @@ source: the settings registry (sprig-settings)
 
 Every setting SprigDB declares, with its default, the scopes that may set it, hard bounds and when a change applies. Settings resolve from the most specific scope: object, database, tenant and its ancestors, cluster, data center, global, then the built-in default. Read them with `SHOW SPRIG SETTINGS`, change them with `ALTER TENANT|DATABASE|TABLE … SPRIG SET (key = value)` or `sprigctl settings`.
 
-701 settings in 59 groups.
+702 settings in 59 groups.
 
 ## `advisor`
 
@@ -475,6 +475,7 @@ Every setting SprigDB declares, with its default, the scopes that may set it, ha
 | `inherit.broadcast_replay` | text | `off` | object, tenant, global | on, off | live | on: a member's new instance gets the broadcasts still in the broadcast log |
 | `inherit.broadcast_retention_hours` | int | `168` | object, tenant, global | 1 to 87600 | live | How long broadcasts stay in the broadcast log |
 | `inherit.broadcasts_per_hour` | int | `60` | object, tenant, global | 1 to 100000 | live | Broadcasts one definition may take per hour |
+| `inherit.copy_wait_ms` | int | `100` | object, database, tenant, global | 0 to 10000 | live | Milliseconds a statement waits for a lagging materialized copy before reading through |
 | `inherit.drop_grace_hours` | int | `168` | object, tenant, global | 0 to 87600 | live | How long instances of a dropped definition drain before removal |
 | `inherit.instance_create_wait_ms` | int | `5000` | tenant, global | 100 to 600000 | live | How long a publish or consumer waits for an instance being created (39899 after) |
 | `inherit.max_definitions_per_tenant` | int | `200` | tenant, global | 1 to 100000 | live | FOR EACH TENANT definitions one tenant may declare |

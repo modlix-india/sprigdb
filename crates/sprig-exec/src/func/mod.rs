@@ -4,12 +4,14 @@
 mod datetime;
 mod hash;
 pub(crate) mod json;
+pub(crate) mod jsontable;
 pub(crate) mod misc;
 mod numeric;
 mod regexp;
 pub(crate) mod sequence;
 mod string;
 mod strtail;
+pub(crate) mod uservar;
 
 pub(crate) use string::latin1_as_utf8;
 
@@ -32,6 +34,14 @@ fn take<const N: usize>(name: &str, args: Vec<Node>) -> Result<[Node; N]> {
 
 /// Compiles the call of built-in function `name`.
 pub(crate) fn build(name: &str, args: &[Expr], env: Env<'_>) -> Result<Node> {
+    if uservar::NAMES.contains(&name) {
+        let nodes = args
+            .iter()
+            .skip(1)
+            .map(|a| build_expr(a, env))
+            .collect::<Result<Vec<_>>>()?;
+        return uservar::build(name, args, nodes, env);
+    }
     if sequence::NAMES.contains(&name) {
         let nodes = args
             .iter()
@@ -138,6 +148,32 @@ pub(crate) fn build(name: &str, args: &[Expr], env: Env<'_>) -> Result<Node> {
         "STRCMP" => {
             let [a, b] = take(name, nodes)?;
             string::strcmp(a, b, env)
+        }
+        // Its argument with a column's weight in collation rules: how the
+        // gateway writes in a user variable's text held in its own
+        // collation (both servers give a variable that weight).
+        "SPRIG_IMPLICIT" => {
+            let [mut a] = take(name, nodes)?;
+            a.ty.deriv = crate::types::Derivation::Implicit;
+            Ok(a)
+        }
+        // A system variable's text, as the gateway writes it in: both
+        // servers hold it in `utf8mb3_general_ci` with the weight of a
+        // system constant, and report it as nullable (MySQL as text of up
+        // to 21845 characters).
+        "SPRIG_SYSVAR" => {
+            let [mut a] = take(name, nodes)?;
+            let utf8 = a.ty.coll.charset() == sprig_engine::keys::collation::Charset::Utf8mb4;
+            if a.ty.kind == crate::types::Kind::Str && (utf8 || a.ty.ascii) {
+                a.ty.coll = Collation::Utf8mb4GeneralCi;
+                a.ty.mb3 = true;
+                a.ty.deriv = crate::types::Derivation::SysConst;
+                if !env.maria() {
+                    a.ty.len = 21845;
+                }
+            }
+            a.ty.nullable = true;
+            Ok(a)
         }
         "COLLATION" | "CHARSET" | "COERCIBILITY" => {
             let [a] = take(name, nodes)?;
@@ -491,7 +527,9 @@ pub(crate) fn build(name: &str, args: &[Expr], env: Env<'_>) -> Result<Node> {
                 Some(cs) => Some(charset_collation(cs, env)?),
                 None => None,
             };
-            Ok(strtail::char_fn(nodes, using, env))
+            let mut n = strtail::char_fn(nodes, using.map(|u| u.0), env);
+            n.ty.mb3 = using.is_some_and(|u| u.1);
+            Ok(n)
         }
         "MD5" => {
             let [a] = take(name, nodes)?;
@@ -540,24 +578,30 @@ pub(crate) fn build(name: &str, args: &[Expr], env: Env<'_>) -> Result<Node> {
         "ROW" => Err(crate::expr::row::operand_columns(1)),
         "CONVERT_USING" => {
             let cs = keyword(args).ok_or_else(|| SqlError::param_count(name))?;
-            let coll = charset_collation(cs, env)?;
+            let (coll, mb3) = charset_collation(cs, env)?;
             let [a] = take(name, nodes)?;
-            Ok(strtail::convert_using(a, coll, env))
+            let mut n = strtail::convert_using(a, coll, env);
+            n.ty.mb3 = mb3;
+            Ok(n)
         }
         "_CHARSET" => {
             let cs = keyword(args).ok_or_else(|| SqlError::param_count(name))?;
-            let coll = charset_collation(cs, env)?;
+            let (coll, mb3) = charset_collation(cs, env)?;
             let mut text = String::new();
             write_sql(&mut text, name, args);
-            match args.iter().find(|a| !matches!(a, Expr::Keyword(_))) {
-                Some(Expr::Str(s)) => Ok(strtail::introducer(s.as_bytes(), text, coll)),
-                Some(Expr::Hex(b)) => Ok(strtail::introducer(b, text, coll)),
-                _ => Err(SqlError::new(
-                    1064,
-                    "42000",
-                    "You have an error in your SQL syntax",
-                )),
-            }
+            let mut n = match args.iter().find(|a| !matches!(a, Expr::Keyword(_))) {
+                Some(Expr::Str(s)) => strtail::introducer(s.as_bytes(), text, coll),
+                Some(Expr::Hex(b)) => strtail::introducer(b, text, coll),
+                _ => {
+                    return Err(SqlError::new(
+                        1064,
+                        "42000",
+                        "You have an error in your SQL syntax",
+                    ));
+                }
+            };
+            n.ty.mb3 = mb3;
+            Ok(n)
         }
         "REGEXP" => regexp::like(nodes, name, env),
         // MariaDB has no REGEXP_LIKE.
@@ -578,28 +622,31 @@ fn keyword(args: &[Expr]) -> Option<&str> {
 }
 
 /// The default collation of a character set named in `USING` or an
-/// introducer, as the persona sets it.
-pub(crate) fn charset_collation(name: &str, env: Env<'_>) -> Result<Collation> {
+/// introducer, as the persona sets it, and whether the set is `utf8mb3`
+/// (held under the collation's `utf8mb4` twin).
+pub(crate) fn charset_collation(name: &str, env: Env<'_>) -> Result<(Collation, bool)> {
     use sprig_engine::keys::collation::Collation as C;
-    Ok(match name.to_ascii_lowercase().as_str() {
-        "utf8mb4" | "utf8mb3" | "utf8" => {
-            if env.maria() {
-                C::Utf8mb4Uca1400AiCi
-            } else {
-                C::Utf8mb4Mysql0900AiCi
+    let l = name.to_ascii_lowercase();
+    let mb3 = matches!(l.as_str(), "utf8mb3" | "utf8");
+    Ok((
+        match l.as_str() {
+            "utf8mb4" | "utf8mb3" | "utf8" if env.maria() => C::Utf8mb4Uca1400AiCi,
+            "utf8mb4" => C::Utf8mb4Mysql0900AiCi,
+            // MySQL's utf8mb3 default.
+            "utf8mb3" | "utf8" => C::Utf8mb4GeneralCi,
+            "latin1" => C::Latin1SwedishCi,
+            "ascii" => C::AsciiGeneralCi,
+            "binary" => C::Binary,
+            other => {
+                return Err(SqlError::new(
+                    1115,
+                    "42000",
+                    format!("Unknown character set: '{other}'"),
+                ));
             }
-        }
-        "latin1" => C::Latin1SwedishCi,
-        "ascii" => C::AsciiGeneralCi,
-        "binary" => C::Binary,
-        other => {
-            return Err(SqlError::new(
-                1115,
-                "42000",
-                format!("Unknown character set: '{other}'"),
-            ));
-        }
-    })
+        },
+        mb3,
+    ))
 }
 
 /// The interval unit among a call's arguments.

@@ -523,7 +523,7 @@ impl Parser<'_> {
             let name = self.take_word()?;
             let coll = Collation::resolve(&name.to_ascii_lowercase(), self.flavor)
                 .ok_or_else(|| format!("unknown collation {name}"))?;
-            e = Expr::Collate(b(e), coll);
+            e = Expr::Collate(b(e), coll, false);
         }
         Ok(e)
     }

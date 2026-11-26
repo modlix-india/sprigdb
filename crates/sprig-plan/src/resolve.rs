@@ -12,7 +12,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use sprig_engine::keys::collation::Collation;
-use sprig_engine::row::{ColumnType, Value};
+use sprig_engine::row::Value;
 use sprig_exec::ops::{AggKind, Aggregate, Row, RowSource};
 use sprig_exec::{BinOp, CastTarget, ColumnRef, Expr, ExprType, Result, SqlError, Truth, compile};
 use sqlparser::ast::{self, BinaryOperator, UnaryOperator, Value as SqlValue};
@@ -159,6 +159,9 @@ pub(crate) enum RelKind {
     Table(Arc<TableDef>),
     /// The result of a query, held in memory.
     Derived(Rc<Derived>),
+    /// `JSON_TABLE(...)`: rows made from a document, again for each row of
+    /// the items it reads.
+    JsonTable(Rc<crate::jsontable::JtRel>),
 }
 
 /// A column a `FROM` item shows under a name.
@@ -711,15 +714,65 @@ impl Cx<'_> {
             .get(index)
             .ok_or_else(|| SqlError::new(1210, "HY000", "Incorrect arguments to EXECUTE"))?;
         let ty = match v {
-            Value::Str(_) => ExprType::string(
-                0,
-                self.session.collation_connection,
-                sprig_exec::types::Derivation::Coercible,
-            ),
+            Value::Str(_) => ExprType {
+                mb3: self.session.connection_mb3,
+                ..ExprType::string(
+                    0,
+                    self.session.collation_connection,
+                    sprig_exec::types::Derivation::Coercible,
+                )
+            },
             Value::Decimal(d) => ExprType::decimal(65, u32::from(d.scale()), false),
             _ => ExprType::datetime(6),
         };
         Ok(literal(v, &ty))
+    }
+
+    /// A string constant with a character set introducer (`_utf8mb4`,
+    /// `_utf8mb3`, `_utf8`, `_binary`); other character sets stay refused.
+    fn introduced(&self, cs: &str, value: &ast::Expr) -> Result<Expr> {
+        use sprig_engine::keys::collation::Collation as C;
+        let refused = || unsupported(&format!("the introducer _{cs}"));
+        let ast::Expr::Value(v) = value else {
+            return Err(refused());
+        };
+        let bytes: Vec<u8> = match &v.value {
+            SqlValue::SingleQuotedString(s) | SqlValue::DoubleQuotedString(s) => {
+                s.clone().into_bytes()
+            }
+            SqlValue::HexStringLiteral(h) => {
+                hex_bytes(h).ok_or_else(|| unsupported("a malformed hex literal"))?
+            }
+            _ => return Err(refused()),
+        };
+        let l = cs.to_ascii_lowercase();
+        let coll = match (l.as_str(), self.maria()) {
+            ("binary", _) => C::Binary,
+            ("utf8mb4" | "utf8mb3" | "utf8", true) => C::Utf8mb4Uca1400AiCi,
+            ("utf8mb4", false) => C::Utf8mb4Mysql0900AiCi,
+            ("utf8mb3" | "utf8", false) => C::Utf8mb4GeneralCi,
+            _ => return Err(refused()),
+        };
+        let mb3 = matches!(l.as_str(), "utf8mb3" | "utf8");
+        let coercible = sprig_exec::types::Derivation::Coercible;
+        if coll == C::Binary {
+            let n = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
+            return Ok(literal(
+                &Value::Bytes(bytes::Bytes::from(bytes)),
+                &ExprType::string(n, C::Binary, coercible),
+            ));
+        }
+        let text = String::from_utf8(bytes).map_err(|_| refused())?;
+        let n = u32::try_from(text.chars().count()).unwrap_or(u32::MAX);
+        let ascii = text.is_ascii();
+        let v = Value::Str(bytes::Bytes::from(text.into_bytes()));
+        let ty = ExprType::string(n, coll, coercible);
+        if mb3 || coll != self.session.collation_connection {
+            // Typed, so the value keeps its own collation (not the
+            // connection's) and its character set's name.
+            return Ok(Expr::Typed(Box::new((v, ExprType { mb3, ascii, ..ty }))));
+        }
+        Ok(literal(&v, &ty))
     }
 
     fn name_expr(&mut self, parts: &[ast::Ident], x: &ExprCx<'_, '_>, top: bool) -> Result<Expr> {
@@ -830,6 +883,11 @@ impl Cx<'_> {
     fn expr_in(&mut self, e: &ast::Expr, x: &mut ExprCx<'_, '_>, top: bool) -> Result<Expr> {
         use ast::Expr as A;
         Ok(match e {
+            // `@v`: a user variable, read through the session.
+            A::Identifier(_) if user_var(e).is_some() => Expr::Func(
+                "SPRIG_USER_VAR".into(),
+                vec![Expr::Keyword(user_var(e).unwrap_or_default())],
+            ),
             A::Identifier(i) => self.name_expr(std::slice::from_ref(i), x, top)?,
             A::CompoundIdentifier(parts) => self.name_expr(parts, x, top)?,
             A::Nested(inner) => self.expr_in(inner, x, top)?,
@@ -846,6 +904,11 @@ impl Cx<'_> {
                 SqlValue::Placeholder(p) => self.param(p)?,
                 other => return Err(unsupported(&format!("the literal {other}"))),
             },
+            // `_cs 'text'`, `_cs X'..'`: a constant in that character set
+            // with its default collation, as coercible as a plain string.
+            A::Prefixed { prefix, value } if prefix.value.starts_with('_') => {
+                self.introduced(&prefix.value[1..], value)?
+            }
             A::TypedString(t) => {
                 let s = match &t.value.value {
                     SqlValue::SingleQuotedString(s) | SqlValue::DoubleQuotedString(s) => s.clone(),
@@ -1001,6 +1064,18 @@ impl Cx<'_> {
                 vec![
                     self.expr_in(&m.value, x, false)?,
                     self.expr_in(&m.array, x, false)?,
+                ],
+            ),
+            // `@v := e`: assigns user variable `v`, as each row reaches it.
+            A::BinaryOp {
+                left,
+                op: BinaryOperator::Assignment,
+                right,
+            } if user_var(left).is_some() => Expr::Func(
+                "SPRIG_SET_USER_VAR".into(),
+                vec![
+                    Expr::Keyword(user_var(left).unwrap_or_default()),
+                    self.expr_in(right, x, false)?,
                 ],
             ),
             // `doc->'$.path'` is `JSON_EXTRACT(doc, '$.path')`; `->>` also
@@ -1164,15 +1239,17 @@ impl Cx<'_> {
                 matches!(n.as_str(), "utf8mb4" | "utf8mb3" | "utf8" | "binary")
             } =>
             {
-                let binary = object_name(cs)?.join(".").eq_ignore_ascii_case("binary");
-                Expr::Cast(
-                    self.boxed(expr, x)?,
-                    if binary {
-                        CastTarget::Binary(None)
-                    } else {
-                        CastTarget::Char(None)
-                    },
-                )
+                let cs = object_name(cs)?.join(".");
+                if cs.eq_ignore_ascii_case("binary") {
+                    Expr::Cast(self.boxed(expr, x)?, CastTarget::Binary(None))
+                } else {
+                    // The character set's own default collation, not the
+                    // connection's.
+                    Expr::Func(
+                        "CONVERT_USING".into(),
+                        vec![self.expr_in(expr, x, false)?, Expr::Keyword(cs)],
+                    )
+                }
             }
             A::Collate { expr, collation } => {
                 let name = object_name(collation)?.join(".");
@@ -1180,7 +1257,9 @@ impl Cx<'_> {
                     Collation::resolve(&name, self.session.persona.flavor()).ok_or_else(|| {
                         SqlError::new(1273, "HY000", format!("Unknown collation: '{name}'"))
                     })?;
-                Expr::Collate(self.boxed(expr, x)?, coll)
+                let l = name.to_ascii_lowercase();
+                let mb3 = l.starts_with("utf8mb3_") || l.starts_with("utf8_");
+                Expr::Collate(self.boxed(expr, x)?, coll, mb3)
             }
             A::Ceil { expr, .. } => Expr::Func("CEIL".into(), vec![self.expr_in(expr, x, false)?]),
             A::Floor { expr, .. } => {
@@ -2406,16 +2485,35 @@ fn unit_keyword(f: &ast::DateTimeField) -> Result<Expr> {
     Ok(Expr::Keyword(name.into()))
 }
 
-pub(crate) fn table_col(base: usize, i: usize, name: &str, ty: ColumnType, nullable: bool) -> Expr {
+pub(crate) fn table_col(base: usize, i: usize, c: &crate::catalog::ColumnDef) -> Expr {
     Expr::Column(ColumnRef {
         slot: base + i,
-        ty,
-        nullable,
-        name: name.to_owned(),
+        ty: c.ty,
+        nullable: c.nullable,
+        name: c.name.clone(),
+        mb3: c.mb3,
     })
 }
 
 /// The named columns of a derived table's rows.
+/// The name of user variable `@v` (lower case, unquoted) when `e` is one.
+fn user_var(e: &ast::Expr) -> Option<String> {
+    let ast::Expr::Identifier(i) = e else {
+        return None;
+    };
+    let n = i.value.strip_prefix('@')?;
+    if n.starts_with('@') || n.is_empty() {
+        return None;
+    }
+    let n = match n.as_bytes()[0] {
+        q @ (b'`' | b'\'' | b'"') if n.len() >= 2 && n.as_bytes()[n.len() - 1] == q => {
+            &n[1..n.len() - 1]
+        }
+        _ => n,
+    };
+    Some(n.to_ascii_lowercase())
+}
+
 pub(crate) fn derived_cols(base: usize, names: &[String], types: &[ExprType]) -> Vec<RelCol> {
     names
         .iter()
@@ -2428,6 +2526,7 @@ pub(crate) fn derived_cols(base: usize, names: &[String], types: &[ExprType]) ->
                 ty: slot_type(ty),
                 nullable: ty.nullable,
                 name: name.clone(),
+                mb3: ty.mb3,
             }),
         })
         .collect()

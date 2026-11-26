@@ -1635,6 +1635,16 @@ impl PassSession {
         {
             return Ok(step);
         }
+        // MySQL 8.4's parse-time warnings for naming utf8mb3: counted in
+        // the answer, first in the diagnostics area.
+        let utf8mb3 = self.utf8mb3_warnings(&original);
+        let mut extra_sink;
+        let out: &mut dyn ResultSink = if utf8mb3.is_empty() {
+            out
+        } else {
+            extra_sink = super::engine_seam::diag::ExtraWarnings::new(out, utf8mb3.len());
+            &mut extra_sink
+        };
         let is_call = sp.info.kind == StmtKind::Call;
         // `SELECT f(constants)` of an engine-tier
         // function, answered by the gateway (`exec::logic`).
@@ -1642,7 +1652,7 @@ impl PassSession {
             sp.info.kind == StmtKind::Select && sprig_logic::invoke::select_candidate(&original);
         // Boxed (clippy's large_futures): the statement paths below are big.
         let route = Box::pin(self.route(cx, sp, &original, more, format, charset, out)).await?;
-        match route {
+        let step = match route {
             Route::Done(step) => Ok(step),
             // A CALL may reach an engine-tier wrapper,
             // which the gateway answers itself (`exec::logic`).
@@ -1657,7 +1667,9 @@ impl PassSession {
             Route::Forward(sql, mapper) => {
                 // Every step left a plain statement's text alone: its
                 // shape may skip them next time (exec/engine_seam/fast.rs).
-                let unchanged = text.as_ptr() == entry.as_ptr() && text.len() == entry.len();
+                let unchanged = text.as_ptr() == entry.as_ptr()
+                    && text.len() == entry.len()
+                    && utf8mb3.is_empty();
                 self.fast_forwarding(&sql, &entry, unchanged);
                 Box::pin(self.forward(
                     cx,
@@ -1671,7 +1683,9 @@ impl PassSession {
                 ))
                 .await
             }
-        }
+        };
+        self.diag_prepend(utf8mb3);
+        step
     }
 
     /// What a single planned statement does.

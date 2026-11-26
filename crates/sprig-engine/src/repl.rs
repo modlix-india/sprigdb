@@ -257,6 +257,14 @@ impl Consensus for Router {
         }
     }
 
+    fn proposed_index(&self, unit: UnitId) -> u64 {
+        match self.route(unit) {
+            Route::Local(l) => l.proposed_index(unit),
+            Route::Repl(r) => r.proposed_index(unit),
+            Route::NotYet => 0,
+        }
+    }
+
     fn wait_applied(&self, unit: UnitId, index: u64) -> Result<()> {
         match self.route(unit) {
             Route::Local(l) => l.wait_applied(unit, index),

@@ -447,19 +447,24 @@ fn infer(s: &Sig<'_>, a: usize, b: usize, cols: &BTreeMap<String, String>) -> Op
     }
     // Arithmetic over numeric columns and literals: integers alone give
     // `BIGINT` (`BIGINT UNSIGNED` with an unsigned column, as MySQL types
-    // it); a `/`, a decimal literal, `RAND()` or a non-integer column gives
-    // `DOUBLE`.
+    // it); a `/`, a decimal literal, `RAND()`, a non-integer column or a
+    // text column (read as a number) gives `DOUBLE`.
     let mut any_col = false;
     let mut real = false;
     let mut unsigned = false;
+    let mut op = false;
+    let mut text = false;
     let mut k = a;
     while k <= b {
         let tk = &s.t[k];
         match tk.kind {
             TokenKind::Number if tk.bytes(s.sql).iter().all(u8::is_ascii_digit) => {}
             TokenKind::Number => real = true,
-            TokenKind::Op if matches!(tk.bytes(s.sql), b"+" | b"-" | b"*") => {}
-            TokenKind::Op if tk.bytes(s.sql) == b"/" => real = true,
+            TokenKind::Op if matches!(tk.bytes(s.sql), b"+" | b"-" | b"*") => op = true,
+            TokenKind::Op if tk.bytes(s.sql) == b"/" => {
+                op = true;
+                real = true;
+            }
             TokenKind::Punct if matches!(tk.bytes(s.sql), b"(" | b")" | b".") => {}
             // `RAND()`: typed, so MariaDB refuses it by name (1901) and
             // the gateway answers MySQL's 3758.
@@ -477,6 +482,9 @@ fn infer(s: &Sig<'_>, a: usize, b: usize, cols: &BTreeMap<String, String>) -> Op
                 let t = cols.get(&name)?;
                 if is_integer_type(t) {
                     unsigned |= is_unsigned_type(t);
+                } else if is_text_type(t) {
+                    real = true;
+                    text = true;
                 } else {
                     let up = t.trim_start().to_ascii_uppercase();
                     if !["DOUBLE", "FLOAT", "REAL", "DECIMAL", "NUMERIC"]
@@ -492,6 +500,10 @@ fn infer(s: &Sig<'_>, a: usize, b: usize, cols: &BTreeMap<String, String>) -> Op
             _ => return None,
         }
         k += 1;
+    }
+    // A text column alone is no arithmetic.
+    if text && !op {
+        return None;
     }
     any_col.then(|| {
         if real {
@@ -615,14 +627,17 @@ fn is_text_type(t: &str) -> bool {
 ///   (MySQL refuses a value its cast would cut, trailing spaces included);
 /// - `CAST(c AS SIGNED)`, `CONVERT(c, SIGNED)` of a text column `c`: an
 ///   integer between spaces, from -2^63 to 2^64 - 1 (MySQL refuses any
-///   other text, and wraps those above 2^63 - 1).
+///   other text, and wraps those above 2^63 - 1);
+/// - arithmetic over a text column `c` (`(c + 1)`): `c` is a number
+///   between spaces, or only spaces (MySQL refuses `'abc'`, `'5abc'`,
+///   `'-'`, `'0x10'`).
 ///
 /// `None` for every other part.
 #[allow(clippy::many_single_char_names)] // the token positions, as in `infer`
 fn guard(s: &Sig<'_>, a: usize, b: usize, cols: &BTreeMap<String, String>) -> Option<String> {
     let cast = s.word(a, b"CAST");
     if !(cast || s.word(a, b"CONVERT")) || !s.punct(a + 1, b'(') || s.matching(a + 1) != Some(b) {
-        return None;
+        return arithmetic_guard(s, a, b, cols);
     }
     let mut d = 0;
     let mut sep = None;
@@ -663,6 +678,49 @@ fn guard(s: &Sig<'_>, a: usize, b: usize, cols: &BTreeMap<String, String>) -> Op
         ));
     }
     None
+}
+
+/// The text columns of an arithmetic part (`[a, b]`, as `infer` reads
+/// arithmetic), each required to read as a number; `None` when the part is
+/// no such arithmetic or names no text column.
+fn arithmetic_guard(
+    s: &Sig<'_>,
+    a: usize,
+    b: usize,
+    cols: &BTreeMap<String, String>,
+) -> Option<String> {
+    let mut text = Vec::new();
+    let mut k = a;
+    while k <= b {
+        let tk = &s.t[k];
+        match tk.kind {
+            TokenKind::Number => {}
+            TokenKind::Op if matches!(tk.bytes(s.sql), b"+" | b"-" | b"*" | b"/") => {}
+            TokenKind::Punct if matches!(tk.bytes(s.sql), b"(" | b")") => {}
+            _ if tk.kind.is_ident_like() => {
+                let (name, last) = if s.punct(k + 1, b'.') {
+                    (s.ident(k + 2)?, k + 2)
+                } else {
+                    (s.ident(k)?, k)
+                };
+                if is_text_type(cols.get(&name.to_lowercase())?) {
+                    text.push(s.text(k, last));
+                }
+                k = last;
+            }
+            _ => return None,
+        }
+        k += 1;
+    }
+    let conds: Vec<String> = text
+        .iter()
+        .map(|c| {
+            format!(
+                "{c} REGEXP '^[[:space:]]*([-+]?([0-9]+([.][0-9]*)?|[.][0-9]+)([eE][-+]?[0-9]+)?)?[[:space:]]*$'"
+            )
+        })
+        .collect();
+    (!conds.is_empty()).then(|| conds.join(" AND "))
 }
 
 /// One functional part found: the part's `(` and `)`, its expression's
@@ -1528,6 +1586,26 @@ mod tests {
         // A column's type is needed and not known here.
         assert_eq!(rw("CREATE INDEX i ON t ((lower(email)))"), None);
         assert_eq!(rw("CREATE INDEX i ON t (a, b)"), None);
+    }
+
+    #[test]
+    fn arithmetic_on_text_columns_is_a_checked_double() {
+        let c = fx_column("e + 1");
+        let out = rw("CREATE TABLE t (id INT, e VARCHAR(20), KEY k ((e + 1), e))").unwrap();
+        assert!(
+            out.contains(&format!("KEY k (`{c}`, e)"))
+                && out.contains(&format!(
+                    "`{c}` DOUBLE GENERATED ALWAYS AS (e + 1) VIRTUAL INVISIBLE"
+                )),
+            "{out}"
+        );
+        assert!(
+            out.contains("CHECK ((e REGEXP '^[[:space:]]*([-+]?")
+                && out.contains(&format!("OR `{c}` IS NULL)")),
+            "{out}"
+        );
+        // A text column alone is not typed.
+        assert_eq!(rw("CREATE TABLE t (e VARCHAR(20), KEY ((e)))"), None);
     }
 
     #[test]

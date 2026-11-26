@@ -58,6 +58,14 @@ pub fn catalog_records() -> Arc<dyn sprig_catalog::RecordStore> {
     Arc::clone(r)
 }
 
+/// Sets where [`catalog_records`] reads in a process that doesn't run the
+/// controller: a worker reads its jobs' tenant settings rows through
+/// [`tenant_scopes::TenantScopes`], which would otherwise read the empty
+/// in-memory store. `false` if something set or read it first.
+pub fn set_catalog_records(r: Arc<dyn sprig_catalog::RecordStore>) -> bool {
+    CATALOG_RECORDS.set(r).is_ok()
+}
+
 pub mod admin;
 // Approvals and recommendations for every automatic decision.
 pub mod approvals;

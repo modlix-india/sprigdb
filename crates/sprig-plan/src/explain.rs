@@ -12,8 +12,10 @@ use sprig_exec::types::Derivation;
 use sprig_exec::{ExprType, Session};
 
 use crate::catalog::{IndexPart, KeyId, TableDef};
-use crate::plan::Column;
+use crate::plan::{AccessStat, Column};
 use crate::range::RangeSet;
+
+mod json;
 
 /// One row of `EXPLAIN`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +41,22 @@ pub struct ExplainRow {
     pub rows: Option<u64>,
     /// The notes of the `Extra` column.
     pub extra: Vec<String>,
+    /// The names of the key's columns the step uses (`used_key_parts` of
+    /// the JSON form).
+    pub key_parts: Vec<String>,
+    /// What `ANALYZE` measured of the step; `None` for `EXPLAIN`.
+    pub actual: Option<Actual>,
+}
+
+/// What `ANALYZE` measured of one step of a plan that ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Actual {
+    /// The times the step started reading (`r_loops`).
+    pub loops: u64,
+    /// The rows it read in all (`r_rows` is this per loop).
+    pub rows: u64,
+    /// Its share of the statement's time, in microseconds.
+    pub micros: u64,
 }
 
 impl ExplainRow {
@@ -54,6 +72,8 @@ impl ExplainRow {
             r#ref: None,
             rows: None,
             extra: Vec::new(),
+            key_parts: Vec::new(),
+            actual: None,
         }
     }
 
@@ -122,6 +142,14 @@ pub(crate) fn key_len(table: &TableDef, parts: &[IndexPart]) -> usize {
         .sum()
 }
 
+/// The names of the columns of these key parts.
+pub(crate) fn part_names(table: &TableDef, parts: &[IndexPart]) -> Vec<String> {
+    parts
+        .iter()
+        .filter_map(|p| table.columns.get(p.column).map(|c| c.name.clone()))
+        .collect()
+}
+
 /// Fills an `EXPLAIN` row for a scan of `key`.
 pub(crate) fn describe_path(
     row: &mut ExplainRow,
@@ -152,6 +180,7 @@ pub(crate) fn describe_path(
     let Some(set) = set.filter(|_| !full) else {
         row.access = Some("index".into());
         row.key_len = Some(key_len(table, &def.parts).to_string());
+        row.key_parts = part_names(table, &def.parts);
         return;
     };
     if set.is_empty() {
@@ -173,6 +202,7 @@ pub(crate) fn describe_path(
         .unwrap_or(0)
         .min(parts.len());
     row.key_len = Some(key_len(table, &parts[..bound]).to_string());
+    row.key_parts = part_names(table, &parts[..bound]);
     let one_point = set.ranges.len() == 1 && set.ranges[0].is_point(bound);
     if one_point {
         let whole = bound >= def.parts.len();
@@ -260,8 +290,16 @@ pub(crate) fn as_rows(
                     t => Value::str(&t),
                 },
             ];
+            // A row that reads no table filters nothing.
             if extended {
-                row.insert(9, Value::Double(100.0));
+                row.insert(
+                    9,
+                    if r.table.is_none() {
+                        Value::Null
+                    } else {
+                        Value::Double(100.0)
+                    },
+                );
             }
             row
         })
@@ -276,5 +314,116 @@ pub(crate) fn as_rows(
                 ty,
             })
             .collect(),
+    )
+}
+
+/// `rows` with what the plan that ran measured (`accesses`, the
+/// statement's time `micros`): each table step's loops and rows from its
+/// counters, the time shared out by rows read.
+#[must_use]
+pub fn analyzed(rows: &[ExplainRow], accesses: &[AccessStat], micros: u64) -> Vec<ExplainRow> {
+    let read: u64 = accesses
+        .iter()
+        .map(|a| a.counters.rows())
+        .sum::<u64>()
+        .max(1);
+    rows.iter()
+        .map(|r| {
+            let mut r = r.clone();
+            let stat = r
+                .table
+                .as_deref()
+                .and_then(|t| accesses.iter().find(|a| a.id == r.id && a.table == t));
+            // A constant table is read while planning, not by the plan.
+            if r.access.as_deref() != Some("const")
+                && let Some(a) = stat
+            {
+                let n = a.counters.rows();
+                r.actual = Some(Actual {
+                    loops: a.counters.seeks().max(1),
+                    rows: n,
+                    micros: micros.saturating_mul(n) / read,
+                });
+            }
+            r
+        })
+        .collect()
+}
+
+/// `ANALYZE`'s answer for `rows` (see [`analyzed`]): MariaDB's table
+/// (the tabular columns with `r_rows` and `r_filtered`) or its JSON
+/// document with the `r_` members (`json`), which the MySQL port draws as
+/// `EXPLAIN ANALYZE`'s tree. The planner keeps no count of the rows a
+/// condition passes, so `r_filtered` is always 100.
+#[must_use]
+pub fn analyze_answer(
+    rows: &[ExplainRow],
+    micros: u64,
+    session: &Session,
+    json: bool,
+) -> (Box<dyn RowSource>, Vec<Column>) {
+    if json {
+        let ty = ExprType::string(78, session.collation_connection, Derivation::Coercible);
+        let doc = json::analyzed_document(rows, micros);
+        return (
+            Box::new(VecSource::new(vec![vec![Value::str(&doc)]], vec![ty])),
+            vec![Column {
+                name: "ANALYZE".to_owned(),
+                ty,
+            }],
+        );
+    }
+    let (mut src, mut columns) = as_rows(rows, session, true);
+    let mut data = Vec::new();
+    let mut ctx = sprig_exec::Ctx::with_params(session, &[]);
+    while let Ok(Some(r)) = src.next(&mut ctx) {
+        data.push(r);
+    }
+    let text = |n: u32| {
+        ExprType::string(n, session.collation_connection, Derivation::Coercible).nullable()
+    };
+    let filtered = columns[9].ty;
+    // MariaDB's `ANALYZE` marks `rows` NOT NULL.
+    columns[8].ty.nullable = false;
+    columns.insert(
+        9,
+        Column {
+            name: "r_rows".to_owned(),
+            ty: text(64),
+        },
+    );
+    columns.insert(
+        11,
+        Column {
+            name: "r_filtered".to_owned(),
+            ty: filtered,
+        },
+    );
+    for (row, r) in data.iter_mut().zip(rows) {
+        let (r_rows, r_filtered) = match r.actual {
+            Some(a) => (
+                Value::str(&format!("{:.2}", a.rows as f64 / a.loops.max(1) as f64)),
+                Value::Double(100.0),
+            ),
+            None => (Value::Null, Value::Null),
+        };
+        row.insert(9, r_rows);
+        row.insert(11, r_filtered);
+    }
+    let types: Vec<ExprType> = columns.iter().map(|c| c.ty).collect();
+    (Box::new(VecSource::new(data, types)), columns)
+}
+
+/// The plan as `EXPLAIN FORMAT=JSON`'s one row: column `EXPLAIN`, the
+/// server's JSON document (see [`json`]).
+pub(crate) fn as_json(rows: &[ExplainRow], session: &Session) -> (Box<dyn RowSource>, Vec<Column>) {
+    let ty = ExprType::string(78, session.collation_connection, Derivation::Coercible);
+    let doc = json::document(rows, session.persona.is_maria());
+    (
+        Box::new(VecSource::new(vec![vec![Value::str(&doc)]], vec![ty])),
+        vec![Column {
+            name: "EXPLAIN".to_owned(),
+            ty,
+        }],
     )
 }

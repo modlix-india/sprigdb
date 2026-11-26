@@ -9,9 +9,12 @@
 //!   first (sprig_inherit::copy::load_family)
 //!   states: rows of each child tenant's catalog records (m/inherit/copies);
 //!   a state whose edge is gone is removed with its copy rows, and the copy
-//!   table once no copy of the object is left
+//!   table once no copy of the object is left (the task runs the pass while
+//!   any state is left, so a share made read-through drops its copies)
 //!   each edge, in order:
-//!     not serving at the object's and share's current versions → seed:
+//!     not serving at the object's and share's current versions, or seeded
+//!     from another share or source object (a share dropped and made again:
+//!     its id changed, its version may not have) → seed:
 //!       the copy table __sprig_ih_<object> in the child's database (made,
 //!       or made again when the child's columns changed), state seeding,
 //!       the source's whole view read (copy::source_select), upserted live,
@@ -26,8 +29,13 @@
 //! stamp (`_sprig_src_v` = process epoch << 32 | unix seconds): a row
 //! written by a later process (or later in this one) is never overwritten
 //! by an older write. Reads use a copy only while its state is serving at
-//! the current versions, so a copy being seeded is never read half-filled.
-//! Copies have no change streams of their own on engine databases.
+//! the current versions and was seeded from the share and source object its
+//! edge is made from now, so a copy being seeded is never read half-filled
+//! and a copy of a share made again is never read before it is seeded.
+//! A seed records its handover in the copy's state (the engine commit
+//! timestamps just after the source read and after the copy's writes), so
+//! change streams send each inherited change once, from the source before
+//! it and from the copy after (`sprig_inherit::handover`).
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
@@ -46,12 +54,18 @@ use sprig_inherit::copy::{
 use sprig_inherit::view::q;
 
 use crate::exec::inherit_tree::{
-    CopyRow, copy_infos, ctl_query, engine_copy_states, engine_ddl, set_engine_copy_state,
+    CopyRow, copy_infos, copy_source, ctl_query, engine_copy_states, engine_ddl,
+    set_engine_copy_state,
 };
 use crate::tenant::TenantServices;
 
 /// Rows per upsert statement.
 const CHUNK: usize = 500;
+
+/// The node engine's newest visible commit timestamp (0 without one).
+fn engine_now() -> u64 {
+    crate::node_engine::engine().map_or(0, |e| e.txn_shared().visible_ts().0)
+}
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -68,6 +82,9 @@ pub(crate) struct Counts {
     pub upserts: u64,
     /// Tombstones written.
     pub tombstones: u64,
+    /// Copy states the family has after the pass (the task runs the pass
+    /// again while any is left).
+    pub states: u64,
 }
 
 /// The family's tenants and catalogs for [`load_family`]: the tenants
@@ -125,16 +142,33 @@ pub(crate) async fn pass(
     family
         .edges
         .retain(|e| e.db_name.eq_ignore_ascii_case(db) && e.table.eq_ignore_ascii_case(table));
+    // What each copy is made from now: a state seeded from something else
+    // is no copy of its edge.
+    let made = family
+        .edges
+        .iter()
+        .filter_map(|e| {
+            let cat = family.cats.get(&e.key.tenant)?;
+            let parent = family
+                .ancestors
+                .get(&e.key.tenant)
+                .and_then(|a| a.last())
+                .map(AsRef::as_ref);
+            Some((e.key, copy_source(cat, parent, e.key)?))
+        })
+        .collect();
     let mut p = Pass {
         svc: Arc::clone(svc),
         lctn,
         epoch,
+        made,
         copies: CopyStates::default(),
         rows: BTreeMap::new(),
         counts: Counts::default(),
     };
     p.load_states(&family, db, table).await?;
     if family.edges.is_empty() {
+        p.counts.states = p.rows.len() as u64;
         return Ok(p.counts);
     }
     // Tenants whose view a seed changed: the copies made from it refresh
@@ -157,6 +191,7 @@ pub(crate) async fn pass(
             p.refresh(&family, e, keys).await?;
         }
     }
+    p.counts.states = p.rows.len() as u64;
     Ok(p.counts)
 }
 
@@ -165,7 +200,10 @@ struct Pass {
     svc: Arc<TenantServices>,
     lctn: bool,
     epoch: u64,
-    /// The copies' states as the read path sees them.
+    /// What each edge's copy is made from now ([`copy_source`]).
+    made: BTreeMap<CopyKey, (u64, u64)>,
+    /// The copies' states as the read path sees them (those seeded from
+    /// what their edge is made from now).
     copies: CopyStates,
     /// The state rows, as stored.
     rows: BTreeMap<CopyKey, CopyRow>,
@@ -173,6 +211,18 @@ struct Pass {
 }
 
 impl Pass {
+    /// [`Self::rows`] as the read path's states: the copies seeded from
+    /// what their edge is made from now.
+    fn infos(&self) -> CopyStates {
+        copy_infos(
+            self.rows
+                .iter()
+                .filter(|(k, r)| r.made_from(self.made.get(k).copied()))
+                .map(|(k, r)| (*k, r.clone()))
+                .collect(),
+        )
+    }
+
     fn stamp(&self) -> u64 {
         (self.epoch << 32) | ((now_ms() / 1000) & 0xFFFF_FFFF)
     }
@@ -231,7 +281,7 @@ impl Pass {
                 self.drop_table(*t, &d.name, &schema, o.object_id).await?;
             }
         }
-        self.copies = copy_infos(self.rows.iter().map(|(k, r)| (*k, r.clone())).collect());
+        self.copies = self.infos();
         Ok(())
     }
 
@@ -266,7 +316,30 @@ impl Pass {
     }
 
     async fn write_state(&mut self, e: &CopyEdge, serving: bool, seeded: bool) -> Result<()> {
+        self.write_state_at(e, serving, seeded, None).await
+    }
+
+    /// [`Self::write_state`], recording the seed's handover timestamps
+    /// `handover` (source read, copy written) unless the copy has one: a
+    /// reseed keeps the first seed's while the copy is made from the same
+    /// share and source object (a share made again starts a new handover).
+    async fn write_state_at(
+        &mut self,
+        e: &CopyEdge,
+        serving: bool,
+        seeded: bool,
+        handover: Option<(u64, u64)>,
+    ) -> Result<()> {
         let now = now_ms();
+        let made = self.made.get(&e.key).copied();
+        let (handover_source, handover_child) = self
+            .rows
+            .get(&e.key)
+            .filter(|r| r.made_from(made))
+            .map(|r| (r.handover_source, r.handover_child))
+            .filter(|(s, _)| *s > 0)
+            .or(handover)
+            .unwrap_or((0, 0));
         let row = CopyRow {
             serving,
             object_version: e.object_version,
@@ -279,10 +352,14 @@ impl Pass {
             },
             caught_up_ms: now,
             source_tenant: e.source_tenant.0,
+            handover_source,
+            handover_child,
+            source_share: made.map_or(0, |m| m.0),
+            source_object: made.map_or(0, |m| m.1),
         };
         set_engine_copy_state(&self.svc, e.key, Some(&row)).await?;
         self.rows.insert(e.key, row);
-        self.copies = copy_infos(self.rows.iter().map(|(k, r)| (*k, r.clone())).collect());
+        self.copies = self.infos();
         Ok(())
     }
 
@@ -326,7 +403,7 @@ impl Pass {
                 set_engine_copy_state(&self.svc, k, None).await?;
                 self.rows.remove(&k);
             }
-            self.copies = copy_infos(self.rows.iter().map(|(k, r)| (*k, r.clone())).collect());
+            self.copies = self.infos();
         }
         let opts = sprig_inherit::adopt::charset_options(&child).unwrap_or_default();
         let with_opts = |schema: &str| {
@@ -419,6 +496,10 @@ impl Pass {
         self.ensure_table(family, e).await?;
         self.write_state(e, false, true).await?;
         let rows = self.source(family, e, None).await?;
+        // The handover (change streams send each inherited change once):
+        // every source commit the read saw is at or before `source_ts`,
+        // every copy write of the seed at or before `child_ts`.
+        let source_ts = engine_now();
         let present: BTreeSet<KeyLit> = rows.iter().map(|r| key_of(e, r)).collect();
         let gone: Vec<KeyLit> = self
             .held(e)
@@ -427,7 +508,9 @@ impl Pass {
             .filter(|k| !present.contains(k))
             .collect();
         self.write(e, &rows, &gone).await?;
-        self.write_state(e, true, true).await?;
+        let child_ts = engine_now();
+        self.write_state_at(e, true, true, Some((source_ts, child_ts)))
+            .await?;
         self.counts.seeds += 1;
         metrics::counter!("sprig_inherit_copy_seeds_total").increment(1);
         tracing::info!(tenant = %e.key.tenant, object = %e.key.object, share = e.key.share, rows = rows.len(), "copy seeded");
@@ -441,6 +524,10 @@ impl Pass {
         e: &CopyEdge,
         keys: Option<&[KeyLit]>,
     ) -> Result<()> {
+        if keys.is_some_and(<[KeyLit]>::is_empty) {
+            // A pass after a catalog change only: nothing to bring up.
+            return Ok(());
+        }
         if let Some(ks) = keys {
             for part in ks.chunks(CHUNK) {
                 let rows = self.source(family, e, Some(part)).await?;

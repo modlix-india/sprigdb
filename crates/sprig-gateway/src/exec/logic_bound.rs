@@ -377,6 +377,14 @@ impl PassSession {
             }
             return Box::pin(self.logic_deploy_change_trigger(decl, &db)).await;
         }
+        // A schedule of an engine database runs from the gateway's runner
+        // (`crate::engine_schedules`).
+        if decl.kind == Kind::Schedule
+            && let Some(db) = decl.db.clone().or_else(|| self.current_logical())
+            && self.engine_database_named(&db)
+        {
+            return Box::pin(self.logic_deploy_schedule(decl, &db)).await;
+        }
         self.logic_deploy_bound_as(cx, decl, None).await
     }
 

@@ -63,6 +63,7 @@ mod dependent;
 pub mod dialect;
 mod explain;
 mod exprs;
+mod jsontable;
 mod keyval;
 pub mod mem;
 mod plan;
@@ -72,5 +73,6 @@ mod resolve;
 mod sources;
 pub mod whatif;
 
-pub use explain::ExplainRow;
+pub use explain::{Actual, ExplainRow, analyze_answer, analyzed};
+pub use jsontable::quote_column_charsets;
 pub use plan::{AccessStat, Column, Plan, PlanOptions, Planner};

@@ -606,7 +606,7 @@ fn run(d: &mut Def, clauses: Vec<Clause>, cx: &Ctx) -> Result<(), Fail> {
                 rc.place = None;
                 let mut keys = Vec::new();
                 let pos = rc.place.clone();
-                add_column(&mut scratch, rc, &mut keys, None)?;
+                add_column(&mut scratch, rc, &mut keys, None, cx.mysql)?;
                 let _ = pos;
                 let newcol = scratch.cols.remove(0);
                 rename_everywhere(d, &oldname, &newcol.name);
@@ -678,7 +678,7 @@ fn run(d: &mut Def, clauses: Vec<Clause>, cx: &Ctx) -> Result<(), Fail> {
                 }
                 let name = rc.col.name.clone();
                 let pl = rc.place.clone();
-                add_column(d, rc.clone(), &mut new_keys, None)?;
+                add_column(d, rc.clone(), &mut new_keys, None, cx.mysql)?;
                 if let Some(pl) = pl {
                     moves.push((ci, name, pl));
                 }
@@ -757,7 +757,7 @@ fn run(d: &mut Def, clauses: Vec<Clause>, cx: &Ctx) -> Result<(), Fail> {
                         collate: o.collate.clone(),
                         ..super::types::CsSpec::default()
                     };
-                    d.cs = super::types::resolve_cs(&spec, (&d.cs.0, &d.cs.1))?;
+                    d.cs = super::types::resolve_cs(&spec, (&d.cs.0, &d.cs.1), cx.mysql)?;
                 }
                 if let Some(a) = o.auto_increment {
                     d.auto_increment = Some(a);
@@ -781,7 +781,7 @@ fn run(d: &mut Def, clauses: Vec<Clause>, cx: &Ctx) -> Result<(), Fail> {
                     collate: co,
                     ..super::types::CsSpec::default()
                 };
-                let to = super::types::resolve_cs(&spec, (&d.cs.0, &d.cs.1))?;
+                let to = super::types::resolve_cs(&spec, (&d.cs.0, &d.cs.1), cx.mysql)?;
                 for c in &mut d.cols {
                     if c.ty.cs.is_some() && !c.ty.json {
                         c.ty.cs = Some(to.clone());

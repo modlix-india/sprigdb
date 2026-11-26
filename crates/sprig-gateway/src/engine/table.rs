@@ -496,6 +496,24 @@ impl TableDef {
         db: &str,
         mysql: bool,
     ) -> sprig_common::SprigError {
+        // The hidden check of a functional key part: MySQL's 3751 naming
+        // the index whose part it guards.
+        if mysql
+            && let Some(col) = sprig_sql::compat::fxindex::fx_column_of_check(&ch.name)
+            && let Some(ix) = self.indexes.iter().find(|ix| {
+                ix.cols.iter().any(|&c| {
+                    self.columns
+                        .get(c)
+                        .is_some_and(|k| k.name.eq_ignore_ascii_case(&col))
+                })
+            })
+        {
+            return sprig_common::SprigError::standard(
+                3751,
+                *b"01000",
+                format!("Data truncated for functional index '{}' at row 1", ix.name),
+            );
+        }
         if mysql {
             sprig_common::SprigError::standard(
                 3819,

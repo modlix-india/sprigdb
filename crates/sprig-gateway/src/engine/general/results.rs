@@ -292,6 +292,108 @@ fn derived_set_columns(stmt: &sqlparser::ast::Statement, n: usize) -> Vec<Option
         .collect()
 }
 
+/// The column names of a `JSON_TABLE`'s `COLUMNS (...)`, nested ones in
+/// place.
+fn json_table_names(cols: &[sqlparser::ast::JsonTableColumn], out: &mut Vec<String>) {
+    use sqlparser::ast::JsonTableColumn;
+    for c in cols {
+        match c {
+            JsonTableColumn::ForOrdinality(n) => out.push(n.value.clone()),
+            JsonTableColumn::Named(n) => out.push(n.name.value.clone()),
+            JsonTableColumn::Nested(n) => json_table_names(&n.columns, out),
+        }
+    }
+}
+
+/// Per result column of `stmt` (`n` of them): when it is a column of a
+/// `JSON_TABLE` item, that item's alias and the column's name. The servers
+/// describe such a column as one of a table named `json_table` (MariaDB in
+/// database `*any*`). Worked out only where the select list says which
+/// item each column is from.
+fn json_table_columns(stmt: &sqlparser::ast::Statement, n: usize) -> Vec<Option<(String, String)>> {
+    use sqlparser::ast::{
+        Expr, ObjectNamePart, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Statement,
+        TableFactor,
+    };
+    let none = vec![None; n];
+    let Statement::Query(q) = stmt else {
+        return none;
+    };
+    let SetExpr::Select(s) = &*q.body else {
+        return none;
+    };
+    // Each FROM item: a JSON_TABLE's alias and columns, or `None`.
+    let mut items: Vec<Option<(String, Vec<String>)>> = Vec::new();
+    for twj in &s.from {
+        for f in std::iter::once(&twj.relation).chain(twj.joins.iter().map(|j| &j.relation)) {
+            items.push(match f {
+                TableFactor::JsonTable {
+                    columns,
+                    alias: Some(a),
+                    ..
+                } => {
+                    let mut names = Vec::new();
+                    json_table_names(columns, &mut names);
+                    Some((a.name.value.clone(), names))
+                }
+                _ => None,
+            });
+        }
+    }
+    if items.iter().all(Option::is_none) {
+        return none;
+    }
+    let only_jt = items.iter().all(Option::is_some);
+    let jt = |alias: &str| {
+        items
+            .iter()
+            .flatten()
+            .find(|(a, _)| a.eq_ignore_ascii_case(alias))
+    };
+    let mut out = Vec::with_capacity(n);
+    for i in &s.projection {
+        match i {
+            SelectItem::Wildcard(_) if only_jt => {
+                for (a, names) in items.iter().flatten() {
+                    out.extend(names.iter().map(|c| Some((a.clone(), c.clone()))));
+                }
+            }
+            SelectItem::QualifiedWildcard(SelectItemQualifiedWildcardKind::ObjectName(o), _) => {
+                let Some(ObjectNamePart::Identifier(id)) = o.0.last() else {
+                    return none;
+                };
+                let Some((a, names)) = jt(&id.value) else {
+                    return none;
+                };
+                out.extend(names.iter().map(|c| Some((a.clone(), c.clone()))));
+            }
+            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+                out.push(match e {
+                    Expr::CompoundIdentifier(p) if p.len() == 2 => {
+                        jt(&p[0].value).and_then(|(a, names)| {
+                            names
+                                .iter()
+                                .find(|c| c.eq_ignore_ascii_case(&p[1].value))
+                                .map(|c| (a.clone(), c.clone()))
+                        })
+                    }
+                    Expr::Identifier(id) if only_jt => {
+                        items.iter().flatten().find_map(|(a, names)| {
+                            names
+                                .iter()
+                                .find(|c| c.eq_ignore_ascii_case(&id.value))
+                                .map(|c| (a.clone(), c.clone()))
+                        })
+                    }
+                    _ => None,
+                });
+            }
+            _ => return none,
+        }
+    }
+    if out.len() == n { out } else { none }
+}
+
 /// A set operation's result column as the servers describe it: the
 /// column of the temporary table they gather the rows in (its name the
 /// column's original name too). A number isn't
@@ -324,6 +426,35 @@ fn set_result_def(d: &mut ColumnDef, ty: &ExprType, dedup: bool, results: Result
     }
 }
 
+/// A `JSON_TABLE` column's definition: the function's rows are a table of
+/// the servers' own (named `json_table`; MariaDB's in database `*any*`). A
+/// number isn't marked binary, a date or time still is, and MySQL's JSON
+/// column is binary text of its full length.
+fn json_table_def(d: &mut ColumnDef, ty: &ExprType, alias: &str, column: &str, results: Results) {
+    let binary = d.flags & ColumnFlags::BINARY.bits();
+    set_result_def(d, ty, false, results);
+    if matches!(
+        ty.kind,
+        Kind::Date | Kind::Time | Kind::DateTime | Kind::Timestamp
+    ) {
+        d.flags |= binary;
+    }
+    if results.mysql && d.col_type == column_type::JSON {
+        d.charset = 63;
+        d.length = u32::MAX;
+    }
+    // MariaDB's JSON column: a LONGTEXT of binary collation.
+    if !results.mysql && ty.json {
+        d.col_type = column_type::BLOB;
+        d.length = u32::MAX;
+        d.flags |= ColumnFlags::BLOB.bits() | ColumnFlags::BINARY.bits();
+    }
+    d.schema = Bytes::from_static(if results.mysql { b"" } else { b"*any*" });
+    d.table = Bytes::from(alias.to_owned());
+    d.org_table = Bytes::from_static(b"json_table");
+    d.org_name = Bytes::from(column.to_owned());
+}
+
 /// The columns of `g`'s result as the planner typed them (`cols`), for
 /// the session's results character set.
 pub(crate) fn layout(g: &General, cols: &[sprig_plan::Column], results: Results) -> Layout {
@@ -350,6 +481,11 @@ pub(crate) fn layout(g: &General, cols: &[sprig_plan::Column], results: Results)
     let setop = set_operation(&g.stmt).filter(|_| !lone_values && !streamed);
     let derived = if setop.is_none() {
         derived_set_columns(&g.stmt, cols.len())
+    } else {
+        vec![None; cols.len()]
+    };
+    let jt_cols = if setop.is_none() && !has_window(&g.stmt) {
+        json_table_columns(&g.stmt, cols.len())
     } else {
         vec![None; cols.len()]
     };
@@ -421,6 +557,8 @@ pub(crate) fn layout(g: &General, cols: &[sprig_plan::Column], results: Results)
             } else if let Some((alias, dedup)) = &derived[i] {
                 set_result_def(&mut d, &c.ty, *dedup, results);
                 d.table = Bytes::from(alias.clone());
+            } else if let Some((alias, column)) = jt_cols.get(i).and_then(Option::as_ref) {
+                json_table_def(&mut d, &c.ty, alias, column, results);
             }
             defs.push(d);
             shapes.push(Shape::Value(c.ty));

@@ -35,6 +35,8 @@ pub(crate) struct EngineCatalog {
     pub tables: HashMap<ObjectId, Arc<Parsed>>,
     /// Each table's definition text, as the catalog stores it.
     pub texts: HashMap<ObjectId, Arc<str>>,
+    /// When each table was created (the catalog object's creation time).
+    pub created: HashMap<ObjectId, std::time::SystemTime>,
     /// The same by (database, name as the catalog stores it).
     pub by_name: HashMap<(DbId, String), ObjectId>,
     /// The same by (database, lower-case name), for tenants whose names
@@ -287,6 +289,7 @@ impl CatalogExtension for EngineExtension {
                 .schema_version(o.object_id, o.schema_version)
                 .await?
                 .and_then(|v| v.create_sql);
+            state.created.insert(o.object_id, o.created_at);
             rows.push((o.object_id, o.db_id, o.name, o.schema_version, create_sql));
         }
         for (object, db, name, version, create_sql) in rows {

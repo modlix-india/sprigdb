@@ -23,6 +23,7 @@ fn first_null_dtc(mut dtc: Dtc, first_null: bool, env: Env<'_>) -> Dtc {
     if first_null && !env.maria() {
         dtc.coll = Collation::Binary;
         dtc.deriv = Derivation::Ignorable;
+        dtc.mb3 = false;
     }
     dtc
 }
@@ -695,6 +696,7 @@ pub(crate) fn quote(a: Node, env: Env<'_>) -> Node {
                 Dtc {
                     coll: a.ty.coll,
                     deriv: a.ty.deriv,
+                    mb3: a.ty.mb3,
                 },
                 true,
             )

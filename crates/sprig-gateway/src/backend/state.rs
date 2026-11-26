@@ -421,9 +421,14 @@ impl SessionVars {
             client_sql_mode,
             ..Self::default()
         };
-        if let Some((cs, coll)) = charset::login(collation_id, &login_map) {
+        // MySQL 8.4 keeps the handshake's collation as it is (45 stays
+        // `utf8mb4_general_ci`); MariaDB maps a compiled default through
+        // `character_set_collations`.
+        let mysql = persona == Persona::MySql84;
+        let map = if mysql { "" } else { login_map.as_str() };
+        if let Some((cs, coll)) = charset::login(collation_id, map) {
             s.set_names(&cs, &coll);
-            if charset::by_id(collation_id).is_some_and(|(_, primary)| primary) {
+            if !mysql && charset::by_id(collation_id).is_some_and(|(_, primary)| primary) {
                 s.login_charset = Some(cs);
             }
         }
@@ -1269,6 +1274,13 @@ mod tests {
         );
         // 45 is utf8mb4's compiled default: character_set_collations maps it.
         assert_eq!(d.vars["collation_connection"], "utf8mb4_uca1400_ai_ci");
+        // MySQL keeps the handshake's collation.
+        let mut g = SessionVars::login(Persona::MySql84, 45, None);
+        g.settle_login(&Baseline::default());
+        assert_eq!(g.vars["collation_connection"], "utf8mb4_general_ci");
+        assert_eq!(g.client_collation.as_deref(), Some("utf8mb4_general_ci"));
+        let g = SessionVars::login(Persona::MySql84, 33, None);
+        assert_eq!(g.vars["collation_connection"], "utf8mb3_general_ci");
     }
 
     fn charset_base(map: &str) -> Baseline {

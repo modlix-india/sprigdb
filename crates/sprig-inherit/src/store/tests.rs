@@ -158,6 +158,66 @@ async fn statements_follow_the_sql_rules() {
     .unwrap();
     let st = load(&m, &names).await;
     assert_eq!(st.dropping().count(), 0);
+    // A purged share's id isn't handed out again.
+    apply(
+        &m,
+        &InheritChange {
+            upsert_shares: vec![share(0, "again", 10, ShareTarget::AllChildren)],
+            ..InheritChange::default()
+        },
+        7,
+    )
+    .await
+    .unwrap();
+    let st = load(&m, &names).await;
+    let again = st.shares().find(|s| s.name == "again").unwrap().id;
+    assert!(again > 77, "share id {again} handed out before");
+    apply(
+        &m,
+        &InheritChange {
+            drop_shares: vec![again],
+            ..InheritChange::default()
+        },
+        7,
+    )
+    .await
+    .unwrap();
+    apply(
+        &m,
+        &InheritChange {
+            purge_shares: vec![again],
+            ..InheritChange::default()
+        },
+        7,
+    )
+    .await
+    .unwrap();
+    apply(
+        &m,
+        &InheritChange {
+            upsert_shares: vec![share(0, "again", 10, ShareTarget::AllChildren)],
+            ..InheritChange::default()
+        },
+        7,
+    )
+    .await
+    .unwrap();
+    let st = load(&m, &names).await;
+    let made_again = st.shares().find(|s| s.name == "again").unwrap().id;
+    assert_eq!(made_again, again + 1, "the dropped share's id came back");
+    apply(
+        &m,
+        &InheritChange {
+            drop_shares: vec![made_again],
+            purge_shares: vec![made_again],
+            ..InheritChange::default()
+        },
+        7,
+    )
+    .await
+    .unwrap();
+    let st = load(&m, &names).await;
+    assert_eq!(st.dropping().count(), 0);
     assert_eq!(
         st.shares().count(),
         0,

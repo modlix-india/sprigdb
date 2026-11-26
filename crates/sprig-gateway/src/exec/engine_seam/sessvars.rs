@@ -18,6 +18,9 @@ use bytes::Bytes;
 use sprig_catalog::TenantCatalog;
 use sprig_common::ids::DbId;
 use sprig_common::{Result, SprigError};
+use sprig_engine::keys::collation::Collation;
+use sprig_exec::ExprType;
+use sprig_exec::types::Derivation;
 use sprig_proto_mysql::packets::OkPacket;
 use sprig_proto_mysql::{ColumnDef, Persona, StatusFlags};
 use sprig_sql::lex::{self, LexOptions, Token, TokenKind};
@@ -449,18 +452,48 @@ fn whole_item(tokens: &[Token], sig: &[usize], sql: &[u8], k: usize) -> bool {
     }
 }
 
+/// Where a user variable is read.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct Place {
+    /// In a `SELECT`.
+    pub select: bool,
+    /// As an operand of arithmetic (`v * @d`).
+    pub arithmetic: bool,
+}
+
 /// What a read of a variable becomes, or `None` when the gateway doesn't
 /// know it.
 pub(super) trait VarSource {
     /// `@@name` (`global`: `@@global.name`).
     fn sysvar(&self, name: &str, global: bool) -> Option<String>;
-    /// `@name`.
-    fn uservar(&self, name: &str) -> String;
+    /// `@name`, read at `at`.
+    fn uservar(&self, name: &str, at: Place) -> String;
+}
+
+/// The value a `SET @a = e` computes: a decimal variable keeps its own
+/// scale in it (`SET @e = @d * 2` holds `3.0` on both servers, where
+/// `SELECT @d * 2` prints the variables' scale).
+struct Assigned<'a>(&'a dyn VarSource);
+
+impl VarSource for Assigned<'_> {
+    fn sysvar(&self, name: &str, global: bool) -> Option<String> {
+        self.0.sysvar(name, global)
+    }
+    fn uservar(&self, name: &str, at: Place) -> String {
+        self.0.uservar(
+            name,
+            Place {
+                arithmetic: false,
+                ..at
+            },
+        )
+    }
 }
 
 /// `sql` with every variable read replaced by a literal; `None` when it
 /// reads none, assigns a user variable, or reads one the source doesn't
 /// know.
+#[allow(clippy::too_many_lines)] // one pass over the tokens: what each read becomes, then the text
 pub(super) fn rewrite(sql: &[u8], opts: LexOptions, src: &dyn VarSource) -> Option<Vec<u8>> {
     if !sql.contains(&b'@') {
         return None;
@@ -485,7 +518,28 @@ pub(super) fn rewrite(sql: &[u8], opts: LexOptions, src: &dyn VarSource) -> Opti
     if !reads.iter().any(|w| first.eq_ignore_ascii_case(w)) {
         return None;
     }
-    let mut edits: Vec<(std::ops::Range<usize>, String)> = Vec::new();
+    let select = first.eq_ignore_ascii_case(b"SELECT");
+    // A select item that reads a variable keeps its text as its name, as
+    // on both servers (`v * @d`, not the value written in).
+    let items = if select {
+        super::sqlprep::unaliased_items(sql, opts)
+    } else {
+        Vec::new()
+    };
+    let arith = |n: Option<&usize>| {
+        n.is_some_and(|&n| {
+            let t = tokens[n];
+            t.kind == TokenKind::Op && matches!(t.bytes(sql), b"+" | b"-" | b"*" | b"/" | b"%")
+                || t.kind == TokenKind::Word
+                    && (t.bytes(sql).eq_ignore_ascii_case(b"DIV")
+                        || t.bytes(sql).eq_ignore_ascii_case(b"MOD"))
+        })
+    };
+    let mut edits: Vec<(
+        std::ops::Range<usize>,
+        String,
+        Option<std::ops::Range<usize>>,
+    )> = Vec::new();
     for (k, &i) in sig.iter().enumerate() {
         let t = tokens[i];
         let next_assigns = sig.get(k + 1).is_some_and(|&n| {
@@ -509,35 +563,60 @@ pub(super) fn rewrite(sql: &[u8], opts: LexOptions, src: &dyn VarSource) -> Opti
                     return None;
                 }
                 let (name, global) = sysvar_name(t.bytes(sql));
-                src.sysvar(&name, global)?
+                let v = src.sysvar(&name, global)?;
+                // Text in a query: held as both servers hold a variable's
+                // text (see the expression engine's `SPRIG_SYSVAR`).
+                if select && (v.starts_with('\'') || v.starts_with("CONVERT(")) {
+                    format!("SPRIG_SYSVAR({v})")
+                } else {
+                    v
+                }
             }
             TokenKind::UserVar => {
                 if next_assigns || after_into {
                     return None;
                 }
-                src.uservar(&uservar_name(t.bytes(sql)))
+                let at = Place {
+                    select,
+                    arithmetic: k > 0 && arith(sig.get(k - 1)) || arith(sig.get(k + 1)),
+                };
+                src.uservar(&uservar_name(t.bytes(sql)), at)
             }
             _ => continue,
         };
-        let lit = if first.eq_ignore_ascii_case(b"SELECT") && whole_item(&tokens, &sig, sql, k) {
-            format!(
-                "{lit} AS {}",
-                quoted(&String::from_utf8_lossy(t.bytes(sql)))
+        let whole = select && whole_item(&tokens, &sig, sql, k);
+        let (lit, item) = if whole {
+            (
+                format!(
+                    "{lit} AS {}",
+                    quoted(&String::from_utf8_lossy(t.bytes(sql)))
+                ),
+                None,
             )
         } else {
-            lit
+            let at = t.start as usize;
+            (lit, items.iter().find(|r| r.contains(&at)).cloned())
         };
-        edits.push((t.range(), lit));
+        edits.push((t.range(), lit, item));
     }
     if edits.is_empty() {
         return None;
     }
     let mut out = Vec::with_capacity(sql.len() + 32);
     let mut at = 0;
-    for (r, lit) in edits {
+    for (n, (r, lit, item)) in edits.iter().enumerate() {
         out.extend_from_slice(&sql[at..r.start]);
         out.extend_from_slice(lit.as_bytes());
         at = r.end;
+        // After the item's last variable: its name.
+        if let Some(item) = item
+            && edits.get(n + 1).is_none_or(|e| e.2.as_ref() != Some(item))
+        {
+            out.extend_from_slice(&sql[at..item.end]);
+            at = item.end;
+            let name = String::from_utf8_lossy(&sql[item.clone()]).into_owned();
+            out.extend_from_slice(format!(" AS {}", quoted(&name)).as_bytes());
+        }
     }
     out.extend_from_slice(&sql[at..]);
     Some(out)
@@ -681,6 +760,13 @@ impl VarSource for Snapshot {
                 if name == "character_set_results" && v == "NULL" {
                     return Some("NULL".to_owned());
                 }
+                // The backend names MySQL's utf8mb4 default by MariaDB's.
+                if self.persona == Persona::MySql84
+                    && name.starts_with("collation_")
+                    && v.eq_ignore_ascii_case("utf8mb4_uca1400_ai_ci")
+                {
+                    return Some(literal(kind, "utf8mb4_0900_ai_ci", self.nbe));
+                }
                 return Some(literal(kind, v, self.nbe));
             }
             if HANDSHAKE_VARS.contains(&name) {
@@ -701,8 +787,183 @@ impl VarSource for Snapshot {
         Some(literal(kind, v, self.nbe))
     }
 
-    fn uservar(&self, name: &str) -> String {
-        self.users.get(name).unwrap_or(&VarValue::Null).literal()
+    fn uservar(&self, name: &str, at: Place) -> String {
+        let mysql = self.persona == Persona::MySql84;
+        match self.users.get(name) {
+            // The MySQL port: text in the session's own collation as a
+            // string literal, which takes on the collation of what it meets
+            // (the same as MySQL's for the port's tables, and it still
+            // compares with tables created before they got MySQL's
+            // collation).
+            Some(VarValue::Text(b)) if mysql => plain_text(b, self.nbe),
+            Some(VarValue::Collated(b, c))
+                if mysql
+                    && (c.eq_ignore_ascii_case("utf8mb4_0900_ai_ci")
+                        || c.eq_ignore_ascii_case("utf8mb4_uca1400_ai_ci")) =>
+            {
+                plain_text(b, self.nbe)
+            }
+            // Text in another collation, in a query: the variable's
+            // collation with a column's weight, so a column of another
+            // collation is MySQL's 1267.
+            Some(v @ VarValue::Collated(..)) if at.select => {
+                format!("SPRIG_IMPLICIT({})", v.literal())
+            }
+            // A decimal in arithmetic has the servers' scale for decimal
+            // variables (30 on MySQL, 38 on MariaDB): `v * @d` prints them.
+            Some(VarValue::Decimal(d)) if at.arithmetic && !d.contains(['e', 'E']) => {
+                format!("CAST({d} AS DECIMAL(65,{}))", if mysql { 30 } else { 38 })
+            }
+            v => v.unwrap_or(&VarValue::Null).literal(),
+        }
+    }
+}
+
+/// Text as a string literal; bytes that aren't UTF-8 as a converted hex
+/// string.
+fn plain_text(b: &[u8], nbe: bool) -> String {
+    match std::str::from_utf8(b) {
+        Ok(t) => sprig_sql::names::rewrite::sql_string(t, nbe),
+        Err(_) => VarValue::Text(b.to_vec()).literal(),
+    }
+}
+
+/// The session's user variables as one statement reads and assigns them
+/// (`@v`, `@v := e` in a query the planner runs): seeded from the session's
+/// values, the assigned ones written back when the statement ends.
+#[derive(Debug, Default)]
+pub(super) struct StatementVars {
+    vars:
+        std::sync::Mutex<std::collections::BTreeMap<String, (sprig_engine::row::Value, ExprType)>>,
+    changed: std::sync::Mutex<std::collections::BTreeSet<String>>,
+    warned: std::sync::atomic::AtomicBool,
+}
+
+impl sprig_exec::UserVars for StatementVars {
+    fn get(&self, name: &str) -> Option<(sprig_engine::row::Value, ExprType)> {
+        self.vars.lock().ok()?.get(name).cloned()
+    }
+
+    fn set(&self, name: &str, value: sprig_engine::row::Value, ty: ExprType) {
+        if let Ok(mut v) = self.vars.lock() {
+            v.insert(name.to_owned(), (value, ty));
+        }
+        if let Ok(mut c) = self.changed.lock() {
+            c.insert(name.to_owned());
+        }
+    }
+
+    fn first_assignment(&self) -> bool {
+        !self.warned.swap(true, std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// The session's `utf8mb4` collation on each port.
+fn utf8_collation(persona: Persona) -> Collation {
+    if persona == Persona::MySql84 {
+        Collation::Utf8mb4Mysql0900AiCi
+    } else {
+        Collation::Utf8mb4Uca1400AiCi
+    }
+}
+
+/// A kept user variable as a value of the expression engine, with its
+/// type; `None` for `NULL`.
+fn var_value(v: &VarValue, persona: Persona) -> Option<(sprig_engine::row::Value, ExprType)> {
+    use sprig_engine::row::Value;
+    // Text on the MySQL port takes on the collation of what it meets (see
+    // `Snapshot::uservar`).
+    let deriv = if persona == Persona::MySql84 {
+        Derivation::Coercible
+    } else {
+        Derivation::Implicit
+    };
+    let text = |b: &[u8], coll: Collation| {
+        let n = u32::try_from(String::from_utf8_lossy(b).chars().count()).unwrap_or(u32::MAX);
+        (
+            Value::Str(Bytes::copy_from_slice(b)),
+            ExprType::string(n, coll, deriv),
+        )
+    };
+    Some(match v {
+        VarValue::Null => return None,
+        // An integer variable is a BIGINT.
+        VarValue::Integer(s) => {
+            let (v, mut ty) = match s.parse::<i64>() {
+                Ok(i) => (Value::Int(i), ExprType::int(20, false)),
+                Err(_) => (Value::UInt(s.parse().ok()?), ExprType::int(20, true)),
+            };
+            ty.width = 8;
+            (v, ty)
+        }
+        VarValue::Decimal(s) if s.contains(['e', 'E']) => {
+            (Value::Double(s.parse().ok()?), ExprType::double())
+        }
+        VarValue::Decimal(s) => {
+            let d = sprig_engine::row::decimal::Decimal::parse(s)?;
+            let scale = u32::from(d.scale());
+            (Value::Decimal(d), ExprType::decimal(65, scale, false))
+        }
+        VarValue::Text(b) => text(b, utf8_collation(persona)),
+        VarValue::Collated(b, c) => {
+            let flavor = if persona == Persona::MySql84 {
+                sprig_engine::keys::collation::Flavor::MySql
+            } else {
+                sprig_engine::keys::collation::Flavor::MariaDb
+            };
+            let coll = Collation::resolve(c, flavor).unwrap_or_else(|| utf8_collation(persona));
+            let (v, mut ty) = text(b, coll);
+            let l = c.to_ascii_lowercase();
+            ty.mb3 = l.starts_with("utf8mb3_") || l.starts_with("utf8_");
+            // Another collation than the session's own: the variable's, as
+            // on MySQL (a column of a third collation is 1267).
+            if coll != utf8_collation(persona) && coll != Collation::Utf8mb4Uca1400AiCi {
+                ty.deriv = Derivation::Implicit;
+            }
+            (v, ty)
+        }
+        VarValue::Binary(b) => {
+            let n = u32::try_from(b.len()).unwrap_or(u32::MAX);
+            (
+                Value::Bytes(Bytes::copy_from_slice(b)),
+                ExprType::string(n, Collation::Binary, Derivation::Implicit),
+            )
+        }
+    })
+}
+
+/// An assigned value as the session keeps user variables.
+fn kept_value(v: &sprig_engine::row::Value, ty: &ExprType, persona: Persona) -> VarValue {
+    use sprig_engine::row::Value;
+    let exec = if persona == Persona::MySql84 {
+        sprig_exec::Persona::MySql
+    } else {
+        sprig_exec::Persona::MariaDb
+    };
+    let printed = || sprig_exec::value_text(v, ty, exec).map(|b| b.to_vec());
+    match v {
+        Value::Null => VarValue::Null,
+        Value::Int(i) => VarValue::Integer(i.to_string()),
+        Value::UInt(u) => VarValue::Integer(u.to_string()),
+        Value::Decimal(d) => VarValue::Decimal(d.to_string()),
+        Value::Double(_) | Value::Float(_) => printed().map_or(VarValue::Null, |b| {
+            VarValue::Decimal(String::from_utf8_lossy(&b).into_owned())
+        }),
+        Value::Bytes(b) => VarValue::Binary(b.to_vec()),
+        // The session's own `utf8mb4` collation (on the MySQL port the engine
+        // holds MySQL's default as MariaDB's equivalent): plain text.
+        Value::Str(b)
+            if !ty.mb3
+                && (ty.coll == utf8_collation(persona)
+                    || ty.coll == Collation::Utf8mb4Uca1400AiCi) =>
+        {
+            VarValue::Text(b.to_vec())
+        }
+        Value::Str(b) => VarValue::Collated(
+            b.to_vec(),
+            sprig_exec::types::collation_name(ty.coll, ty.mb3).into_owned(),
+        ),
+        _ => printed().map_or(VarValue::Null, VarValue::Text),
     }
 }
 
@@ -822,6 +1083,61 @@ impl PassSession {
         }
     }
 
+    /// User variable `name`'s value as text; `None` when it is `NULL` or
+    /// unset.
+    pub(super) fn user_var_text(&mut self, cx: &ExecCtx<'_>, name: &str) -> Option<Vec<u8>> {
+        match self.bs(cx).vars().user_vars.get(name)? {
+            VarValue::Null => None,
+            VarValue::Integer(s) | VarValue::Decimal(s) => Some(s.clone().into_bytes()),
+            VarValue::Text(b) | VarValue::Binary(b) | VarValue::Collated(b, _) => Some(b.clone()),
+        }
+    }
+
+    /// A statement that assigns user variables inside a query (`@v :=
+    /// e`): its handle on the session's variables, seeded with their
+    /// values; `None` for any other statement.
+    pub(super) fn statement_vars(
+        &mut self,
+        cx: &ExecCtx<'_>,
+        sql: &[u8],
+    ) -> Option<std::sync::Arc<StatementVars>> {
+        if !sql.contains(&b'@') || !sql.windows(2).any(|w| w == b":=") {
+            return None;
+        }
+        let persona = self.persona;
+        let seeded = self
+            .bs(cx)
+            .vars()
+            .user_vars
+            .iter()
+            .filter_map(|(k, v)| Some((k.clone(), var_value(v, persona)?)))
+            .collect();
+        Some(std::sync::Arc::new(StatementVars {
+            vars: std::sync::Mutex::new(seeded),
+            ..StatementVars::default()
+        }))
+    }
+
+    /// The variables a statement assigned become the session's.
+    pub(super) fn statement_vars_end(&mut self, cx: &ExecCtx<'_>, h: &StatementVars) {
+        let persona = self.persona;
+        let (Ok(changed), Ok(vars)) = (h.changed.lock(), h.vars.lock()) else {
+            return;
+        };
+        let kept: Vec<(String, VarValue)> = changed
+            .iter()
+            .filter_map(|n| {
+                let (v, ty) = vars.get(n)?;
+                Some((n.clone(), kept_value(v, ty, persona)))
+            })
+            .collect();
+        drop((changed, vars));
+        let bs = self.bs(cx);
+        for (n, v) in kept {
+            bs.vars_mut().user_vars.insert(n, v);
+        }
+    }
+
     /// The statement with its variable reads replaced (see the module
     /// docs); `None` when it reads none or the gateway can't answer one.
     pub(super) fn engine_var_reads(
@@ -857,11 +1173,29 @@ impl PassSession {
         let Some(sets) = user_sets(sql, lex) else {
             return Ok(None);
         };
+        let default_conn = self
+            .bs(cx)
+            .vars()
+            .vars
+            .get("collation_connection")
+            .is_none_or(|c| {
+                c.eq_ignore_ascii_case("utf8mb4_uca1400_ai_ci")
+                    || c.eq_ignore_ascii_case("utf8mb4_0900_ai_ci")
+            });
         for (name, expr) in &sets {
-            let select = format!("SELECT {expr}");
+            // A value given a collation keeps it (`SET @v = 'x' COLLATE
+            // utf8mb4_bin`), and so does text in a session whose
+            // collation isn't the port's default (a MySQL client's
+            // `utf8mb4_general_ci` login): its name is read with it.
+            let collated = expr.to_ascii_uppercase().contains("COLLATE") || !default_conn;
+            let select = if collated {
+                format!("SELECT {expr}, COLLATION({expr})")
+            } else {
+                format!("SELECT {expr}")
+            };
             let snap = self.var_snapshot(cx);
-            let text =
-                rewrite(select.as_bytes(), lex, &snap).unwrap_or_else(|| select.into_bytes());
+            let text = rewrite(select.as_bytes(), lex, &Assigned(&snap))
+                .unwrap_or_else(|| select.into_bytes());
             let mut cap = Capture {
                 wire: out.wire(),
                 columns: Vec::new(),
@@ -894,6 +1228,11 @@ impl PassSession {
             };
             let Some(v) = captured(col, row.first().and_then(|c| c.as_deref())) else {
                 return Ok(None);
+            };
+            let v = if collated {
+                v.with_collation(row.get(1).and_then(|c| c.as_deref()))
+            } else {
+                v
             };
             self.bs(cx).vars_mut().user_vars.insert(name.clone(), v);
         }
@@ -1051,7 +1390,7 @@ mod tests {
                 _ => None,
             }
         }
-        fn uservar(&self, name: &str) -> String {
+        fn uservar(&self, name: &str, _at: Place) -> String {
             if name == "x" {
                 "5".into()
             } else {
@@ -1068,11 +1407,11 @@ mod tests {
     fn reads_become_literals() {
         assert_eq!(
             rw("SELECT @@autocommit, @@session.sql_mode AS m"),
-            Some("SELECT 1 AS `@@autocommit`, 'STRICT' AS m".into())
+            Some("SELECT 1 AS `@@autocommit`, SPRIG_SYSVAR('STRICT') AS m".into())
         );
         assert_eq!(
             rw("select @x + 1, @`x`"),
-            Some("select 5 + 1, 5 AS `@``x```".into())
+            Some("select 5 + 1 AS `@x + 1`, 5 AS `@``x```".into())
         );
         assert_eq!(
             rw("SELECT * FROM t WHERE id = @x"),

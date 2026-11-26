@@ -435,6 +435,250 @@ async fn engine_copies_converge_to_the_model() {
     model_run(&eps, None, true).await;
 }
 
+/// The ids tenant `c` (in its root space `space`) reads from `db.products`.
+async fn ids_of(c: &mut Conn, space: &str) -> Vec<i64> {
+    exec(c, &format!("USE SPACE `{space}`")).await;
+    rows(c, "SELECT id FROM products ORDER BY id")
+        .await
+        .into_iter()
+        .map(|r| r[0].as_ref().unwrap().parse().unwrap())
+        .collect()
+}
+
+/// Wrong reads of the child's view seen by [`reads_stay`] (the test goes
+/// on to its later steps and fails at the end).
+static WRONG_READS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Reads the child's view for `ms` milliseconds, every read checked
+/// against `want` (a copy served before it caught up would miss rows); a
+/// wrong read is recorded in [`WRONG_READS`] and ends the reads.
+async fn reads_stay(c: &mut Conn, space: &str, want: &[i64], ms: u64, what: &str) -> u64 {
+    let t0 = Instant::now();
+    let mut n = 0;
+    while t0.elapsed() < std::time::Duration::from_millis(ms) {
+        let got = ids_of(c, space).await;
+        if got != want {
+            let e = format!("{what}: read {n} of the child's view: got {got:?}, want {want:?}");
+            eprintln!("WRONG {e}");
+            WRONG_READS.lock().unwrap().push(e);
+            return n;
+        }
+        n += 1;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    n
+}
+
+/// Waits until the child's `SHOW SHARES` shows share `name` received with
+/// `filter` and `mode` (the parent's catalog change reached the child's
+/// gateway), so what the reads that follow check is the copy, not the
+/// catalog's propagation.
+async fn child_sees(c: &mut Conn, name: &str, filter: Option<&str>, mode: &str, what: &str) {
+    let t0 = Instant::now();
+    loop {
+        let seen = rows(c, "SHOW SHARES").await.into_iter().any(|r| {
+            r.first().cloned().flatten().as_deref() == Some(name)
+                && r.get(5).cloned().flatten().is_some() == filter.is_some()
+                && r.get(9).cloned().flatten().as_deref() == Some(mode)
+        });
+        if seen {
+            return;
+        }
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(10),
+            "{what}: the child doesn't see share {name} ({mode})"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+/// Waits until the child's copy of `db.products` serves (`SHOW SHARES`).
+async fn child_copy_serves(c: &mut Conn, db: &str, what: &str) {
+    let t0 = Instant::now();
+    loop {
+        if serving_copies(std::slice::from_mut(c), db).await >= 1 {
+            eprintln!("{what}: the child's copy serves after {:.1?}", t0.elapsed());
+            return;
+        }
+        if t0.elapsed() > std::time::Duration::from_secs(30) {
+            let e = format!("{what}: the child's copy doesn't serve after 30 s");
+            eprintln!("WRONG {e}");
+            WRONG_READS.lock().unwrap().push(e);
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+/// A share to a child tenant dropped and made again on engine databases
+/// (`SPRIG_TEST_R6I_ENGINE_COPIES=1`): made again with another filter at
+/// the same versions, made read-through while the parent writes, and made
+/// materialized again. The child's view never misses a parent row: the old
+/// copy is not read until it is seeded again from the new share.
+#[tokio::test]
+async fn engine_copy_of_a_share_made_again() {
+    let test = "engine_copy_of_a_share_made_again";
+    let Some(eps) = endpoints(test) else {
+        return;
+    };
+    if needs(test, "SPRIG_TEST_R6I_ENGINE_COPIES").is_none() {
+        return;
+    }
+    let t = tenants();
+    for (pi, ep) in eps.iter().enumerate() {
+        let p = persona(pi);
+        let db = format!("r6inh_again_{p}");
+        let (mut a, mut b) = (conn(ep, &t[0]).await, conn(ep, &t[1]).await);
+        let share =
+            |filter: &str| format!("CREATE SHARE sg{p} ON products TO SPACE `{}`{filter}", t[1]);
+        exec(&mut a, &format!("USE SPACE `{}`", t[0])).await;
+        for n in ["sg", "sk"] {
+            exec(&mut a, &format!("DROP SHARE IF EXISTS {n}{p}")).await;
+        }
+        for (c, tn) in [(&mut a, &t[0]), (&mut b, &t[1])] {
+            exec(c, &format!("USE SPACE `{tn}`")).await;
+            for s in ["DROP DATABASE IF EXISTS", "CREATE DATABASE"] {
+                exec(c, &format!("{s} {db}")).await;
+            }
+            exec(c, &format!("USE {db}")).await;
+            exec(c, DDL).await;
+            exec(c, "ALTER TABLE products SPRIG INHERITABLE KEY (id)").await;
+        }
+        match try_exec(&mut a, &format!("CREATE SPACE ax1 UNDER `{}`", t[0])).await {
+            Ok(_) | Err(39881) => {}
+            Err(e) => panic!("CREATE SPACE: {e}"),
+        }
+        exec(&mut a, &format!("USE SPACE `{}`", t[0])).await;
+        let mode = |m: &str| format!("SPRIG SET inherit.merge = '{m}'");
+        exec(&mut a, &mode("materialized")).await;
+        // A copy inside the parent tenant keeps the family's copy pass
+        // running while the child's share is dropped and made again.
+        exec(
+            &mut a,
+            &format!("CREATE SHARE sk{p} ON products TO SPACE ax1"),
+        )
+        .await;
+        for (id, price) in [(1, 10), (2, 20), (3, 30)] {
+            exec(
+                &mut a,
+                &format!("INSERT INTO products VALUES ({id}, 'n{id}', 'c', {price}, 'IN')"),
+            )
+            .await;
+        }
+        exec(&mut a, &share(" WHERE price < 25")).await;
+        let sg = format!("sg{p}");
+        child_sees(&mut b, &sg, Some("price < 25"), "materialized", p).await;
+        child_copy_serves(&mut b, &db, &format!("{p} filtered")).await;
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        let n = reads_stay(&mut b, &t[1], &[1, 2], 500, &format!("{p} filtered")).await;
+        eprintln!("{p}: filtered copy: {n} reads of [1, 2]");
+
+        // 1. Made again without the filter (version 1 both times), no
+        // write in between: every read sees the rows the filter left out.
+        let drop = format!("DROP SHARE sg{p}");
+        exec(&mut a, &drop).await;
+        exec(&mut a, &share("")).await;
+        child_sees(&mut b, &sg, None, "materialized", p).await;
+        let n = reads_stay(&mut b, &t[1], &[1, 2, 3], 3000, &format!("{p} unfiltered")).await;
+        child_copy_serves(&mut b, &db, &format!("{p} unfiltered")).await;
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        let m = reads_stay(&mut b, &t[1], &[1, 2, 3], 500, &format!("{p} unfiltered")).await;
+        eprintln!("{p}: share made again without its filter: {n} + {m} reads of [1, 2, 3]");
+
+        // 2. Read-through while the parent inserts, then materialized
+        // again: the row inserted meanwhile stays in the child's view. The
+        // child's share is the family's only materialized one from here.
+        exec(&mut a, &format!("DROP SHARE sk{p}")).await;
+        exec(&mut a, &drop).await;
+        exec(&mut a, &mode("read_through")).await;
+        exec(&mut a, &share("")).await;
+        child_sees(&mut b, &sg, None, "read_through", p).await;
+        exec(
+            &mut a,
+            "INSERT INTO products VALUES (4, 'n4', 'c', 40, 'IN')",
+        )
+        .await;
+        let n = reads_stay(
+            &mut b,
+            &t[1],
+            &[1, 2, 3, 4],
+            1500,
+            &format!("{p} read-through"),
+        )
+        .await;
+        exec(&mut a, &drop).await;
+        exec(&mut a, &mode("materialized")).await;
+        exec(&mut a, &share("")).await;
+        child_sees(&mut b, &sg, None, "materialized", p).await;
+        let m = reads_stay(
+            &mut b,
+            &t[1],
+            &[1, 2, 3, 4],
+            3000,
+            &format!("{p} materialized again"),
+        )
+        .await;
+        child_copy_serves(&mut b, &db, &format!("{p} materialized again")).await;
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        let k = reads_stay(
+            &mut b,
+            &t[1],
+            &[1, 2, 3, 4],
+            500,
+            &format!("{p} materialized again"),
+        )
+        .await;
+        eprintln!(
+            "{p}: read-through, insert, materialized again: {n} + {m} + {k} reads of [1, 2, 3, 4]"
+        );
+
+        // 3. The same with no pause: dropped, read-through, a parent
+        // insert, materialized again, read at once.
+        exec(&mut a, &drop).await;
+        exec(&mut a, &mode("read_through")).await;
+        exec(&mut a, &share("")).await;
+        exec(
+            &mut a,
+            "INSERT INTO products VALUES (5, 'n5', 'c', 50, 'IN')",
+        )
+        .await;
+        exec(&mut a, &drop).await;
+        exec(&mut a, &mode("materialized")).await;
+        exec(&mut a, &share("")).await;
+        child_sees(&mut b, &sg, None, "materialized", p).await;
+        let want = [1, 2, 3, 4, 5];
+        let n = reads_stay(&mut b, &t[1], &want, 3000, &format!("{p} quick switch")).await;
+        child_copy_serves(&mut b, &db, &format!("{p} quick switch")).await;
+        // A parent write after the copy serves again reaches it.
+        exec(
+            &mut a,
+            "INSERT INTO products VALUES (6, 'n6', 'c', 60, 'IN')",
+        )
+        .await;
+        let m = reads_stay(
+            &mut b,
+            &t[1],
+            &[1, 2, 3, 4, 5, 6],
+            1000,
+            &format!("{p} after"),
+        )
+        .await;
+        eprintln!("{p}: quick switch: {n} reads of {want:?}, then {m} of [1..6]");
+
+        exec(&mut a, &format!("USE SPACE `{}`", t[0])).await;
+        for n in ["sg", "sk"] {
+            exec(&mut a, &format!("DROP SHARE IF EXISTS {n}{p}")).await;
+        }
+        let _ = try_exec(&mut a, "SPRIG RESET inherit.merge").await;
+        for c in [&mut b, &mut a] {
+            exec(c, &format!("DROP DATABASE IF EXISTS {db}")).await;
+        }
+        eprintln!("{p}: {test} done");
+    }
+    let wrong = WRONG_READS.lock().unwrap().clone();
+    assert!(wrong.is_empty(), "{test}: wrong reads: {wrong:#?}");
+}
+
 /// How many of `db`'s copies serve, as `SHOW SHARES` tells each tenant.
 async fn serving_copies(conns: &mut [Conn], db: &str) -> usize {
     let mut n = 0;

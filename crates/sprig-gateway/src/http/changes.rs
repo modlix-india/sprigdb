@@ -66,6 +66,7 @@ use super::Core;
 use super::sql::{Caller, SqlCall, collect};
 use crate::exec::rls_images::{ImagesRequest, TableImages, answer, statement};
 
+mod engine;
 mod inherit;
 mod relay;
 
@@ -355,12 +356,12 @@ async fn open_here(
             "ER_SPRIG_FEED_BAD_RESUME_TOKEN: give start_after or start_at_hlc, not both",
         ));
     }
+    let cat = svc
+        .cache
+        .get(tenant, sprig_catalog::Freshness::Latest)
+        .await?;
     // The stream limits, at the tenant's scope when set there.
     let limits = {
-        let cat = svc
-            .cache
-            .get(tenant, sprig_catalog::Freshness::Latest)
-            .await?;
         let ctx = cat.setting_ctx(&svc.dc);
         let get = |k: &'static sprig_settings::Setting<u64>| {
             svc.settings.get(k, &ctx, Some(&cat.settings))
@@ -409,6 +410,10 @@ async fn open_here(
         }
     }
     let slot = Slot::take(tenant, limits.streams)?;
+    // Engine databases: the node's change log.
+    if engine::serves(&svc, &cat, tenant, &spec.database).await {
+        return engine::open(core, caller, spec, limits, slot, tenant).await;
+    }
     let (clusters, placement, names) = feed(&svc)?;
     let start = if spec.start_at_hlc != 0 {
         start_at(&svc, &clusters, &placement, tenant, spec.start_at_hlc).await?
@@ -757,14 +762,15 @@ fn shown(p: &Pending, seen: &[Vec<bool>], full: bool) -> Option<WatchEvent> {
 }
 
 /// An inheritable object's event `p` as the subscriber sees it
-/// ([`inherit::decide`]); `was_visible`: its record just before the change.
+/// ([`inherit::decide`]); `was_visible`: its record just before the change
+/// (`None`: unknown).
 fn mapped_event(
     p: &Pending,
     m: &inherit::Mapped,
     mapper: &inherit::Mapper,
     records: &HashMap<String, inherit::Record>,
     full: bool,
-    was_visible: bool,
+    was_visible: Option<bool>,
 ) -> Option<WatchEvent> {
     let e = &p.event;
     let mut out = WatchEvent {
@@ -1020,14 +1026,19 @@ async fn run(
             probes: Vec::new(),
         };
         let mut probe_of: HashMap<usize, (usize, bool)> = HashMap::new();
+        // A key's later changes in this batch go by what its earlier one
+        // left in `known`: each probe puts back only its own change's row,
+        // so a second probe of the key would see the first change undone.
+        let mut batch_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
         for (j, p) in pending.iter().enumerate() {
             let Some(m) = &p.mapped else { continue };
             if !readable(p) {
                 continue;
             }
             let id = inherit::key_id(&p.event.table, &m.key);
+            let again = !batch_keys.insert(id.clone());
             let mut item = inherit::probe_item(&p.event, m);
-            item.reads_only = records.contains_key(&id) || known.get(&id).is_some();
+            item.reads_only = again || records.contains_key(&id) || known.get(&id).is_some();
             item.counted = p.counted;
             probe_of.insert(j, (probes.probes.len(), item.reads_only));
             probes.probes.push(item);
@@ -1052,14 +1063,14 @@ async fn run(
                     // A change the subscriber's view doesn't read sends
                     // nothing and leaves the key as it was (the change it
                     // reads comes as its own event); else known, else
-                    // probed, else (present now) not visible before.
+                    // probed, else (present now) unknown.
                     let asked = probe_of
                         .get(&j)
                         .map(|(i, only)| (before.get(*i).copied().unwrap_or(Some(false)), *only));
                     let was = match asked {
                         Some((None, _)) => None,
-                        Some((Some(v), false)) => Some(v),
-                        _ => Some(known.get(&id).unwrap_or(false)),
+                        Some((Some(v), false)) => Some(Some(v)),
+                        _ => Some(known.get(&id)),
                     };
                     match was {
                         Some(was) => {

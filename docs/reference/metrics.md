@@ -9,21 +9,16 @@ source: the metric macros in the source tree, and docs/metrics-help.toml
 
 Every metric SprigDB records, as exported on each process's telemetry port (`/metrics`, Prometheus text) and through OTLP. Counters end in `_total`; durations are histograms in seconds.
 
-528 metrics in 55 groups.
+472 metrics in 54 groups.
 
 ## `sprig_advisor_*`
 
 | Metric | Type | Labels | Recorded by | Description |
 |---|---|---|---|---|
-| `sprig_advisor_autoindex_build_seconds` | histogram | `method` | sprig-advisor | Time to build one automatic index across its shards; `method` is the build method used. Unit: seconds. |
-| `sprig_advisor_autoindex_candidates_total` | counter | `status` | sprig-advisor | Index candidates the automatic-indexing evaluation recorded; `status` is the candidate's status, `skipped` when no candidate could be designed. Unit: count. |
-| `sprig_advisor_autoindex_churn_total` | counter | - | sprig-advisor | Automatic index definitions created again within 30 days of being dropped, a sign of flapping. Unit: count. |
-| `sprig_advisor_autoindex_drops_total` | counter | `reason` | sprig-advisor | Automatic indexes dropped; `reason` is why, such as unused, regressed or `failed_rollout`. Unit: count. |
-| `sprig_advisor_autoindex_pass_timeouts_total` | counter | - | sprig-controller | Automatic-indexing passes for a tenant cut off by the controller because they ran past their time budget. Unit: count. |
-| `sprig_advisor_autoindex_runs_total` | counter | - | sprig-advisor | Automatic-indexing evaluation runs, one per tenant evaluation. Unit: count. |
-| `sprig_advisor_autoindex_validation_leftovers_total` | counter | - | sprig-advisor | Indexes and helper columns left on replicas or Galera nodes by interrupted validations, then dropped by the clean-up. Unit: count. |
-| `sprig_advisor_rekeys_total` | counter | `outcome` | sprig-controller | Online re-keys of table groups; `outcome` is `started` or `finished`. Unit: count. |
-| `sprig_advisor_runs_total` | counter | `cause`, `verdict` | sprig-controller | Periodic sharding-advisor runs for tenants whose tables are in table groups, one per tenant every `advisor.interval_hours`, each scoring the best re-key of a group; `cause` is `periodic`, `verdict` is `apply`, `recommend`, `wait` or `no_change`. Unit: count. |
+| `sprig_advisor_autoindex_build_seconds` | histogram | - | sprig-gateway | Time to build one automatic index across its shards; `method` is the build method used. Unit: seconds. |
+| `sprig_advisor_autoindex_candidates_total` | counter | - | sprig-gateway | Index candidates the automatic-indexing evaluation recorded; `status` is the candidate's status, `skipped` when no candidate could be designed. Unit: count. |
+| `sprig_advisor_autoindex_drops_total` | counter | `reason` | sprig-gateway | Automatic indexes dropped; `reason` is why, such as unused, regressed or `failed_rollout`. Unit: count. |
+| `sprig_advisor_autoindex_runs_total` | counter | - | sprig-gateway | Automatic-indexing evaluation runs, one per tenant evaluation. Unit: count. |
 
 ## `sprig_agent_*`
 
@@ -74,6 +69,7 @@ Every metric SprigDB records, as exported on each process's telemetry port (`/me
 | `sprig_amqp_channels` | gauge | - | sprig-proto-amqp | AMQP 0-9-1 channels open on this gateway. Unit: count. |
 | `sprig_amqp_connections` | gauge | `protocol` | sprig-proto-amqp | AMQP connections open on this gateway; `protocol` is the protocol version detected from the header (0-9-1 or 1.0). Unit: count. |
 | `sprig_amqp_protocol_header_refused_total` | counter | `header` | sprig-proto-amqp | AMQP connections refused at the protocol header; `header` is what the client sent (a version not offered, or unknown). Unit: count. |
+| `sprig_amqp_relayed_connections_total` | counter | - | sprig-proto-amqp | - |
 
 ## `sprig_api_*`
 
@@ -172,15 +168,11 @@ Every metric SprigDB records, as exported on each process's telemetry port (`/me
 | `sprig_balancer_blocked_total` | counter | `guardrail` | sprig-balancer | Balancer moves held back by a guardrail; `guardrail` names it, such as a cooldown or a concurrency limit. Unit: count. |
 | `sprig_balancer_cluster_full_ratio` | gauge | `cluster`, `dimension` | sprig-controller | How full a cluster is on its tightest resource, as the balancer sees it; `cluster` is the cluster, `dimension` the bottleneck (such as storage or CPU). Unit: ratio (1 is full). |
 | `sprig_balancer_constraint_violations` | gauge | - | sprig-controller | Placement constraint violations in the balancer's current view of the data centre; the balancer keeps it at 0. Unit: count. |
-| `sprig_balancer_jobs_waiting_total` | counter | `blocked_by` | sprig-controller | Shard jobs (splits, merges, moves) the controller held back; `blocked_by` is what they wait for, such as `limit`, `ddl` or `index`. Unit: count. |
-| `sprig_balancer_load_reports_total` | counter | - | sprig-controller | Load reports from gateways that the data centre's leading controller read for placement and hot-shard detection. Unit: count. |
 | `sprig_balancer_moves_reverted_total` | counter | `after_recovery` | sprig-balancer | Balancer moves that undid an earlier move (thrashing); `after_recovery` is `true` when the reversal followed a cluster's recovery. Unit: count. |
 | `sprig_balancer_moves_total` | counter | `outcome`, `reason` | sprig-balancer | Moves the balancer decided; `reason` is why (such as relieving a hot cluster or spreading load), `outcome` what became of it. Unit: count. |
 | `sprig_balancer_plan_duration_seconds` | histogram | - | sprig-controller | Time of one balancer planning pass in the data centre. Unit: seconds. |
 | `sprig_balancer_recommendations` | gauge | `kind` | sprig-controller | Balancer recommendations waiting for approval; `kind` is the recommendation kind. Unit: count. |
-| `sprig_balancer_shard_jobs_total` | counter | `kind`, `outcome` | sprig-controller | Split, merge and move jobs the controller submitted for sharding; `kind` is the job kind, `outcome` how it ended. Unit: count. |
 | `sprig_balancer_shard_schemas` | gauge | `cluster` | sprig-controller | Shard schemas on each cluster; `cluster` is the cluster. Compare with `placement.max_shard_schemas_per_cluster`. Unit: count. |
-| `sprig_balancer_shard_size_bytes` | histogram | - | sprig-controller | Sizes of shards measured by the sharding loop when deciding splits and merges. Unit: bytes. |
 
 ## `sprig_binlog_*`
 
@@ -194,7 +186,6 @@ Every metric SprigDB records, as exported on each process's telemetry port (`/me
 | Metric | Type | Labels | Recorded by | Description |
 |---|---|---|---|---|
 | `sprig_bolt_auth_total` | counter | `result`, `scheme` | sprig-proto-bolt | Bolt (Neo4j protocol) logins; `scheme` is the authentication scheme, `result` is `ok` or `refused`. Unit: count. |
-| `sprig_bolt_bookmark_waits_total` | counter | `outcome` | sprig-gateway | Bolt reads with a bookmark that waited for a replica to catch up; `outcome` says whether the replica caught up or the read stayed on the writer. Unit: count. |
 | `sprig_bolt_connections` | gauge | `version` | sprig-proto-bolt | Bolt connections open on this gateway; `version` is the negotiated Bolt version. Unit: count. |
 | `sprig_bolt_keepalives_total` | counter | - | sprig-proto-bolt | Keep-alive (NOOP) chunks the gateway sent on Bolt connections while a request ran, one every half `bolt.recv_timeout_seconds`, so drivers wait for long statements. Unit: count. |
 | `sprig_bolt_messages_total` | counter | `message`, `result` | sprig-proto-bolt | Bolt protocol messages; `message` is the message name, `result` how it was handled (such as `sent` or `ignored` after a failure). Unit: count. |
@@ -318,13 +309,6 @@ Every metric SprigDB records, as exported on each process's telemetry port (`/me
 | `sprig_feed_shared_subscriptions` | gauge | `cluster` | sprig-feed | Subscriptions attached to the shared feed reader of each cluster in this process, such as queue forwarders, stream sequencers and change topics; `cluster` is the cluster. Updated about once a second. Unit: count. |
 | `sprig_feed_txn_overflow_total` | counter | - | sprig-feed | Transactions whose row changes were larger than the feed keeps (64 MiB, estimated): their rows were let go and only the tables they touched kept, so one bulk load can't fill a reader's memory. Readers of those tables read them again from MariaDB (search copies seed again); other readers pass them by. Unit: count. |
 
-## `sprig_fk_*`
-
-| Metric | Type | Labels | Recorded by | Description |
-|---|---|---|---|---|
-| `sprig_fk_actions_total` | counter | `action` | sprig-router | Cascading foreign-key statements the gateway ran for foreign keys across table groups; `action` is `cascade` or `set_null`. Unit: count. |
-| `sprig_fk_checks_total` | counter | `result`, `side` | sprig-router | Foreign-key checks the gateway ran across table groups; `side` is `child` (does the parent exist) or `parent` (do children exist), `result` is `ok` or `violation`. Unit: count. |
-
 ## `sprig_gateway_*`
 
 | Metric | Type | Labels | Recorded by | Description |
@@ -350,8 +334,6 @@ Every metric SprigDB records, as exported on each process's telemetry port (`/me
 | `sprig_gateway_lease_lost_total` | counter | - | sprig-gateway | Times this gateway lost its registration lease in the control plane and re-registered. Unit: count. |
 | `sprig_gateway_listener_generation` | gauge | `listener` | sprig-gateway | Configuration generation of each listener; it rises whenever the listener's bind address, TLS or certificate changes. `listener` is the listener. Unit: count. |
 | `sprig_gateway_listener_plaintext_public` | gauge | `listener` | sprig-gateway | Whether a listener accepts plaintext connections on a non-loopback address; `listener` is the listener. Unit: 0 or 1. |
-| `sprig_gateway_load_report_trimmed_total` | counter | - | sprig-gateway | Load reports this gateway trimmed to fit the registration record's size limit, keeping the cluster totals and the newest, most-written index sketches and dropping the rest, so the report still registers. Unit: count. |
-| `sprig_gateway_load_reports_total` | counter | - | sprig-gateway | Write-load reports this gateway sent for placement and hot-shard detection. Unit: count. |
 | `sprig_gateway_long_polls_total` | counter | - | sprig-gateway | Single polls of a request that held an async worker of the gateway for 250 ms or more. Unit: count. |
 | `sprig_gateway_offloaded_steps_total` | counter | - | sprig-common | Large synchronous steps (such as sorting or hashing) moved off the gateway's async workers. Unit: count. |
 | `sprig_gateway_overhead_seconds` | histogram | `protocol` | sprig-gateway | Time statements spent in the gateway itself, excluding time waiting on MariaDB; `protocol` is the front end. Unit: seconds. |
@@ -384,16 +366,7 @@ Every metric SprigDB records, as exported on each process's telemetry port (`/me
 | `sprig_graph_budget_exceeded_total` | counter | `reason` | sprig-graph | Graph statements stopped by a budget (`ER_SPRIG_GRAPH_BUDGET_EXCEEDED`); `reason` is the budget: hops, frontier, rows, time or memory. Unit: count. |
 | `sprig_graph_expansion_hops` | histogram | - | sprig-graph | Hops a graph pattern expansion went through. Unit: count. |
 | `sprig_graph_frontier_nodes` | histogram | - | sprig-graph | Nodes in the frontier at each step of a graph traversal. Unit: count. |
-| `sprig_graph_mirror_applied_total` | counter | - | sprig-worker | Rows the graph mirror applier wrote or deleted on workers. Unit: count. |
-| `sprig_graph_mirror_checkpoint_age_seconds` | gauge | - | sprig-worker | Time since the oldest graph mirror applier on this worker last recorded its checkpoint (its binlog positions in the job record), from the job's start if it hasn't yet. Written every 2 s while etcd answers. Unit: seconds. |
-| `sprig_graph_mirror_checkpoint_failures_total` | counter | - | sprig-worker | Graph mirror checkpoints (the applier's binlog positions in the job record) that failed to write; the applier keeps applying and tries again after a backoff, and a new owner resumes at the catalog's position rows meanwhile. Unit: count. |
-| `sprig_graph_mirror_fallbacks_total` | counter | `reason` | sprig-graph | Graph statements whose incoming hops couldn't use an asynchronously kept graph mirror and read every shard instead; `reason` is `lag` (the mirror hadn't caught up for a read) or `write` (a write statement, which never reads an asynchronous mirror). Unit: count. |
-| `sprig_graph_mirror_wait_seconds` | histogram | - | sprig-gateway | Time graph reads waited for the graph mirror to catch up. Unit: seconds. |
-| `sprig_graph_mirror_waits_total` | counter | `outcome` | sprig-gateway | Graph reads that asked whether the graph mirror had caught up; `outcome` is `ok`, `lag` (still behind after the wait, or not served), `skipped` (behind, and the graph's waits are paused because recent reads waited the whole `graph.mirror_max_wait_ms` in vain), `busy` (no connection for the check in time) or `error`. Every outcome but `ok` reads incoming hops from every shard instead. Unit: count. |
-| `sprig_graph_route_hold_waits_total` | counter | - | sprig-gateway | Auto-commit Bolt reads that waited for a move's hold on a shard they route to. Unit: count. |
 | `sprig_graph_shard_queries_total` | counter | `tier` | sprig-graph | Shard queries graph traversals ran; `tier` is how the step ran: `join`, `cte`, `gateway` or `plugin`. Unit: count. |
-| `sprig_graph_spares_total` | counter | `outcome` | sprig-gateway | Extra backend connections auto-commit graph reads asked for, to read several shards of a cluster at once; `outcome` is `taken`, `budget` (the cluster's spare budget, a quarter of the session pool, was used up) or `busy` (none free within 50 ms). Without one, the shards are read one after another. Unit: count. |
-| `sprig_graph_stale_map_retries_total` | counter | - | sprig-gateway | Auto-commit graph statements run again after a split, merge or move changed the shard map. Unit: count. |
 | `sprig_graph_statement_duration_seconds` | histogram | `kind`, `language` | sprig-graph | Duration of graph statements; `language` is the query language (such as `cypher`), `kind` is `read` or `write`. Unit: seconds. |
 | `sprig_graph_statements_total` | counter | `kind`, `language`, `result` | sprig-graph | Graph statements; `language` is the query language, `kind` `read` or `write`, `result` `ok` or `error`. Unit: count. |
 
@@ -410,9 +383,6 @@ Every metric SprigDB records, as exported on each process's telemetry port (`/me
 | Metric | Type | Labels | Recorded by | Description |
 |---|---|---|---|---|
 | `sprig_ids_blocks_fetched_total` | counter | `kind` | sprig-gateway | Id blocks fetched from the catalog for generated ids; `kind` is `auto_increment` or `inherit_tree`. Unit: count. |
-| `sprig_ids_collision_retries_total` | counter | - | sprig-gateway | Statements run again with new ids after a generated id collided with an existing row. Unit: count. |
-| `sprig_ids_fetch_duration_seconds` | histogram | - | sprig-gateway | Time to fetch an id block from the tenant's catalog. Unit: seconds. |
-| `sprig_ids_reserved_refusals_total` | counter | - | sprig-gateway | Explicit `AUTO_INCREMENT` values refused because another gateway holds their id block (`ER_SPRIG_ID_VALUE_RESERVED`). Unit: count. |
 
 ## `sprig_inherit_*`
 
@@ -424,8 +394,9 @@ Every metric SprigDB records, as exported on each process's telemetry port (`/me
 | `sprig_inherit_broadcast_deliveries_total` | counter | `result` | sprig-gateway | Deliveries of broadcasts into member tenants' instances; `result` is `delivered` or `failed`. Unit: count. |
 | `sprig_inherit_broadcast_lag_seconds` | histogram | - | sprig-gateway | Time from a broadcast's commit until its last member was reached. Unit: seconds. |
 | `sprig_inherit_broadcasts_total` | counter | `form` | sprig-gateway | Broadcasts published to the members of an inherited definition; `form` is the broadcast's form. Unit: count. |
+| `sprig_inherit_copy_exact_reads_total` | counter | `outcome` | sprig-gateway | Materialised copies of inherited tables on engine databases that a statement considered, by outcome: `current` (the copy had applied every commit the statement could see), `waited` (it caught up within inherit.copy_wait_ms) or `read_through` (it was behind, or in a transaction, so the statement read the levels above instead). Unit: count. |
 | `sprig_inherit_copy_kept_serving_total` | counter | - | sprig-inherit | Materialised copies of inherited tables that kept serving after the child tenant added columns of its own. Unit: count. |
-| `sprig_inherit_copy_seeds_total` | counter | - | sprig-inherit | Materialised copies of shared data seeded in child tenants by the copy worker. Unit: count. |
+| `sprig_inherit_copy_seeds_total` | counter | - | sprig-gateway, sprig-inherit | Materialised copies of shared data seeded in child tenants by the copy worker. Unit: count. |
 | `sprig_inherit_deletes_refused_total` | counter | - | sprig-inherit | Deletes refused with 1451 because a row at or below the tenant's level still references the key. Unit: count. |
 | `sprig_inherit_discriminators_followed_total` | counter | - | sprig-gateway | Child tenants whose type trees followed a parent's new discriminator. Unit: count. |
 | `sprig_inherit_discriminators_unfollowed_total` | counter | - | sprig-gateway | Child tenants whose type trees couldn't follow a parent's new discriminator; the log says why. Unit: count. |
@@ -443,8 +414,6 @@ Every metric SprigDB records, as exported on each process's telemetry port (`/me
 | `sprig_inherit_hierarchy_tenant_reconciles_total` | counter | - | sprig-inherit | Descendant tenants whose paths in an inherited hierarchy were recomputed after a change above them. Unit: count. |
 | `sprig_inherit_id_collisions_found_total` | counter | - | sprig-inherit | Ids that `SPRIG CHECK IDS` found held by more than one tenant of a tree. Unit: count. |
 | `sprig_inherit_id_collisions_total` | counter | - | sprig-gateway | Ids already held by more than one tenant when a tree-wide sequence was created; reported, not renumbered. Unit: count. |
-| `sprig_inherit_instance_create_retries_total` | counter | `kind` | sprig-gateway | Instances of inherited definitions created again after a transient failure; `kind` is the object kind. Unit: count. |
-| `sprig_inherit_instance_create_seconds` | histogram | `kind` | sprig-gateway | Time to create a tenant's instance of an inherited definition; `kind` is the object kind (stream, queue, sink, trigger). Unit: seconds. |
 | `sprig_inherit_instance_creations_total` | counter | `cause`, `kind` | sprig-gateway | Instances of inherited definitions created; `kind` is the object kind, `cause` what triggered it (such as `declare` or first use). Unit: count. |
 | `sprig_inherit_layer_writes_total` | counter | `op` | sprig-inherit | Writes to the override layer of inherited data; `op` is `override`, `add`, `hide` or `reset`. Unit: count. |
 | `sprig_inherit_orphan_claims_total` | counter | - | sprig-inherit | Reference claims the copy worker made for orphaned rows across tenants. Unit: count. |
@@ -465,7 +434,6 @@ Every metric SprigDB records, as exported on each process's telemetry port (`/me
 |---|---|---|---|---|
 | `sprig_kafka_fetch_bytes_total` | counter | - | sprig-proto-kafka | Record bytes returned to Kafka consumers by fetch requests. Unit: bytes. |
 | `sprig_kafka_group_rebalances_total` | counter | - | sprig-proto-kafka | Kafka consumer-group rebalances (generation changes). Unit: count. |
-| `sprig_kafka_produce_duplicates_total` | counter | - | sprig-gateway | Retried idempotent Kafka produce batches answered without appending again. Unit: count. |
 | `sprig_kafka_produce_wait_seconds` | histogram | - | sprig-proto-kafka | Time Kafka produce requests waited for their records' offsets. Unit: seconds. |
 | `sprig_kafka_request_duration_seconds` | histogram | `api` | sprig-proto-kafka | Duration of Kafka protocol requests; `api` is the Kafka API name. Unit: seconds. |
 | `sprig_kafka_requests_total` | counter | `api`, `result` | sprig-proto-kafka | Kafka protocol requests; `api` is the Kafka API name, `result` is `ok`, `auth_failed` or `error`. Unit: count. |
@@ -477,11 +445,16 @@ Every metric SprigDB records, as exported on each process's telemetry port (`/me
 | `sprig_kv_orphan_elements_deleted_total` | counter | - | sprig-worker | Elements of deleted key-value collections (hash fields, set members) removed by the background sweep. Unit: count. |
 | `sprig_kv_purged_keys_total` | counter | - | sprig-worker | Expired keys removed by the key-value expiry sweep. Unit: count. |
 
+## `sprig_logic_*`
+
+| Metric | Type | Labels | Recorded by | Description |
+|---|---|---|---|---|
+| `sprig_logic_schedule_runs_total` | counter | `outcome` | sprig-gateway | Runs of logic schedules of engine databases started by the gateway on the tenant's leader, and fires passed over; `outcome` is `ok`, `error`, `budget`, `skipped` or `misfired`. Unit: count. |
+
 ## `sprig_lookup_*`
 
 | Metric | Type | Labels | Recorded by | Description |
 |---|---|---|---|---|
-| `sprig_lookup_claims_total` | counter | `result` | sprig-gateway | Values claimed in unique lookup indexes by inserts; `result` is `inserted`, `own`, `reclaimed` or `duplicate`. Unit: count. |
 | `sprig_lookup_orphans_removed_total` | counter | - | sprig-shard | Orphan entries removed from unique lookup indexes, whose owner row no longer exists, by the orphan scan that runs every `lookup.orphan_scan_hours` and after a lookup index is rebuilt. Unit: count. |
 | `sprig_lookup_publish_fenced_total` | counter | - | sprig-shard | Gateways fenced because they didn't acknowledge a lookup change within `lookup.publish_timeout_ms`: their leases were revoked, so they reload the tenant's catalog before their next statement of it. Unit: gateways. |
 | `sprig_lookup_publish_seconds` | histogram | - | sprig-shard | How long a lookup change waited for every gateway of the DC to load the new catalog version (fenced gateways included). Unit: seconds. |
@@ -619,41 +592,12 @@ Every metric SprigDB records, as exported on each process's telemetry port (`/me
 
 | Metric | Type | Labels | Recorded by | Description |
 |---|---|---|---|---|
-| `sprig_rls_feed_events_filtered_total` | counter | `protocol` | sprig-gateway, sprig-sinks, sprig-worker | Change events withheld from a reader by row-level security; `protocol` is where they were read, such as `kafka` or `trigger`. Unit: count. |
+| `sprig_rls_feed_events_filtered_total` | counter | `protocol` | sprig-gateway, sprig-worker | Change events withheld from a reader by row-level security; `protocol` is where they were read, such as `kafka` or `trigger`. Unit: count. |
 | `sprig_rls_merged_reads_total` | counter | - | sprig-gateway | Statements that read a table with row-level security merged with a parent's shared rows (inheritance): the policy views let the shared layers through for that statement only. Unit: count. |
 | `sprig_rls_policies_recompiled_total` | counter | - | sprig-gateway | Row-level security policies written as MongoDB filters whose stored SQL was compiled again with this build's translator, because an earlier build had stored a different rendering; rewritten on the tenant's first statement on a gateway. Unit: policies. |
 | `sprig_rls_reprepares_total` | counter | - | sprig-gateway | Prepared statements prepared again because the row-level security policies they depend on changed. Unit: count. |
 | `sprig_rls_rewrites_total` | counter | `protocol` | sprig-gateway | Statements rewritten to apply row-level security policies; `protocol` is the front end. Unit: count. |
 | `sprig_rls_search_rechecks_total` | counter | `scoring` | sprig-gateway | Searches by a user that row-level security binds, answered from the hits that user may read; `scoring` is `matched` (ranked with statistics of those hits alone) or `plain` (no index statistics, when the search matched more than `search.max_window` rows). Unit: count. |
-
-## `sprig_router_*`
-
-| Metric | Type | Labels | Recorded by | Description |
-|---|---|---|---|---|
-| `sprig_router_analytics_rows_total` | counter | - | sprig-router | Rows analytic reads read from shards. Unit: rows. |
-| `sprig_router_analytics_total` | counter | `result` | sprig-router | Reads handed to the analytic engine (`router.analytics.mode`); `result` is `done` or `refused`. Unit: count. |
-| `sprig_router_datafusion_duration_seconds` | histogram | - | sprig-router | Duration of reads run on the analytic engine. Unit: seconds. |
-| `sprig_router_fanout_shards` | histogram | - | sprig-router | Shards each distributed read ran on; a value of 1 means the read was routed to one shard. Unit: shards. |
-| `sprig_router_gather_duration_seconds` | histogram | - | sprig-router | Duration of gathered reads, where the gateway copies rows to run a statement shards can't run alone. Unit: seconds. |
-| `sprig_router_gather_rows_total` | counter | - | sprig-router | Rows gathered reads copied into the gateway (limit `router.gather.max_rows` per read). Unit: rows. |
-| `sprig_router_graph_filters_pushed_total` | counter | - | sprig-gateway | `GRAPH_TABLE` calls run with the outer statement's filters pushed into their Cypher. Unit: count. |
-| `sprig_router_graph_narrowed_total` | counter | - | sprig-router | Reads joined to a graph call's rows that the router narrowed to the shards holding those rows' keys. Unit: count. |
-| `sprig_router_graph_routes_total` | counter | `op`, `plan` | sprig-router | Graph read steps the router planned; `op` is the step, `plan` how it was routed. Unit: count. |
-| `sprig_router_graph_temp_tables_total` | counter | - | sprig-gateway | Temporary tables created to hold `GRAPH_TABLE` rows too many to inline. Unit: count. |
-| `sprig_router_hold_waits_total` | counter | - | sprig-gateway | Statements the router held while a shard they needed was being cut over. Unit: count. |
-| `sprig_router_implicit_commits_total` | counter | - | sprig-gateway | Transactions committed implicitly before DDL, `LOCK TABLES` or `SET autocommit = 1`. Unit: count. |
-| `sprig_router_implicit_txns_total` | counter | - | sprig-gateway | Transactions opened implicitly by `autocommit = 0`. Unit: count. |
-| `sprig_router_lookup_batches_total` | counter | - | sprig-router | Batches of keys (up to `router.lookup_batch_size`) sent by lookup joins. Unit: count. |
-| `sprig_router_lookup_claims_total` | counter | - | sprig-router | Unique lookup-index values claimed by inserts. Unit: count. |
-| `sprig_router_lookup_routes_total` | counter | - | sprig-router | Statements narrowed to fewer shards by a unique lookup index. Unit: count. |
-| `sprig_router_parent_routes_total` | counter | - | sprig-router | Inserts of child rows placed by finding their parent row across shards. Unit: count. |
-| `sprig_router_plan_cache_hits_total` | counter | - | sprig-gateway | Statement plans found in the gateway's plan cache (`router.plan_cache_entries`). Unit: count. |
-| `sprig_router_plan_cache_misses_total` | counter | - | sprig-gateway | Statement plans not in the plan cache, so planned afresh. Unit: count. |
-| `sprig_router_rejected_total` | counter | `reason` | sprig-router | Statements refused with `ER_SPRIG_STATEMENT_NOT_DISTRIBUTABLE`; `reason` is the reason code, such as `join_condition` or `window_function`. Unit: count. |
-| `sprig_router_schema_change_retries_total` | counter | - | sprig-gateway | Statements run again because a schema change had dropped a column from some shards first. Unit: count. |
-| `sprig_router_stale_map_retries_total` | counter | - | sprig-gateway | Statements run again after meeting a stale shard map (limit `router.stale_map_retries`). Unit: count. |
-| `sprig_router_statements_total` | counter | `plan` | sprig-gateway, sprig-router | Statements the router planned over sharded tables; `plan` is the plan kind: `pass`, `scatter`, `merge`, `aggregate`, `lookup_join`, `write`, `via_lookup`, `via_parent`, `need_ids`, `gather`, `analytics`, `graph`, `explain`, `reject`, `txn_control` and others. Unit: count. |
-| `sprig_router_txn_map_changed_total` | counter | - | sprig-gateway | Transactions rolled back with `ER_SPRIG_SHARD_MAP_CHANGED` because a shard moved under them. Unit: count. |
 
 ## `sprig_search_*`
 
@@ -692,7 +636,6 @@ Every metric SprigDB records, as exported on each process's telemetry port (`/me
 | `sprig_sink_connection_tests_total` | counter | `result` | sprig-sinks | `TEST CONNECTION` runs; `result` is `ok` or `failed`. Unit: count. |
 | `sprig_sink_credential_rotations_total` | counter | - | sprig-gateway, sprig-sinks | Sink connection credentials changed. Unit: count. |
 | `sprig_sink_dead_lettered_total` | counter | `reason`, `target` | sprig-sinks | Sink records sent to the dead-letter stream after `sink.record_max_attempts`; `target` is the target kind, `reason` the failure class. Unit: count. |
-| `sprig_sink_dead_letters_total` | counter | `to` | sprig-sinks | Records written to sink dead-letter destinations; `to` is where (such as `stream`). Unit: count. |
 | `sprig_sink_delivery_seconds` | histogram | `target` | sprig-sinks | Round-trip time of one sink batch to its destination; `target` is the target kind. Unit: seconds. |
 | `sprig_sink_destination_refused_total` | counter | `reason` | sprig-sinks | Sink destinations refused by policy; `reason` is `allowlist`, `residency` or `identity`. Unit: count. |
 | `sprig_sink_dry_runs_total` | counter | - | sprig-sinks | `TEST SINK` dry runs. Unit: count. |
@@ -717,16 +660,12 @@ Every metric SprigDB records, as exported on each process's telemetry port (`/me
 | `sprig_sink_tasks` | gauge | `state` | sprig-sinks | Sink tasks running on this worker; `state` is `running`. Unit: count. |
 | `sprig_sink_transform_failures_total` | counter | - | sprig-sinks | Records whose sink transform failed; they go to the dead-letter stream. Unit: count. |
 
-## `sprig_stream_*`
+## `sprig_sql_*`
 
 | Metric | Type | Labels | Recorded by | Description |
 |---|---|---|---|---|
-| `sprig_stream_compaction_records_removed_total` | counter | - | sprig-streams | Records removed from compacted streams by compaction. Unit: count. |
-| `sprig_stream_records_appended_total` | counter | `kind` | sprig-streams | Records the stream sequencer appended; `kind` is `events` or `changes`. Unit: count. |
-| `sprig_stream_retention_partitions_dropped_total` | counter | - | sprig-streams | Stream storage partitions dropped by retention (`stream.retention_hours`, `stream.retention_bytes`). Unit: count. |
-| `sprig_stream_sequencer_lag_max_seconds` | gauge | - | sprig-streams | The largest lag of any stream sequencer running on this worker. Unit: seconds. |
-| `sprig_stream_sequencers_lagging` | gauge | - | sprig-streams | Stream sequencers on this worker whose lag is above `stream.sequencer_lag_alert_seconds`. Unit: count. |
-| `sprig_stream_sequencing_lag_seconds` | histogram | - | sprig-streams | Time from a record's commit to its sequencing (offset assignment) in a stream. Unit: seconds. |
+| `sprig_sql_event_failures_total` | counter | - | sprig-gateway | - |
+| `sprig_sql_event_runs_total` | counter | - | sprig-gateway | - |
 
 ## `sprig_studio_*`
 

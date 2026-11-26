@@ -47,11 +47,14 @@ pub(super) fn loosen(d: Derivation) -> Derivation {
 }
 
 pub(super) fn str_type(chars: u64, dtc: Dtc, nullable: bool) -> ExprType {
-    ExprType::string(
-        chars.min(u64::from(u32::MAX / 4)) as u32,
-        dtc.coll,
-        loosen(dtc.deriv),
-    )
+    ExprType {
+        mb3: dtc.mb3,
+        ..ExprType::string(
+            chars.min(u64::from(u32::MAX / 4)) as u32,
+            dtc.coll,
+            loosen(dtc.deriv),
+        )
+    }
     .with_null(nullable)
 }
 
@@ -214,8 +217,11 @@ fn map_string(
         } else {
             1
         };
-    let ty =
-        ExprType::string(a.ty.len.saturating_mul(grow), a.ty.coll, loosen(a.ty.deriv)).nullable();
+    let ty = ExprType {
+        mb3: a.ty.mb3,
+        ..ExprType::string(a.ty.len.saturating_mul(grow), a.ty.coll, loosen(a.ty.deriv))
+    }
+    .nullable();
     Node::new(ty, name, move |ctx, row| {
         Ok(match text(a.eval(ctx, row)?) {
             None => Value::Null,
@@ -429,7 +435,11 @@ pub(crate) fn substring(name: &str, args: Vec<Node>, env: Env<'_>) -> Result<Nod
         }
         chars = c.min(u64::from(u32::MAX / 4)) as u32;
     }
-    let ty = ExprType::string(chars, s.ty.coll, loosen(s.ty.deriv)).nullable();
+    let ty = ExprType {
+        mb3: s.ty.mb3,
+        ..ExprType::string(chars, s.ty.coll, loosen(s.ty.deriv))
+    }
+    .nullable();
     Ok(Node::new(ty, "substring", move |ctx, row| {
         let sv = s.eval(ctx, row)?;
         // A text that reaches a binary result keeps its own character set
@@ -782,6 +792,7 @@ pub(crate) fn repeat(s: Node, n: Node, name: &'static str, env: Env<'_>) -> Resu
         Dtc {
             coll: s.ty.coll,
             deriv: s.ty.deriv,
+            mb3: s.ty.mb3,
         },
         true,
     );
@@ -826,31 +837,24 @@ pub(crate) fn strcmp(a: Node, b: Node, env: Env<'_>) -> Result<Node> {
     }))
 }
 
-/// The collation's name as the persona spells it.
-fn collation_name(c: Collation) -> &'static str {
-    c.name()
-}
-
 /// `COLLATION(x)`, `CHARSET(x)` and `COERCIBILITY(x)`: what the type
 /// derivation decided, for the argument as it stands.
 pub(crate) fn describe(name: &str, a: Node, env: Env<'_>) -> Node {
     let dtc = if a.ty.kind == Kind::Str || a.ty.kind == Kind::Null {
         Dtc::of(&a.ty, env.conn())
     } else {
-        Dtc {
-            coll: Collation::Binary,
-            // A number is held as loosely as numbers are, except where
-            // a function says otherwise (MySQL's LOCATE and INSTR).
-            deriv: a.ty.deriv,
-        }
+        // A number is held as loosely as numbers are, except where a
+        // function says otherwise (MySQL's LOCATE and INSTR).
+        Dtc::new(Collation::Binary, a.ty.deriv)
     };
     let sys = ExprType::string(64, Collation::Utf8mb4GeneralCi, Derivation::SysConst).nullable();
     match name {
-        "COLLATION" => Node::new(sys, "collation", move |_, _| {
-            Ok(Value::str(collation_name(dtc.coll)))
-        }),
+        "COLLATION" => {
+            let n = dtc.name();
+            Node::new(sys, "collation", move |_, _| Ok(Value::str(&n)))
+        }
         "CHARSET" => Node::new(sys, "charset", move |_, _| {
-            Ok(Value::str(crate::expr::charset_name(dtc.coll.charset())))
+            Ok(Value::str(dtc.charset_name()))
         }),
         _ => {
             let maria = env.maria();

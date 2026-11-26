@@ -209,6 +209,16 @@ pub trait Consensus: Send + Sync {
     /// The highest index of `unit` applied to the state machine.
     fn applied_index(&self, unit: UnitId) -> u64;
 
+    /// The highest index of `unit` handed to a proposal so far: every
+    /// commit a reader can already see (applied, or pending in the
+    /// overlay) has an index at or below it, so once the unit's apply
+    /// observers have seen this index they have seen every such commit.
+    /// The default is [`Consensus::durable_index`], right for a log whose
+    /// commits are answered only once committed.
+    fn proposed_index(&self, unit: UnitId) -> u64 {
+        self.durable_index(unit)
+    }
+
     /// Blocks until `unit` has applied `index`.
     ///
     /// # Errors
@@ -1095,6 +1105,15 @@ impl Consensus for LocalLog {
 
     fn applied_index(&self, unit: UnitId) -> u64 {
         self.unit(unit).applied.load(Ordering::Acquire)
+    }
+
+    fn proposed_index(&self, unit: UnitId) -> u64 {
+        let next = lock_queue(&self.sh).next.get(&unit).copied();
+        // A unit with no proposal since the log opened: what it holds.
+        next.map_or_else(
+            || self.unit(unit).written.load(Ordering::Acquire),
+            |n| n.saturating_sub(1),
+        )
     }
 
     fn wait_applied(&self, unit: UnitId, index: u64) -> Result<()> {

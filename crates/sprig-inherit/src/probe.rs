@@ -421,6 +421,12 @@ pub async fn visible_before(
                         cols.push(c.clone());
                     }
                 }
+                // The copy's share and liveness follow, as the row put back
+                // has them (a copy row's image carries them too).
+                cols.retain(|c| {
+                    !c.eq_ignore_ascii_case("_sprig_share")
+                        && !c.eq_ignore_ascii_case("_sprig_live")
+                });
                 let src = "`__sprig_src`";
                 let share_lit = sql_value(share, None, nbe);
                 // The copy's own columns too: the view's condition reads
@@ -497,7 +503,7 @@ pub async fn visible_before(
                     }
                     // No record before: no row (and no relation read).
                     None => format!(
-                        "SELECT {}{copy_cols} FROM DUAL WHERE FALSE",
+                        "SELECT {}{copy_cols} WHERE FALSE",
                         columns
                             .iter()
                             .map(|c| format!("NULL AS {}", q(c)))
@@ -519,11 +525,15 @@ pub async fn visible_before(
     let view = vs.view(&chain);
     let filtered =
         crate::rewrite::filtered(ctx, r, &res, view, &vs.output_columns(), RowCmd::Select).await?;
-    let rows = r
-        .query(&format!(
-            "SELECT COUNT(*) FROM ({filtered}) AS `__sprig_pb`"
-        ))
-        .await?;
+    let sql = format!("SELECT COUNT(*) FROM ({filtered}) AS `__sprig_pb`");
+    let rows = match r.query(&sql).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            // The statement carries the record's values: debug level only.
+            tracing::debug!(table = %p.table, %sql, error = %e, "a visibility probe's statement failed");
+            return Err(e);
+        }
+    };
     Ok(Some(
         rows.rows
             .first()

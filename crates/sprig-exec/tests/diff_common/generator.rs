@@ -258,7 +258,7 @@ impl<'a> Generator<'a> {
         }
         match self.rng.below(100) {
             0..=74 => self.str_lit(),
-            75..=84 => Expr::Collate(b(self.str_lit()), self.coll),
+            75..=84 => Expr::Collate(b(self.str_lit()), self.coll, false),
             85..=89 => Expr::Cast(b(self.str_lit()), CastTarget::Binary(None)),
             90..=94 => Expr::Cast(b(self.num_leaf()), CastTarget::Char(None)),
             _ => Expr::Null,
@@ -360,7 +360,7 @@ impl<'a> Generator<'a> {
                 if self.plain > 0 {
                     inner
                 } else {
-                    Expr::Collate(b(inner), self.coll)
+                    Expr::Collate(b(inner), self.coll, false)
                 }
             }
         }
@@ -1304,6 +1304,7 @@ impl<'a> Generator<'a> {
                     Collation::Latin1GeneralCi,
                     Collation::Latin1SwedishCi,
                 ]),
+                false,
             ),
             6 | 7 => lit(self),
             _ => self.str_arg(depth),

@@ -145,6 +145,30 @@ pub(crate) fn default_collation(cs: &str) -> &'static str {
         .map_or("binary", |(_, c)| *c)
 }
 
+/// A character set's default collation on a port: MySQL 8.4's on the
+/// MySQL port (`utf8mb4_0900_ai_ci`, `utf8mb3_general_ci`), MariaDB
+/// 11.8's otherwise.
+pub(crate) fn port_collation(cs: &str, mysql: bool) -> &'static str {
+    match (mysql, cs) {
+        (true, "utf8mb4") => "utf8mb4_0900_ai_ci",
+        (true, "utf8mb3") => "utf8mb3_general_ci",
+        _ => default_collation(cs),
+    }
+}
+
+/// A database's default character set and collation as a port reads it.
+/// A database records MariaDB's default collation of its character set
+/// when it was created without one; on the MySQL port that stands for
+/// MySQL's default of the same character set, so tables created there
+/// get MySQL's collation.
+pub(crate) fn port_db_cs(db: &(String, String), mysql: bool) -> (String, String) {
+    if mysql && db.1.eq_ignore_ascii_case(default_collation(&db.0)) {
+        (db.0.clone(), port_collation(&db.0, true).to_owned())
+    } else {
+        db.clone()
+    }
+}
+
 /// A collation's name as printed and its character set, or `None` for a
 /// collation the engine doesn't know.
 pub(crate) fn collation(name: &str) -> Option<(String, &'static str)> {
@@ -185,7 +209,11 @@ pub(crate) struct CsSpec {
 ///
 /// # Errors
 /// 1115, 1273, 1253.
-pub(crate) fn resolve_cs(spec: &CsSpec, table: (&str, &str)) -> Result<(String, String), Fail> {
+pub(crate) fn resolve_cs(
+    spec: &CsSpec,
+    table: (&str, &str),
+    mysql: bool,
+) -> Result<(String, String), Fail> {
     let named_cs = match (&spec.charset, spec.short, spec.national) {
         (Some(c), _, _) => Some(
             charset_name(c)
@@ -212,14 +240,16 @@ pub(crate) fn resolve_cs(spec: &CsSpec, table: (&str, &str)) -> Result<(String, 
             }
             Ok((cs.to_owned(), co))
         }
-        (Some(cs), None) => Ok((cs.to_owned(), bin_or_default(cs, spec.binary))),
+        (Some(cs), None) => Ok((cs.to_owned(), bin_or_default(cs, spec.binary, mysql))),
         (None, Some((co, ccs))) => Ok((ccs.to_owned(), co)),
-        (None, None) if spec.binary => Ok((table.0.to_owned(), bin_or_default(table.0, true))),
+        (None, None) if spec.binary => {
+            Ok((table.0.to_owned(), bin_or_default(table.0, true, mysql)))
+        }
         (None, None) => Ok((table.0.to_owned(), table.1.to_owned())),
     }
 }
 
-fn bin_or_default(cs: &str, binary: bool) -> String {
+fn bin_or_default(cs: &str, binary: bool, mysql: bool) -> String {
     if binary {
         if cs == "binary" {
             "binary".into()
@@ -227,7 +257,7 @@ fn bin_or_default(cs: &str, binary: bool) -> String {
             format!("{cs}_bin")
         }
     } else {
-        default_collation(cs).to_owned()
+        port_collation(cs, mysql).to_owned()
     }
 }
 

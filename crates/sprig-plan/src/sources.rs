@@ -22,7 +22,10 @@ pub(crate) fn table_types(table: &TableDef) -> Vec<ExprType> {
     table
         .columns
         .iter()
-        .map(|c| ExprType::of_column(&c.ty, c.nullable))
+        .map(|c| ExprType {
+            mb3: c.mb3,
+            ..ExprType::of_column(&c.ty, c.nullable)
+        })
         .collect()
 }
 

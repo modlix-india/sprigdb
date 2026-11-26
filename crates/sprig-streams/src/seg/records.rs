@@ -185,6 +185,26 @@ pub async fn move_offset(
     Ok(true)
 }
 
+/// A group's committed offset of `(stream, partition)` as `txn` reads it
+/// now (the newest committed value or its own write, 0 when there is
+/// none), without a lock.
+///
+/// # Errors
+/// The engine failed or the record is corrupt.
+pub fn read_offset(
+    txn: &mut Txn,
+    tenant: u64,
+    group: &str,
+    stream: u64,
+    partition: i32,
+) -> Result<i64> {
+    let k = offset_key(tenant, group, 0, stream, partition);
+    Ok(match txn.read_current(&k)? {
+        Some(b) => parse::<OffsetRow>(&b)?.offset,
+        None => 0,
+    })
+}
+
 /// The engine records of streams.
 #[derive(Clone)]
 pub struct StreamRecords {

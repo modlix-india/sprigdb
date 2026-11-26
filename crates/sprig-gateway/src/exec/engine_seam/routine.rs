@@ -38,6 +38,7 @@ use crate::pipeline::{EndOfRows, ExecCtx, ResultSink, RowFormat, RowValues, Wire
 use crate::tenant::session::LocalWarning;
 
 mod event;
+mod schedule;
 mod trigger;
 mod validation;
 
@@ -982,6 +983,20 @@ impl PassSession {
             last_id: sink.last_id,
             warnings,
         })
+    }
+
+    /// Runs `sql` as a statement of the client's, its answer kept: the
+    /// affected rows, the conditions and the result's columns, or the
+    /// error (`LOAD DATA`'s batches).
+    pub(super) async fn run_kept(
+        &mut self,
+        cx: &mut ExecCtx<'_>,
+        sql: &str,
+    ) -> Result<(u64, Vec<LocalWarning>, Vec<ColumnDef>)> {
+        match Box::pin(self.sp_statement(cx, sql, None, true)).await {
+            Ok(r) => Ok((r.affected, r.warnings, r.columns)),
+            Err(e) => Err(e.to_error()),
+        }
     }
 
     /// The value of an expression of a body.
