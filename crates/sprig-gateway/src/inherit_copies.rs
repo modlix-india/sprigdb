@@ -89,9 +89,9 @@ pub(crate) struct Counts {
 
 /// The family's tenants and catalogs for [`load_family`]: the tenants
 /// holding the table, read from the cache now.
-struct Env {
-    svc: Arc<TenantServices>,
-    tenants: Vec<TenantId>,
+pub(crate) struct Env {
+    pub(crate) svc: Arc<TenantServices>,
+    pub(crate) tenants: Vec<TenantId>,
 }
 
 #[async_trait::async_trait]

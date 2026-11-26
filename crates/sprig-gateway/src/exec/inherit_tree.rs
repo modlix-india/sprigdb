@@ -273,8 +273,24 @@ fn strip_lock(sql: &str) -> (&str, Option<crate::engine::plan::RowLock>) {
 /// What exists only on MariaDB answers nothing: share views and their
 /// definer's grants (`DROP VIEW`, `REVOKE`), copies (`DROP TABLE`, their
 /// `information_schema` lookups) and the catalog schema's tables.
-#[allow(clippy::too_many_lines)] // the statement kinds, in order
 async fn engine_ctl(cat: &TenantCatalog, sql: &str, lctn: bool) -> Result<RawRows> {
+    // Boxed: the statement's future is large, and many callers await it.
+    Box::pin(engine_stmt(cat, sql, lctn, None))
+        .await
+        .map(|(rows, _)| rows)
+}
+
+/// [`engine_ctl`]'s statement, run as one statement of `txn` when given
+/// (else in a transaction of its own); also `INSERT ... SELECT` (the query
+/// through the planner, then the insert of its rows). Returns the rows (as
+/// text) and the rows a write affected.
+#[allow(clippy::too_many_lines)] // the statement kinds, in order
+async fn engine_stmt(
+    cat: &TenantCatalog,
+    sql: &str,
+    lctn: bool,
+    mut txn: Option<&mut crate::engine::session::SessionTxn>,
+) -> Result<(RawRows, u64)> {
     use sprig_engine::txn::TxnOptions;
     use sqlparser::ast::Statement;
 
@@ -286,10 +302,12 @@ async fn engine_ctl(cat: &TenantCatalog, sql: &str, lctn: bool) -> Result<RawRow
     enum Bound {
         Read(Box<general::General>),
         Write(Box<crate::engine::plan::Plan>),
+        InsertSelect(Box<(general::General, sqlparser::ast::Insert)>),
+        Multi(Box<crate::engine::multiwrite::MultiWrite>),
     }
 
-    let s = sql.trim();
-    let lower = s.to_ascii_lowercase();
+    let trimmed = sql.trim();
+    let lower = trimmed.to_ascii_lowercase();
     let mut words = lower.split_whitespace();
     let head = (words.next().unwrap_or(""), words.next().unwrap_or(""));
     if matches!(
@@ -298,9 +316,9 @@ async fn engine_ctl(cat: &TenantCatalog, sql: &str, lctn: bool) -> Result<RawRow
     ) || lower.contains("information_schema.")
         || lower.contains("_sprig`.")
     {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), 0));
     }
-    let (text, lock) = strip_lock(s);
+    let (text, lock) = strip_lock(trimmed);
     // A layer row's state is an `ENUM`, which the planner reads as its
     // member's text only as a plain result column.
     let text = text.replace("CAST(`_sprig_state` AS CHAR)", "`_sprig_state`");
@@ -318,7 +336,7 @@ async fn engine_ctl(cat: &TenantCatalog, sql: &str, lctn: bool) -> Result<RawRow
     let eng = crate::engine::engine()?;
     let Some(ecat) = crate::engine::catalog::of(cat) else {
         // No engine database at all: nothing to read or change.
-        return Ok(Vec::new());
+        return Ok((Vec::new(), 0));
     };
     // Bound before any wait: the names aren't `Send`.
     let bound = {
@@ -333,18 +351,44 @@ async fn engine_ctl(cat: &TenantCatalog, sql: &str, lctn: bool) -> Result<RawRow
             current: None,
             backslash: true,
         };
-        match &stmt {
+        match stmt {
             Statement::Query(_) => {
                 general::bind(&cx, &stmt, Some(&text), lock)?.map(|g| Bound::Read(Box::new(g)))
             }
+            Statement::Insert(ins) if crate::engine::plan::insert_select(&ins) => {
+                let Some(src) = ins.source.clone() else {
+                    return Err(crate::engine::not_on_engine("INSERT ... SELECT"));
+                };
+                let g = general::bind_view(&cx, &Statement::Query(src), None)?
+                    .ok_or_else(|| crate::engine::not_on_engine("INSERT ... SELECT"))?;
+                Some(Bound::InsertSelect(Box::new((g, ins))))
+            }
             Statement::Update { .. } | Statement::Delete(_) | Statement::Insert(_) => {
-                Some(Bound::Write(Box::new(
-                    crate::engine::plan::bind(&cx, &stmt)?.ok_or_else(|| {
-                        crate::engine::not_on_engine(
+                match crate::engine::plan::bind(&cx, &stmt) {
+                    Ok(Some(p)) => Some(Bound::Write(Box::new(p))),
+                    Ok(None) => {
+                        return Err(crate::engine::not_on_engine(
                             "an inheritance write outside the engine's tables",
-                        )
-                    })?,
-                )))
+                        ));
+                    }
+                    // An UPDATE or DELETE the single-table writer doesn't
+                    // take (an expression such as `_sprig_ovr & 6`): the
+                    // planner's write, as a session's statement would run.
+                    Err(e)
+                        if !matches!(stmt, Statement::Insert(_))
+                            && e.code() == Some(SprigCode::NotOnEngine) =>
+                    {
+                        let w = crate::engine::multiwrite::bind(
+                            &cx,
+                            &text,
+                            sprig_sql::lex::LexOptions::mariadb(),
+                            false,
+                        )?
+                        .ok_or(e)?;
+                        Some(Bound::Multi(Box::new(w)))
+                    }
+                    Err(e) => return Err(e),
+                }
             }
             _ => {
                 return Err(crate::engine::not_on_engine(
@@ -353,51 +397,272 @@ async fn engine_ctl(cat: &TenantCatalog, sql: &str, lctn: bool) -> Result<RawRow
             }
         }
     };
+    let seed = Seed::from_vars(false, &Env::STRICT, |_| None);
+    let args = RunArgs {
+        tenant: cat.tenant.0,
+        params: &[],
+        seed: &seed,
+        deadline: None,
+        stop: None,
+    };
     match bound {
-        None => Ok(Vec::new()),
+        None => Ok((Vec::new(), 0)),
         Some(Bound::Read(g)) => {
-            let seed = Seed::from_vars(false, &Env::STRICT, |_| None);
-            let a = RunArgs {
-                tenant: cat.tenant.0,
-                params: &[],
-                seed: &seed,
-                deadline: None,
-                stop: None,
+            let ran = match txn {
+                Some(txn) => {
+                    let r = eng.general_run_in(&g, &args, txn).await;
+                    txn.statement_done();
+                    r?
+                }
+                None => {
+                    eng.general_run(&g, &args, TxnOptions::default(), Env::STRICT)
+                        .await?
+                }
             };
-            let ran = eng
-                .general_run(&g, &a, TxnOptions::default(), Env::STRICT)
-                .await?;
             let results = Results {
                 cs: Some(ResultsCs { id: 224, mbmax: 4 }),
                 mysql: false,
             };
             let layout = general::results::layout(&g, &ran.columns, results);
-            Ok(ran
-                .rows
-                .iter()
-                .map(|r| {
-                    r.iter()
-                        .zip(&layout.shapes)
-                        .map(|(v, shape)| {
-                            general::results::text(&g, shape, v, &Env::STRICT, results)
-                                .map(|b| b.to_vec())
-                        })
-                        .collect()
-                })
-                .collect())
+            Ok((
+                ran.rows
+                    .iter()
+                    .map(|r| {
+                        r.iter()
+                            .zip(&layout.shapes)
+                            .map(|(v, shape)| {
+                                general::results::text(&g, shape, v, &Env::STRICT, results)
+                                    .map(|b| b.to_vec())
+                            })
+                            .collect()
+                    })
+                    .collect(),
+                0,
+            ))
         }
-        Some(Bound::Write(plan)) => {
-            eng.run_env(
-                cat.tenant.0,
-                &plan,
+        Some(Bound::InsertSelect(bound)) => {
+            let (g, ins) = *bound;
+            let ran = match txn.as_deref_mut() {
+                Some(txn) => {
+                    let r = eng.general_run_in(&g, &args, txn).await;
+                    txn.statement_done();
+                    r?
+                }
+                None => {
+                    eng.general_run(&g, &args, TxnOptions::default(), Env::STRICT)
+                        .await?
+                }
+            };
+            let plan = {
+                let names = CatalogNames {
+                    cat,
+                    eng: ecat,
+                    lower_case: lctn,
+                };
+                let cx = BindCtx {
+                    tenant: cat.tenant,
+                    names: &names,
+                    current: None,
+                    backslash: true,
+                };
+                crate::engine::plan::bind_insert_rows(&cx, &ins, &ran.rows, ran.columns.len())?
+                    .ok_or_else(|| crate::engine::not_on_engine("INSERT ... SELECT"))?
+            };
+            Ok((
+                Vec::new(),
+                engine_write(eng, cat.tenant.0, &plan, txn).await?,
+            ))
+        }
+        Some(Bound::Write(plan)) => Ok((
+            Vec::new(),
+            engine_write(eng, cat.tenant.0, &plan, txn).await?,
+        )),
+        Some(Bound::Multi(w)) => {
+            // Without `txn`, a transaction of its own.
+            let solo = txn.is_none();
+            let mut own = crate::engine::session::SessionTxn::default();
+            if solo {
+                own.begin(
+                    eng,
+                    TxnOptions::default(),
+                    false,
+                    crate::engine::session::Start::default(),
+                )?;
+                if let Some(tx) = own.open_tx() {
+                    tx.set_env(Env::STRICT);
+                }
+            }
+            let t = txn.unwrap_or(&mut own);
+            let r = eng.multi_write_in(&w, &args, t, false).await;
+            t.statement_done();
+            let o = r.inspect_err(|_| {
+                if solo {
+                    own.rollback();
+                }
+            })?;
+            if solo {
+                own.commit().await?;
+            }
+            Ok((Vec::new(), o.affected))
+        }
+    }
+}
+
+/// Runs write `plan` of `tenant` as one statement of `txn`, or in a
+/// transaction of its own; the rows it affected.
+async fn engine_write(
+    eng: &crate::engine::Engine,
+    tenant: u64,
+    plan: &crate::engine::plan::Plan,
+    txn: Option<&mut crate::engine::session::SessionTxn>,
+) -> Result<u64> {
+    use crate::engine::assign::Env;
+    let Some(txn) = txn else {
+        return Ok(eng
+            .run_env(
+                tenant,
+                plan,
                 &[],
                 false,
-                TxnOptions::default(),
+                sprig_engine::txn::TxnOptions::default(),
                 Env::STRICT,
             )
-            .await?;
-            Ok(Vec::new())
+            .await?
+            .affected);
+    };
+    let tx = txn
+        .statement()
+        .ok_or_else(|| SprigError::internal("engine: no open transaction"))?;
+    let o = eng.run_in(tenant, plan, &[], false, tx).await;
+    txn.statement_done();
+    Ok(o?.affected)
+}
+
+/// Statements of one engine transaction of tenant `cat`, as the system (no
+/// privileges checked; physical names, as [`engine_ctl`]), at READ
+/// COMMITTED as a plan's own transaction: the copy task's hierarchy pass
+/// writes a child tenant's paths in one transaction, under the tenant's
+/// hierarchy lock ([`engine_hier_lock`], taken by the caller). Dropped
+/// without [`EngineTx::commit`], its writes are undone.
+pub(crate) struct EngineTx {
+    cat: Arc<TenantCatalog>,
+    lctn: bool,
+    txn: crate::engine::session::SessionTxn,
+}
+
+impl EngineTx {
+    /// Starts the transaction; its row locks wait at most `wait`.
+    ///
+    /// # Errors
+    /// The engine's (39070 when it isn't available).
+    pub(crate) fn begin(
+        cat: Arc<TenantCatalog>,
+        lctn: bool,
+        wait: std::time::Duration,
+    ) -> Result<Self> {
+        use sprig_engine::txn::{Isolation, TxnOptions};
+        let eng = crate::engine::engine()?;
+        let mut txn = crate::engine::session::SessionTxn::default();
+        txn.begin(
+            eng,
+            TxnOptions {
+                isolation: Isolation::ReadCommitted,
+                lock_wait_timeout: Some(wait),
+                ..TxnOptions::default()
+            },
+            false,
+            crate::engine::session::Start::default(),
+        )?;
+        if let Some(tx) = txn.open_tx() {
+            tx.set_env(crate::engine::assign::Env::STRICT);
         }
+        Ok(Self { cat, lctn, txn })
+    }
+
+    /// Commits the transaction.
+    ///
+    /// # Errors
+    /// The log's: the transaction is gone either way.
+    pub(crate) async fn commit(mut self) -> Result<()> {
+        self.txn.commit().await.map(|_| ())
+    }
+
+    /// Undoes the transaction's writes and releases its locks.
+    pub(crate) fn rollback(mut self) {
+        self.txn.rollback();
+    }
+
+    async fn run(&mut self, sql: &str) -> Result<(RawRows, u64)> {
+        if !self.txn.is_open() {
+            return Err(SprigError::internal(
+                "engine: the hierarchy pass's transaction ended",
+            ));
+        }
+        Box::pin(engine_stmt(&self.cat, sql, self.lctn, Some(&mut self.txn))).await
+    }
+}
+
+fn no_session() -> SprigError {
+    SprigError::internal("the hierarchy pass has no session")
+}
+
+#[async_trait::async_trait]
+impl sprig_types::Runner for EngineTx {
+    async fn query(&mut self, sql: &str) -> Result<sprig_types::Rows> {
+        // No column types: keys and parents come back as quoted literals,
+        // as the copy task's keys are written.
+        let (rows, _) = self.run(sql).await?;
+        Ok(sprig_types::Rows {
+            columns: Vec::new(),
+            rows,
+        })
+    }
+
+    async fn exec(&mut self, sql: &str) -> Result<sprig_types::Done> {
+        let (_, affected_rows) = self.run(sql).await?;
+        Ok(sprig_types::Done {
+            affected_rows,
+            ..sprig_types::Done::default()
+        })
+    }
+
+    fn in_transaction(&self) -> bool {
+        true
+    }
+
+    fn found_rows(&self) -> bool {
+        false
+    }
+
+    async fn object_id(
+        &mut self,
+        _db: Option<&str>,
+        _table: &str,
+    ) -> Result<Option<(sprig_common::ids::DbId, ObjectId)>> {
+        Err(no_session())
+    }
+
+    async fn commit_types(&mut self, _change: &TypesChange) -> Result<()> {
+        Err(no_session())
+    }
+}
+
+#[async_trait::async_trait]
+impl sprig_inherit::Runner for EngineTx {
+    async fn commit(&mut self, _change: &InheritChange) -> Result<()> {
+        Err(no_session())
+    }
+
+    async fn ctl(&mut self, _sql: &str) -> Result<()> {
+        Err(no_session())
+    }
+
+    async fn child_tenant(&mut self, _name: &str) -> Result<Option<TenantId>> {
+        Ok(None)
+    }
+
+    fn user_id(&self, _name: &str) -> Option<u32> {
+        None
     }
 }
 

@@ -255,9 +255,11 @@ impl InheritStore {
     ) -> Result<Vec<String>> {
         let mut out = Vec::new();
         for (pk, row) in SHARES.scan::<ShareRow>(rec, &Pk::new()).await? {
-            let Some((object, role)) = share_key(&pk) else {
+            // A share row is keyed by its share id; the object is a field.
+            let Some((_, role)) = share_key(&pk) else {
                 continue;
             };
+            let object = row.object_id;
             if role != GRANTED || row.state != "active" || !objects.contains(&object) {
                 continue;
             }

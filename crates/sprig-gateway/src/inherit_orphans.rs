@@ -1,6 +1,7 @@
-//! Orphans across tenants and materialized copies on engine databases,
-//! kept from the node's change log (what the copy worker's orphan and copy
-//! passes do on MariaDB databases).
+//! Orphans across tenants, materialized copies and record hierarchies
+//! across tenants on engine databases, kept from the node's change log
+//! (what the copy worker's orphan, copy and hierarchy passes do on MariaDB
+//! databases).
 //!
 //! ```text
 //! spawn(services): one task per process
@@ -28,6 +29,10 @@
 //!     sources for the gathered keys, or all of them; the states of copies
 //!     whose edge is gone (a share dropped, or made read-through) removed
 //!     with their rows
+//!     the hierarchy pass (crate::inherit_hier) when the table carries a
+//!     record hierarchy: each child tenant's paths of the gathered keys
+//!     (or all of them) brought up to date, parents first; a busy
+//!     hierarchy lock keeps the keys for the next look
 //! ```
 //!
 //! Both passes recompute from the current state, so a change seen twice is
@@ -379,10 +384,10 @@ async fn look(
     if n > 0 {
         tracing::info!(root = %root, db = %f.1, table = %f.2, orphaned = n, "overrides of records gone above became orphans");
     }
+    let lits: Option<Vec<KeyLit>> = keys
+        .as_ref()
+        .map(|ks| ks.iter().cloned().map(KeyLit).collect());
     if copies {
-        let lits: Option<Vec<KeyLit>> = keys
-            .as_ref()
-            .map(|ks| ks.iter().cloned().map(KeyLit).collect());
         let c = crate::inherit_copies::pass(
             svc,
             root,
@@ -401,10 +406,29 @@ async fn look(
             k.copy_states = materialized_now || c.states > 0;
         }
     }
+    let h = crate::inherit_hier::pass(
+        svc,
+        root,
+        tenants.iter().map(|t| t.tenant).collect(),
+        &f.1,
+        &f.2,
+        lctn,
+        lits.as_deref(),
+    )
+    .await?;
+    if h.tenants > 0 || h.conflicts > 0 {
+        tracing::debug!(root = %root, db = %f.1, table = %f.2, tenants = h.tenants, rows = h.rows, conflicts = h.conflicts, skipped = h.skipped, "hierarchy paths kept across tenants");
+    }
     if let Some(k) = known.get_mut(f) {
-        k.dirty = false;
-        k.full = false;
-        k.keys.clear();
+        if h.retry {
+            // A tenant's hierarchy lock was busy: the same keys (or the
+            // full pass) next look.
+            k.dirty = true;
+        } else {
+            k.dirty = false;
+            k.full = false;
+            k.keys.clear();
+        }
     }
     // Everything read before the passes is now in the copies.
     crate::inherit_lag::publish(f, &objects, &places);

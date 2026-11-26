@@ -839,12 +839,7 @@ pub async fn reconcile_tenant(
     r.exec("BEGIN").await?;
     let result = async {
         r.query(&lock).await?;
-        let root = crate::model::ROOT_SPACE;
-        let mut n = reconcile(ctx, r, res, h, root, keys, false).await?.1;
-        for x in below(ctx, &res.obj, root)? {
-            n += reconcile(ctx, r, res, h, x, keys, false).await?.1;
-        }
-        Ok(n)
+        reconcile_levels(ctx, r, res, h, Some(keys)).await
     }
     .await;
     match result {
@@ -857,6 +852,63 @@ pub async fn reconcile_tenant(
             Err(e)
         }
     }
+}
+
+/// The body of [`reconcile_tenant`], for a caller that holds the tenant's
+/// hierarchy lock and runs `r` in a transaction of its own (the engine's
+/// copy task): the root space's paths of `keys`, then every space below it
+/// that inherits through it. `None`: every row, walked from each space's
+/// own top rows (a pass after changes were missed, such as a restart).
+/// Returns the rows written.
+///
+/// # Errors
+/// [`reconcile`]'s; the backend's.
+pub async fn reconcile_levels(
+    ctx: &Ctx<'_>,
+    r: &mut dyn Runner,
+    res: &Resolved,
+    h: &HierarchyDef,
+    keys: Option<&[String]>,
+) -> Result<u64> {
+    let root = crate::model::ROOT_SPACE;
+    let mut spaces = vec![root];
+    spaces.extend(below(ctx, &res.obj, root)?);
+    let mut n = 0;
+    for x in spaces {
+        let roots = match keys {
+            Some(k) => k.to_vec(),
+            None => tops(ctx, r, res, h, x).await?,
+        };
+        n += reconcile(ctx, r, res, h, x, &roots, false).await?.1;
+    }
+    Ok(n)
+}
+
+/// The keys of space `x`'s top rows (no parent), as literals.
+async fn tops(
+    ctx: &Ctx<'_>,
+    r: &mut dyn Runner,
+    res: &Resolved,
+    h: &HierarchyDef,
+    x: SpaceId,
+) -> Result<Vec<String>> {
+    let nbe = ctx.lex.no_backslash_escapes;
+    let sv = SpaceView {
+        res,
+        h,
+        x,
+        chain: ctx.chain(&res.obj, x, &res.prefix)?,
+        nbe,
+    };
+    let rows = r
+        .query(&format!(
+            "{} FROM ({}) AS `__sprig_x` WHERE {} IS NULL",
+            sv.select(),
+            sv.view(None),
+            q(&h.parent)
+        ))
+        .await?;
+    Ok(nodes(&rows, nbe).into_iter().map(|n| n.key).collect())
 }
 
 /// Before `SPRIG RESET` of a hierarchical object in the session's space

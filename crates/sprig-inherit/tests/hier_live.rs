@@ -18,6 +18,10 @@
 //!   row's path follows.
 //! - Both orders of `ADD HIERARCHY` and `SPRIG INHERITABLE`; `DROP
 //!   HIERARCHY`; the refusals that remain (39891).
+//! - Across tenants `a > b > (b1, c)` (`SPRIG_TEST_HL_TENANTS=a,b,c`): the
+//!   same, with child tenants' paths following asynchronously; with
+//!   `SPRIG_TEST_HL_RESTART` (a command that kills the gateway with SIGKILL
+//!   and starts it again), the gateway killed while they are followed.
 //!
 //! ```sh
 //! export SPRIG_TEST_HL_GATEWAY=127.0.0.1:33306,127.0.0.1:33307   # mysql, mariadb persona
@@ -1117,6 +1121,13 @@ impl Multi {
         x
     }
 
+    /// New sessions at every level (after the gateway was started again).
+    async fn reconnect(&mut self) {
+        for lv in 0..LEVELS {
+            self.c[lv] = self.session(lv).await;
+        }
+    }
+
     /// `tb` with a hierarchy, inheritable, shared `a > b > (b1, c)`.
     async fn table(&mut self, tb: &str) {
         let a = &mut self.c[0];
@@ -1686,6 +1697,87 @@ async fn tenants_max_move(m: &mut Multi) {
     settle(m, t, &mut rng, 4, "after the bound was reset").await;
 }
 
+/// `SPRIG_TEST_HL_RESTART`: a shell command that kills the gateway with
+/// SIGKILL and starts it again, returning once it is ready.
+const RESTART: &str = "SPRIG_TEST_HL_RESTART";
+
+/// The gateway killed while child tenants' paths are being brought up to
+/// date: `b` keeps its own structure (4 under 3, with a subtree of 400
+/// rows), and each round `a` moves 3, so every path of that subtree in `b`
+/// (and below) changes; the gateway is killed 0 ms to 1 s after `a`'s
+/// commit, started again, and every level must settle to its model.
+async fn tenants_restart(m: &mut Multi, cmd: &str, rounds: usize) {
+    let t = "tk";
+    m.table(t).await;
+    let mut vals = vec![
+        "(1, NULL)".to_owned(),
+        "(2, 1)".to_owned(),
+        "(3, 1)".to_owned(),
+        "(4, 2)".to_owned(),
+    ];
+    for i in 5..=404i64 {
+        vals.push(format!("({i}, {})", (i - 5) / 3 + 4));
+    }
+    exec(
+        &mut m.c[0],
+        &format!("INSERT INTO {t} (id, parent_id) VALUES {}", vals.join(", ")),
+    )
+    .await;
+    let mut rng = Rng(77);
+    settle(m, t, &mut rng, 4, "restart seed").await;
+    exec(
+        &mut m.c[1],
+        &format!("UPDATE {t} SET parent_id = 3 WHERE id = 4"),
+    )
+    .await;
+    settle(m, t, &mut rng, 4, "b moves 4 under 3").await;
+    let delays = [0u64, 50, 150, 300, 600, 1000];
+    for round in 0..rounds {
+        let p = if round % 2 == 0 { 2 } else { 1 };
+        exec(
+            &mut m.c[0],
+            &format!("UPDATE {t} SET parent_id = {p} WHERE id = 3"),
+        )
+        .await;
+        let delay = delays[round % delays.len()];
+        tokio::time::sleep(Duration::from_millis(delay)).await;
+        let t0 = Instant::now();
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(cmd)
+            .output()
+            .unwrap_or_else(|e| panic!("{RESTART}: {e}"));
+        assert!(
+            out.status.success(),
+            "{RESTART} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        eprintln!(
+            "tenants: round {round}: a moved 3 under {p}, gateway killed {delay} ms later, \
+             back in {:?}",
+            t0.elapsed()
+        );
+        m.reconnect().await;
+        let d = settle(
+            m,
+            t,
+            &mut rng,
+            4,
+            &format!("round {round} after the restart"),
+        )
+        .await;
+        let want = if p == 2 { "/1/2/3/4/" } else { "/1/3/4/" };
+        for lv in 1..LEVELS {
+            assert_eq!(
+                path_at(&mut m.c[lv], t, 4).await.as_deref(),
+                Some(want),
+                "round {round}, level {lv}"
+            );
+        }
+        eprintln!("tenants: round {round}: settled {d:?} after the restart");
+    }
+}
+
 async fn run_tenants(addr: &str, tag: &str) {
     let Some(t) = tenant_line("hierarchies_across_tenants") else {
         return;
@@ -1733,4 +1825,50 @@ async fn hierarchies_across_tenants_mariadb() {
     };
     let tag = if materialized() { "mam" } else { "mar" };
     run_tenants(addr, tag).await;
+}
+
+/// [`tenants_restart`] (`SPRIG_TEST_HL_RESTART`; `SPRIG_TEST_HL_ROUNDS`
+/// rounds, 6 by default).
+async fn run_restart(addr: &str, tag: &str) {
+    let Some(t) = tenant_line("hierarchies_across_tenants_restart") else {
+        return;
+    };
+    let cmd = std::env::var(RESTART).ok().filter(|v| !v.trim().is_empty());
+    let Some(cmd) = cmd else {
+        assert!(
+            std::env::var("SPRIG_TEST_STRICT").ok().as_deref() != Some("1"),
+            "hierarchies_across_tenants_restart: {RESTART} is not set"
+        );
+        eprintln!("hierarchies_across_tenants_restart: skipped, set {RESTART}");
+        return;
+    };
+    let rounds: usize = std::env::var("SPRIG_TEST_HL_ROUNDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(6);
+    let mut m = Multi::open(addr, t, tag).await;
+    let start = Instant::now();
+    tenants_restart(&mut m, &cmd, rounds).await;
+    eprintln!("[{tag}] tenants: {rounds} restarts: {:?}", start.elapsed());
+    m.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hierarchies_across_tenants_restart_mysql() {
+    let Some(eps) = endpoints("hierarchies_across_tenants_restart_mysql") else {
+        return;
+    };
+    run_restart(&eps[0], "myk").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hierarchies_across_tenants_restart_mariadb() {
+    let Some(eps) = endpoints("hierarchies_across_tenants_restart_mariadb") else {
+        return;
+    };
+    let Some(addr) = eps.get(1) else {
+        eprintln!("hierarchies_across_tenants_restart_mariadb: no second endpoint");
+        return;
+    };
+    run_restart(addr, "mak").await;
 }

@@ -113,6 +113,7 @@ pub mod triggers;
 // Orphans across tenants and materialized copies on engine databases,
 // from the change log.
 pub(crate) mod inherit_copies;
+pub(crate) mod inherit_hier;
 pub(crate) mod inherit_lag;
 pub(crate) mod inherit_orphans;
 pub mod workload;

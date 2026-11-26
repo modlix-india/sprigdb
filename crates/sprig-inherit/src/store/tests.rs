@@ -247,3 +247,43 @@ async fn statements_follow_the_sql_rules() {
     let st = load(&m, &ObjectNames::new()).await;
     assert_eq!(st.objects().count(), 0);
 }
+
+#[tokio::test]
+async fn granted_shares_are_found_by_their_object() {
+    let m = MemRecords::new();
+    apply(
+        &m,
+        &InheritChange {
+            root_name: Some("root".into()),
+            upsert_objects: vec![obj(2), obj(10)],
+            upsert_shares: vec![share(0, "s10", 10, ShareTarget::AllChildren)],
+            ..InheritChange::default()
+        },
+        1,
+    )
+    .await
+    .unwrap();
+    let mut tx = m.begin(T).await.unwrap();
+    let names: ObjectNames = [2, 10]
+        .into_iter()
+        .map(|i| (ObjectId(i), (DbId(1), format!("t{i}"))))
+        .collect();
+    let id = InheritStore::load(&mut *tx, &names)
+        .await
+        .unwrap()
+        .shares()
+        .map(|s| s.id)
+        .next()
+        .unwrap();
+    // An object whose id is the share's id holds no share.
+    let other = InheritStore::granted_share_names(&mut *tx, &[id], false)
+        .await
+        .unwrap();
+    let mine = InheritStore::granted_share_names(&mut *tx, &[10], true)
+        .await
+        .unwrap();
+    tx.rollback().await.unwrap();
+    assert_ne!(id, 10);
+    assert!(other.is_empty(), "{other:?}");
+    assert_eq!(mine, vec!["s10".to_owned()]);
+}
