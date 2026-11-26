@@ -68,6 +68,7 @@ pub(crate) mod row;
 pub(crate) mod sequence;
 pub(crate) mod session;
 pub(crate) mod show;
+pub(crate) mod streamtable;
 pub(crate) mod store;
 pub(crate) mod table;
 pub(crate) mod temp;

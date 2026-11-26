@@ -79,6 +79,8 @@ pub(super) struct Bound {
     lock: Option<(LockMode, Wait)>,
     /// A MongoDB collection read as a table (`coll`).
     coll: Option<coll::CollBound>,
+    /// A stream read as a table: its storage (`engine::streamtable`).
+    stream: Option<Arc<dyn Storage>>,
 }
 
 impl Bound {
@@ -91,6 +93,7 @@ impl Bound {
             all: t.read.iter().all(|r| *r),
             read: t.read.clone(),
             coll: t.coll.clone().map(coll::CollBound::new),
+            stream: t.stream.as_ref().map(|s| Arc::clone(&s.storage)),
         }
     }
 
@@ -104,6 +107,15 @@ impl Bound {
             }
         }
     }
+}
+
+/// A locking read of a stream: refused (a stream's records aren't locked).
+fn stream_locked() -> SqlError {
+    SqlError::new(
+        1235,
+        "42000",
+        "This version of SprigDB doesn't yet support 'a locking read of a stream'",
+    )
 }
 
 /// A keyspace for planning without reading (a `PREPARE`'s description).
@@ -487,16 +499,22 @@ fn integer_span(range: &KeyRange) -> Option<u64> {
 
 impl Storage for TxStorage {
     fn table_rows(&self, table: &PlanTable) -> u64 {
-        self.inner.bound(table).map_or(0, |b| match &b.coll {
-            Some(c) => coll::table_rows(&self.inner, b, c),
-            None => self.inner.table_rows(b),
-        })
+        self.inner
+            .bound(table)
+            .map_or(0, |b| match (&b.coll, &b.stream) {
+                (_, Some(s)) => s.table_rows(table),
+                (Some(c), _) => coll::table_rows(&self.inner, b, c),
+                _ => self.inner.table_rows(b),
+            })
     }
 
     fn rows_in_range(&self, table: &PlanTable, key: KeyId, range: &KeyRange) -> u64 {
         let Ok(b) = self.inner.bound(table) else {
             return 0;
         };
+        if let Some(s) = &b.stream {
+            return s.rows_in_range(table, key, range);
+        }
         if let Some(c) = &b.coll {
             return coll::rows_in_range(&self.inner, b, c, key, range);
         }
@@ -523,6 +541,9 @@ impl Storage for TxStorage {
 
     fn rows_per_key(&self, table: &PlanTable, key: KeyId, parts: usize) -> Option<f64> {
         let b = self.inner.bound(table).ok()?;
+        if let Some(s) = &b.stream {
+            return s.rows_per_key(table, key, parts);
+        }
         if b.coll.is_some() {
             return coll::rows_per_key(key);
         }
@@ -603,6 +624,12 @@ impl Storage for TxStorage {
         counters: &Counters,
     ) -> Result<Option<Row>, SqlError> {
         let b = self.inner.bound(table)?;
+        if let Some(s) = &b.stream {
+            if b.lock.is_some() {
+                return Err(stream_locked());
+            }
+            return s.get(table, key, counters);
+        }
         if b.coll.is_some() {
             return Err(internal("a MongoDB collection has no primary key"));
         }
@@ -647,6 +674,12 @@ impl Storage for TxStorage {
     ) -> Result<Box<dyn RowCursor>, SqlError> {
         let at = self.inner.bound_at(table)?;
         let b = &self.inner.tables[at];
+        if let Some(s) = &b.stream {
+            if b.lock.is_some() {
+                return Err(stream_locked());
+            }
+            return s.scan(table, key, ranges, reverse, fetch, counters);
+        }
         if b.coll.is_some() {
             return coll::scan(&self.inner, at, key, &ranges, reverse, counters);
         }

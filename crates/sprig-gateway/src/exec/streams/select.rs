@@ -9,7 +9,9 @@
 //! SELECT ... FROM <stream> [JOIN <stream>] ...
 //!   names           every table it names is a stream of an engine
 //!                   database (a common table expression's name aside);
-//!                   a stream joined with tables: 1235
+//!                   a stream joined with tables goes to the engine's
+//!                   general path, which reads streams as tables
+//!                   (`engine::streamtable`), as a prepared statement does
 //!   privileges      SELECT on each stream (1142)
 //!   plan and run    sprig_plan over StreamCatalog / StreamStorage,
 //!                   sprig_exec for expressions; text results
@@ -145,6 +147,32 @@ fn stream_def(db: &str, name: &str) -> TableDef {
         )),
         indexes: Vec::new(),
     }
+}
+
+/// The storage of one stream read as table `db`.`name` by the engine's
+/// general path (`engine::streamtable`).
+pub(crate) fn one_stream(
+    eng: Arc<EngineStreams>,
+    tenant: u64,
+    db: &str,
+    name: &str,
+    stream_id: u64,
+    partitions: u32,
+) -> Arc<dyn Storage> {
+    let mut tables = HashMap::new();
+    tables.insert(
+        lower(db, name),
+        StreamTable {
+            def: Arc::new(stream_def(db, name)),
+            stream_id,
+            partitions,
+        },
+    );
+    Arc::new(StreamStorage {
+        eng,
+        tenant,
+        tables,
+    })
 }
 
 fn lower(db: &str, name: &str) -> (String, String) {
@@ -617,7 +645,7 @@ fn column_def(name: &str, ty: &ExprType, persona: Persona, charset: u16) -> Colu
 /// the streams by name. `Ok(None)`: it names none (it goes on as usual).
 ///
 /// # Errors
-/// 1235 for a stream joined with tables; 1142 without `SELECT` on a
+/// `None` for a stream joined with tables; 1142 without `SELECT` on a
 /// stream.
 fn streams_read(
     eng: &EngineStreams,
@@ -693,13 +721,9 @@ fn streams_read(
     if streams.is_empty() {
         return Ok(None);
     }
+    // With tables: the engine's general path reads the streams as tables.
     if tables {
-        return Err(SprigError::standard(
-            1235,
-            *b"42000",
-            "This version of SprigDB doesn't yet support 'a SELECT that reads a stream of an \
-             engine database together with tables'",
-        ));
+        return Ok(None);
     }
     Ok(Some(streams))
 }

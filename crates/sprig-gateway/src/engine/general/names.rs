@@ -79,6 +79,8 @@ pub(crate) struct TableUse {
     pub tenant: Option<u64>,
     /// A MongoDB collection read as a table (`engine::collection`).
     pub coll: Option<Arc<crate::engine::collection::CollTable>>,
+    /// A stream read as a table (`engine::streamtable`).
+    pub stream: Option<Arc<crate::engine::streamtable::StreamSource>>,
 }
 
 impl TableUse {
@@ -1277,6 +1279,7 @@ impl Walk<'_, '_> {
             self.elsewhere = true;
             return None;
         };
+        let mut stream = None;
         let (def, coll) = if let Some(parsed) = self.cx.names.table(db, table) {
             match &*parsed {
                 Ok(def) => (Arc::clone(def), None),
@@ -1291,6 +1294,14 @@ impl Walk<'_, '_> {
         {
             // A MongoDB collection of the database of the same name.
             (Arc::clone(&c.def), Some(c))
+        } else if let Some(s) = (!self.cx.names.other_relation(db, table))
+            .then(|| self.cx.names.stream(db, table))
+            .flatten()
+        {
+            // A stream of the database, read as a table.
+            let d = Arc::clone(&s.def);
+            stream = Some(s);
+            (d, None)
         } else {
             if self.cx.names.other_relation(db, table) {
                 self.fail(not_on_engine("a view or another relation kind"));
@@ -1321,6 +1332,7 @@ impl Walk<'_, '_> {
                     plan_table(&def, &db_name)
                 }),
                 coll,
+                stream,
                 read: vec![false; def.columns.len()],
                 order: Vec::new(),
                 aliases: Vec::new(),
@@ -1386,6 +1398,7 @@ impl Walk<'_, '_> {
                 def,
                 tenant: Some(tenant),
                 coll: None,
+                stream: None,
             });
             self.tables.len() - 1
         };

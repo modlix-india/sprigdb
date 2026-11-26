@@ -7,7 +7,7 @@
 //! transaction when one is open) and `SELECT ... FROM <stream>`
 //! ([`select`]).
 
-mod select;
+pub(crate) mod select;
 
 use std::sync::Arc;
 
@@ -261,19 +261,10 @@ impl PassSession {
             }
         };
         if let Some((columns, rows)) = selected.take() {
+            // A prepared statement's binary rows: the engine's general path
+            // reads the streams as tables (`engine::streamtable`).
             if format == RowFormat::Binary {
-                return Ok(Some(
-                    self.fail(
-                        out,
-                        &SprigError::standard(
-                            1235,
-                            *b"42000",
-                            "This version of SprigDB doesn't yet support 'a prepared SELECT that \
-                             reads a stream of an engine database'",
-                        ),
-                    )
-                    .await?,
-                ));
+                return Ok(None);
             }
             let status = self.streams_status(more);
             let rows = sprig_types::Rows { columns, rows };

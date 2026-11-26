@@ -661,7 +661,7 @@ impl Engine {
         for t in &g.tables {
             // A MongoDB collection has no table keyspace: storage reads its
             // documents (`storage::coll`).
-            if t.coll.is_some() {
+            if t.coll.is_some() || t.stream.is_some() {
                 out.push(storage::unread_space(&t.def));
                 continue;
             }

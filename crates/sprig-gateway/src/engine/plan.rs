@@ -75,6 +75,11 @@ pub(crate) trait Names {
     fn collection(&self, _db: DbId, _name: &str) -> Option<Arc<super::collection::CollTable>> {
         None
     }
+    /// The stream `name` of `db`, read as a table (`engine::streamtable`),
+    /// if any.
+    fn stream(&self, _db: DbId, _name: &str) -> Option<Arc<super::streamtable::StreamSource>> {
+        None
+    }
 }
 
 /// [`Names`] over a catalog snapshot.
@@ -139,6 +144,9 @@ impl Names for CatalogNames<'_> {
             name,
             self.lower_case,
         )
+    }
+    fn stream(&self, db: DbId, name: &str) -> Option<Arc<super::streamtable::StreamSource>> {
+        super::streamtable::find(self.cat.tenant.0, db, &self.db_name(db), name)
     }
     fn referencing(&self, db: DbId, name: &str) -> Vec<(Arc<TableDef>, usize)> {
         if self.eng.refs.is_empty() {
@@ -385,6 +393,13 @@ pub(crate) fn resolve(cx: &BindCtx<'_>, name: &ObjectName) -> Result<Resolved> {
                 "this statement on a MongoDB collection (collections are read-only from SQL)",
             ));
         }
+        // A stream likewise (`engine::streamtable`); writes to it are the
+        // stream layer's.
+        if cx.names.stream(db, table).is_some() {
+            return Err(not_on_engine(
+                "this statement on a stream (a stream is read as a table by queries)",
+            ));
+        }
         return Err(SprigError::standard(
             1146,
             *b"42S02",
@@ -421,7 +436,8 @@ pub(crate) fn names_engine_table(cx: &BindCtx<'_>, stmt: &Statement) -> bool {
         match db.filter(|d| cx.names.engine_db(*d)) {
             Some(db)
                 if cx.names.table(db, table).is_some()
-                    || cx.names.collection(db, table).is_some() =>
+                    || cx.names.collection(db, table).is_some()
+                    || cx.names.stream(db, table).is_some() =>
             {
                 ControlFlow::Break(())
             }

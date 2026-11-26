@@ -79,7 +79,7 @@ mod inherit_sinks;
 pub(crate) mod inherit_probe;
 pub(crate) mod types;
 // Event streams.
-mod streams;
+pub(crate) mod streams;
 // `sprig.mq_*` calls.
 mod queues;
 // Sinks and connections.

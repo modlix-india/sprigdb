@@ -69,8 +69,10 @@ fn current(cat: &TenantCatalog, g: &General) -> bool {
         return false;
     };
     g.tables.iter().all(|t| {
-        // A MongoDB collection is found by name again at each run.
+        // A MongoDB collection or a stream is found by name again at each
+        // run.
         t.coll.is_some()
+            || t.stream.is_some()
             || matches!(
                 eng.tables.get(&t.def.object).map(AsRef::as_ref),
                 Some(Ok(d)) if d.version == t.def.version && d.indexes.len() == t.def.indexes.len()
@@ -138,6 +140,20 @@ impl PassSession {
                 continue;
             }
             let db_key = database_key(&t.db_name, ts.lower_case_table_names());
+            // A stream: `SELECT` on it by name, or on its database.
+            if t.stream.is_some() {
+                if stream_readable(cp, &db_key, &t.def.name, ts.lower_case_table_names()) {
+                    continue;
+                }
+                return Err(table_denied(
+                    self.persona,
+                    Action::Select.command(),
+                    &ts.principal.user,
+                    &client_host,
+                    &t.db_name,
+                    &t.def.name,
+                ));
+            }
             let target = Target::Object {
                 db_key: &db_key,
                 db: t.def.db,
@@ -750,4 +766,19 @@ impl PassSession {
             db: None,
         }))
     }
+}
+
+/// Whether `cp` may read stream `name` of the database keyed `db_key`:
+/// `SELECT` on it by name, or on the database.
+fn stream_readable(cp: &CompiledPrivileges, db_key: &str, name: &str, lctn: bool) -> bool {
+    let name_key =
+        sprig_catalog::ddl::object_key(sprig_catalog::store::ObjectKind::Table, name, lctn);
+    cp.actions_on(Target::Named {
+        db_key,
+        name_key: &name_key,
+    })
+    .has(Action::Select)
+        || cp
+            .actions_on(Target::Database { db_key })
+            .has(Action::Select)
 }
