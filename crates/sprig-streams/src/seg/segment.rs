@@ -14,12 +14,24 @@
 //! ([`Segment::write_out`]). A pending batch lost in a crash is no worse
 //! than an unsynced one: the commit log keeps every entry above the
 //! durable floor and the log replays them.
+//!
+//! **Blob segments** (`<base>.ref`). On a replicated node the log store
+//! already wrote each append's batch once, into a note blob file
+//! ([`sprig_engine::log::blobs`]). A blob segment keeps, per batch, only
+//! its head as stored (offset and epoch written in) and where the batch
+//! is in the blob file; its file holds those records
+//! (`head | blob file id u64 | position u64`, little-endian). Readers see
+//! the same bytes as from a plain segment: positions, lengths and the
+//! index count the batches' bytes, not the records'.
 
+use std::collections::BTreeSet;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+use sprig_engine::log::blobs::BlobFile;
 
 use super::batch::{HEAD, Head};
 
@@ -29,6 +41,36 @@ pub const PENDING_MAX: u64 = 4 << 20;
 
 /// Batches not in the file yet: (position, bytes), back to back.
 type Chunks = Vec<(u64, Arc<[u8]>)>;
+
+/// A blob segment's record: the stored head, the blob file, the position.
+const REF_REC: usize = HEAD + 16;
+
+/// A view of a blob segment carries batches up to this many bytes (a
+/// read returns fewer than it may when asked for more).
+const VIEW_REFS_BYTES: u64 = 16 << 20;
+
+/// Where a batch's bytes are when a note blob holds them: the batch, as
+/// the producer sent it, starts at `at` in `file`.
+#[derive(Debug, Clone)]
+pub struct BlobBatch {
+    /// The blob file.
+    pub file: Arc<BlobFile>,
+    /// Where the batch starts in it.
+    pub at: u64,
+}
+
+/// One batch of a blob segment.
+#[derive(Debug, Clone)]
+struct RefEntry {
+    /// Its position among the segment's batches.
+    pos: u64,
+    /// Its length.
+    total: u64,
+    /// Its head as stored.
+    head: [u8; HEAD],
+    /// Where the rest is.
+    blob: BlobBatch,
+}
 
 /// One sparse index entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,21 +83,29 @@ struct Entry {
     max_ts_before: i64,
 }
 
-/// See the module docs.
-#[derive(Debug)]
+/// See the module docs. A clone reads what the segment held when it was
+/// taken ([`Segment::read_copy`]); only the original appends.
+#[derive(Debug, Clone)]
 pub struct Segment {
     /// The first offset it may hold.
     pub base: i64,
     /// Its file.
     pub path: PathBuf,
     file: Arc<File>,
-    /// Bytes appended (in the file or pending).
+    /// Bytes of its batches (in the file, pending, or in blob files).
     pub len: u64,
-    /// Bytes known synced.
+    /// Bytes of its file, pending ones included (`len` for a plain
+    /// segment; records for a blob segment).
+    pub flen: u64,
+    /// File bytes known synced.
     pub synced: u64,
-    /// Bytes in the file; `pending` holds the rest up to `len`.
+    /// File bytes written; `pending` holds the rest up to `flen`.
     written: u64,
     pending: Chunks,
+    /// A blob segment's batches, in order.
+    refs: Option<Vec<RefEntry>>,
+    /// The blob files a blob segment refers to.
+    blob_ids: BTreeSet<u64>,
     /// The offset after its last batch (`base` while empty).
     pub next: i64,
     /// The largest batch timestamp (-1 while empty).
@@ -67,17 +117,41 @@ pub struct Segment {
     interval: u64,
 }
 
+/// Where a view's bytes come from.
+#[derive(Debug, Clone)]
+enum Src {
+    /// A plain segment's file below `written`, its pending batches from
+    /// there on.
+    Data {
+        file: Arc<File>,
+        written: u64,
+        tail: Chunks,
+    },
+    /// A blob segment's batches from the view's position.
+    Refs(Vec<RefEntry>),
+}
+
+impl Src {
+    fn fill(&self, buf: &mut [u8], pos: u64) -> io::Result<()> {
+        match self {
+            Src::Data {
+                file,
+                written,
+                tail,
+            } => fill(file, *written, tail, buf, pos),
+            Src::Refs(r) => fill_refs(r, buf, pos),
+        }
+    }
+}
+
 /// A read-only view of a segment for reading outside the partition lock.
 #[derive(Debug, Clone)]
 pub struct View {
-    file: Arc<File>,
+    src: Src,
     /// Readable bytes.
     pub len: u64,
     /// Where to start (a batch head).
     pub pos: u64,
-    /// Bytes in the file when the view was taken; the rest is in `tail`.
-    written: u64,
-    tail: Chunks,
 }
 
 /// A segment's pending batches, to write outside the partition lock
@@ -127,7 +201,13 @@ fn write_chunks(file: &File, at: u64, chunks: &[(u64, Arc<[u8]>)]) -> io::Result
 
 /// Fills `buf` from position `pos`: from the file below `written`, from
 /// `tail` (pending batches) from there on.
-fn fill(file: &File, written: u64, tail: &[(u64, Arc<[u8]>)], buf: &mut [u8], pos: u64) -> io::Result<()> {
+fn fill(
+    file: &File,
+    written: u64,
+    tail: &[(u64, Arc<[u8]>)],
+    buf: &mut [u8],
+    pos: u64,
+) -> io::Result<()> {
     let mut at = pos;
     let mut done = 0usize;
     if at < written {
@@ -153,10 +233,54 @@ fn fill(file: &File, written: u64, tail: &[(u64, Arc<[u8]>)], buf: &mut [u8], po
     Ok(())
 }
 
+/// Fills `buf` from position `pos` of a blob segment's batches: heads from
+/// the records, the rest from the blob files.
+fn fill_refs(refs: &[RefEntry], buf: &mut [u8], pos: u64) -> io::Result<()> {
+    let mut i = refs.partition_point(|e| e.pos + e.total <= pos);
+    let mut at = pos;
+    let mut done = 0usize;
+    while done < buf.len() {
+        let Some(e) = refs.get(i).filter(|e| e.pos <= at) else {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "read past a segment's end",
+            ));
+        };
+        let mut off = at - e.pos;
+        let end = (e.total - off).min((buf.len() - done) as u64);
+        let stop = off + end;
+        if off < HEAD as u64 {
+            let h = usize::try_from(stop.min(HEAD as u64)).unwrap_or(HEAD);
+            let o = usize::try_from(off).unwrap_or(0);
+            buf[done..done + h - o].copy_from_slice(&e.head[o..h]);
+            done += h - o;
+            off = h as u64;
+        }
+        if off < stop {
+            let n = usize::try_from(stop - off).unwrap_or(0);
+            e.blob
+                .file
+                .read_exact_at(&mut buf[done..done + n], e.blob.at + off)?;
+            done += n;
+        }
+        at = e.pos + stop;
+        if stop == e.total {
+            i += 1;
+        }
+    }
+    Ok(())
+}
+
 /// The name of the segment starting at `base`.
 #[must_use]
 pub fn file_name(base: i64) -> String {
     format!("{base:020}.log")
+}
+
+/// The name of the blob segment starting at `base`.
+#[must_use]
+pub fn ref_file_name(base: i64) -> String {
+    format!("{base:020}.ref")
 }
 
 /// The base offset a segment file name gives.
@@ -185,7 +309,29 @@ impl Segment {
     /// # Errors
     /// The file system's.
     pub fn create(dir: &Path, base: i64, now_ms: i64, interval: u64) -> io::Result<Segment> {
-        let path = dir.join(file_name(base));
+        Self::create_kind(dir, base, now_ms, interval, false)
+    }
+
+    /// Creates an empty blob segment (replacing a stale one).
+    ///
+    /// # Errors
+    /// The file system's.
+    pub fn create_refs(dir: &Path, base: i64, now_ms: i64, interval: u64) -> io::Result<Segment> {
+        Self::create_kind(dir, base, now_ms, interval, true)
+    }
+
+    fn create_kind(
+        dir: &Path,
+        base: i64,
+        now_ms: i64,
+        interval: u64,
+        refs: bool,
+    ) -> io::Result<Segment> {
+        let path = dir.join(if refs {
+            ref_file_name(base)
+        } else {
+            file_name(base)
+        });
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -197,9 +343,12 @@ impl Segment {
             path,
             file: Arc::new(file),
             len: 0,
+            flen: 0,
             synced: 0,
             written: 0,
             pending: Vec::new(),
+            refs: refs.then(Vec::new),
+            blob_ids: BTreeSet::new(),
             next: base,
             max_ts: -1,
             created_ms: now_ms,
@@ -238,6 +387,72 @@ impl Segment {
         Ok(s)
     }
 
+    /// Opens a blob segment: reads its records (cut at `keep` bytes when
+    /// given, and at the first incomplete or malformed one), finding each
+    /// one's blob file with `blob`.
+    ///
+    /// # Errors
+    /// The file system's; `InvalidData` when a blob file it refers to is
+    /// gone.
+    pub fn open_refs(
+        path: &Path,
+        base: i64,
+        keep: Option<u64>,
+        created_ms: i64,
+        interval: u64,
+        blob: &dyn Fn(u64) -> Option<Arc<BlobFile>>,
+    ) -> io::Result<Segment> {
+        let file = OpenOptions::new().read(true).write(true).open(path)?;
+        let size = file.metadata()?.len();
+        let limit = keep.map_or(size, |k| k.min(size));
+        let mut s = Segment {
+            base,
+            path: path.to_path_buf(),
+            file: Arc::new(file),
+            len: 0,
+            flen: 0,
+            synced: 0,
+            written: 0,
+            pending: Vec::new(),
+            refs: Some(Vec::new()),
+            blob_ids: BTreeSet::new(),
+            next: base,
+            max_ts: -1,
+            created_ms,
+            index: Vec::new(),
+            since_entry: 0,
+            interval: interval.max(1),
+        };
+        let mut body = vec![0u8; usize::try_from(limit).unwrap_or(0)];
+        s.file.read_exact_at(&mut body, 0)?;
+        for rec in body.chunks_exact(REF_REC) {
+            let Some(h) = Head::parse(&rec[..HEAD]) else {
+                break;
+            };
+            if h.base_offset < s.next {
+                break;
+            }
+            let id = u64::from_le_bytes(rec[HEAD..HEAD + 8].try_into().unwrap_or([0; 8]));
+            let at = u64::from_le_bytes(rec[HEAD + 8..].try_into().unwrap_or([0; 8]));
+            let file = blob(id).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{}: note blob file {id} is gone", path.display()),
+                )
+            })?;
+            let mut head = [0u8; HEAD];
+            head.copy_from_slice(&rec[..HEAD]);
+            s.push_ref(head, &h, BlobBatch { file, at });
+            s.flen += REF_REC as u64;
+        }
+        s.synced = s.flen;
+        s.written = s.flen;
+        if size != s.flen {
+            s.file.set_len(s.flen)?;
+        }
+        Ok(s)
+    }
+
     /// Opens a segment for reading only, as far as it is written now
     /// (another holder may be appending to it).
     ///
@@ -262,9 +477,12 @@ impl Segment {
             path: path.to_path_buf(),
             file: Arc::new(file),
             len: 0,
+            flen: 0,
             synced: 0,
             written: 0,
             pending: Vec::new(),
+            refs: None,
+            blob_ids: BTreeSet::new(),
             next: base,
             max_ts: -1,
             created_ms,
@@ -284,9 +502,44 @@ impl Segment {
             pos += h.total as u64;
         }
         s.len = pos;
+        s.flen = pos;
         s.synced = pos;
         s.written = pos;
         Ok(s)
+    }
+
+    /// Whether it is a blob segment.
+    #[must_use]
+    pub fn is_refs(&self) -> bool {
+        self.refs.is_some()
+    }
+
+    /// The blob files a blob segment refers to.
+    #[must_use]
+    pub fn blob_ids(&self) -> &BTreeSet<u64> {
+        &self.blob_ids
+    }
+
+    /// A copy that reads what the segment holds now, outside the
+    /// partition lock (a plain segment's pending batches included).
+    #[must_use]
+    pub fn read_copy(&self) -> Segment {
+        self.clone()
+    }
+
+    fn push_ref(&mut self, head: [u8; HEAD], h: &Head, blob: BlobBatch) {
+        let pos = self.len;
+        self.blob_ids.insert(blob.file.id());
+        if let Some(r) = self.refs.as_mut() {
+            r.push(RefEntry {
+                pos,
+                total: h.total as u64,
+                head,
+                blob,
+            });
+        }
+        self.note(pos, h);
+        self.len += h.total as u64;
     }
 
     fn note(&mut self, pos: u64, h: &Head) {
@@ -310,31 +563,64 @@ impl Segment {
     /// # Errors
     /// The file system's (the batch is then not appended).
     pub fn append(&mut self, bytes: &[u8], h: &Head) -> io::Result<()> {
-        if self.len - self.written + bytes.len() as u64 > PENDING_MAX {
+        if self.is_refs() {
+            return Err(io::Error::other(
+                "a batch's bytes appended to a blob segment",
+            ));
+        }
+        if self.flen - self.written + bytes.len() as u64 > PENDING_MAX {
             self.write_out()?;
         }
         let pos = self.len;
         self.pending.push((pos, Arc::from(bytes)));
         self.note(pos, h);
         self.len += bytes.len() as u64;
+        self.flen = self.len;
         Ok(())
     }
 
-    /// Writes every pending batch into the file.
+    /// Appends one batch whose bytes `blob` holds, with `head` its stored
+    /// head (already patched; `h` parsed from it). Only its record goes in
+    /// the file, pending like a plain segment's batches.
+    ///
+    /// # Errors
+    /// The file system's (the batch is then not appended).
+    pub fn append_ref(&mut self, head: &[u8], h: &Head, blob: BlobBatch) -> io::Result<()> {
+        if !self.is_refs() || head.len() < HEAD {
+            return Err(io::Error::other(
+                "a blob reference appended to a plain segment",
+            ));
+        }
+        if self.flen - self.written + REF_REC as u64 > PENDING_MAX {
+            self.write_out()?;
+        }
+        let mut rec = Vec::with_capacity(REF_REC);
+        rec.extend_from_slice(&head[..HEAD]);
+        rec.extend_from_slice(&blob.file.id().to_le_bytes());
+        rec.extend_from_slice(&blob.at.to_le_bytes());
+        self.pending.push((self.flen, Arc::from(rec)));
+        let mut hb = [0u8; HEAD];
+        hb.copy_from_slice(&head[..HEAD]);
+        self.push_ref(hb, h, blob);
+        self.flen += REF_REC as u64;
+        Ok(())
+    }
+
+    /// Writes every pending batch (or record) into the file.
     ///
     /// # Errors
     /// The file system's (the batches stay pending).
     pub fn write_out(&mut self) -> io::Result<()> {
         write_chunks(&self.file, self.written, &self.pending)?;
-        self.written = self.len;
+        self.written = self.flen;
         self.pending.clear();
         Ok(())
     }
 
-    /// Pending bytes (appended, not in the file yet).
+    /// Pending file bytes (appended, not in the file yet).
     #[must_use]
     pub fn pending_bytes(&self) -> u64 {
-        self.len - self.written
+        self.flen - self.written
     }
 
     /// The pending batches, to write outside the partition lock; `None`
@@ -352,7 +638,7 @@ impl Segment {
     /// Records that a [`PendingWrite`] taken at `at` put everything before
     /// `end` in the file (ignored when another writer got there first).
     pub fn written_through(&mut self, at: u64, end: u64) {
-        if self.written != at || end > self.len {
+        if self.written != at || end > self.flen {
             return;
         }
         let k = self.pending.partition_point(|(p, _)| *p < end);
@@ -360,14 +646,14 @@ impl Segment {
         self.written = end;
     }
 
-    /// Writes pending batches out, then syncs the file; returns the length
-    /// synced.
+    /// Writes pending batches out, then syncs the file; returns the file
+    /// length synced.
     ///
     /// # Errors
     /// The file system's.
     pub fn sync(&mut self) -> io::Result<u64> {
         self.write_out()?;
-        let len = self.len;
+        let len = self.flen;
         self.file.sync_data()?;
         Ok(len)
     }
@@ -385,6 +671,13 @@ impl Segment {
         if pos + HEAD as u64 > self.len {
             return Ok(None);
         }
+        if let Some(r) = &self.refs {
+            let i = r.partition_point(|e| e.pos < pos);
+            return Ok(r
+                .get(i)
+                .filter(|e| e.pos == pos)
+                .and_then(|e| Head::parse(&e.head)));
+        }
         if pos < self.written {
             return read_head(&self.file, pos);
         }
@@ -395,13 +688,41 @@ impl Segment {
 
     /// A view from `pos` (a batch head).
     fn view_from(&self, pos: u64) -> View {
-        let from = self.pending.partition_point(|(p, b)| p + b.len() as u64 <= pos);
+        if let Some(r) = &self.refs {
+            let from = r.partition_point(|e| e.pos < pos);
+            let mut to = from;
+            while to < r.len() && (to == from || r[to].pos - pos < VIEW_REFS_BYTES) {
+                to += 1;
+            }
+            let len = r.get(to).map_or(self.len, |e| e.pos);
+            return View {
+                src: Src::Refs(r[from..to].to_vec()),
+                len,
+                pos,
+            };
+        }
+        let from = self
+            .pending
+            .partition_point(|(p, b)| p + b.len() as u64 <= pos);
         View {
-            file: Arc::clone(&self.file),
+            src: Src::Data {
+                file: Arc::clone(&self.file),
+                written: self.written,
+                tail: self.pending[from..].to_vec(),
+            },
             len: self.len,
             pos,
-            written: self.written,
-            tail: self.pending[from..].to_vec(),
+        }
+    }
+
+    /// Fills `buf` with the batches' bytes from `pos`.
+    ///
+    /// # Errors
+    /// The file system's, or `pos` and `buf` reach past the end.
+    pub fn read_bytes(&self, buf: &mut [u8], pos: u64) -> io::Result<()> {
+        match &self.refs {
+            Some(r) => fill_refs(r, buf, pos),
+            None => fill(&self.file, self.written, &self.pending, buf, pos),
         }
     }
 
@@ -486,7 +807,7 @@ impl Segment {
     /// The file system's.
     pub fn batch_at(&self, pos: u64, h: &Head) -> io::Result<Vec<u8>> {
         let mut buf = vec![0u8; h.total];
-        fill(&self.file, self.written, &self.pending, &mut buf, pos)?;
+        self.read_bytes(&mut buf, pos)?;
         Ok(buf)
     }
 }
@@ -501,7 +822,7 @@ impl View {
         let avail = self.len.saturating_sub(self.pos);
         let want = (max_bytes as u64).min(avail).max(HEAD as u64).min(avail);
         let mut buf = vec![0u8; usize::try_from(want).unwrap_or(usize::MAX)];
-        fill(&self.file, self.written, &self.tail, &mut buf, self.pos)?;
+        self.src.fill(&mut buf, self.pos)?;
         // Keep whole batches; the first one whole whatever its size.
         let mut end = 0usize;
         loop {
@@ -511,7 +832,7 @@ impl View {
             if end + h.total > buf.len() {
                 if end == 0 {
                     let mut first = vec![0u8; h.total];
-                    fill(&self.file, self.written, &self.tail, &mut first, self.pos)?;
+                    self.src.fill(&mut first, self.pos)?;
                     return Ok(first);
                 }
                 break;
@@ -555,7 +876,11 @@ mod tests {
         let (_, h) = s.view_at_time(1_010).unwrap().unwrap();
         assert_eq!(h.base_offset, 124);
         // Reopen with a torn tail: it is cut at the last whole batch.
-        assert_eq!(s.pending_bytes(), s.len, "appends stay pending until written");
+        assert_eq!(
+            s.pending_bytes(),
+            s.len,
+            "appends stay pending until written"
+        );
         s.write_out().unwrap();
         let full = s.len;
         let path = s.path.clone();
@@ -628,5 +953,124 @@ mod tests {
         }
         assert!(s.pending_bytes() <= PENDING_MAX);
         assert!(std::fs::metadata(&s.path).unwrap().len() > all.len() as u64);
+    }
+
+    /// A blob segment reads exactly like a plain one holding the same
+    /// batches (views, heads, times, copies), its file holds only records,
+    /// and it reopens (cut at a recorded length) from its records.
+    #[test]
+    #[allow(clippy::too_many_lines)] // one scenario, step by step
+    fn blob_segments_read_like_plain_ones() {
+        use sprig_engine::log::Payload;
+        use sprig_engine::log::SyncMode;
+        use sprig_engine::log::blobs::NoteBlobs;
+
+        use crate::seg::note;
+        use crate::seg::part::PartKey;
+
+        let d = TempDir::new("segment-blobs");
+        let blobs =
+            NoteBlobs::open(d.path().join("notes"), SyncMode::Off, note::is_append, true).unwrap();
+        let key = PartKey {
+            tenant: 1,
+            stream: 2,
+            partition: 0,
+        };
+        let mut plain = Segment::create(d.path(), 0, 0, 700).unwrap();
+        let mut refs = Segment::create_refs(d.path(), 0, 0, 700).unwrap();
+        assert!(refs.is_refs() && !plain.is_refs());
+        let mut off = 0;
+        let mut ends = Vec::new();
+        for i in 0..20u64 {
+            let mut b = batch_bytes(3, 1_000 + i64::try_from(i).unwrap(), 100);
+            let n = note::encode_append(key, 0, false, &b);
+            let mut p = Payload::new();
+            p.note(&n);
+            let data = p.into_bytes();
+            assert!(blobs.take_out(9, i + 1, 1, &data).unwrap().is_some());
+            blobs.persist(true).unwrap();
+            let loc = blobs.take_located(9, i + 1, 1)[0].1;
+            let blob = BlobBatch {
+                file: blobs.file(loc.file).unwrap(),
+                at: loc.at + (n.len() - b.len()) as u64,
+            };
+            set_offset_and_epoch(&mut b, off, 4);
+            let h = Head::parse(&b).unwrap();
+            plain.append(&b, &h).unwrap();
+            refs.append_ref(&b, &h, blob).unwrap();
+            off = h.next_offset();
+            ends.push(refs.flen);
+        }
+        let h0 = plain.heads().unwrap()[0].1;
+        let b0 = plain.batch_at(0, &h0).unwrap();
+        assert!(
+            refs.append(&b0, &h0).is_err(),
+            "bytes never go in a blob segment"
+        );
+        assert_eq!(
+            (refs.len, refs.next, refs.max_ts),
+            (plain.len, plain.next, plain.max_ts)
+        );
+        assert_eq!(refs.flen, 20 * REF_REC as u64, "only records in its file");
+        assert_eq!(refs.blob_ids().len(), 1);
+        let all = |s: &Segment| {
+            s.view_at(0)
+                .unwrap()
+                .unwrap()
+                .read(usize::MAX >> 1)
+                .unwrap()
+        };
+        assert_eq!(all(&refs), all(&plain));
+        for o in [0, 7, 31, 59] {
+            let (a, b) = (
+                refs.view_at(o).unwrap().unwrap(),
+                plain.view_at(o).unwrap().unwrap(),
+            );
+            assert_eq!(a.pos, b.pos);
+            for max in [1, 300, 1_000, 5_000] {
+                assert_eq!(
+                    a.read(max).unwrap(),
+                    b.read(max).unwrap(),
+                    "offset {o}, {max} bytes"
+                );
+            }
+        }
+        assert_eq!(refs.heads().unwrap(), plain.heads().unwrap());
+        let (rv, rh) = refs.view_at_time(1_010).unwrap().unwrap();
+        let (pv, ph) = plain.view_at_time(1_010).unwrap().unwrap();
+        assert_eq!((rv.pos, rh), (pv.pos, ph));
+        let mut buf = vec![0u8; 500];
+        let mut want = vec![0u8; 500];
+        refs.read_bytes(&mut buf, 333).unwrap();
+        plain.read_bytes(&mut want, 333).unwrap();
+        assert_eq!(buf, want, "a range across batches and heads");
+        // A copy keeps reading what it saw.
+        let copy = refs.read_copy();
+        assert_eq!(all(&copy), all(&plain));
+        // Reopened from its records, cut at a recorded length, and at a
+        // torn record.
+        refs.sync().unwrap();
+        let path = refs.path.clone();
+        assert!(path.to_string_lossy().ends_with(".ref"));
+        drop(refs);
+        let find = |id: u64| blobs.file(id);
+        let again = Segment::open_refs(&path, 0, None, 0, 700, &find).unwrap();
+        assert_eq!(all(&again), all(&plain));
+        let cut = Segment::open_refs(&path, 0, Some(ends[9] + 5), 0, 700, &find).unwrap();
+        assert_eq!((cut.next, cut.flen), (30, ends[9]));
+        let p = cut
+            .view_at(0)
+            .unwrap()
+            .unwrap()
+            .read(usize::MAX >> 1)
+            .unwrap();
+        assert_eq!(p[..], all(&plain)[..usize::try_from(cut.len).unwrap()]);
+        // A blob file that is gone is an error, never an empty segment.
+        assert_eq!(
+            Segment::open_refs(&path, 0, None, 0, 700, &|_| None)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 }

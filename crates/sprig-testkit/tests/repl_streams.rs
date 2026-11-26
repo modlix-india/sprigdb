@@ -1,6 +1,8 @@
 //! Stream appends on replicated units: every replica's stream log writes
 //! the same records at the same offsets (the apply observer runs on every
-//! replica), through a leader failover and a replica's restart.
+//! replica), through a leader failover and a replica's restart. With note
+//! blobs each batch is written once per replica (the Raft log's blob file,
+//! referred to by the stream's segments).
 
 #![allow(
     clippy::unwrap_used,
@@ -17,6 +19,7 @@ use std::time::{Duration, Instant};
 
 use sprig_common::time::SystemClock;
 use sprig_engine::log::SyncMode;
+use sprig_engine::log::blobs::NoteBlobs;
 use sprig_engine::{Engine, EngineConfig, StoreKind, UnitId};
 use sprig_raft::{EngineLogStore, EngineNode, EngineNodeOptions, MemNetwork, RaftConfig};
 use sprig_streams::seg::kafka::EngineStreams;
@@ -49,6 +52,8 @@ struct Cluster {
     replicas: BTreeMap<u64, Replica>,
     /// Partition groups per tenant (0: the tenant's unit).
     groups: u32,
+    /// Stream appends written once (note blobs).
+    blobs: bool,
 }
 
 fn key() -> PartKey {
@@ -79,13 +84,38 @@ impl Replica {
 impl Cluster {
     fn start(&mut self, id: u64) {
         let d = self.dir.join(format!("n{id}"));
-        let mut c = EngineConfig::new(d.join("engine"));
-        c.store = StoreKind::Rocks;
-        c.checkpoint_interval = Duration::ZERO;
-        c.log.sync = SyncMode::Off;
-        c.budget.engine_mb = 64;
-        c.replicated = true;
-        let engine = Engine::open(c).unwrap();
+        let blobs = self.blobs.then(|| {
+            NoteBlobs::open(
+                d.join("notes"),
+                SyncMode::Off,
+                sprig_streams::seg::note::is_append,
+                true,
+            )
+            .unwrap()
+        });
+        let config = || {
+            let mut c = EngineConfig::new(d.join("engine"));
+            c.store = StoreKind::Rocks;
+            c.checkpoint_interval = Duration::ZERO;
+            c.log.sync = SyncMode::Off;
+            c.budget.engine_mb = 64;
+            c.replicated = true;
+            c
+        };
+        // A restarted replica's previous engine may still be closing (a
+        // background pass of its stream log held it): its store's lock goes
+        // with it.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let engine = loop {
+            match Engine::open(config()) {
+                Ok(e) => break e,
+                Err(e) if Instant::now() < deadline => {
+                    let _ = e;
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(e) => panic!("engine of replica {id}: {e}"),
+            }
+        };
         let node = EngineNode::open(
             &engine,
             EngineNodeOptions {
@@ -99,7 +129,13 @@ impl Cluster {
                     static_voters: VOTERS.to_vec(),
                     ..RaftConfig::default()
                 },
-                store: EngineLogStore::open(d.join("raft"), SyncMode::Off, None).unwrap(),
+                store: {
+                    let s = EngineLogStore::open(d.join("raft"), SyncMode::Off, None).unwrap();
+                    if let Some(b) = &blobs {
+                        s.set_note_blobs(Arc::clone(b));
+                    }
+                    s
+                },
                 transport: self.net.transport(id),
                 clock: Arc::new(SystemClock),
                 seed: id,
@@ -127,6 +163,7 @@ impl Cluster {
                 segment_bytes: 4096,
                 index_interval: 512,
                 groups: self.groups,
+                blobs,
                 ..SegConfig::default()
             },
             Default::default(),
@@ -163,11 +200,16 @@ impl Cluster {
     /// Appends `n` records through the leader, retrying across leader
     /// changes; returns the batch's base offset.
     async fn append(&self, n: i32) -> i64 {
+        self.append_sized(n, 10).await
+    }
+
+    /// [`Cluster::append`] with values of `len` bytes.
+    async fn append_sized(&self, n: i32, len: usize) -> i64 {
         loop {
             if let Some(l) = self.leader()
                 && let Ok(Outcome::Appended { base, .. }) = self.replicas[&l]
                     .log()
-                    .append(key(), &batch_bytes(n, 1, 10), W)
+                    .append(key(), &batch_bytes(n, 1, len), W)
                     .await
             {
                 return base;
@@ -194,13 +236,42 @@ impl Cluster {
             if let Some(l) = self.leader_of(unit)
                 && let Ok(Outcome::Appended { base, .. }) = self.replicas[&l]
                     .log()
-                    .append(k, &batch_bytes(n, 1, 10), W)
+                    .append(k, &batch_bytes(n, 1, 150), W)
                     .await
             {
                 return base;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    /// Bytes in replica `id`'s plain segment files and blob segment files
+    /// (`.log`, `.ref`), and in its note blob files, after a flush.
+    fn disk(&self, id: u64) -> (u64, u64, u64) {
+        fn walk(p: &std::path::Path, ext: &str) -> u64 {
+            let Ok(rd) = std::fs::read_dir(p) else {
+                return 0;
+            };
+            rd.flatten()
+                .map(|e| {
+                    let p = e.path();
+                    if p.is_dir() {
+                        walk(&p, ext)
+                    } else if p.extension().is_some_and(|x| x == ext) {
+                        e.metadata().map_or(0, |m| m.len())
+                    } else {
+                        0
+                    }
+                })
+                .sum()
+        }
+        self.replicas[&id].log().flush().unwrap();
+        let d = self.dir.join(format!("n{id}"));
+        (
+            walk(&d.join("streams"), "log"),
+            walk(&d.join("streams"), "ref"),
+            walk(&d.join("notes"), "blob"),
+        )
     }
 
     /// Every record replica `id`'s stream log holds, by offset.
@@ -255,6 +326,7 @@ async fn every_replica_writes_the_streams_segments() {
         net: MemNetwork::new(),
         replicas: BTreeMap::new(),
         groups: 0,
+        blobs: false,
     };
     for id in VOTERS {
         c.start(id);
@@ -338,6 +410,7 @@ async fn topic_records_reach_every_replica() {
         net: MemNetwork::new(),
         replicas: BTreeMap::new(),
         groups: 0,
+        blobs: false,
     };
     for id in VOTERS {
         c.start(id);
@@ -432,6 +505,7 @@ async fn partition_groups_spread_their_leaders_and_replicate() {
         net: MemNetwork::new(),
         replicas: BTreeMap::new(),
         groups: GROUPS,
+        blobs: true,
     };
     for id in VOTERS {
         c.start(id);
@@ -516,4 +590,145 @@ async fn partition_groups_spread_their_leaders_and_replicate() {
     .await;
     let base = c.append_to(part(0), 1).await;
     assert_eq!(base, *want[&0].last().unwrap() + 1);
+}
+
+/// With note blobs every replica writes each batch once: its Raft log keeps
+/// the batch in a blob file, and its segments are blob segments that refer
+/// to it (no plain segment bytes). Records and stored bytes match on every
+/// replica through a failover, a restart (the log's references put back),
+/// a snapshot install on a replica the log left behind (written as plain
+/// segments), and compaction (which rewrites blob segments as plain ones).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)] // one scenario, step by step
+async fn appends_are_written_once_on_every_replica() {
+    let dir = std::env::temp_dir().join(format!("sprig-repl-once-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut c = Cluster {
+        dir,
+        net: MemNetwork::new(),
+        replicas: BTreeMap::new(),
+        groups: 0,
+        blobs: true,
+    };
+    for id in VOTERS {
+        c.start(id);
+    }
+    let unit = UnitId(TENANT);
+    c.replicas[&1].node.start_unit(unit, &VOTERS).unwrap();
+    let mut want = Vec::new();
+    for _ in 0..40 {
+        let base = c.append_sized(5, 200).await;
+        want.extend(base..base + 5);
+    }
+    let same = |c: &Cluster, want: &Vec<i64>| c.replicas.keys().all(|id| c.records(*id) == *want);
+    until("every replica's records", || same(&c, &want).then_some(())).await;
+    let payload: u64 = 40 * batch_bytes(5, 1, 200).len() as u64;
+    for id in VOTERS {
+        let (plain, refs, blobs) = c.disk(id);
+        assert_eq!(plain, 0, "replica {id}: no batch bytes in segment files");
+        assert!(
+            refs > 0 && refs < payload / 4,
+            "replica {id}: records only ({refs} B)"
+        );
+        assert!(
+            blobs >= payload,
+            "replica {id}: the blobs hold the batches ({blobs} B)"
+        );
+    }
+    let bytes = |c: &Cluster, id: u64| c.replicas[&id].log().read(key(), 0, 1 << 24).unwrap().1;
+    // A failover and a restart: the restarted replica reopens its blob
+    // segments and catches up through the log's references.
+    let l = c.leader().unwrap();
+    c.kill(l);
+    for _ in 0..10 {
+        let base = c.append_sized(5, 200).await;
+        want.extend(base..base + 5);
+    }
+    c.start(l);
+    until("every replica after a restart", || {
+        same(&c, &want).then_some(())
+    })
+    .await;
+    for id in VOTERS {
+        assert_eq!(
+            bytes(&c, id),
+            bytes(&c, VOTERS[0]),
+            "replica {id}'s batches"
+        );
+    }
+    // A replica the log leaves behind gets a snapshot: the stream part
+    // reads the leader's blob segments and writes plain ones.
+    let behind = VOTERS
+        .into_iter()
+        .find(|id| Some(*id) != c.leader())
+        .unwrap();
+    c.kill(behind);
+    for _ in 0..20 {
+        let base = c.append_sized(5, 200).await;
+        want.extend(base..base + 5);
+    }
+    let last = c.replicas[&c.leader().unwrap()]
+        .node
+        .node()
+        .committed(unit.0);
+    for r in c.replicas.values() {
+        r.log().flush().unwrap();
+        r.engine.checkpoint().unwrap();
+    }
+    for id in c.replicas.keys().copied().collect::<Vec<_>>() {
+        until("the log trimmed", || {
+            let r = &c.replicas[&id];
+            let _ = r.log().flush();
+            let _ = r.engine.checkpoint();
+            r.node
+                .node()
+                .log_first_index(unit.0)
+                .is_none_or(|f| f > last.saturating_sub(5))
+                .then_some(())
+        })
+        .await;
+    }
+    c.start(behind);
+    until("the replica restored from a snapshot", || {
+        same(&c, &want).then_some(())
+    })
+    .await;
+    let (plain, ..) = c.disk(behind);
+    assert!(
+        plain > 0,
+        "a snapshot's partitions are written as plain segments"
+    );
+    // Appends after it go to blob segments again.
+    for _ in 0..5 {
+        let base = c.append_sized(5, 200).await;
+        want.extend(base..base + 5);
+    }
+    until("every replica after the snapshot", || {
+        same(&c, &want).then_some(())
+    })
+    .await;
+    for id in VOTERS {
+        assert_eq!(
+            bytes(&c, id),
+            bytes(&c, VOTERS[0]),
+            "replica {id}'s batches"
+        );
+    }
+    // Compaction keeps each key's newest record (keys k0..k4 repeat in
+    // every batch) and rewrites rolled blob segments as plain ones.
+    let pol = sprig_streams::seg::Policy {
+        compact: true,
+        ..sprig_streams::seg::Policy::default()
+    };
+    let leader = c.leader().unwrap();
+    let before = c.disk(leader);
+    c.replicas[&leader].log().set_policy(TENANT, 1, pol);
+    c.replicas[&leader].log().maintain().unwrap();
+    let after = c.disk(leader);
+    assert!(
+        after.1 < before.1,
+        "rolled blob segments rewritten: {before:?} -> {after:?}"
+    );
+    let kept = c.records(leader);
+    assert!(kept.len() < want.len() && kept.ends_with(&want[want.len() - 5..]));
 }

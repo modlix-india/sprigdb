@@ -1311,6 +1311,14 @@ pub fn mysql_create_table(text: &str) -> String {
     if !text.starts_with("CREATE TABLE") && !text.starts_with("CREATE TEMPORARY TABLE") {
         return text.to_owned();
     }
+    // The partitioning comes last, in MySQL's versioned comment.
+    if let Some(at) = text.find("\n PARTITION BY ") {
+        return format!(
+            "{}{}",
+            mysql_create_table(&text[..at]),
+            mysql_partitioning(&text[at..])
+        );
+    }
     // Generated columns' NOT NULL checks ([`super::ddl`]): the
     // check line goes, the column says NOT NULL again.
     let mut not_null: Vec<String> = Vec::new();
@@ -1373,6 +1381,74 @@ pub fn mysql_create_table(text: &str) -> String {
     }
     // Expressions printed the MySQL way.
     super::exprprint::mysql_expressions(&mysql_collations(&lines.join("\n")))
+}
+
+/// A name MySQL prints without back quotes.
+fn plain_name(n: &str) -> bool {
+    !n.is_empty()
+        && n.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'$')
+        && !n.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// `` `name` `` as MySQL prints it in a partitioning clause.
+fn unquote_names(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find('`') {
+        out.push_str(&rest[..i]);
+        let tail = &rest[i + 1..];
+        let Some(j) = tail.find('`') else {
+            out.push_str(&rest[i..]);
+            return out;
+        };
+        let name = &tail[..j];
+        if plain_name(name) {
+            out.push_str(name);
+        } else {
+            out.push('`');
+            out.push_str(name);
+            out.push('`');
+        }
+        rest = &tail[j + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// MariaDB's partitioning clause (``\n PARTITION BY ...``) as MySQL 8.4
+/// prints it: in a `/*!50100 ... */` comment (`/*!50500` for `COLUMNS`),
+/// partition names and `COLUMNS` / `KEY` column lists without back quotes
+/// where none are needed; expressions keep theirs.
+fn mysql_partitioning(tail: &str) -> String {
+    let body = tail.trim_start_matches('\n').trim_start();
+    let version = if body.contains("  COLUMNS(") {
+        50500
+    } else {
+        50100
+    };
+    let (head, parts) = match body.find('\n') {
+        Some(i) => (&body[..i], &body[i..]),
+        None => (body, ""),
+    };
+    let head = if head.contains("  COLUMNS(") || head.contains(" KEY (") {
+        unquote_names(head)
+    } else {
+        head.to_owned()
+    };
+    // Partition names after `PARTITION `.
+    let mut list = String::with_capacity(parts.len());
+    let mut rest = parts;
+    while let Some(i) = rest.find("PARTITION `") {
+        list.push_str(&rest[..i]);
+        list.push_str("PARTITION ");
+        let tail = &rest[i + "PARTITION ".len()..];
+        let end = tail[1..].find('`').map_or(tail.len(), |j| j + 2);
+        list.push_str(&unquote_names(&tail[..end]));
+        rest = &tail[end..];
+    }
+    list.push_str(rest);
+    format!("\n/*!{version} {head}{list} */")
 }
 
 /// MySQL 8.4's default collation of a character set other than `utf8mb4`.

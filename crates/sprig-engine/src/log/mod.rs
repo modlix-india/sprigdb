@@ -30,6 +30,7 @@
 //! On open, every unit's entries above the state machine's applied index are
 //! replayed into it before the log accepts proposals.
 
+pub mod blobs;
 mod entry;
 mod fs;
 pub mod payload;

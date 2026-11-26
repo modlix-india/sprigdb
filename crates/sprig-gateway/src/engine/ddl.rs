@@ -718,6 +718,20 @@ impl Engine {
         if d1.hidden && !d0.hidden {
             plan.reports_rows = true;
         }
+        // Partitioning made or removed: both servers copy the table (and
+        // report its rows); a rehash (`COALESCE`, `ADD PARTITION
+        // PARTITIONS n`) reports them on MariaDB only; dropping, adding or
+        // reorganizing RANGE / LIST partitions doesn't.
+        if alter.specs.iter().any(|s| {
+            matches!(s, alter::Spec::Other(o)
+                if o.starts_with("PARTITION BY")
+                    || o.starts_with("REMOVE PARTITIONING")
+                    || (!sess.env.mysql
+                        && (o.starts_with("COALESCE PARTITION")
+                            || o == "ADD PARTITION PARTITIONS")))
+        }) {
+            plan.reports_rows = true;
+        }
         if sess.env.mysql {
             alter::mysql_clauses(alter, &plan)?;
         } else {

@@ -6,13 +6,15 @@
 //! at all, and the batches that survive are a prefix of those written (all
 //! synced ones, then perhaps some unsynced ones).
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use raft::prelude::{Entry, HardState, Snapshot};
 use raft_engine::{Command, LogBatch, MessageExt, ReadableSize, RecoveryMode};
+use sprig_engine::log::blobs::NoteBlobs;
 use sprig_engine::log::{LogFs, SimDisk, SyncMode};
 
 use crate::GroupId;
@@ -131,6 +133,20 @@ pub trait LogStore: Send + Sync {
     /// The write or sync failed. The driver stops: the batch may or may not
     /// be on disk.
     fn write(&self, batch: &WriteBatch, sync: bool) -> Result<(), RaftError>;
+
+    /// Writes `batches` in order, syncing once after the last when `sync`
+    /// (the log writer thread's queued jobs). On a failure, says how many
+    /// were written before it.
+    ///
+    /// # Errors
+    /// As [`LogStore::write`], with the count of batches written.
+    fn write_all(&self, batches: &[&WriteBatch], sync: bool) -> Result<(), (usize, RaftError)> {
+        let n = batches.len();
+        for (i, b) in batches.iter().enumerate() {
+            self.write(b, sync && i + 1 == n).map_err(|e| (i, e))?;
+        }
+        Ok(())
+    }
 
     /// Every group the log holds.
     ///
@@ -326,10 +342,14 @@ fn engine_err(what: &str, e: &raft_engine::Error) -> RaftError {
 
 /// The node's log on disk: raft-engine, one raft-engine group per Raft
 /// group, entries as raft-rs writes them, the hard state, snapshot record
-/// and tombstone as keys of the group.
+/// and tombstone as keys of the group. With note blobs
+/// ([`EngineLogStore::set_note_blobs`]) the large notes of synced entries
+/// (stream appends) are written once into blob files and the log keeps
+/// references; every read puts them back.
 pub struct EngineLogStore {
     engine: raft_engine::Engine<LogFs>,
     dir: PathBuf,
+    blobs: OnceLock<Arc<NoteBlobs>>,
 }
 
 impl std::fmt::Debug for EngineLogStore {
@@ -369,34 +389,28 @@ impl EngineLogStore {
         let engine = on_fresh_thread(move || {
             raft_engine::Engine::open_with_file_system(cfg, fs).map_err(|e| engine_err("open", &e))
         })?;
-        Ok(Arc::new(Self { engine, dir }))
+        Ok(Arc::new(Self {
+            engine,
+            dir,
+            blobs: OnceLock::new(),
+        }))
     }
 
-    /// Bytes of log files on disk.
+    /// Keeps large notes in `blobs` (see the type's docs). Set it before the
+    /// node opens: its recovery reads the log, and references must be put
+    /// back. Only the first call counts.
+    pub fn set_note_blobs(&self, blobs: Arc<NoteBlobs>) {
+        let _ = self.blobs.set(blobs);
+    }
+
+    /// The note blobs, if set.
     #[must_use]
-    pub fn disk_bytes(&self) -> u64 {
-        self.engine.get_used_size() as u64
+    pub fn note_blobs(&self) -> Option<&Arc<NoteBlobs>> {
+        self.blobs.get()
     }
-}
 
-/// Runs `f` on a new thread: raft-engine caches the last block it read in a
-/// per-thread slot keyed by file position only, so reads of two logs on one
-/// thread could mix.
-fn on_fresh_thread<T: Send>(
-    f: impl FnOnce() -> Result<T, RaftError> + Send,
-) -> Result<T, RaftError> {
-    std::thread::scope(|s| {
-        std::thread::Builder::new()
-            .name("sprig-raft-read".into())
-            .spawn_scoped(s, f)
-            .map_err(|e| RaftError::Storage(format!("spawn reader: {e}")))?
-            .join()
-            .unwrap_or_else(|p| std::panic::resume_unwind(p))
-    })
-}
-
-impl LogStore for EngineLogStore {
-    fn write(&self, batch: &WriteBatch, sync: bool) -> Result<(), RaftError> {
+    /// One batch as raft-engine writes it, taking notes out into `take`.
+    fn log_batch(batch: &WriteBatch, take: Option<&NoteBlobs>) -> Result<LogBatch, RaftError> {
         let mut lb = LogBatch::with_capacity(batch.groups.len());
         for w in &batch.groups {
             let g = w.group;
@@ -424,19 +438,166 @@ impl LogStore for EngineLogStore {
                 None => {}
             }
             if !w.entries.is_empty() {
-                lb.add_entries::<EntryExt>(g, &w.entries).map_err(enc)?;
+                let entries = match take {
+                    Some(b) => take_out(b, g, &w.entries)?,
+                    None => Cow::Borrowed(&w.entries[..]),
+                };
+                lb.add_entries::<EntryExt>(g, &entries).map_err(enc)?;
             }
             if let Some(hs) = &w.hard_state {
                 lb.put_message(g, KEY_HS.to_vec(), hs).map_err(enc)?;
             }
         }
-        if lb.is_empty() {
-            return Ok(());
+        Ok(lb)
+    }
+
+    /// [`EngineLogStore::put_back`] at recovery: entries whose notes were
+    /// in a blob file's unsynced tail when the node stopped (the log's last
+    /// write, never reported persisted) are cut off with everything after
+    /// them. Returns the index of the first entry cut.
+    fn put_back_recovered(
+        &self,
+        group: GroupId,
+        entries: &mut Vec<Entry>,
+    ) -> Result<Option<u64>, RaftError> {
+        let Some(b) = self.blobs.get() else {
+            return Ok(None);
+        };
+        for i in 0..entries.len() {
+            let e = &mut entries[i];
+            match b.put_back(group, e.index, e.term, &e.data) {
+                Ok(Some(d)) => e.data = d.into(),
+                Ok(None) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    let cut = e.index;
+                    tracing::warn!(group, index = cut, dropped = entries.len() - i, error = %err, "raft log: entries of the last write lost their notes in a crash; cut off (they were never reported persisted)");
+                    entries.truncate(i);
+                    return Ok(Some(cut));
+                }
+                Err(err) => return Err(RaftError::Storage(format!("note blobs: {err}"))),
+            }
         }
-        self.engine
-            .write(&mut lb, sync)
-            .map(drop)
-            .map_err(|e| engine_err("write", &e))
+        Ok(None)
+    }
+
+    /// Puts back the notes `entries` (read from the log) refer to.
+    fn put_back(&self, group: GroupId, entries: &mut [Entry]) -> Result<(), RaftError> {
+        let Some(b) = self.blobs.get() else {
+            return Ok(());
+        };
+        for e in entries {
+            if let Some(d) = b
+                .put_back(group, e.index, e.term, &e.data)
+                .map_err(|err| RaftError::Storage(format!("note blobs: {err}")))?
+            {
+                e.data = d.into();
+            }
+        }
+        Ok(())
+    }
+
+    /// Bytes of log files on disk.
+    #[must_use]
+    pub fn disk_bytes(&self) -> u64 {
+        self.engine.get_used_size() as u64
+    }
+}
+
+/// Runs `f` on a new thread: raft-engine caches the last block it read in a
+/// per-thread slot keyed by file position only, so reads of two logs on one
+/// thread could mix.
+fn on_fresh_thread<T: Send>(
+    f: impl FnOnce() -> Result<T, RaftError> + Send,
+) -> Result<T, RaftError> {
+    std::thread::scope(|s| {
+        std::thread::Builder::new()
+            .name("sprig-raft-read".into())
+            .spawn_scoped(s, f)
+            .map_err(|e| RaftError::Storage(format!("spawn reader: {e}")))?
+            .join()
+            .unwrap_or_else(|p| std::panic::resume_unwind(p))
+    })
+}
+
+impl EngineLogStore {
+    /// Writes raft-engine batches in order, the sync with the last one that
+    /// writes anything (raft-engine skips an empty one, sync and all).
+    fn write_lbs(&self, lbs: Vec<LogBatch>, sync: bool) -> Result<(), (usize, RaftError)> {
+        let last = lbs.iter().rposition(|lb| !lb.is_empty());
+        for (i, mut lb) in lbs.into_iter().enumerate() {
+            if lb.is_empty() {
+                continue;
+            }
+            self.engine
+                .write(&mut lb, sync && Some(i) == last)
+                .map_err(|e| (i, engine_err("write", &e)))?;
+        }
+        Ok(())
+    }
+}
+
+/// `entries` with the notes `blobs` picks taken out (borrowed when none
+/// is).
+fn take_out<'a>(
+    blobs: &NoteBlobs,
+    group: GroupId,
+    entries: &'a [Entry],
+) -> Result<Cow<'a, [Entry]>, RaftError> {
+    let mut out: Option<Vec<Entry>> = None;
+    for (i, e) in entries.iter().enumerate() {
+        let taken = blobs
+            .take_out(group, e.index, e.term, &e.data)
+            .map_err(|err| RaftError::Storage(format!("note blobs: {err}")))?;
+        if let Some(d) = taken {
+            let v = out.get_or_insert_with(|| entries[..i].to_vec());
+            let mut e = e.clone();
+            e.data = d.into();
+            v.push(e);
+        } else if let Some(v) = out.as_mut() {
+            v.push(e.clone());
+        }
+    }
+    Ok(out.map_or(Cow::Borrowed(entries), Cow::Owned))
+}
+
+impl LogStore for EngineLogStore {
+    fn write(&self, batch: &WriteBatch, sync: bool) -> Result<(), RaftError> {
+        self.write_all(&[batch], sync).map_err(|(_, e)| e)
+    }
+
+    fn write_all(&self, batches: &[&WriteBatch], sync: bool) -> Result<(), (usize, RaftError)> {
+        // Notes leave only synced writes. Their blobs are written before
+        // the log and synced alongside its write and sync; the write counts
+        // as persisted only once both are done (a crash between them cuts
+        // the log there on recovery: see `NoteBlobs`).
+        let take = self
+            .blobs
+            .get()
+            .filter(|b| sync && b.takes())
+            .map(Arc::as_ref);
+        let mut lbs = Vec::with_capacity(batches.len());
+        for b in batches {
+            lbs.push(Self::log_batch(b, take).map_err(|e| (0, e))?);
+        }
+        let blob_err =
+            |what: &str, e: &std::io::Error| RaftError::Storage(format!("note blobs: {what}: {e}"));
+        let Some(b) = take else {
+            return self.write_lbs(lbs, sync);
+        };
+        b.write_out().map_err(|e| (0, blob_err("write", &e)))?;
+        std::thread::scope(|s| {
+            let synced = std::thread::Builder::new()
+                .name("sprig-raft-blob-sync".into())
+                .spawn_scoped(s, || b.sync());
+            let wrote = self.write_lbs(lbs, sync);
+            let synced = match synced {
+                Ok(t) => t.join().unwrap_or_else(|p| std::panic::resume_unwind(p)),
+                // No thread: sync here.
+                Err(_) => b.sync(),
+            };
+            wrote?;
+            synced.map_err(|e| (0, blob_err("sync", &e)))
+        })
     }
 
     fn first_index(&self, group: GroupId) -> Option<u64> {
@@ -456,6 +617,7 @@ impl LogStore for EngineLogStore {
                     .fetch_entries_to::<EntryExt>(group, lo, hi, None, &mut out)
                     .map_err(|e| engine_err("read", &e))?;
             }
+            self.put_back(group, &mut out)?;
             Ok(out)
         })
     }
@@ -499,6 +661,13 @@ impl LogStore for EngineLogStore {
                 }
                 let si = snapshot.get_metadata().index;
                 entries.retain(|e| e.index > si);
+                let mut hard_state = hard_state;
+                if let Some(cut) = self.put_back_recovered(g, &mut entries)? {
+                    // Never reported persisted: raft-rs re-fetches them.
+                    // The commit index learned with them may not pass the
+                    // log's end.
+                    hard_state.commit = hard_state.commit.min(cut - 1);
+                }
                 out.push(RecoveredGroup {
                     group: g,
                     hard_state,
@@ -518,6 +687,13 @@ impl LogStore for EngineLogStore {
                 .map(drop)
                 .map_err(|e| engine_err("purge", &e))
         });
+        // With a holder (the stream log) registered, its own maintenance
+        // removes blob files: it knows which ones its segments refer to.
+        if let Some(b) = self.blobs.get()
+            && !b.has_holder()
+        {
+            b.collect(&|g| self.engine.first_index(g));
+        }
     }
 }
 

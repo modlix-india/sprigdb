@@ -1181,6 +1181,7 @@ impl Node {
         std::thread::Builder::new()
             .name(format!("sprig-raft-{}", self.inner.id))
             .spawn(move || {
+                let maint = node.start_maintenance();
                 match tokio::runtime::Builder::new_current_thread()
                     .enable_time()
                     .build()
@@ -1197,7 +1198,38 @@ impl Node {
                 if let Some(t) = writer {
                     let _ = t.join();
                 }
+                if let Some(t) = maint {
+                    let _ = t.join();
+                }
             })
+    }
+
+    /// The log store's housekeeping ([`LogStore::maintain`]: files the log
+    /// no longer needs are deleted) every ten seconds, on a thread of its
+    /// own, until the node closes. Simulations drive [`Node::run`] without
+    /// it.
+    fn start_maintenance(&self) -> Option<std::thread::JoinHandle<()>> {
+        let node = self.clone();
+        let spawned = std::thread::Builder::new()
+            .name(format!("sprig-raft-maint-{}", self.inner.id))
+            .spawn(move || {
+                loop {
+                    for _ in 0..100 {
+                        if node.is_closed() {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                    node.inner.store.maintain();
+                }
+            });
+        match spawned {
+            Ok(t) => Some(t),
+            Err(e) => {
+                tracing::warn!(node = self.inner.id, error = %e, "raft log housekeeping not started: trimmed log files stay on disk");
+                None
+            }
+        }
     }
 
     fn has_work(&self) -> bool {
@@ -1230,14 +1262,17 @@ impl Node {
             }
             let sync = jobs.iter().any(|j| j.sync);
             let n = jobs.len();
-            let mut res = Ok(());
-            for (i, j) in jobs.iter().enumerate() {
-                res = self.inner.store.write(&j.batch, sync && i + 1 == n);
-                if res.is_err() {
-                    break;
+            let batches: Vec<&WriteBatch> = jobs.iter().map(|j| &j.batch).collect();
+            let res = match self.inner.store.write_all(&batches, sync) {
+                Ok(()) => {
+                    bump(&self.inner.counters.writes, n as u64);
+                    Ok(())
                 }
-                bump(&self.inner.counters.writes, 1);
-            }
+                Err((done, e)) => {
+                    bump(&self.inner.counters.writes, done as u64);
+                    Err(e)
+                }
+            };
             if sync && res.is_ok() {
                 bump(&self.inner.counters.syncs, 1);
             }

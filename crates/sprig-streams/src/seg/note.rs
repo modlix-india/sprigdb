@@ -46,6 +46,13 @@ pub fn encode_append(key: PartKey, now_ms: i64, log_append_time: bool, batch: &[
     v
 }
 
+/// Whether a payload note is a stream append (the notes a replicated
+/// node's log store keeps in note blobs).
+#[must_use]
+pub fn is_append(n: &[u8]) -> bool {
+    n.len() >= FIXED && &n[..3] == TAG && n[3] == APPEND
+}
+
 fn u64_at(b: &[u8], at: usize) -> u64 {
     let mut a = [0u8; 8];
     a.copy_from_slice(&b[at..at + 8]);

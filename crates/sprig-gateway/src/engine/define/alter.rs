@@ -38,6 +38,8 @@ enum Clause {
     KeyIgnored(String, bool),
     Options(super::Opts),
     Convert(String, Option<String>),
+    /// A partitioning change.
+    Partition(super::partition::Change),
     Nothing,
 }
 
@@ -177,7 +179,14 @@ fn read_alter(p: &mut P<'_>, cs: &str) -> Result<Vec<Clause>, Fail> {
         return Ok(out);
     }
     loop {
-        if skip_algorithm_lock(p)? {
+        if let Some(c) = super::partition::read_change(p, cs)? {
+            out.push(Clause::Partition(c));
+            // `PARTITION BY ...` ends the statement (or comes last).
+            if !p.op(",") {
+                super::end(p)?;
+                return Ok(out);
+            }
+        } else if skip_algorithm_lock(p)? {
             out.push(Clause::Nothing);
         } else if p.eat("ADD") {
             if p.eat("COLUMN") {
@@ -412,6 +421,13 @@ fn reads(e: &E, c: &str) -> bool {
 
 #[allow(clippy::too_many_lines)] // the phases in order
 fn run(d: &mut Def, clauses: Vec<Clause>, cx: &Ctx) -> Result<(), Fail> {
+    let part_changes: Vec<super::partition::Change> = clauses
+        .iter()
+        .filter_map(|c| match c {
+            Clause::Partition(ch) => Some(ch.clone()),
+            _ => None,
+        })
+        .collect();
     // Phase 1: drops.
     let mut dropped_cols: Vec<String> = Vec::new();
     for c in &clauses {
@@ -808,7 +824,18 @@ fn run(d: &mut Def, clauses: Vec<Clause>, cx: &Ctx) -> Result<(), Fail> {
             _ => {}
         }
     }
-    settle(d, cx)
+    settle(d, cx)?;
+    // Partitioning changes last, against the table as the statement left
+    // it; the partitioning is checked again in any case.
+    for ch in &part_changes {
+        super::partition::apply(d, ch, cx.mysql)?;
+    }
+    if part_changes.is_empty()
+        && let Some(s) = &d.partition
+    {
+        super::partition::check(s, d, cx.mysql)?;
+    }
+    Ok(())
 }
 
 /// A column renamed in the keys, foreign keys and expressions that name

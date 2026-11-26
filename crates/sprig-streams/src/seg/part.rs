@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use super::batch::{self, Head};
-use super::segment::{Segment, View};
+use super::segment::{BlobBatch, Segment, View};
 
 /// Kafka's `OUT_OF_ORDER_SEQUENCE_NUMBER`.
 pub const OUT_OF_ORDER_SEQUENCE: i16 = 45;
@@ -199,11 +199,14 @@ impl PartState {
     }
 
     /// Applies one batch: idempotence, offsets, epoch, append (rolling at
-    /// `segment_bytes`). `bytes` is patched in place.
+    /// `segment_bytes`). `bytes` is patched in place. With `blob` (where a
+    /// note blob already holds the batch as received) only its patched
+    /// head and that place are kept, in a blob segment.
     ///
     /// # Errors
     /// Writing the segment failed (the partition is then unusable until a
     /// restart replays it).
+    #[allow(clippy::too_many_arguments)]
     pub fn append(
         &mut self,
         bytes: &mut [u8],
@@ -212,6 +215,7 @@ impl PartState {
         log_append_time: bool,
         segment_bytes: u64,
         interval: u64,
+        blob: Option<BlobBatch>,
     ) -> io::Result<Outcome> {
         let Some(h) = Head::parse(bytes).filter(|h| h.total == bytes.len()) else {
             return Ok(Outcome::Refused {
@@ -230,21 +234,37 @@ impl PartState {
             now_ms
         });
         let h = Head::parse(bytes).unwrap_or(h);
-        let roll = self
+        let refs = blob.is_some();
+        // An empty active segment of the other kind gives way.
+        if self
             .segments
             .last()
-            .is_none_or(|s| !s.is_empty() && s.len + bytes.len() as u64 > segment_bytes);
+            .is_some_and(|s| s.is_empty() && s.is_refs() != refs)
+            && let Some(s) = self.segments.pop()
+        {
+            let _ = std::fs::remove_file(&s.path);
+            self.dirty = true;
+        }
+        let roll = self.segments.last().is_none_or(|s| {
+            !s.is_empty() && (s.len + bytes.len() as u64 > segment_bytes || s.is_refs() != refs)
+        });
         if roll {
             std::fs::create_dir_all(&self.dir)?;
             self.new_files = true;
-            self.segments
-                .push(Segment::create(&self.dir, base, now_ms, interval)?);
+            self.segments.push(if refs {
+                Segment::create_refs(&self.dir, base, now_ms, interval)?
+            } else {
+                Segment::create(&self.dir, base, now_ms, interval)?
+            });
         }
         let seg = self
             .segments
             .last_mut()
             .ok_or_else(|| io::Error::other("no segment"))?;
-        seg.append(bytes, &h)?;
+        match blob {
+            Some(b) => seg.append_ref(bytes, &h, b)?,
+            None => seg.append(bytes, &h)?,
+        }
         self.next_offset = h.next_offset();
         if self.epochs.last().is_none_or(|e| e.0 < epoch) {
             self.epochs.push((epoch, base));
@@ -318,7 +338,7 @@ impl PartState {
         }
     }
 
-    /// Bytes in every segment.
+    /// Bytes in every segment (a blob segment's batches counted whole).
     #[must_use]
     pub fn bytes(&self) -> u64 {
         self.segments.iter().map(|s| s.len).sum()

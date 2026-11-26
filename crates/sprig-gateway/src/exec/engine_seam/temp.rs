@@ -100,6 +100,10 @@ impl PassSession {
         if let Some(r) = Box::pin(self.engine_event_prepare(cx, target, text, status, out)).await {
             return Some(r);
         }
+        // Partition DDL: the rows it drops or must fit.
+        if let Some(r) = Box::pin(self.engine_partition_ddl(cx, target, text, status, out)).await {
+            return Some(r);
+        }
         // Plain indexes added to an engine table: built online.
         if let Some(r) = Box::pin(self.engine_online_index(cx, target, text, status, out)).await {
             return Some(r);
@@ -682,6 +686,21 @@ impl PassSession {
                 return Err(not_on_engine(&why));
             }
             match define::create(&text, &define::Ctx { mysql, db_cs })? {
+                define::Created::Def(d) if d.partition.is_some() => {
+                    return Err(if mysql {
+                        SprigError::standard(
+                            1562,
+                            *b"HY000",
+                            "Cannot create temporary table with partitions",
+                        )
+                    } else {
+                        SprigError::standard(
+                            1506,
+                            *b"HY000",
+                            "Partitioned tables do not support CREATE TEMPORARY TABLE",
+                        )
+                    });
+                }
                 define::Created::Def(d) => {
                     let mut d = *d;
                     name.name.clone_into(&mut d.name);

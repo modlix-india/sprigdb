@@ -648,6 +648,7 @@ fn plan_def(t: &str) -> TableDef {
 }
 
 /// A value of a row being built.
+#[derive(Clone)]
 enum V {
     S(String),
     U(u64),
@@ -1000,6 +1001,7 @@ fn add_table(
     next: Option<u64>,
     created: Option<String>,
     rows: Option<u64>,
+    part_rows: Option<&Vec<u64>>,
 ) {
     let mut put = |t: &str, vals: HashMap<&str, V>| {
         if let Err(e) = db.insert(t, row_of(t, &vals)) {
@@ -1046,8 +1048,8 @@ fn add_table(
     v.insert("TABLE_COMMENT", s(def.comment.clone().unwrap_or_default()));
     v.insert("MAX_INDEX_LENGTH", V::U(0));
     v.insert("TEMPORARY", s("N"));
-    // Engine tables aren't partitioned: one row with no partition, as
-    // MariaDB lists an unpartitioned table.
+    // An unpartitioned table: one row with no partition, as the servers
+    // list it; a partitioned one: a row per partition.
     let mut p = HashMap::new();
     base(&mut p);
     for k in [
@@ -1063,8 +1065,34 @@ fn add_table(
     }
     p.insert("PARTITION_COMMENT", s(""));
     p.insert("NODEGROUP", s(""));
-    put("TABLES", v);
-    put("PARTITIONS", p);
+    if let Some(spec) = &def.partition {
+        v.insert("CREATE_OPTIONS", s("partitioned"));
+        for (i, part) in spec.parts.iter().enumerate() {
+            let mut q = p.clone();
+            q.insert("PARTITION_NAME", s(part.name.clone()));
+            q.insert("PARTITION_ORDINAL_POSITION", V::U(i as u64 + 1));
+            q.insert("PARTITION_METHOD", s(spec.method_name()));
+            q.insert("PARTITION_EXPRESSION", s(spec.expression()));
+            q.insert("PARTITION_DESCRIPTION", spec.description(i).map_or(V::N, s));
+            let n = part_rows.and_then(|c| c.get(i)).copied().unwrap_or(0);
+            q.insert("TABLE_ROWS", V::U(n));
+            q.insert(
+                "AVG_ROW_LENGTH",
+                V::U(16384_u64.checked_div(n).unwrap_or(0)),
+            );
+            q.insert("DATA_LENGTH", V::U(16384));
+            q.insert(
+                "PARTITION_COMMENT",
+                s(part.comment.clone().unwrap_or_default()),
+            );
+            q.insert("NODEGROUP", s("default"));
+            put("PARTITIONS", q);
+        }
+        put("TABLES", v);
+    } else {
+        put("TABLES", v);
+        put("PARTITIONS", p);
+    }
     for (i, c) in def.cols.iter().enumerate() {
         let mut v = HashMap::new();
         base(&mut v);
@@ -1915,6 +1943,9 @@ pub(crate) struct Source<'a> {
     pub counters: &'a HashMap<u64, u64>,
     /// Each table's row count (`TABLE_ROWS`), when the query asks for it.
     pub rows: &'a HashMap<u64, u64>,
+    /// A partitioned table's rows per partition (`PARTITIONS.TABLE_ROWS`),
+    /// when the query asks for them.
+    pub part_rows: &'a HashMap<u64, Vec<u64>>,
     /// The tenant's logic functions and procedures (engine-tier code).
     pub logic: &'a [LogicRoutine],
     /// `@sprig_show_auto_indexes = 1`: automatic indexes (`sprig_auto_*`)
@@ -2204,6 +2235,7 @@ fn try_answer(sql: &str, src: &Source<'_>, mysql: bool) -> Result<Answer, String
                 src.counters.get(&o.0).copied(),
                 created,
                 src.rows.get(&o.0).copied(),
+                src.part_rows.get(&o.0),
             );
         }
         let mut views: Vec<_> = src
@@ -2429,6 +2461,7 @@ mod tests {
             tenant: 7,
             counters: &counters,
             rows: &counters,
+            part_rows: &HashMap::new(),
             logic: &[],
             show_auto_indexes: false,
         };
@@ -2453,6 +2486,7 @@ mod tests {
             tenant: 7,
             counters: &counters,
             rows: &counters,
+            part_rows: &HashMap::new(),
             logic: &[],
             show_auto_indexes: false,
         };
@@ -2489,6 +2523,7 @@ mod tests {
             tenant: 61_306_000_000,
             counters: &counters,
             rows: &counters,
+            part_rows: &HashMap::new(),
             logic: &[],
             show_auto_indexes: false,
         };
@@ -2520,6 +2555,7 @@ mod tests {
                 tenant: 7,
                 counters: &counters,
                 rows: &counters,
+                part_rows: &HashMap::new(),
                 logic: &[],
                 show_auto_indexes: shown,
             };

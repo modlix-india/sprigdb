@@ -1052,6 +1052,18 @@ impl PassSession {
                 }
             }
         }
+        // A partitioned table's rows per partition, likewise.
+        let mut part_rows = std::collections::HashMap::new();
+        if lower.contains("partitions") && lower.contains("table_rows") {
+            for p in eng.tables.values() {
+                if let Ok(td) = p.as_ref().as_ref()
+                    && td.partition.is_some()
+                    && let Ok(Some(c)) = e.partition_rows(ts.tenant.0, td, ROW_COUNT_BOUND).await
+                {
+                    part_rows.insert(td.object.0, c);
+                }
+            }
+        }
         let logic = if text.to_ascii_lowercase().contains("routines")
             || text.to_ascii_lowercase().contains("parameters")
         {
@@ -1064,6 +1076,7 @@ impl PassSession {
             tenant: ts.tenant.0,
             counters: &counters,
             rows: &rows,
+            part_rows: &part_rows,
             logic: &logic,
             show_auto_indexes: show_auto_indexes(ts, self.persona),
         };

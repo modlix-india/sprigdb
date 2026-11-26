@@ -60,6 +60,7 @@ pub(crate) mod locking;
 pub(crate) mod meta;
 pub(crate) mod multiwrite;
 pub(crate) mod paramtype;
+pub(crate) mod partition;
 pub(crate) mod plan;
 pub(crate) mod plancache;
 pub(crate) mod routine;
@@ -507,6 +508,55 @@ impl Engine {
             }
         }
         Ok(n)
+    }
+
+    /// A partitioned table's rows per partition, up to `cap` rows read
+    /// (`information_schema.PARTITIONS.TABLE_ROWS`); `None` when the rows'
+    /// partitions aren't known (`KEY` partitioning, or none).
+    pub(crate) async fn partition_rows(
+        &self,
+        tenant: u64,
+        def: &TableDef,
+        cap: u64,
+    ) -> Result<Option<Vec<u64>>> {
+        let Some(rule) = def.partition.clone() else {
+            return Ok(None);
+        };
+        if rule.spec.method == define::partition::Method::Key && !rule.spec.columns {
+            return Ok(None);
+        }
+        let sp = self.space(tenant, def).await?;
+        let mut tx = self.begin(TxnOptions::default())?;
+        let p = sp.rows();
+        let end = keys::prefix_end(&p);
+        let mut lo = p;
+        let mut n: u64 = 0;
+        let mut counts = vec![0u64; rule.spec.parts.len()];
+        let a = expr::Args {
+            params: &[],
+            env: assign::Env::STRICT,
+            now: std::sync::OnceLock::new(),
+            conds: expr::Conds::default(),
+        };
+        let mut pace = Pace::default();
+        loop {
+            let batch = tx.scan(&lo, &end, false, WALK_BATCH)?;
+            for (k, v) in &batch {
+                let row = row::decode(def, &sp, k, v)?;
+                if let Ok(partition::Placed::In(i)) = rule.place(def, &row, &a)
+                    && let Some(c) = counts.get_mut(i)
+                {
+                    *c += 1;
+                }
+            }
+            n += batch.len() as u64;
+            pace.add(batch.len()).await;
+            match batch.last() {
+                Some((k, _)) if batch.len() == WALK_BATCH && n < cap => lo = keys::prefix_end(k),
+                _ => break,
+            }
+        }
+        Ok(Some(counts))
     }
 
     /// The lock of table `object` of `tenant`.

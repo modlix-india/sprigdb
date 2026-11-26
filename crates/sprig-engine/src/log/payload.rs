@@ -17,11 +17,15 @@ use sprig_common::{Result, SprigError};
 
 use crate::store::{Cf, StoreBatch};
 
-const FORMAT: u8 = 1;
+pub(crate) const FORMAT: u8 = 1;
 const PUT: u8 = 1;
 const DELETE: u8 = 2;
 const RANGE: u8 = 3;
-const NOTE: u8 = 4;
+pub(crate) const NOTE: u8 = 4;
+/// A note kept in a blob file ([`super::blobs`]): only the log store's own
+/// copy of an entry holds it, never what readers of the log get (they see
+/// the note again), so the readers below refuse it as corrupt.
+pub(crate) const BLOB: u8 = 5;
 
 /// A payload under construction.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -184,6 +188,52 @@ pub fn decode_into(data: &[u8], batch: &mut StoreBatch) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// One operation of a payload as stored: its code, all its bytes, and for a
+/// note or a blob reference the bytes it carries.
+pub(crate) type RawOp<'a> = (u8, &'a [u8], &'a [u8]);
+
+/// Splits a payload into its operations, in order (blob references
+/// included).
+///
+/// # Errors
+/// The payload is malformed.
+pub(crate) fn split(data: &[u8]) -> Result<Vec<RawOp<'_>>> {
+    let mut r = Reader(data);
+    if r.byte()? != FORMAT {
+        return Err(Reader::bad());
+    }
+    let mut out = Vec::new();
+    while !r.0.is_empty() {
+        let start = r.0;
+        let code = r.byte()?;
+        let body: &[u8] = match code {
+            PUT | RANGE => {
+                r.cf()?;
+                r.slice()?;
+                r.slice()?;
+                &[]
+            }
+            DELETE => {
+                r.cf()?;
+                r.slice()?;
+                &[]
+            }
+            NOTE | BLOB => r.slice()?,
+            _ => return Err(Reader::bad()),
+        };
+        let used = start.len() - r.0.len();
+        out.push((code, &start[..used], body));
+    }
+    Ok(out)
+}
+
+/// Appends a note or a blob reference carrying `bytes` to an encoded
+/// payload.
+pub(crate) fn push_op(out: &mut Vec<u8>, code: u8, bytes: &[u8]) {
+    out.push(code);
+    put_slice(out, bytes);
 }
 
 /// The notes of one payload, in order (what [`Payload::note`] added).

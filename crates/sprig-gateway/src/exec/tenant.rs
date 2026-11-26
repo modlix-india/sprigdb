@@ -628,6 +628,16 @@ impl PassSession {
         if let Some(ts) = self.tenant.as_deref_mut() {
             ts.rls.covered.clear();
         }
+        // `PARTITION (p)` after an engine table's name: the statement
+        // rewritten (exec/engine_seam/partition.rs).
+        if text
+            .windows(9)
+            .any(|w| w.eq_ignore_ascii_case(b"PARTITION"))
+            && let Some(step) =
+                Box::pin(self.engine_partition_dml(cx, text, attrs, more, format, out)).await?
+        {
+            return Ok(step);
+        }
         // A plain statement on an engine table of a shape seen to pass
         // every step below unchanged: straight to the engine
         // (exec/engine_seam/fast.rs).

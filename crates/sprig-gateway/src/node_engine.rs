@@ -30,6 +30,12 @@
 //!   keeps stepping groups (and answering) while a sync runs, and writes
 //!   queued meanwhile share the next sync (default `true`; `false` writes
 //!   on the loop, as before).
+//! - `SPRIGDB_ENGINE_STREAM_WRITE_ONCE`: on a replicated node, each stream
+//!   append's batch is written once: the Raft log keeps it in a note blob
+//!   file (`<engine dir>/raft-notes`) with only a reference in the log, and
+//!   the stream's segments refer to the same bytes instead of copying them
+//!   (default `true`; `false` writes the batch into both, as before; blobs
+//!   already written are still read).
 //! - `SPRIGDB_ENGINE_RAFT_JOIN=true`: this node replaces a lost replica.
 //!   It starts with no units of its own and takes each unit only from the
 //!   unit's leader, once an operator runs `sprigctl engine replace-replica`
@@ -66,6 +72,8 @@ pub const RAFT_JOIN_VAR: &str = "SPRIGDB_ENGINE_RAFT_JOIN";
 pub const STREAM_GROUPS_VAR: &str = "SPRIGDB_ENGINE_STREAM_GROUPS";
 /// The variable that turns the Raft log writer thread off (`false`).
 pub const RAFT_LOG_THREAD_VAR: &str = "SPRIGDB_ENGINE_RAFT_LOG_THREAD";
+/// The variable that turns writing stream appends once off (`false`).
+pub const STREAM_WRITE_ONCE_VAR: &str = "SPRIGDB_ENGINE_STREAM_WRITE_ONCE";
 /// The node-local Admin API route that replaces a lost replica.
 pub const REPLACE_PATH: &str = "/admin/v1/engine/replicas:replace";
 
@@ -330,8 +338,23 @@ fn start_raft(engine: &Engine, r: &RaftSetup, dir: PathBuf) -> Result<()> {
     for (pid, addr) in &r.peers {
         transport.set_peer(*pid, *addr);
     }
+    let notes_dir = dir.with_file_name("raft-notes");
     let store = sprig_raft::EngineLogStore::open(dir, SyncMode::Full, None)
         .map_err(|e| raft_err(e.to_string()))?;
+    // Before the node opens: its recovery reads the log, whose references
+    // to note blobs must be put back. Opened even with writing once off, to
+    // read the blobs an earlier run wrote.
+    let write_once =
+        !std::env::var(STREAM_WRITE_ONCE_VAR).is_ok_and(|v| v.trim().eq_ignore_ascii_case("false"));
+    let blobs = sprig_engine::log::blobs::NoteBlobs::open(
+        &notes_dir,
+        SyncMode::Full,
+        sprig_streams::seg::note::is_append,
+        write_once,
+    )
+    .map_err(|e| raft_err(format!("note blobs in {}: {e}", notes_dir.display())))?;
+    store.set_note_blobs(Arc::clone(&blobs));
+    let _ = NOTE_BLOBS.set(blobs);
     let node = sprig_raft::EngineNode::open(
         engine,
         sprig_raft::EngineNodeOptions {
@@ -376,7 +399,7 @@ fn start_raft(engine: &Engine, r: &RaftSetup, dir: PathBuf) -> Result<()> {
         std::time::Duration::from_secs(10),
     )
     .map_err(|e| raft_err(e.to_string()))?;
-    tracing::info!(id = r.id, raft = %bound, voters = r.peers.len(), join = r.join, stream_groups = groups_from(|k| std::env::var(k).ok()), "engine units replicate through raft");
+    tracing::info!(id = r.id, raft = %bound, voters = r.peers.len(), join = r.join, stream_groups = groups_from(|k| std::env::var(k).ok()), stream_write_once = write_once, "engine units replicate through raft");
     let _ = RAFT.set(Raft {
         node,
         transport,
@@ -394,6 +417,15 @@ struct Raft {
 }
 
 static RAFT: OnceLock<Raft> = OnceLock::new();
+
+static NOTE_BLOBS: OnceLock<Arc<sprig_engine::log::blobs::NoteBlobs>> = OnceLock::new();
+
+/// The Raft log's note blobs on a replicated node (after [`engine`]
+/// opened), for the stream log's segments to refer to.
+#[must_use]
+pub fn note_blobs() -> Option<Arc<sprig_engine::log::blobs::NoteBlobs>> {
+    NOTE_BLOBS.get().cloned()
+}
 
 /// What [`replace_replica`] did.
 #[derive(Debug, Default, serde::Serialize)]

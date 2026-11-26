@@ -35,6 +35,7 @@ mod alter;
 pub(crate) mod expr;
 pub(crate) mod fkcheck;
 pub(crate) mod lex;
+pub(crate) mod partition;
 mod types;
 
 #[cfg(test)]
@@ -191,6 +192,8 @@ pub(crate) struct Def {
     pub key_block_size: Option<u64>,
     /// `STATS_PERSISTENT=n`.
     pub stats_persistent: Option<String>,
+    /// `PARTITION BY ...`.
+    pub partition: Option<partition::Spec>,
 }
 
 impl Def {
@@ -507,9 +510,11 @@ fn create_in(toks: &[Tok], cx: &Ctx) -> Result<Created, Fail> {
         return Err(Fail::Syntax(p.i));
     }
     table_options(&mut p, &mut raw.opts)?;
-    if p.is("PARTITION") {
-        return Err(refuse("partitioned tables"));
-    }
+    let part = if p.is("PARTITION") {
+        Some(partition::read(&mut p, &cx.db_cs.0)?)
+    } else {
+        None
+    };
     if p.is("AS") || p.is("SELECT") || p.is("IGNORE") || p.is("REPLACE") || p.is("WITH") {
         return Err(refuse("CREATE TABLE ... SELECT"));
     }
@@ -517,7 +522,11 @@ fn create_in(toks: &[Tok], cx: &Ctx) -> Result<Created, Fail> {
     if raw.cols.is_empty() {
         return Err(err(1113, "42000", "A table must have at least 1 column"));
     }
-    let def = finish(name, raw, cx)?;
+    let mut def = finish(name, raw, cx)?;
+    if let Some(s) = part {
+        partition::check(&s, &def, cx.mysql)?;
+        def.partition = Some(s);
+    }
     Ok(Created::Def(Box::new(def)))
 }
 
@@ -1112,6 +1121,7 @@ pub(crate) fn finish(name: String, raw: Raw, cx: &Ctx) -> Result<Def, Fail> {
         row_format: opts.row_format,
         key_block_size: opts.key_block_size,
         stats_persistent: opts.stats_persistent,
+        partition: None,
     };
     let mut keys = Vec::new();
     for rc in rcols {
@@ -1964,6 +1974,9 @@ pub(crate) fn render(def: &Def) -> String {
     }
     if let Some(c) = &def.comment {
         _ = write!(s, " COMMENT={}", quote_str(c).replace("\\'", "''"));
+    }
+    if let Some(p) = &def.partition {
+        s.push_str(&p.print());
     }
     s
 }

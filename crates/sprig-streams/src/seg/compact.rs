@@ -8,12 +8,14 @@
 //! The rewrite is written beside the segment and synced, then renamed over
 //! it under the partition lock: a reader holding the old file keeps
 //! reading the old bytes. Each pass cleans the rolled segments not cleaned
-//! yet (`cleaned_to`).
+//! yet (`cleaned_to`). A blob segment's rewrite is a plain segment; its old
+//! file goes once the manifest no longer names it.
 
 use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::os::unix::fs::FileExt;
+use std::path::PathBuf;
 
 use sprig_proto_kafka::records::RecordBatch;
 use sprig_proto_kafka::wire::Reader;
@@ -36,13 +38,22 @@ fn batches(s: &Segment) -> io::Result<Vec<(Head, Vec<u8>)>> {
 }
 
 /// One compaction pass over a partition; returns whether it rewrote
-/// anything.
+/// anything. Files to remove after the next manifest go in `gone`.
 ///
 /// # Errors
 /// The files can't be read or written.
-pub fn compact(p: &Part, pol: &Policy, now_ms: i64, interval: u64) -> io::Result<bool> {
-    // What to clean: rolled segments past `cleaned_to`.
-    let (rolled, cleaned_to, files) = {
+pub fn compact(
+    p: &Part,
+    pol: &Policy,
+    now_ms: i64,
+    interval: u64,
+    gone: &mut Vec<PathBuf>,
+) -> io::Result<bool> {
+    // What to clean: rolled segments past `cleaned_to`. Each key's newest
+    // offset is taken over every segment (the active one up to what it
+    // holds now; later records only make us keep more), read from copies
+    // outside the lock.
+    let (rolled, cleaned_to, segs) = {
         let mut st = p.lock();
         if st.segments.len() < 2 {
             return Ok(false);
@@ -56,19 +67,9 @@ pub fn compact(p: &Part, pol: &Policy, now_ms: i64, interval: u64) -> io::Result
         if end <= st.cleaned_to {
             return Ok(false);
         }
-        let files: Vec<(i64, std::path::PathBuf)> = st
-            .segments
-            .iter()
-            .map(|s| (s.base, s.path.clone()))
-            .collect();
-        (rolled, st.cleaned_to, files)
+        let segs: Vec<Segment> = st.segments.iter().map(Segment::read_copy).collect();
+        (rolled, st.cleaned_to, segs)
     };
-    // Each key's newest offset, over every segment (the active one up to
-    // what it holds now; later records only make us keep more).
-    let segs: Vec<Segment> = files
-        .iter()
-        .map(|(base, path)| Segment::open_read(path, *base, interval))
-        .collect::<io::Result<_>>()?;
     let mut newest: HashMap<Vec<u8>, i64> = HashMap::new();
     for s in &segs {
         for (_, bytes) in batches(s)? {
@@ -117,7 +118,8 @@ pub fn compact(p: &Part, pol: &Policy, now_ms: i64, interval: u64) -> io::Result
             let f = fs::File::create(&tmp)?;
             f.write_all_at(&out, 0)?;
             f.sync_all()?;
-            rewritten.push((s.base, s.path.clone(), tmp));
+            let path = s.path.with_file_name(super::segment::file_name(s.base));
+            rewritten.push((s.base, path, tmp));
         }
     }
     let end = segs[rolled - 1].next.max(cleaned_to);
@@ -128,6 +130,9 @@ pub fn compact(p: &Part, pol: &Policy, now_ms: i64, interval: u64) -> io::Result
             continue;
         };
         fs::rename(tmp, path)?;
+        if st.segments[i].is_refs() {
+            gone.push(st.segments[i].path.clone());
+        }
         let created = st.segments[i].created_ms;
         let mut s = Segment::open(path, *base, None, created, interval)?;
         // A rewritten segment still spans the offsets it did.

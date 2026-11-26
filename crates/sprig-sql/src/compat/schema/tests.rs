@@ -485,3 +485,24 @@ fn mysql_tables_leave_out_their_default_collation() {
             .ends_with("DEFAULT CHARSET=utf8mb3 COMMENT='x'")
     );
 }
+
+#[test]
+fn partitioning_reads_as_mysql_prints_it() {
+    let maria = "CREATE TABLE `t` (\n  `a` int(11) DEFAULT NULL,\n  `b` varchar(5) DEFAULT NULL\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci\n PARTITION BY RANGE  COLUMNS(`a`,`b`)\n(PARTITION `p0` VALUES LESS THAN (10,'m') ENGINE = InnoDB,\n PARTITION `p 1` VALUES LESS THAN (MAXVALUE,MAXVALUE) ENGINE = InnoDB)";
+    let got = mysql_create_table(maria);
+    assert!(
+        got.starts_with("CREATE TABLE `t` (\n  `a` int DEFAULT NULL,"),
+        "{got}"
+    );
+    assert!(
+        got.ends_with(
+            "\n/*!50500 PARTITION BY RANGE  COLUMNS(a,b)\n(PARTITION p0 VALUES LESS THAN (10,'m') ENGINE = InnoDB,\n PARTITION `p 1` VALUES LESS THAN (MAXVALUE,MAXVALUE) ENGINE = InnoDB) */"
+        ),
+        "{got}"
+    );
+    let hash = "CREATE TABLE `h` (\n  `d` date DEFAULT NULL\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci\n PARTITION BY HASH (year(`d`))\nPARTITIONS 4";
+    assert!(
+        mysql_create_table(hash)
+            .ends_with("\n/*!50100 PARTITION BY HASH (year(`d`))\nPARTITIONS 4 */")
+    );
+}

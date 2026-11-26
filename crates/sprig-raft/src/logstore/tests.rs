@@ -227,3 +227,83 @@ fn raft_engine_after_a_power_cut_keeps_a_prefix() {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+/// With note blobs, synced writes keep large notes in blob files and the
+/// log reads them back whole; unsynced writes keep them inline. A crash
+/// that cut the newest blob file's tail cuts the log at the first entry
+/// whose note was there, and the commit index with it.
+#[test]
+fn note_blobs_go_out_come_back_and_cut_a_torn_tail() {
+    use sprig_engine::log::Payload;
+    let dir = std::env::temp_dir().join(format!("sprig-raft-blobs-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let open = || {
+        let s = EngineLogStore::open(dir.join("raft"), SyncMode::Off, None).unwrap();
+        let b = NoteBlobs::open(
+            dir.join("notes"),
+            SyncMode::Off,
+            |n| n.first() == Some(&b'K'),
+            true,
+        )
+        .unwrap();
+        s.set_note_blobs(Arc::clone(&b));
+        (s, b)
+    };
+    let data = |i: u64| {
+        let mut p = Payload::new();
+        p.note(&[b'K'; 1000]);
+        p.note(&i.to_le_bytes());
+        p.into_bytes()
+    };
+    let ents = |r: std::ops::RangeInclusive<u64>| -> Vec<Entry> {
+        r.map(|i| Entry {
+            index: i,
+            term: 2,
+            data: data(i).into(),
+            ..Entry::default()
+        })
+        .collect()
+    };
+    let (store, blobs) = open();
+    for (r, commit, sync) in [(1..=5, 5, true), (6..=8, 8, true), (9..=9, 9, false)] {
+        store
+            .write(
+                &batch(vec![GroupWrite {
+                    group: 1,
+                    entries: ents(r),
+                    hard_state: Some(hs(2, commit)),
+                    ..GroupWrite::default()
+                }]),
+                sync,
+            )
+            .unwrap();
+    }
+    let got = store.entries(1, 1, 10).unwrap();
+    assert_eq!(got, ents(1..=9), "read back whole");
+    assert!(
+        blobs.disk_bytes() >= 8 * 1000 && blobs.disk_bytes() < 9 * 1000,
+        "eight notes in blobs, the unsynced one inline"
+    );
+    let blob = std::fs::read_dir(dir.join("notes"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|x| x == "blob"))
+        .unwrap();
+    drop((store, blobs));
+    // A crash cut the last note's record.
+    let f = std::fs::OpenOptions::new().write(true).open(&blob).unwrap();
+    let len = f.metadata().unwrap().len();
+    f.set_len(len - 10).unwrap();
+    let (s, _b) = open();
+    let r = s.recover().unwrap();
+    let g = r.iter().find(|g| g.group == 1).unwrap();
+    assert_eq!(
+        g.entries,
+        ents(1..=7),
+        "cut at the entry whose note was lost"
+    );
+    assert_eq!(g.hard_state.commit, 7);
+    drop(s);
+    let _ = std::fs::remove_dir_all(&dir);
+}

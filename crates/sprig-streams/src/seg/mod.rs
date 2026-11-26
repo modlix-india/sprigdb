@@ -31,6 +31,15 @@
 //!
 //! Consumer offsets and groups are engine records ([`records`]), so an
 //! offset commit can be part of a SQL transaction.
+//!
+//! **Written once** ([`SegConfig::blobs`]). On a replicated node the log
+//! store keeps each append's batch in a note blob file and only a
+//! reference in the Raft log. The apply step then appends the batch to a
+//! blob segment ([`segment`]): its patched head and where the blob file
+//! holds the rest, so the batch's bytes reach the disk once per node. The
+//! stream log tells the blobs which files its segments still refer to
+//! ([`BlobHolder`]); compaction and snapshots read through the references
+//! and write plain segments.
 
 pub mod batch;
 pub mod compact;
@@ -52,11 +61,12 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use sprig_common::{Result, SprigError};
+use sprig_engine::log::blobs::{BlobHolder, NoteBlobs};
 use sprig_engine::log::{LogEntry, Payload};
 use sprig_engine::{ApplyObserver, Durability, Engine};
 
 use self::part::{Outcome, PartKey, PartState, ProducedBatch, Producer};
-use self::segment::Segment;
+use self::segment::{BlobBatch, Segment};
 
 pub use self::part::PartKey as Key;
 
@@ -87,6 +97,11 @@ pub struct SegConfig {
     /// any replica (replicated engines spread them). A stream log keeps
     /// the value it first ran with while it holds partitions.
     pub groups: u32,
+    /// The log store's note blobs, where a replicated node's log store
+    /// already wrote each append's batch: segments then refer to those
+    /// bytes instead of writing them again. Needed to open segments that
+    /// refer to them.
+    pub blobs: Option<Arc<NoteBlobs>>,
 }
 
 impl Default for SegConfig {
@@ -99,6 +114,7 @@ impl Default for SegConfig {
             durability: Durability::Local,
             producer_expiry_ms: 7 * 24 * 3_600_000,
             groups: 0,
+            blobs: None,
         }
     }
 }
@@ -157,12 +173,16 @@ pub struct Pending {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OutOfRange(pub Bounds);
 
-/// What the manifest keeps of one segment.
+/// What the manifest keeps of one segment: its file's length (a blob
+/// segment's records).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SegMeta {
     base: i64,
     len: u64,
     created_ms: i64,
+    /// A blob segment (`<base>.ref`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    refs: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -263,6 +283,9 @@ struct Inner {
     /// Appends happened since the last write pass began.
     unwritten: AtomicBool,
     policies: Mutex<HashMap<(u64, u64), Policy>>,
+    /// What the note blobs ask about this log's references (kept alive
+    /// with the log; the blobs hold it weakly).
+    holder: std::sync::OnceLock<Arc<dyn BlobHolder>>,
 }
 
 /// The node's stream log. Cheap to clone.
@@ -352,6 +375,41 @@ impl ApplyObserver for Applier {
             // the node unit): every unit's index sequence is tracked.
             i.apply(unit.0, entries);
         }
+    }
+}
+
+/// Tells the note blobs which blob files the segments refer to.
+struct Holder(Weak<Inner>);
+
+impl BlobHolder for Holder {
+    fn in_use(&self) -> BTreeSet<u64> {
+        let Some(inner) = self.0.upgrade() else {
+            return BTreeSet::new();
+        };
+        let parts: Vec<Arc<Part>> = inner
+            .parts
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .cloned()
+            .collect();
+        let mut ids = BTreeSet::new();
+        for p in parts {
+            for s in &p.lock().segments {
+                ids.extend(s.blob_ids().iter().copied());
+            }
+        }
+        ids
+    }
+}
+
+/// Registers the log with its note blobs as the holder of the files its
+/// segments refer to.
+fn hold_blobs(inner: &Arc<Inner>) {
+    if let Some(b) = &inner.cfg.blobs {
+        let h: Arc<dyn BlobHolder> = Arc::new(Holder(Arc::downgrade(inner)));
+        b.set_holder(Arc::downgrade(&h));
+        let _ = inner.holder.set(h);
     }
 }
 
@@ -456,7 +514,8 @@ impl Inner {
             }
             std::thread::sleep(Duration::from_millis(1));
         }
-        // One point: no append applies while the partitions are read.
+        // One point: no append applies while the partitions are read. Blob
+        // segments go out as plain ones (their batches' bytes).
         let (head, segs) = {
             let a = lock(&self.apply);
             let applied = a.applied.get(&unit).copied().unwrap_or(index).max(index);
@@ -469,7 +528,7 @@ impl Inner {
                 .map(|(k, p)| (*k, Arc::clone(p)))
                 .collect();
             let mut metas = Vec::with_capacity(parts.len());
-            let mut segs: Vec<(Arc<fs::File>, u64)> = Vec::new();
+            let mut segs: Vec<Segment> = Vec::new();
             for (k, p) in parts {
                 let mut st = p.lock();
                 // The snapshot reads the files: pending batches go in first.
@@ -477,10 +536,15 @@ impl Inner {
                     s.write_out()
                         .map_err(|e| io_err("snapshot: write segment", &e))?;
                 }
-                metas.push(meta_of(k, &st));
-                // An open handle reads what the segment held now, even if a
+                let mut m = meta_of(k, &st);
+                for (sm, s) in m.segments.iter_mut().zip(&st.segments) {
+                    sm.len = s.len;
+                    sm.refs = false;
+                }
+                metas.push(m);
+                // A copy reads what the segment held now, even if a
                 // compaction or retention replaces or removes the file.
-                segs.extend(st.segments.iter().map(|s| (s.handle(), s.len)));
+                segs.extend(st.segments.iter().map(Segment::read_copy));
             }
             let head = UnitStreams {
                 applied,
@@ -504,11 +568,11 @@ impl Inner {
         )?;
         w(out, &body)?;
         let mut buf = vec![0u8; 1 << 20];
-        for (f, len) in segs {
+        for s in segs {
             let mut at = 0u64;
-            while at < len {
-                let n = usize::try_from((len - at).min(buf.len() as u64)).unwrap_or(buf.len());
-                std::os::unix::fs::FileExt::read_exact_at(&*f, &mut buf[..n], at)
+            while at < s.len {
+                let n = usize::try_from((s.len - at).min(buf.len() as u64)).unwrap_or(buf.len());
+                s.read_bytes(&mut buf[..n], at)
                     .map_err(|e| io_err("snapshot: read segment", &e))?;
                 w(out, &buf[..n])?;
                 at += n as u64;
@@ -729,6 +793,13 @@ impl Inner {
             let Ok(notes) = sprig_engine::log::payload::notes(&e.data) else {
                 continue;
             };
+            // Where this node's log store keeps the entry's appends.
+            let located = self
+                .cfg
+                .blobs
+                .as_ref()
+                .map(|b| (b, b.take_located(unit, e.index, e.term)))
+                .filter(|(_, l)| !l.is_empty());
             for (slot, n) in notes.iter().enumerate() {
                 let Some(op) = note::decode(n) else {
                     continue;
@@ -740,7 +811,16 @@ impl Inner {
                     log_append_time,
                     batch,
                 } = op;
-                let out = self.apply_append(&mut a, unit, key, now_ms, log_append_time, batch);
+                let blob = located.as_ref().and_then(|(b, l)| {
+                    let (_, loc) = l.iter().find(|(s, _)| *s == slot)?;
+                    (loc.len as usize == n.len()).then_some(())?;
+                    Some(BlobBatch {
+                        file: b.file(loc.file)?,
+                        at: loc.at + (n.len() - batch.len()) as u64,
+                    })
+                });
+                let out =
+                    self.apply_append(&mut a, unit, key, now_ms, log_append_time, batch, blob);
                 outs.push(((unit, e.index, slot), out));
             }
         }
@@ -801,6 +881,7 @@ impl Inner {
             .unwrap_or(a.epoch_at_start)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn apply_append(
         &self,
         a: &mut ApplyState,
@@ -809,6 +890,7 @@ impl Inner {
         now_ms: i64,
         log_append_time: bool,
         batch: &[u8],
+        blob: Option<BlobBatch>,
     ) -> Outcome {
         if a.dropped.contains(&(key.tenant, key.stream)) {
             return Outcome::Refused {
@@ -833,6 +915,7 @@ impl Inner {
             log_append_time,
             self.cfg.segment_bytes,
             self.cfg.index_interval,
+            blob,
         ) {
             Ok(o) => o,
             Err(e) => {
@@ -891,6 +974,7 @@ impl SegLog {
             writing: Mutex::new(()),
             unwritten: AtomicBool::new(false),
             policies: Mutex::new(HashMap::new()),
+            holder: std::sync::OnceLock::new(),
         });
         // Where each unit's catch-up starts: the manifest's floors, raised
         // to the engine's (a floor set after the manifest was written).
@@ -948,6 +1032,9 @@ impl SegLog {
         )?;
         engine.on_leader_change(Arc::new(Leadership(Arc::downgrade(&inner))));
         engine.add_snapshot_part(Arc::new(SnapshotPart(Arc::downgrade(&inner))));
+        // After the restore above: the blobs may now remove files these
+        // segments don't refer to.
+        hold_blobs(&inner);
         let log = SegLog { inner };
         {
             let mut a = lock(&log.inner.apply);
@@ -1560,10 +1647,10 @@ impl SegLog {
                     return Err(io_err("write segment", &e));
                 }
                 for s in &mut st.segments {
-                    if s.synced < s.len {
+                    if s.synced < s.flen {
                         files.push(s.handle());
                         synced.push((s.base, s.synced));
-                        s.synced = s.len;
+                        s.synced = s.flen;
                     }
                 }
                 let new_files = std::mem::take(&mut st.new_files);
@@ -1687,7 +1774,8 @@ impl SegLog {
         for (k, p) in &parts {
             let policy = self.inner.policy(k.tenant, k.stream);
             if let Some(pol) = policy.filter(|p| p.compact)
-                && let Err(e) = compact::compact(p, &pol, now, self.inner.cfg.index_interval)
+                && let Err(e) =
+                    compact::compact(p, &pol, now, self.inner.cfg.index_interval, &mut gone)
             {
                 tracing::warn!(tenant = k.tenant, stream = k.stream, partition = k.partition, error = %e, "stream compaction failed");
             }
@@ -1721,6 +1809,11 @@ impl SegLog {
         self.flush()?;
         for g in gone {
             let _ = fs::remove_file(g);
+        }
+        // Blob files no segment refers to and the log no longer holds.
+        if let Some(b) = &self.inner.cfg.blobs {
+            let e = &self.inner.engine;
+            b.collect(&|u| e.log_first_index_of(sprig_engine::UnitId(u)));
         }
         Ok(())
     }
@@ -1806,8 +1899,9 @@ fn meta_of(k: PartKey, st: &PartState) -> PartMeta {
             .iter()
             .map(|s| SegMeta {
                 base: s.base,
-                len: s.len,
+                len: s.flen,
                 created_ms: s.created_ms,
+                refs: s.is_refs(),
             })
             .collect(),
         producers: st
@@ -1898,11 +1992,14 @@ fn restore_part(inner: &Inner, pm: &PartMeta) -> Result<PartState> {
             )
         })
         .collect();
-    let names: BTreeSet<String> = pm
-        .segments
-        .iter()
-        .map(|s| segment::file_name(s.base))
-        .collect();
+    let name = |s: &SegMeta| {
+        if s.refs {
+            segment::ref_file_name(s.base)
+        } else {
+            segment::file_name(s.base)
+        }
+    };
+    let names: BTreeSet<String> = pm.segments.iter().map(name).collect();
     if let Ok(rd) = fs::read_dir(&dir) {
         for e in rd.flatten() {
             if !names.contains(&*e.file_name().to_string_lossy()) {
@@ -1912,15 +2009,33 @@ fn restore_part(inner: &Inner, pm: &PartMeta) -> Result<PartState> {
     }
     let n = pm.segments.len();
     for (i, sm) in pm.segments.iter().enumerate() {
-        let path = dir.join(segment::file_name(sm.base));
+        let path = dir.join(name(sm));
         let active = i + 1 == n;
-        match Segment::open(
-            &path,
-            sm.base,
-            active.then_some(sm.len),
-            sm.created_ms,
-            inner.cfg.index_interval,
-        ) {
+        let opened = if sm.refs {
+            let Some(b) = &inner.cfg.blobs else {
+                return Err(SprigError::internal(format!(
+                    "stream log: {} refers to note blobs, and this node runs without them",
+                    path.display()
+                )));
+            };
+            Segment::open_refs(
+                &path,
+                sm.base,
+                active.then_some(sm.len),
+                sm.created_ms,
+                inner.cfg.index_interval,
+                &|id| b.file(id),
+            )
+        } else {
+            Segment::open(
+                &path,
+                sm.base,
+                active.then_some(sm.len),
+                sm.created_ms,
+                inner.cfg.index_interval,
+            )
+        };
+        match opened {
             Ok(s) => st.segments.push(s),
             Err(e) if e.kind() == io::ErrorKind::NotFound && !active => {
                 // Retention removed it after the manifest was written.

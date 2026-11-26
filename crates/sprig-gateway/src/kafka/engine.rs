@@ -79,6 +79,7 @@ pub fn streams() -> Option<Arc<EngineStreams>> {
                 .join("streams");
             let cfg = SegConfig {
                 groups: crate::node_engine::stream_groups(),
+                blobs: crate::node_engine::note_blobs(),
                 ..SegConfig::default()
             };
             EngineStreams::open(&e, dir, cfg, TopicDefaults::default())

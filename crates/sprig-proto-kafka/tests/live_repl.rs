@@ -708,7 +708,9 @@ async fn live_writes_follow_the_tenants_leader() {
 /// leader epoch, as Kafka's clients do) while the tenant's leading gateway
 /// is killed `SPRIG_KAFKA_KILLS` times, every `SPRIG_KAFKA_KILL_EVERY_S`
 /// seconds, with `SPRIG_KAFKA_FAILOVER`. Reports the gaps between
-/// acknowledgements and checks every acknowledged record is read back.
+/// acknowledgements and the error codes answered on the way, and checks
+/// every acknowledged record is read back. `SPRIG_KAFKA_KILL_SPRAY=1` adds
+/// a producer that sends to every gateway in turn.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs a three-gateway cluster and a kill command"]
 async fn live_kill_loop() {
@@ -766,10 +768,54 @@ async fn live_kill_loop() {
             stop.store(true, std::sync::atomic::Ordering::Relaxed);
         })
     };
+    // With SPRIG_KAFKA_KILL_SPRAY=1 a second producer sends to every
+    // gateway in turn, followers included, as clients that bootstrap from
+    // all brokers do, and counts what each answers.
+    let spray_codes: Arc<std::sync::Mutex<BTreeMap<i16, usize>>> = Arc::default();
+    let spray_task = env("SPRIG_KAFKA_KILL_SPRAY")
+        .is_some_and(|v| v != "0")
+        .then(|| {
+            let (stop, topic, codes) = (Arc::clone(&stop), topic.clone(), Arc::clone(&spray_codes));
+            tokio::spawn(async move {
+                let mut s = View::default();
+                s.refresh(Some(&topic)).await;
+                let mut n = 0usize;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let ids: Vec<i32> = s.brokers.keys().copied().collect();
+                    for id in ids {
+                        let p = i32::try_from(n % 6).unwrap();
+                        n += 1;
+                        let req = produce_req(&topic, p, batch("s", n, 1));
+                        let code = match s.conn(id).await {
+                            None => -2,
+                            Some(c) => match tokio::time::timeout(
+                                Duration::from_secs(10),
+                                c.call::<_, ProduceResponse>(9, &req),
+                            )
+                            .await
+                            {
+                                Ok(Ok(r)) => r.responses[0].partition_responses[0].error_code,
+                                _ => {
+                                    s.conns.remove(&id);
+                                    -2
+                                }
+                            },
+                        };
+                        *codes.lock().unwrap().entry(code).or_default() += 1;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    if n.is_multiple_of(300) {
+                        s.refresh(Some(&topic)).await;
+                    }
+                }
+            })
+        });
     let started = Instant::now();
     let mut acks: Vec<Duration> = Vec::new();
     let mut acked: BTreeMap<i32, Vec<String>> = BTreeMap::new();
     let mut retried = 0usize;
+    // Kafka error codes answered on the way (-2: no connection).
+    let mut codes: BTreeMap<i16, usize> = BTreeMap::new();
     let mut sent = 0;
     while !stop.load(std::sync::atomic::Ordering::Relaxed) {
         let p = i32::try_from(sent % 6).unwrap();
@@ -782,12 +828,22 @@ async fn live_kill_loop() {
         )
         .await;
         retried += seen.len();
+        for c in seen {
+            *codes.entry(c).or_default() += 1;
+        }
         acks.push(started.elapsed());
         acked.entry(p).or_default().push(format!("k-{sent}"));
         sent += 1;
         tokio::time::sleep(Duration::from_millis(2)).await;
     }
     killer.await.unwrap();
+    let sprayed: BTreeMap<i16, usize> = match spray_task {
+        Some(t) => {
+            t.await.unwrap();
+            spray_codes.lock().unwrap().clone()
+        }
+        None => BTreeMap::new(),
+    };
     let mut gaps: Vec<f64> = acks
         .windows(2)
         .map(|w| w[1].saturating_sub(w[0]).as_secs_f64())
@@ -804,8 +860,8 @@ async fn live_kill_loop() {
         missing += acked[&p].iter().filter(|r| !got.contains(*r)).count();
     }
     println!(
-        "kill loop: {kills} kills, {sent} acknowledged, {retried} errors on the way, {} stale Metadata answers, \
-         lost {missing}; gaps > 1 s: {}, > 5 s: {}, longest {:?}",
+        "kill loop: {kills} kills, {sent} acknowledged, {retried} errors on the way {codes:?} (spray: answers \
+         by code {sprayed:?}), {} stale Metadata answers, lost {missing}; gaps > 1 s: {}, > 5 s: {}, longest {:?}",
         v.stale,
         gaps.iter().filter(|g| **g > 1.0).count(),
         gaps.iter().filter(|g| **g > 5.0).count(),
@@ -814,13 +870,31 @@ async fn live_kill_loop() {
     assert_eq!(missing, 0, "acknowledged records lost");
 }
 
+/// `n` random capital letters, a different run for each record.
+fn letters(part: i32, record: usize, n: usize) -> Vec<u8> {
+    let mut x = ((u64::from(part.unsigned_abs()) << 40) ^ record as u64)
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        | 1;
+    (0..n)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            b'A' + u8::try_from(x % 26).unwrap_or(0)
+        })
+        .collect()
+}
+
 /// Produce throughput the way kafka-producer-perf-test runs it (acks=all,
 /// batches of `SPRIG_KAFKA_TP_BATCH` records of `SPRIG_KAFKA_TP_SIZE`
 /// bytes, `SPRIG_KAFKA_TP_INFLIGHT` requests in flight per partition), each
 /// partition's batches sent to the leader Metadata names. Fails if any
 /// append was answered KAFKA_STORAGE_ERROR (an append the gateway
 /// reported lost) or the partitions hold more records than were
-/// acknowledged.
+/// acknowledged. With `SPRIG_KAFKA_TP_RANDOM=1` every record's value is
+/// fresh random letters, as kafka-producer-perf-test sends them (a
+/// repeated value compresses to almost nothing in the log's files, which
+/// hides what the disks write).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs three gateways whose engines replicate, with the kafka listener"]
 async fn live_repl_throughput() {
@@ -829,6 +903,7 @@ async fn live_repl_throughput() {
     let per: usize = env("SPRIG_KAFKA_TP_BATCH").map_or(16, |v| v.parse().unwrap());
     let inflight: usize = env("SPRIG_KAFKA_TP_INFLIGHT").map_or(5, |v| v.parse().unwrap());
     let parts: i32 = env("SPRIG_KAFKA_TP_PARTITIONS").map_or(6, |v| v.parse().unwrap());
+    let random = env("SPRIG_KAFKA_TP_RANDOM").is_some_and(|v| v != "0");
     let db = env("SPRIG_KAFKA_DB").unwrap();
     let topic = format!("{db}.tp_{}", std::process::id());
     let mut v = View::default();
@@ -889,7 +964,11 @@ async fn live_repl_throughput() {
                         .map(|i| Record {
                             offset_delta: i as i32,
                             key: Some(format!("k{}", first + i).into_bytes()),
-                            value: Some(value.clone()),
+                            value: Some(if random {
+                                letters(part, first + i, size)
+                            } else {
+                                value.clone()
+                            }),
                             ..Record::default()
                         })
                         .collect(),

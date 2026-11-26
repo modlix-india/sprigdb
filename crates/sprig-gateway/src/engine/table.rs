@@ -445,6 +445,9 @@ pub(crate) struct TableDef {
     pub generated_cols: Vec<usize>,
     /// The foreign keys, in definition order.
     pub fks: Vec<ForeignKey>,
+    /// `PARTITION BY ...`: what a row may hold, and which rows a partition
+    /// has.
+    pub partition: Option<Arc<super::partition::Rule>>,
 }
 
 impl TableDef {
@@ -1236,6 +1239,11 @@ pub(crate) fn text_in(charset: Charset, s: &str) -> Option<Bytes> {
 #[allow(clippy::too_many_lines)] // one pass over the definition
 pub(crate) fn parse(object: ObjectId, version: u64, db: DbId, create_sql: &str) -> Parsed {
     let bad = |why: &str| Err(format!("table definition not served by the engine: {why}"));
+    // The partitioning, which the engine's own text prints last.
+    let (create_sql, part_text) = match create_sql.find("\n PARTITION BY ") {
+        Some(i) => (&create_sql[..i], Some(&create_sql[i..])),
+        None => (create_sql, None),
+    };
     let Some(t) = tokens(create_sql) else {
         return bad("unreadable text");
     };
@@ -1915,6 +1923,7 @@ pub(crate) fn parse(object: ObjectId, version: u64, db: DbId, create_sql: &str) 
         checks_mysql: Vec::new(),
         generated_cols: Vec::new(),
         fks: Vec::new(),
+        partition: None,
     };
     def.index_sigs = super::indexes::sigs(&def);
     for f in raw_fks {
@@ -2031,6 +2040,27 @@ pub(crate) fn parse(object: ObjectId, version: u64, db: DbId, create_sql: &str) 
     order.sort_by_key(|&i| checks[i].mysql_name.to_lowercase());
     def.checks = checks;
     def.checks_mysql = order;
+    if let Some(text) = part_text {
+        let Ok(t) = super::define::lex::lex(text) else {
+            return bad("the partitioning");
+        };
+        let mut p = super::define::P { t: &t, i: 0 };
+        let Ok(spec) = super::define::partition::read(&mut p, "utf8mb4") else {
+            return bad("the partitioning");
+        };
+        let expr = match &spec.expr {
+            Some(e) => match compile_expr(&def, &super::define::expr::print(e)) {
+                Ok(x) => Some(x),
+                Err(why) => {
+                    return bad(&format!(
+                        "a partitioning expression the engine can't evaluate ({why})"
+                    ));
+                }
+            },
+            None => None,
+        };
+        def.partition = Some(Arc::new(super::partition::Rule::new(spec, expr, &def)));
+    }
     Ok(Arc::new(def))
 }
 
@@ -2189,9 +2219,9 @@ pub(crate) fn check_create(text: &str) -> std::result::Result<(), String> {
             }
         };
         match w.as_str() {
-            "PARTITION" => return Err("partitions".into()),
+            // Partitioning is the definition's (`define::partition`).
+            "PARTITION" | "SELECT" => return Ok(()),
             "VERSIONING" => return Err("system versioning".into()),
-            "SELECT" => return Ok(()),
             "COLLATE" | "CHARSET" => {
                 if let Some(n) = value(i + 1) {
                     collation(n)?;
@@ -2441,9 +2471,10 @@ mod tests {
         assert!(
             check_create("CREATE TABLE t (id INT PRIMARY KEY, c INT AS (id + 1) VIRTUAL)").is_ok()
         );
+        // Partitioning is the definition's to judge.
         assert!(
             check_create("CREATE TABLE t (id INT PRIMARY KEY) PARTITION BY HASH (id) PARTITIONS 4")
-                .is_err()
+                .is_ok()
         );
         // Not a column list: left to the definition's reader.
         assert!(check_create("CREATE TABLE t LIKE o").is_ok());

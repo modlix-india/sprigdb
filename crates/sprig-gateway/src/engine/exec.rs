@@ -538,18 +538,19 @@ fn generated_given(
     Ok(())
 }
 
-/// The table's `CHECK` constraints on a new row version: the server's
+/// The table's `CHECK` constraints and partitioning on a new row version: the server's
 /// error (4025 on MariaDB's port, 3819 on MySQL's) for the first that is
 /// false.
 fn check_constraints(plan: &Plan, row: &[Datum], a: &Args<'_>) -> Result<()> {
     let def = &*plan.table;
-    if def.checks.is_empty() {
-        return Ok(());
+    if !def.checks.is_empty()
+        && let Some(ch) = def.failed_check(row, a, None)?
+    {
+        return Err(def.check_error(ch, &String::from_utf8_lossy(&plan.db_name), a.env.mysql));
     }
-    match def.failed_check(row, a, None)? {
-        None => Ok(()),
-        Some(ch) => Err(def.check_error(ch, &String::from_utf8_lossy(&plan.db_name), a.env.mysql)),
-    }
+    // A partitioned table: a partition takes the row (1526), one the
+    // statement's `PARTITION (...)` names (1748).
+    super::partition::check_row(def, row, a)
 }
 
 /// 1020 as MariaDB 11.8 words it, naming the table the client wrote.

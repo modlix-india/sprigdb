@@ -82,6 +82,7 @@ mod general;
 /// `LOAD DATA LOCAL INFILE` into engine tables.
 mod loaddata;
 mod online_index;
+mod partition;
 mod routine;
 mod setvars;
 /// `PREPARE`, `EXECUTE` and `DEALLOCATE PREPARE` as statements.
