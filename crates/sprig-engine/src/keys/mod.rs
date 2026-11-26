@@ -112,6 +112,11 @@ pub const UNVERSIONED_OBJECT_END: u32 = 0x5200_0000;
 /// The object of a tenant's queue messages (`'Q'`), an unversioned object.
 pub const QUEUES_OBJECT: u32 = UNVERSIONED_OBJECT_MIN;
 
+/// The objects of a tenant's Redis databases (database `n` is object
+/// `0x5244_0000 + n`): versioned, and left out of the change log, which
+/// records their keyspace events instead (when the tenant turns them on).
+pub const REDIS_OBJECTS: std::ops::Range<u32> = 0x5244_0000..0x5245_0000;
+
 /// Whether a stored key is unversioned: engine bookkeeping under the
 /// reserved tenant, or a key of an unversioned object in a tenant's range.
 #[must_use]

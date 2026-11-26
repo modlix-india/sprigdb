@@ -21,7 +21,14 @@
 //!       the keys the copy held that the source doesn't tombstoned, state
 //!       serving; the edges below it then refresh in full
 //!     serving → refresh: the source's view of K (or all) upserted live, the
-//!       keys of K (or held) it no longer has tombstoned
+//!       keys of K (or held) it no longer has tombstoned; only rows that
+//!       differ from what the copy holds as this process wrote them are
+//!       written (K is every key changed anywhere in the family, so most
+//!       copies have nothing to write)
+//!   a copy's state row is written when its state changes (seeded, serving,
+//!   versions, source, process); while only its caught-up time moves, that
+//!   time is kept in memory (read by SHOW SHARES) and the row is written at
+//!   most every 30 s, so a busy family doesn't commit a state row per pass
 //! ```
 //!
 //! Writes go through the engine in process as the system
@@ -61,6 +68,47 @@ use crate::tenant::TenantServices;
 
 /// Rows per upsert statement.
 const CHUNK: usize = 500;
+
+/// How often a serving copy's state row is written while only its
+/// caught-up time changes (the time itself is kept in memory,
+/// [`caught_up`]).
+const STATE_EVERY_MS: u64 = 30_000;
+
+/// When each copy this process keeps last caught up with its source, in
+/// unix milliseconds (its state row holds it as of its last write).
+fn caught_up_map() -> &'static std::sync::Mutex<BTreeMap<CopyKey, u64>> {
+    static M: std::sync::OnceLock<std::sync::Mutex<BTreeMap<CopyKey, u64>>> =
+        std::sync::OnceLock::new();
+    M.get_or_init(Default::default)
+}
+
+/// When copy `k` last caught up with its source, as this process knows it
+/// (0 when it doesn't keep `k`).
+pub(crate) fn caught_up(k: CopyKey) -> u64 {
+    caught_up_map()
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&k).copied())
+        .unwrap_or(0)
+}
+
+fn note_caught_up(k: CopyKey, ms: Option<u64>) {
+    if let Ok(mut m) = caught_up_map().lock() {
+        match ms {
+            Some(ms) => {
+                let at = m.entry(k).or_default();
+                *at = (*at).max(ms);
+            }
+            None => {
+                m.remove(&k);
+            }
+        }
+    }
+}
+
+/// A copy's row as it holds it: the child's columns as text, live, and
+/// its guard stamp.
+type Held = BTreeMap<KeyLit, (Vec<Option<Vec<u8>>>, bool, u64)>;
 
 /// The node engine's newest visible commit timestamp (0 without one).
 fn engine_now() -> u64 {
@@ -275,6 +323,7 @@ impl Pass {
                 )
                 .await;
                 set_engine_copy_state(&self.svc, *k, None).await?;
+                note_caught_up(*k, None);
                 tracing::info!(tenant = %t, object = %k.object, share = k.share, "copy of a share that is gone removed");
             }
             if kept == 0 {
@@ -358,6 +407,7 @@ impl Pass {
             source_object: made.map_or(0, |m| m.1),
         };
         set_engine_copy_state(&self.svc, e.key, Some(&row)).await?;
+        note_caught_up(e.key, serving.then_some(now));
         self.rows.insert(e.key, row);
         self.copies = self.infos();
         Ok(())
@@ -401,6 +451,7 @@ impl Pass {
                 .collect();
             for k in others {
                 set_engine_copy_state(&self.svc, k, None).await?;
+                note_caught_up(k, None);
                 self.rows.remove(&k);
             }
             self.copies = self.infos();
@@ -469,6 +520,100 @@ impl Pass {
         ctl_query(&self.svc, e.source_tenant, &sql, self.lctn).await
     }
 
+    /// `e`'s copy rows of `keys` (all when `None`), live or tombstoned.
+    async fn current(&self, e: &CopyEdge, keys: Option<&[KeyLit]>) -> Result<Held> {
+        let names: Vec<String> = e.columns.iter().map(|(n, _)| q(n)).collect();
+        let only = keys.map_or_else(String::new, |ks| {
+            let lhs = if e.child_key.len() == 1 {
+                q(&e.child_key[0])
+            } else {
+                format!(
+                    "({})",
+                    e.child_key
+                        .iter()
+                        .map(|k| q(k))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
+            format!(
+                " AND {lhs} IN ({})",
+                ks.iter().map(KeyLit::tuple).collect::<Vec<_>>().join(", ")
+            )
+        });
+        let rows = ctl_query(
+            &self.svc,
+            e.key.tenant,
+            &format!(
+                "SELECT {}, `_sprig_live`, `_sprig_src_v` FROM {}.{} WHERE `_sprig_share` = {}{only}",
+                names.join(", "),
+                q(&e.child_schema),
+                q(&copy_table(e.key.object)),
+                e.key.share
+            ),
+            self.lctn,
+        )
+        .await?;
+        let n = e.columns.len();
+        Ok(rows
+            .into_iter()
+            .filter(|r| r.len() == n + 2)
+            .map(|mut r| {
+                let stamp = r[n + 1]
+                    .as_deref()
+                    .and_then(|b| std::str::from_utf8(b).ok())
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0);
+                // Only a clear "live" counts: anything else is written again.
+                let live = r[n]
+                    .as_deref()
+                    .is_some_and(|b| b == b"1" || b.eq_ignore_ascii_case(b"true"));
+                r.truncate(n);
+                (key_of(e, &r), (r, live, stamp))
+            })
+            .collect())
+    }
+
+    /// Leaves out of `rows` and `gone` what `e`'s copy already holds as
+    /// this process wrote it (`held`): the same values live, or a tombstone.
+    /// A row written by an earlier process is written again, so every row
+    /// left as it is carries this process's stamp (no older process's
+    /// write can win over it).
+    fn unchanged(&self, e: &CopyEdge, held: &Held, rows: &mut RawRows, gone: &mut Vec<KeyLit>) {
+        let ours = |stamp: u64| stamp >> 32 == self.epoch;
+        rows.retain(|r| {
+            !held
+                .get(&key_of(e, r))
+                .is_some_and(|(v, live, stamp)| *live && ours(*stamp) && v == r)
+        });
+        gone.retain(|k| {
+            !held
+                .get(k)
+                .is_some_and(|(_, live, stamp)| !*live && ours(*stamp))
+        });
+    }
+
+    /// Records that `e`'s copy is caught up with its source; its state row
+    /// is written only when it changed or every [`STATE_EVERY_MS`].
+    async fn caught_up(&mut self, e: &CopyEdge) -> Result<()> {
+        let now = now_ms();
+        let made = self.made.get(&e.key).copied();
+        let same = self.rows.get(&e.key).is_some_and(|r| {
+            r.serving
+                && r.object_version == e.object_version
+                && r.share_version == e.share_version
+                && r.epoch == self.epoch
+                && r.source_tenant == e.source_tenant.0
+                && r.made_from(made)
+                && now.saturating_sub(r.caught_up_ms) < STATE_EVERY_MS
+        });
+        if same {
+            note_caught_up(e.key, Some(now));
+            return Ok(());
+        }
+        self.write_state(e, true, false).await
+    }
+
     /// The keys `e`'s copy holds live.
     async fn held(&self, e: &CopyEdge) -> Result<BTreeSet<KeyLit>> {
         let rows = ctl_query(
@@ -528,29 +673,35 @@ impl Pass {
             // A pass after a catalog change only: nothing to bring up.
             return Ok(());
         }
+        // Only what differs from the copy is written: a key changed
+        // anywhere in the family is looked at in every copy, and a write
+        // that changes nothing would still cost a commit (and a version).
         if let Some(ks) = keys {
             for part in ks.chunks(CHUNK) {
-                let rows = self.source(family, e, Some(part)).await?;
+                let mut rows = self.source(family, e, Some(part)).await?;
                 let present: BTreeSet<KeyLit> = rows.iter().map(|r| key_of(e, r)).collect();
-                let gone: Vec<KeyLit> = part
+                let mut gone: Vec<KeyLit> = part
                     .iter()
                     .filter(|k| !present.contains(*k))
                     .cloned()
                     .collect();
+                let held = self.current(e, Some(part)).await?;
+                self.unchanged(e, &held, &mut rows, &mut gone);
                 self.write(e, &rows, &gone).await?;
             }
         } else {
-            let rows = self.source(family, e, None).await?;
+            let mut rows = self.source(family, e, None).await?;
             let present: BTreeSet<KeyLit> = rows.iter().map(|r| key_of(e, r)).collect();
-            let gone: Vec<KeyLit> = self
-                .held(e)
-                .await?
-                .into_iter()
-                .filter(|k| !present.contains(k))
+            let held = self.current(e, None).await?;
+            let mut gone: Vec<KeyLit> = held
+                .iter()
+                .filter(|(k, (_, live, _))| *live && !present.contains(*k))
+                .map(|(k, _)| k.clone())
                 .collect();
+            self.unchanged(e, &held, &mut rows, &mut gone);
             self.write(e, &rows, &gone).await?;
         }
-        self.write_state(e, true, false).await
+        self.caught_up(e).await
     }
 
     /// Writes `rows` live and `gone` as tombstones into `e`'s copy.

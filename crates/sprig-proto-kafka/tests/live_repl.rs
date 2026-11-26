@@ -868,6 +868,12 @@ async fn live_kill_loop() {
         &gaps[..gaps.len().min(5)]
     );
     assert_eq!(missing, 0, "acknowledged records lost");
+    // Leaders moving must never look like a denial: clients give up on it.
+    assert!(
+        !codes.contains_key(&err::TOPIC_AUTHORIZATION_FAILED)
+            && !sprayed.contains_key(&err::TOPIC_AUTHORIZATION_FAILED),
+        "TOPIC_AUTHORIZATION_FAILED while leaders moved: {codes:?}, sprayed {sprayed:?}"
+    );
 }
 
 /// `n` random capital letters, a different run for each record.
@@ -885,6 +891,25 @@ fn letters(part: i32, record: usize, n: usize) -> Vec<u8> {
         .collect()
 }
 
+/// About `n` bytes of JSON-like text: repeated field names around random
+/// digits (compressible, as application records usually are).
+fn fields(part: i32, record: usize, n: usize) -> Vec<u8> {
+    let digits = letters(part, record, n);
+    let mut out = Vec::with_capacity(n + 64);
+    let mut k = 0usize;
+    while out.len() < n {
+        let d: String = digits[k % digits.len()..]
+            .iter()
+            .take(8)
+            .map(|c| char::from(b'0' + (c - b'A') % 10))
+            .collect();
+        out.extend_from_slice(format!("\"field_{}\":\"{d}-value-{}\",", k % 26, k % 7).as_bytes());
+        k += 8;
+    }
+    out.truncate(n);
+    out
+}
+
 /// Produce throughput the way kafka-producer-perf-test runs it (acks=all,
 /// batches of `SPRIG_KAFKA_TP_BATCH` records of `SPRIG_KAFKA_TP_SIZE`
 /// bytes, `SPRIG_KAFKA_TP_INFLIGHT` requests in flight per partition), each
@@ -893,8 +918,9 @@ fn letters(part: i32, record: usize, n: usize) -> Vec<u8> {
 /// reported lost) or the partitions hold more records than were
 /// acknowledged. With `SPRIG_KAFKA_TP_RANDOM=1` every record's value is
 /// fresh random letters, as kafka-producer-perf-test sends them (a
-/// repeated value compresses to almost nothing in the log's files, which
-/// hides what the disks write).
+/// repeated value compresses to almost nothing, which hides what the disks
+/// write); with `text`, JSON-like text around random digits (compressible
+/// about 3x, as application records often are).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs three gateways whose engines replicate, with the kafka listener"]
 async fn live_repl_throughput() {
@@ -903,7 +929,9 @@ async fn live_repl_throughput() {
     let per: usize = env("SPRIG_KAFKA_TP_BATCH").map_or(16, |v| v.parse().unwrap());
     let inflight: usize = env("SPRIG_KAFKA_TP_INFLIGHT").map_or(5, |v| v.parse().unwrap());
     let parts: i32 = env("SPRIG_KAFKA_TP_PARTITIONS").map_or(6, |v| v.parse().unwrap());
-    let random = env("SPRIG_KAFKA_TP_RANDOM").is_some_and(|v| v != "0");
+    let mode = env("SPRIG_KAFKA_TP_RANDOM").unwrap_or_default();
+    let random = !mode.is_empty() && mode != "0";
+    let text = mode == "text";
     let db = env("SPRIG_KAFKA_DB").unwrap();
     let topic = format!("{db}.tp_{}", std::process::id());
     let mut v = View::default();
@@ -964,7 +992,9 @@ async fn live_repl_throughput() {
                         .map(|i| Record {
                             offset_delta: i as i32,
                             key: Some(format!("k{}", first + i).into_bytes()),
-                            value: Some(if random {
+                            value: Some(if text {
+                                fields(part, first + i, size)
+                            } else if random {
                                 letters(part, first + i, size)
                             } else {
                                 value.clone()

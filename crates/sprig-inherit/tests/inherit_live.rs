@@ -694,6 +694,289 @@ async fn serving_copies(conns: &mut [Conn], db: &str) -> usize {
     n
 }
 
+/// Percentile `q` of sorted `v` (0 when empty).
+fn pct_of(v: &[u128], q: usize) -> u128 {
+    if v.is_empty() {
+        return 0;
+    }
+    v[(v.len() * q / 100).min(v.len() - 1)]
+}
+
+/// Times `n` runs of `sql` on `c` in microseconds, sorted; each result
+/// must have `want` rows.
+async fn timed(c: &mut Conn, sql: &str, n: usize, want: usize) -> Vec<u128> {
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        let t0 = Instant::now();
+        let r = rows(c, sql).await;
+        out.push(t0.elapsed().as_micros());
+        assert_eq!(r.len(), want, "{sql}");
+    }
+    out.sort_unstable();
+    out
+}
+
+/// Read speed by depth on engine databases (`SPRIG_TEST_R6I_DEPTH`: a
+/// chain of tenants, each the child of the one before it, top first): the
+/// top tenant holds `SPRIG_TEST_R6I_DEPTH_ROWS` rows (1,000) of an
+/// inheritable table, each tenant shares it to the next with reshare, and
+/// each level below the top overrides the price of the rows whose id ends
+/// in its level number (10 per level at 1,000 rows). For each mode
+/// (`SPRIG_TEST_R6I_DEPTH_MODES`: `read_through`, `materialized`), at each
+/// depth (`SPRIG_TEST_R6I_DEPTH_AT`: 2, 4, 7; depth 1 is the top's own
+/// table), on the first gateway: point reads by key, full scans, an
+/// aggregate, a scan with a non-key filter, and the first read of a row
+/// right after the top updates it (exact reads: a copy behind waits or
+/// reads through). A plain table with the same rows at the top is the
+/// baseline.
+#[tokio::test]
+async fn engine_read_depth() {
+    let test = "engine_read_depth";
+    let Some(eps) = endpoints(test) else {
+        return;
+    };
+    let Some(chain) = needs(test, "SPRIG_TEST_R6I_DEPTH") else {
+        return;
+    };
+    let env_or = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_owned());
+    let chain: Vec<String> = chain.split(',').map(|s| s.trim().to_owned()).collect();
+    let n_rows: usize = env_or("SPRIG_TEST_R6I_DEPTH_ROWS", "1000").parse().unwrap();
+    let depths: Vec<usize> = env_or("SPRIG_TEST_R6I_DEPTH_AT", "2,4,7")
+        .split(',')
+        .map(|d| d.trim().parse().unwrap())
+        .filter(|d| (1..=chain.len()).contains(d))
+        .collect();
+    let modes = env_or("SPRIG_TEST_R6I_DEPTH_MODES", "read_through,materialized");
+    let ep = &eps[0];
+    let mut conns = Vec::new();
+    for t in &chain {
+        conns.push(conn(ep, t).await);
+    }
+    let base_sum: u64 = (1..=n_rows as u64).map(|id| id % 100 + 1).sum();
+    // Rows whose price level `i` (0-based, below the top) overrides.
+    let ovr = |i: usize| (1..=n_rows).filter(|id| id % 100 == i).count() as u64;
+    let want_sum = |level: usize| base_sum + (1..=level).map(|i| 1000 * ovr(i)).sum::<u64>();
+    for mode in modes.split(',').map(str::trim) {
+        let db = format!(
+            "r6inh_depth_{}",
+            if mode == "materialized" { "mat" } else { "rt" }
+        );
+        for (i, c) in conns.iter_mut().enumerate() {
+            exec(c, &format!("USE SPACE `{}`", chain[i])).await;
+            exec(c, &format!("DROP SHARE IF EXISTS dp{i}")).await;
+        }
+        for (i, c) in conns.iter_mut().enumerate().rev() {
+            exec(c, &format!("SPRIG SET inherit.merge = '{mode}'")).await;
+            exec(c, "SPRIG SET inherit.read_through_max_depth = 16").await;
+            for s in ["DROP DATABASE IF EXISTS", "CREATE DATABASE"] {
+                exec(c, &format!("{s} {db}")).await;
+            }
+            exec(c, &format!("USE {db}")).await;
+            exec(c, DDL).await;
+            exec(c, "ALTER TABLE products SPRIG INHERITABLE KEY (id)").await;
+            if i == 0 {
+                exec(c, &DDL.replace("TABLE products", "TABLE plain")).await;
+            }
+        }
+        let top = &mut conns[0];
+        let ids: Vec<usize> = (1..=n_rows).collect();
+        for part in ids.chunks(250) {
+            let vals: Vec<String> = part
+                .iter()
+                .map(|id| {
+                    format!(
+                        "({id}, 'n{id}', 'c{}', {}, '{}')",
+                        id % 10,
+                        id % 100 + 1,
+                        ["IN", "US"][id % 2]
+                    )
+                })
+                .collect();
+            for t in ["products", "plain"] {
+                exec(top, &format!("INSERT INTO {t} VALUES {}", vals.join(", "))).await;
+            }
+        }
+        let t0 = Instant::now();
+        for i in 0..chain.len() - 1 {
+            exec(
+                &mut conns[i],
+                &format!(
+                    "CREATE SHARE dp{i} ON products TO SPACE `{}` WITH RESHARE",
+                    chain[i + 1]
+                ),
+            )
+            .await;
+        }
+        if mode == "materialized" {
+            loop {
+                let n = serving_copies(&mut conns, &db).await;
+                if n >= chain.len() - 1 {
+                    break;
+                }
+                assert!(
+                    t0.elapsed() < std::time::Duration::from_secs(180),
+                    "{mode}: only {n} of {} copies serve",
+                    chain.len() - 1
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            eprintln!(
+                "{mode}: {} copies serving {:.1?} after the shares",
+                chain.len() - 1,
+                t0.elapsed()
+            );
+        }
+        for (i, c) in conns.iter_mut().enumerate().skip(1) {
+            let n = exec(
+                c,
+                &format!("UPDATE products SET price = price + 1000 WHERE id % 100 = {i}"),
+            )
+            .await;
+            assert_eq!(n, ovr(i), "{mode}: overrides at level {}", i + 1);
+        }
+        // Every level's view settled (the copies caught up with the overrides).
+        let t0 = Instant::now();
+        for (i, c) in conns.iter_mut().enumerate() {
+            loop {
+                let r = rows(c, "SELECT COUNT(*), SUM(price) FROM products").await;
+                let got = (
+                    r[0][0].clone().unwrap_or_default(),
+                    r[0][1].clone().unwrap_or_default(),
+                );
+                if got == (n_rows.to_string(), want_sum(i).to_string()) {
+                    break;
+                }
+                assert!(
+                    t0.elapsed() < std::time::Duration::from_secs(60),
+                    "{mode}: level {} reads {got:?}, want {n_rows} rows summing {}",
+                    i + 1,
+                    want_sum(i)
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+        eprintln!(
+            "{mode}: every level settled {:.1?} after the overrides",
+            t0.elapsed()
+        );
+        let mut g = Lcg(0xdee9);
+        let report = |what: &str, v: &[u128]| {
+            eprintln!(
+                "{mode} {what}: p50 {} us, p90 {} us, p99 {} us (n {})",
+                pct_of(v, 50),
+                pct_of(v, 90),
+                pct_of(v, 99),
+                v.len()
+            );
+        };
+        let low = (1..=n_rows).filter(|id| id % 100 + 1 < 20).count();
+        let mut levels: Vec<(String, usize, &str)> = vec![("plain".into(), 1, "plain")];
+        levels.extend(
+            depths
+                .iter()
+                .map(|d| (format!("depth {d}"), *d, "products")),
+        );
+        for (label, d, table) in &levels {
+            if *table == "plain" && mode != modes.split(',').next().unwrap_or("").trim() {
+                continue;
+            }
+            let c = &mut conns[d - 1];
+            for _ in 0..50 {
+                let k = g.below(n_rows as u64) + 1;
+                rows(c, &format!("SELECT price FROM {table} WHERE id = {k}")).await;
+            }
+            let mut point = Vec::with_capacity(1000);
+            for _ in 0..1000 {
+                let k = g.below(n_rows as u64) + 1;
+                let t0 = Instant::now();
+                let r = rows(
+                    c,
+                    &format!("SELECT name, colour, price, region FROM {table} WHERE id = {k}"),
+                )
+                .await;
+                point.push(t0.elapsed().as_micros());
+                assert_eq!(r.len(), 1);
+            }
+            point.sort_unstable();
+            report(&format!("{label} point read"), &point);
+            let scan = timed(
+                c,
+                &format!("SELECT id, name, colour, price, region FROM {table}"),
+                50,
+                n_rows,
+            )
+            .await;
+            report(&format!("{label} full scan ({n_rows} rows)"), &scan);
+            let agg = timed(
+                c,
+                &format!("SELECT COUNT(*), SUM(price) FROM {table}"),
+                50,
+                1,
+            )
+            .await;
+            report(&format!("{label} COUNT/SUM"), &agg);
+            // Rows overridden at a level above aren't below 20 any more.
+            let want_low = if *table == "plain" {
+                low
+            } else {
+                (1..=n_rows)
+                    .filter(|id| id % 100 + 1 < 20 && !(1..*d).contains(&(id % 100)))
+                    .count()
+            };
+            let filt = timed(
+                c,
+                &format!("SELECT id FROM {table} WHERE price < 20"),
+                50,
+                want_low,
+            )
+            .await;
+            report(&format!("{label} filtered scan ({want_low} rows)"), &filt);
+        }
+        // The first read of a row right after the top updates it.
+        let mut seq = 0;
+        for d in &depths {
+            let mut first = Vec::new();
+            for _ in 0..20 {
+                seq += 1;
+                // Ids ending in 00 are overridden nowhere.
+                let k = (g.below((n_rows / 100).max(1) as u64) + 1) * 100;
+                let v = format!("w{seq}");
+                exec(
+                    &mut conns[0],
+                    &format!("UPDATE products SET name = '{v}' WHERE id = {k}"),
+                )
+                .await;
+                let t0 = Instant::now();
+                let r = rows(
+                    &mut conns[d - 1],
+                    &format!("SELECT name FROM products WHERE id = {k}"),
+                )
+                .await;
+                first.push(t0.elapsed().as_micros());
+                assert_eq!(
+                    r[0][0].as_deref(),
+                    Some(v.as_str()),
+                    "{mode}: depth {d} read a stale name right after the top's update"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            }
+            first.sort_unstable();
+            report(&format!("depth {d} first read after a top update"), &first);
+        }
+        if std::env::var("SPRIG_TEST_R6I_KEEP").as_deref() == Ok("1") {
+            continue;
+        }
+        for (i, c) in conns.iter_mut().enumerate().rev() {
+            exec(c, &format!("DROP SHARE IF EXISTS dp{i}")).await;
+        }
+        for c in conns.iter_mut().rev() {
+            exec(c, &format!("DROP DATABASE IF EXISTS {db}")).await;
+            exec(c, "SPRIG RESET inherit.merge").await;
+            exec(c, "SPRIG RESET inherit.read_through_max_depth").await;
+        }
+    }
+}
+
 /// The reference-model workload. With a worker, every share is
 /// materialized (`inherit.merge = materialized`), the copy worker runs in
 /// this process, and after each write the test waits until every space's
@@ -730,6 +1013,9 @@ async fn model_run(eps: &[String], mut worker: Option<&mut copyw::Worker>, engin
         m.async_orphans = converge;
         let mut lags: Vec<u128> = Vec::new();
         let mut instant = 0u64;
+        // Progress over long runs: each 1,000 writes' convergence and the
+        // mean time of one read of all six levels.
+        let (mut read_us, mut read_n) = (0u128, 0u128);
         if let Some(w) = worker.as_deref_mut() {
             w.ensure_running();
             let t0 = Instant::now();
@@ -862,11 +1148,16 @@ async fn model_run(eps: &[String], mut worker: Option<&mut copyw::Worker>, engin
                 let mut polls = 0;
                 loop {
                     let mut same = true;
+                    let tr = Instant::now();
                     for x in &spaces {
                         if read_view(&mut conns[x.t], x).await != m.view(x.id) {
                             same = false;
                             break;
                         }
+                    }
+                    if same {
+                        read_us += tr.elapsed().as_micros();
+                        read_n += 1;
                     }
                     reads += 1;
                     if same {
@@ -893,6 +1184,21 @@ async fn model_run(eps: &[String], mut worker: Option<&mut copyw::Worker>, engin
                 lags.push(t0.elapsed().as_millis());
                 // Put the session back in the written space.
                 use_space(&mut conns[s.t], &s).await;
+                if lags.len().is_multiple_of(1000) {
+                    let mut w = lags[lags.len() - 1000..].to_vec();
+                    w.sort_unstable();
+                    let us = read_us / read_n.max(1);
+                    eprintln!(
+                        "{p}: writes {}..{}: converged p50 {} ms, p99 {} ms; a six-level read {}.{} ms",
+                        lags.len() - 999,
+                        lags.len(),
+                        w[500],
+                        w[990],
+                        us / 1000,
+                        us % 1000 / 100
+                    );
+                    (read_us, read_n) = (0, 0);
+                }
             }
             let c = &mut conns[s.t];
             // A point read (the key pushed into every level) of the key.

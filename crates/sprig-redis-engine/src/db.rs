@@ -366,6 +366,8 @@ pub struct EngineDb<U: Unit> {
     versions: Arc<Versions>,
     /// The tenant's blocked clients.
     waiters: Arc<Waiters>,
+    /// The tenant's keyspace notifications (unset: off).
+    notify: std::sync::OnceLock<Arc<crate::notify::Notifier>>,
     me: Weak<Self>,
 }
 
@@ -441,8 +443,26 @@ impl<U: Unit> EngineDb<U> {
             uids,
             versions,
             waiters,
+            notify: std::sync::OnceLock::new(),
             me: me.clone(),
         })
+    }
+
+    /// Shares the tenant's keyspace notifications (once).
+    pub fn set_notify(&self, n: Arc<crate::notify::Notifier>) {
+        let _ = self.notify.set(n);
+    }
+
+    /// The flags that record events now (0: off).
+    fn recording(&self) -> u16 {
+        self.notify.get().map_or(0, |n| n.flags.recording())
+    }
+
+    /// Hands events that change nothing to the node's sink.
+    fn direct(&self, events: Vec<crate::notify::Event>) {
+        if let Some(n) = self.notify.get() {
+            n.direct(self.space.tenant, events);
+        }
     }
 
     /// The database's place in the keyspace.
@@ -528,6 +548,10 @@ impl<U: Unit> EngineDb<U> {
             touched: Vec::new(),
         };
         let mut replies = Vec::with_capacity(cmds.len());
+        // Keyspace notifications: off costs this one load.
+        let flags = self.recording();
+        let mut events = Vec::new();
+        let mut misses = Vec::new();
         for (i, (c, n)) in cmds.iter().zip(names).enumerate() {
             cx.resp3 = resp3.get(i).copied().unwrap_or(false);
             // `SELECT` inside `EXEC`: the commands after it use that
@@ -542,7 +566,19 @@ impl<U: Unit> EngineDb<U> {
                 });
                 continue;
             }
-            replies.push(exec::run(&mut cx, n, c)?);
+            if flags == 0 {
+                replies.push(exec::run(&mut cx, n, c)?);
+                continue;
+            }
+            let mut absent = Vec::new();
+            crate::notify::keymiss(&mut cx, n, c, flags, &mut absent)?;
+            let before = crate::notify::before(&mut cx, n, c)?;
+            let r = exec::run(&mut cx, n, c)?;
+            crate::notify::after(&mut cx, before, n, c, &r, flags, &mut events)?;
+            if !r.is_error() {
+                misses.append(&mut absent);
+            }
+            replies.push(r);
         }
         let mut touched = std::mem::take(&mut cx.touched);
         touched.sort_unstable();
@@ -551,8 +587,10 @@ impl<U: Unit> EngineDb<U> {
         if names.iter().any(|n| n.starts_with("flush")) {
             self.versions.flushed();
         }
+        crate::notify::add_note(&mut b, self.space.tenant, &events)?;
         let ticket = b.commit()?;
         self.waiters.wake(&touched);
+        self.direct(misses);
         Ok(Some((replies, ticket)))
     }
 

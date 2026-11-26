@@ -821,7 +821,9 @@ pub(crate) async fn engine_copy_states(
 
 /// [`engine_copy_states`] as the read path's [`CopyStates`]: a serving copy
 /// is its subscribers' source from the start (no change streams of copies
-/// on engine databases).
+/// on engine databases). A copy's caught-up time is the later of its row's
+/// and the one the copy task keeps in memory (the row is written only when
+/// the state changes, and at most every 30 s while only that time moves).
 ///
 /// [`CopyStates`]: sprig_inherit::copy::CopyStates
 pub(crate) fn copy_infos(
@@ -836,7 +838,7 @@ pub(crate) fn copy_infos(
                         serving: r.serving,
                         object_version: r.object_version,
                         share_version: r.share_version,
-                        caught_up_ms: r.caught_up_ms,
+                        caught_up_ms: r.caught_up_ms.max(crate::inherit_copies::caught_up(k)),
                         seeded_ms: r.seeded_ms,
                         handover: r.handover(),
                     },

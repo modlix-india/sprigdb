@@ -329,17 +329,19 @@ impl Session {
         // notifications from the change feed pass over them; the feed
         // sends the others' (scripts, commands it doesn't know, and an
         // EXEC holding any of those).
-        let mark = match &queued {
-            Some(q) => q.iter().all(|c| {
-                let n = c
-                    .args
-                    .first()
-                    .map(|a| String::from_utf8_lossy(a).to_ascii_lowercase())
-                    .unwrap_or_default();
-                !spec::lookup(&n).is_some_and(|s| s.has('w')) || crate::keyspace::covered(&n)
-            }),
-            None => spec.has('w') && crate::keyspace::covered(&name),
-        };
+        // Databases on the engine record their events with the batch.
+        let mark = self.engine.is_none()
+            && match &queued {
+                Some(q) => q.iter().all(|c| {
+                    let n = c
+                        .args
+                        .first()
+                        .map(|a| String::from_utf8_lossy(a).to_ascii_lowercase())
+                        .unwrap_or_default();
+                    !spec::lookup(&n).is_some_and(|s| s.has('w')) || crate::keyspace::covered(&n)
+                }),
+                None => spec.has('w') && crate::keyspace::covered(&name),
+            };
         if mark && let Some(l) = self.login.as_mut() {
             l.sql.notified(true);
         }
@@ -610,14 +612,43 @@ impl Session {
         }
     }
 
+    /// Writes `flags` (canonical) as the tenant's
+    /// `redis.notify_keyspace_events` (`CONFIG SET` on the engine); the
+    /// error reply when the user may not.
+    async fn save_keyspace_flags(&mut self, flags: &str) -> Result<(), Frame> {
+        let Some(l) = self.login.as_mut() else {
+            return Err(Frame::error("NOAUTH Authentication required."));
+        };
+        let sql = format!(
+            "ALTER TENANT SPRIG SET (redis.notify_keyspace_events = '{}')",
+            flags.replace('\\', "\\\\").replace('\'', "''")
+        );
+        match l.sql.exec(&sql).await {
+            Ok(_) => Ok(()),
+            Err(e) if matches!(e.errno, Some(1044 | 1045 | 1142 | 1227)) => {
+                Err(Frame::error(format!(
+                    "NOPERM User {} has no permissions to run the 'config|set' command",
+                    l.user
+                )))
+            }
+            Err(e) => Err(Frame::err(&format!(
+                "CONFIG SET failed (possibly related to argument 'notify-keyspace-events') - {}",
+                e.message
+            ))),
+        }
+    }
+
     /// A pub/sub message as this connection may see it (row-level
     /// security): a keyspace notification goes out only when the session may
-    /// read its key (the gateway's [`crate::keyspace::KeyFilter`]).
+    /// read its key (the gateway's [`crate::keyspace::KeyFilter`]). On the
+    /// engine, Redis keys have no row policies: the channel's own check at
+    /// `SUBSCRIBE` is all.
     pub async fn deliver(&mut self, m: Msg) -> Option<Frame> {
         let (channel, data) = match &m {
             Msg::Message(c, d) | Msg::PMessage(_, c, d) | Msg::SMessage(c, d) => (c, d),
         };
-        if let Some((db, key)) = crate::keyspace::key_of(channel, data)
+        if self.engine.is_none()
+            && let Some((db, key)) = crate::keyspace::key_of(channel, data)
             && let Some(f) = self.env.key_filter().cloned()
         {
             let cfg = self.env.config();
@@ -791,11 +822,26 @@ impl Session {
                                  'Ag$lshzxeKEtmdn'.",
                             ));
                         };
-                        self.env
-                            .set_keyspace_flags(&scope, crate::keyspace::flags_text(f));
+                        let text = crate::keyspace::flags_lossless(f);
+                        // On the engine the tenant's setting keeps the flags,
+                        // for every gateway and across restarts; the engine's
+                        // writes record events at once.
+                        if self.engine.is_some() {
+                            if let Err(e) = self.save_keyspace_flags(&text).await {
+                                return one(e);
+                            }
+                            if let Some(b) = self.env.engine() {
+                                b.set_keyspace_flags(&scope, f);
+                            }
+                        }
+                        self.env.set_keyspace_flags(&scope, text);
                     }
                 }
-                let flags = self.env.keyspace_flags(&scope);
+                // As Redis shows them (`A` hides `n`).
+                let flags =
+                    crate::keyspace::parse_flags(self.env.keyspace_flags(&scope).as_bytes())
+                        .map(crate::keyspace::flags_text)
+                        .unwrap_or_default();
                 one(server::config(a, self.env.config().databases, &flags))
             }
             "command" => one(server::command(a)),
@@ -1526,8 +1572,10 @@ impl Session {
                 // Registered with the hub before the reply, so a later
                 // PUBLISH on any gateway is delivered.
                 self.env.hold(&scope, interest(kind, c)).await;
-                // The notifications from the change feed.
-                if (kind == Kind::Pattern || c.starts_with(b"__key"))
+                // The notifications from the change feed (databases on
+                // the engine send theirs from the change log).
+                if self.engine.is_none()
+                    && (kind == Kind::Pattern || c.starts_with(b"__key"))
                     && let Some(f) = self.env.keyspace_feed()
                 {
                     f.watch(&scope);

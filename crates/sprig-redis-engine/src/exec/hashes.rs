@@ -969,10 +969,16 @@ fn hpersist<B: Batch>(cx: &mut Cx<'_, B>, a: &[Bytes]) -> Out {
 /// Removes the due fields of the hash at `key` whose hash-due entry is
 /// `(at, key)`, and moves the entry to its next field expiry; the key goes
 /// when no field is left. A stale entry is deleted. (The sweeper.)
+/// Whether the key went, when fields were removed; `None` for a stale
+/// entry.
 ///
 /// # Errors
 /// The engine's.
-pub fn sweep_hash<B: Batch>(cx: &mut Cx<'_, B>, at: i64, key: &[u8]) -> Result<(), StoreError> {
+pub fn sweep_hash<B: Batch>(
+    cx: &mut Cx<'_, B>,
+    at: i64,
+    key: &[u8],
+) -> Result<Option<bool>, StoreError> {
     let raw = cx.raw(key)?;
     match raw {
         Some(Meta {
@@ -983,14 +989,20 @@ pub fn sweep_hash<B: Batch>(cx: &mut Cx<'_, B>, at: i64, key: &[u8]) -> Result<(
             match h {
                 Some(h) if h.body.is_some() => {
                     cx.hash_write(key, &h, Vec::new())?;
+                    Ok(Some(false))
                 }
                 // Every field is due: the key goes.
-                _ => cx.write(key, raw.as_ref(), None)?,
+                _ => {
+                    cx.write(key, raw.as_ref(), None)?;
+                    Ok(Some(true))
+                }
             }
         }
-        _ => cx.b.delete(cx.space.hdue(at, key))?,
+        _ => {
+            cx.b.delete(cx.space.hdue(at, key))?;
+            Ok(None)
+        }
     }
-    Ok(())
 }
 
 fn tri_store(r: Arg<Hash>) -> Option<Hash> {

@@ -22,6 +22,9 @@ impl Ticket for MemTicket {
 
 type Latch = Arc<tokio::sync::Mutex<()>>;
 
+/// Committed notes: (tenant, note), in commit order.
+type Notes = Arc<Mutex<Vec<(u64, Vec<u8>)>>>;
+
 /// The in-memory unit.
 #[derive(Debug, Default)]
 pub struct MemUnit {
@@ -29,6 +32,8 @@ pub struct MemUnit {
     latches: Arc<Mutex<HashMap<Bytes, Latch>>>,
     /// A fixed clock (tests of expiry), else the system's.
     clock: Mutex<Option<i64>>,
+    /// The notes of committed batches, in commit order.
+    notes: Notes,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -45,6 +50,12 @@ impl MemUnit {
     /// Fixes the clock at `ms` (`None`: the system's again).
     pub fn set_clock(&self, ms: Option<i64>) {
         *lock(&self.clock) = ms;
+    }
+
+    /// Takes the notes committed so far: (tenant, note).
+    #[must_use]
+    pub fn take_notes(&self) -> Vec<(u64, Vec<u8>)> {
+        std::mem::take(&mut *lock(&self.notes))
     }
 
     /// Every entry, in key order.
@@ -64,6 +75,8 @@ pub struct MemBatch {
     latches: Arc<Mutex<HashMap<Bytes, Latch>>>,
     held: Vec<(Bytes, OwnedMutexGuard<()>)>,
     writes: BTreeMap<Bytes, Option<Bytes>>,
+    notes: Vec<(u64, Vec<u8>)>,
+    committed_notes: Notes,
 }
 
 impl Unit for MemUnit {
@@ -80,6 +93,8 @@ impl Unit for MemUnit {
             latches: Arc::clone(&self.latches),
             held,
             writes: BTreeMap::new(),
+            notes: Vec::new(),
+            committed_notes: Arc::clone(&self.notes),
         })
     }
 
@@ -184,7 +199,13 @@ impl Batch for MemBatch {
         Ok(())
     }
 
+    fn note(&mut self, tenant: u64, note: Vec<u8>) -> StoreResult<()> {
+        self.notes.push((tenant, note));
+        Ok(())
+    }
+
     fn commit(mut self) -> StoreResult<MemTicket> {
+        lock(&self.committed_notes).append(&mut self.notes);
         let writes = std::mem::take(&mut self.writes);
         let mut d = lock(&self.data);
         for (k, v) in writes {

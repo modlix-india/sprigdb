@@ -768,7 +768,7 @@ Every setting SprigDB declares, with its default, the scopes that may set it, ha
 | `redis.max_bulk_bytes` | int | `16777216` | dc, global | 1024 to 536870912 | live | Largest bulk string |
 | `redis.max_command_bytes` | int | `67108864` | dc, global | 1024 to 1073741824 | live | Largest command |
 | `redis.max_multi_commands` | int | `10000` | dc, global | 1 to 1000000 | live | Queued commands per MULTI |
-| `redis.notify_keyspace_events` | text | `` | dc, global | - | live | Keyspace notification classes (Redis's notify-keyspace-events) |
+| `redis.notify_keyspace_events` | text | `` | tenant, global | - | live | Keyspace notification classes (Redis's notify-keyspace-events), per tenant |
 | `redis.scan_small_key_elements` | int | `128` | dc, global | 0 to 100000 | live | Element scans returned whole |
 | `redis.server_version` | text | `7.2.0` | dc, global | - | live | HELLO and INFO version |
 | `redis.sharded_pubsub_hubs` | int | `8` | dc, global | 1 to 1024 | restart | Hubs for sharded channels |

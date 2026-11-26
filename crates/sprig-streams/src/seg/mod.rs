@@ -102,6 +102,10 @@ pub struct SegConfig {
     /// bytes instead of writing them again. Needed to open segments that
     /// refer to them.
     pub blobs: Option<Arc<NoteBlobs>>,
+    /// Batches that arrive uncompressed go into the log LZ4-compressed when
+    /// that makes them an eighth smaller ([`batch::lz4`]); batches a client
+    /// compressed are stored as they arrive either way.
+    pub compress: bool,
 }
 
 impl Default for SegConfig {
@@ -115,6 +119,7 @@ impl Default for SegConfig {
             producer_expiry_ms: 7 * 24 * 3_600_000,
             groups: 0,
             blobs: None,
+            compress: false,
         }
     }
 }
@@ -1113,6 +1118,14 @@ impl SegLog {
         Ok(())
     }
 
+    /// The batch as it goes into the log (see [`SegConfig::compress`]).
+    fn stored<'a>(&self, batch: &'a [u8]) -> std::borrow::Cow<'a, [u8]> {
+        match self.inner.cfg.compress.then(|| batch::lz4(batch)).flatten() {
+            Some(z) => std::borrow::Cow::Owned(z),
+            None => std::borrow::Cow::Borrowed(batch),
+        }
+    }
+
     /// Proposes one batch (a whole, checked magic-2 batch) for `key`.
     ///
     /// # Errors
@@ -1125,7 +1138,12 @@ impl SegLog {
         let unit = self.inner.unit_of_part(&key);
         self.ensure_floor(unit)?;
         let mut p = Payload::with_capacity(batch.len() + 48);
-        p.note(&note::encode_append(key, now_ms(), lat, batch));
+        p.note(&note::encode_append(
+            key,
+            now_ms(),
+            lat,
+            &self.stored(batch),
+        ));
         let t = self.inner.engine.consensus().propose(
             sprig_engine::UnitId(unit),
             p.into_bytes(),
@@ -1174,7 +1192,8 @@ impl SegLog {
                 units.len() - 1
             };
             let part = &mut units[i];
-            part.1.note(&note::encode_append(*key, now, lat, batch));
+            part.1
+                .note(&note::encode_append(*key, now, lat, &self.stored(batch)));
             at.push((i, part.2));
             part.2 += 1;
         }
@@ -1252,7 +1271,10 @@ impl SegLog {
             unit
         };
         let slot = u32::try_from(txn.notes_for_tenant(owner)).unwrap_or(u32::MAX);
-        txn.add_note_for_tenant(owner, note::encode_append(key, now_ms(), lat, batch))?;
+        txn.add_note_for_tenant(
+            owner,
+            note::encode_append(key, now_ms(), lat, &self.stored(batch)),
+        )?;
         Ok(slot)
     }
 

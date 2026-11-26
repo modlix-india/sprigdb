@@ -27,6 +27,13 @@ pub trait EngineBackend: Send + Sync + std::fmt::Debug {
     /// Database `db` of tenant `scope`, when it lives on the engine;
     /// `placed`: the tenant's Redis databases are placed on the engine.
     fn database(&self, scope: &str, db: u32, placed: bool) -> Option<Arc<dyn EngineDatabase>>;
+
+    /// Tenant `scope`'s keyspace notification flags changed on this
+    /// gateway (`CONFIG SET notify-keyspace-events`): the engine's writes
+    /// record events from now on, or stop.
+    fn set_keyspace_flags(&self, scope: &str, flags: u16) {
+        let _ = (scope, flags);
+    }
 }
 
 /// A key a transaction watches on the engine (`WATCH`).

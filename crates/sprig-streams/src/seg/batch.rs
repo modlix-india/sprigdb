@@ -146,6 +146,36 @@ pub fn set_log_append_time(b: &mut [u8], now_ms: i64) {
     b[CRC_AT..CRC_AT + 4].copy_from_slice(&crc.to_be_bytes());
 }
 
+/// The batch with its records compressed by LZ4 (frames as the Java client
+/// writes them), when it arrived uncompressed and that makes it at least an
+/// eighth smaller; `None` keeps it as it is: already compressed (stored as
+/// the client sent it), a control batch, malformed, or not worth it. Every
+/// head field but the attributes' codec, the length and the CRC stays.
+#[must_use]
+pub fn lz4(bytes: &[u8]) -> Option<Vec<u8>> {
+    let h = Head::parse(bytes).filter(|h| h.total == bytes.len())?;
+    if h.attributes & 0x07 != 0 || h.is_control() || bytes.len() < HEAD + 128 {
+        return None;
+    }
+    let body = &bytes[HEAD..];
+    let z = sprig_proto_kafka::compression::Compression::Lz4
+        .compress(body)
+        .ok()?;
+    if z.len() > body.len() - body.len() / 8 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(HEAD + z.len());
+    out.extend_from_slice(&bytes[..HEAD]);
+    out.extend_from_slice(&z);
+    let len = i32::try_from(out.len() - LOG_OVERHEAD).ok()?;
+    out[8..12].copy_from_slice(&len.to_be_bytes());
+    let attrs = h.attributes | 0x03;
+    out[21..23].copy_from_slice(&attrs.to_be_bytes());
+    let crc = sprig_proto_kafka::crc32c::crc32c(&out[CRC_FROM..]);
+    out[CRC_AT..CRC_AT + 4].copy_from_slice(&crc.to_be_bytes());
+    Some(out)
+}
+
 /// Whether the batch's CRC matches its bytes.
 #[must_use]
 pub fn crc_ok(b: &[u8]) -> bool {
@@ -203,5 +233,88 @@ mod tests {
         b[70] ^= 1;
         assert!(!crc_ok(&b));
         assert!(Head::parse(&b[..20]).is_none());
+    }
+
+    /// An uncompressed batch is stored LZ4-compressed with the same records
+    /// and head; compressed, control, small and incompressible batches stay.
+    #[test]
+    fn uncompressed_batches_go_in_compressed_when_it_pays() {
+        use sprig_proto_kafka::compression::Compression;
+        let records = |value: &dyn Fn(i32) -> Vec<u8>| -> Vec<Record> {
+            (0..20)
+                .map(|i| Record {
+                    offset_delta: i,
+                    timestamp_delta: i64::from(i),
+                    key: Some(format!("k{i}").into_bytes()),
+                    value: Some(value(i)),
+                    ..Record::default()
+                })
+                .collect()
+        };
+        let mk = |rs: Vec<Record>, attributes: i16| {
+            RecordBatch {
+                base_timestamp: 1_000,
+                max_timestamp: 1_019,
+                last_offset_delta: 19,
+                producer_id: 7,
+                producer_epoch: 1,
+                base_sequence: 40,
+                attributes,
+                records: rs,
+                ..RecordBatch::default()
+            }
+            .to_bytes()
+            .unwrap()
+        };
+        let plain = mk(records(&|_| vec![b'v'; 500]), 0);
+        let z = lz4(&plain).unwrap();
+        assert!(z.len() < plain.len() / 4, "{} -> {}", plain.len(), z.len());
+        assert!(crc_ok(&z));
+        let (a, b) = (Head::parse(&plain).unwrap(), Head::parse(&z).unwrap());
+        assert_eq!(b.total, z.len());
+        assert_eq!(
+            (
+                b.producer_id,
+                b.producer_epoch,
+                b.base_sequence,
+                b.count,
+                b.last_delta,
+                b.max_ts
+            ),
+            (
+                a.producer_id,
+                a.producer_epoch,
+                a.base_sequence,
+                a.count,
+                a.last_delta,
+                a.max_ts
+            )
+        );
+        let back =
+            RecordBatch::decode(&mut sprig_proto_kafka::wire::Reader::new(&z), 1 << 20).unwrap();
+        assert_eq!(back.compression().unwrap(), Compression::Lz4);
+        let orig = RecordBatch::decode(&mut sprig_proto_kafka::wire::Reader::new(&plain), 1 << 20)
+            .unwrap();
+        assert_eq!(back.records, orig.records);
+        // Already compressed (gzip here): stored as it arrived.
+        assert!(lz4(&mk(records(&|_| vec![b'v'; 500]), 1)).is_none());
+        // Control records stay.
+        assert!(lz4(&mk(records(&|_| vec![b'v'; 500]), ATTR_CONTROL)).is_none());
+        // Random bytes don't get an eighth smaller.
+        let noise = mk(
+            records(&|i| {
+                let mut x = 0x9E37_79B9_7F4A_7C15_u64 ^ u64::from(i.unsigned_abs());
+                (0..500)
+                    .map(|_| {
+                        x ^= x << 13;
+                        x ^= x >> 7;
+                        x ^= x << 17;
+                        x.to_le_bytes()[0]
+                    })
+                    .collect()
+            }),
+            0,
+        );
+        assert!(lz4(&noise).is_none());
     }
 }

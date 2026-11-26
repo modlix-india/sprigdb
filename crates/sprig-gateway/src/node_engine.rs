@@ -17,14 +17,16 @@
 //!   `SPRIGDB_ENGINE_RAFT_LISTEN` is the address the Raft listener binds
 //!   (default: this node's own entry). Unset: one node, as before.
 //! - `SPRIGDB_ENGINE_STREAM_GROUPS`: on a replicated node, the partition
-//!   groups per tenant (default `0`: every partition in its tenant's
-//!   unit). With `n` groups, partition `p` of a stream commits through its
-//!   tenant's group unit `p % n`, each group's leader preferably on a
-//!   different replica, so Kafka writes spread over the nodes. Off by
-//!   default: measured, the spread made produce slower, because each
-//!   node's one Raft loop then syncs for a group it leads and groups it
-//!   follows in turn, and commits wait on more of those syncs. Every
-//!   replica must use the same value.
+//!   groups per tenant: a number, or `auto` (the default): one group per
+//!   replica where the Raft log writer thread is on, else `0` (every
+//!   partition in its tenant's unit). With `n` groups, partition `p` of a
+//!   stream commits through its tenant's group unit `p % n`, each group's
+//!   leader preferably on a different replica, so Kafka writes spread over
+//!   the nodes. Groups pay only with the writer thread: without it each
+//!   node's one Raft loop syncs for a group it leads and groups it follows
+//!   in turn. A stream log keeps the groups it was written with. Every
+//!   replica must use the same value (and the same writer-thread setting
+//!   under `auto`).
 //! - `SPRIGDB_ENGINE_RAFT_LOG_THREAD`: on a replicated node, the Raft
 //!   log's writes and syncs run on a thread of their own, so the Raft loop
 //!   keeps stepping groups (and answering) while a sync runs, and writes
@@ -36,6 +38,10 @@
 //!   the stream's segments refer to the same bytes instead of copying them
 //!   (default `true`; `false` writes the batch into both, as before; blobs
 //!   already written are still read).
+//! - `SPRIGDB_ENGINE_STREAM_COMPRESS`: a stream batch that arrives
+//!   uncompressed goes into the log LZ4-compressed when that makes it an
+//!   eighth smaller (default `true`; `false` stores it as it arrives).
+//!   Batches a client compressed are always stored as they arrive.
 //! - `SPRIGDB_ENGINE_RAFT_JOIN=true`: this node replaces a lost replica.
 //!   It starts with no units of its own and takes each unit only from the
 //!   unit's leader, once an operator runs `sprigctl engine replace-replica`
@@ -74,6 +80,16 @@ pub const STREAM_GROUPS_VAR: &str = "SPRIGDB_ENGINE_STREAM_GROUPS";
 pub const RAFT_LOG_THREAD_VAR: &str = "SPRIGDB_ENGINE_RAFT_LOG_THREAD";
 /// The variable that turns writing stream appends once off (`false`).
 pub const STREAM_WRITE_ONCE_VAR: &str = "SPRIGDB_ENGINE_STREAM_WRITE_ONCE";
+/// The variable that turns LZ4 on uncompressed stream batches off
+/// (`false`).
+pub const STREAM_COMPRESS_VAR: &str = "SPRIGDB_ENGINE_STREAM_COMPRESS";
+
+/// Whether uncompressed stream batches go into the log LZ4-compressed
+/// ([`STREAM_COMPRESS_VAR`], default on).
+#[must_use]
+pub fn stream_compress() -> bool {
+    !std::env::var(STREAM_COMPRESS_VAR).is_ok_and(|v| v.trim().eq_ignore_ascii_case("false"))
+}
 /// The node-local Admin API route that replaces a lost replica.
 pub const REPLACE_PATH: &str = "/admin/v1/engine/replicas:replace";
 
@@ -164,23 +180,38 @@ fn preferred_leader(voters: &[u64], unit: u64) -> Option<u64> {
 }
 
 /// The partition groups per tenant for this node's stream log: 0 on one
-/// node; on a replicated node [`STREAM_GROUPS_VAR`], else 0.
+/// node; on a replicated node [`STREAM_GROUPS_VAR`], where `auto` (also
+/// when unset) is one group per replica with the Raft log writer thread on,
+/// 0 with it off.
 #[must_use]
 pub fn stream_groups() -> u32 {
     groups_from(|k| std::env::var(k).ok())
 }
 
 fn groups_from(lookup: impl Fn(&str) -> Option<String>) -> u32 {
-    let Ok(Some(_)) = raft_from(&lookup) else {
+    let Ok(Some(r)) = raft_from(&lookup) else {
         return 0;
     };
-    match lookup(STREAM_GROUPS_VAR).map(|v| v.trim().parse::<u32>()) {
-        Some(Ok(n)) => n.min(255),
-        Some(Err(_)) => {
-            tracing::warn!("{STREAM_GROUPS_VAR} isn't a number; no partition groups");
+    let auto = || {
+        let thread =
+            !lookup(RAFT_LOG_THREAD_VAR).is_some_and(|v| v.trim().eq_ignore_ascii_case("false"));
+        if thread {
+            u32::try_from(r.peers.len()).unwrap_or(0).min(255)
+        } else {
             0
         }
-        None => 0,
+    };
+    let v = lookup(STREAM_GROUPS_VAR).map(|v| v.trim().to_owned());
+    match v.as_deref() {
+        None | Some("") => auto(),
+        Some(a) if a.eq_ignore_ascii_case("auto") => auto(),
+        Some(n) => n.parse::<u32>().map_or_else(
+            |_| {
+                tracing::warn!("{STREAM_GROUPS_VAR} isn't a number or auto; no partition groups");
+                0
+            },
+            |n| n.min(255),
+        ),
     }
 }
 
@@ -653,13 +684,29 @@ mod tests {
         };
         assert_eq!(groups(&[]), 0, "one node: no groups");
         let repl = [(RAFT_ID_VAR, "1"), (RAFT_PEERS_VAR, peers)];
-        assert_eq!(groups(&repl), 0, "off unless asked for");
+        assert_eq!(
+            groups(&repl),
+            3,
+            "by default one per replica (writer thread on)"
+        );
         let mut set = repl.to_vec();
+        set.push((RAFT_LOG_THREAD_VAR, "false"));
+        assert_eq!(groups(&set), 0, "none without the writer thread");
+        set.push((STREAM_GROUPS_VAR, "auto"));
+        assert_eq!(groups(&set), 0);
+        set.pop();
+        set.pop();
+        set.push((STREAM_GROUPS_VAR, "AUTO"));
+        assert_eq!(groups(&set), 3);
+        set.pop();
         set.push((STREAM_GROUPS_VAR, "0"));
         assert_eq!(groups(&set), 0);
         set.pop();
         set.push((STREAM_GROUPS_VAR, "6"));
         assert_eq!(groups(&set), 6);
+        set.pop();
+        set.push((STREAM_GROUPS_VAR, "three"));
+        assert_eq!(groups(&set), 0, "malformed: none");
         // A tenant's groups land on different replicas; tenant units have
         // no preference.
         let voters = [1, 2, 3];

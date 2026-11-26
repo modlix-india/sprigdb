@@ -74,6 +74,24 @@ pub trait Gate: Send + Sync + 'static {
     fn tenant_on_engine(&self, tenant: u64) -> bool;
     /// Whether `p` may do `need` on `db`.`stream`.
     async fn allowed(&self, p: &Principal, db: &str, stream: &str, need: Need) -> bool;
+    /// Whether `p` may do each of `needs` on `db`.`stream`, all decided from
+    /// one view of the grants. `Err` (a retriable Kafka error) when the
+    /// grants can't be read now, as while a tenant's catalog moves with its
+    /// unit's leader: the client retries, where a denial would be fatal to
+    /// it. The default asks [`Gate::allowed`] for each.
+    async fn check(
+        &self,
+        p: &Principal,
+        db: &str,
+        stream: &str,
+        needs: &[Need],
+    ) -> std::result::Result<Vec<bool>, TopicError> {
+        let mut out = Vec::with_capacity(needs.len());
+        for n in needs {
+            out.push(self.allowed(p, db, stream, *n).await);
+        }
+        Ok(out)
+    }
     /// The produce and fetch limits for `p` when no other data plane gives
     /// them.
     async fn limits(&self, p: &Principal) -> Limits {
@@ -96,6 +114,20 @@ fn internal(e: &SprigError) -> TopicError {
     // controller, the unit's leader.
     if e.code() == Some(SprigCode::ShardMoved) {
         return terr(err::NOT_CONTROLLER, e.to_string());
+    }
+    terr(err::UNKNOWN_SERVER_ERROR, e.to_string())
+}
+
+/// A failure to read a topic's record for a data request (produce, fetch,
+/// offsets): on a replica that doesn't lead the unit, or while it can't
+/// confirm what it holds, a retriable answer that sends the client back to
+/// Metadata; otherwise an unknown server error.
+fn data_err(e: &SprigError) -> TopicError {
+    if e.code() == Some(SprigCode::ShardMoved) {
+        return terr(err::NOT_LEADER_OR_FOLLOWER, e.to_string());
+    }
+    if e.retryable {
+        return terr(err::LEADER_NOT_AVAILABLE, e.to_string());
     }
     terr(err::UNKNOWN_SERVER_ERROR, e.to_string())
 }
@@ -685,11 +717,14 @@ impl RoutedTopics {
     }
 
     async fn visible(&self, p: &Principal, r: &TopicRecord) -> bool {
+        // Grants that can't be read now hide the topic (Metadata then
+        // answers UNKNOWN_TOPIC_OR_PARTITION, which clients retry).
         match split(&r.name) {
-            Ok((db, s)) => {
-                self.gate.allowed(p, db, s, Need::Read).await
-                    || self.gate.allowed(p, db, s, Need::Write).await
-            }
+            Ok((db, s)) => self
+                .gate
+                .check(p, db, s, &[Need::Read, Need::Write])
+                .await
+                .is_ok_and(|v| v.contains(&true)),
             Err(_) => false,
         }
     }
@@ -708,7 +743,7 @@ impl RoutedTopics {
         need: Need,
     ) -> std::result::Result<(), TopicError> {
         let (db, s) = split(name)?;
-        if self.gate.allowed(p, db, s, need).await {
+        if self.gate.check(p, db, s, &[need]).await?.first() == Some(&true) {
             Ok(())
         } else {
             Err(terr(
@@ -1120,16 +1155,16 @@ impl RoutedData {
             return Err(unknown(name));
         };
         let (db, s) = split(&r.name)?;
-        let need = match access {
-            Access::Read => Need::Read,
-            Access::Write => Need::Write,
+        let (need, other) = match access {
+            Access::Read => (Need::Read, Need::Write),
+            Access::Write => (Need::Write, Need::Read),
         };
-        if !self.gate.allowed(p, db, s, need).await {
-            let other = match access {
-                Access::Read => Need::Write,
-                Access::Write => Need::Read,
-            };
-            if !self.gate.allowed(p, db, s, other).await {
+        // Both from one view of the grants: two separate reads of a catalog
+        // that is moving with its unit's leader could deny one and allow
+        // the other, and TOPIC_AUTHORIZATION_FAILED is fatal to a client.
+        let got = self.gate.check(p, db, s, &[need, other]).await?;
+        if got.first() != Some(&true) {
+            if got.get(1) != Some(&true) {
                 return Err(unknown(name));
             }
             return Err(terr(
@@ -1167,7 +1202,7 @@ impl StreamData for RoutedData {
         let r = self
             .eng
             .topic(p.tenant_id, name)
-            .map_err(|e| internal(&e))?;
+            .map_err(|e| data_err(&e))?;
         self.resolve(p, r, name, access).await
     }
 
@@ -1188,7 +1223,7 @@ impl StreamData for RoutedData {
         let r = self
             .eng
             .topic_by_id(tenant, stream)
-            .map_err(|e| internal(&e))?
+            .map_err(|e| data_err(&e))?
             .ok_or_else(unknown_id)?;
         let name = r.name.clone();
         self.resolve(p, Some(r), &name, access).await

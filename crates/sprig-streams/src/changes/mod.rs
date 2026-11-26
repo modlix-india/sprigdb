@@ -529,15 +529,39 @@ fn walk_payload<'a>(data: &'a [u8], mut f: impl FnMut(PayloadOp<'a>)) -> bool {
 
 /// Calls `f` with each change of one log entry, in order, without
 /// holding the entry's changes in memory. `f` sees `last` set on the last.
-pub fn for_each_change(e: &LogEntry, mut f: impl FnMut(&Change)) {
+/// The entry's event notes come after its changes, as records of their
+/// own keys, at the entry's commit timestamp.
+pub fn for_each_change(e: &LogEntry, f: impl FnMut(&Change)) {
+    for_each_change_at(e, None, f);
+}
+
+/// [`for_each_change`]; an entry with event notes and no versioned write
+/// (a command that changed nothing, such as `LTRIM l 0 -1`) gives its
+/// events `fallback_cts` (the unit's highest commit timestamp so far, the
+/// same on every replica), or none without one.
+fn for_each_change_at(e: &LogEntry, fallback_cts: Option<u64>, mut f: impl FnMut(&Change)) {
     let data_cf = Cf::Data.code();
     let mut hints: HashMap<&[u8], (HintOp, &[u8])> = HashMap::new();
-    let ok = walk_payload(&e.data, |op| {
-        if let PayloadOp::Note(n) = op
-            && let Some((k, op, d)) = record::decode_hint(n)
-        {
-            hints.insert(k, (op, d));
+    let mut events: Vec<(&[u8], &[u8])> = Vec::new();
+    let mut entry_ts = None;
+    let ok = walk_payload(&e.data, |op| match op {
+        PayloadOp::Note(n) => {
+            if let Some((k, op, d)) = record::decode_hint(n) {
+                hints.insert(k, (op, d));
+            } else if let Some(kv) = sprig_engine::observe::event::decode(n) {
+                events.push(kv);
+            }
         }
+        PayloadOp::Put(cf, key, _) if entry_ts.is_none() => {
+            if cf == data_cf
+                && key.len() >= keys::PREFIX_LEN + keys::VERSION_LEN
+                && !keys::is_unversioned(key)
+                && let Some((_, ts)) = keys::split_version(key)
+            {
+                entry_ts = Some(ts.0);
+            }
+        }
+        _ => {}
     });
     if !ok {
         return;
@@ -560,8 +584,11 @@ pub fn for_each_change(e: &LogEntry, mut f: impl FnMut(&Change)) {
         let Some((p, _)) = KeyPrefix::decode(logical) else {
             return;
         };
+        // Redis databases' entries aren't changes anyone reads: their
+        // keyspace events are recorded as event notes instead.
         if p.tenant == keys::META_TENANT
             || (p.kind != keys::kind::PRIMARY && p.kind != keys::kind::META)
+            || keys::REDIS_OBJECTS.contains(&p.object)
         {
             return;
         }
@@ -582,6 +609,25 @@ pub fn for_each_change(e: &LogEntry, mut f: impl FnMut(&Change)) {
         });
         seq = seq.saturating_add(1);
     });
+    // Event notes take the entry's commit timestamp, or the fallback when
+    // the entry wrote nothing versioned.
+    if let Some(cts) = entry_ts.or(fallback_cts) {
+        for (key, value) in events {
+            if let Some(h) = held.take() {
+                f(&h);
+            }
+            held = Some(Change {
+                index: e.index,
+                seq,
+                cts,
+                last: false,
+                key: key.to_vec(),
+                value: Some(value.to_vec()),
+                hint: None,
+            });
+            seq = seq.saturating_add(1);
+        }
+    }
     if let Some(mut h) = held {
         h.last = true;
         f(&h);
@@ -726,8 +772,9 @@ impl Inner {
         let mut cts = 0;
         buf.clear();
         let dir = st.dir.clone();
+        let fallback = Some(st.max_cts);
         let segs = &mut st.segs;
-        for_each_change(e, |r| {
+        for_each_change_at(e, fallback, |r| {
             if res.is_err() {
                 return;
             }

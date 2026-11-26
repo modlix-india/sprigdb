@@ -14,7 +14,9 @@ use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use sprig_auth::authz::Action;
-use sprig_proto_kafka::topics::{Principal, TopicDefaults};
+use sprig_common::{SprigCode, SprigError};
+use sprig_proto_kafka::protocol::err;
+use sprig_proto_kafka::topics::{Principal, TopicDefaults, TopicError};
 use sprig_streams::seg::SegConfig;
 use sprig_streams::seg::kafka::{EngineStreams, Gate, Need};
 
@@ -80,6 +82,7 @@ pub fn streams() -> Option<Arc<EngineStreams>> {
             let cfg = SegConfig {
                 groups: crate::node_engine::stream_groups(),
                 blobs: crate::node_engine::note_blobs(),
+                compress: crate::node_engine::stream_compress(),
                 ..SegConfig::default()
             };
             EngineStreams::open(&e, dir, cfg, TopicDefaults::default())
@@ -138,22 +141,56 @@ impl Gate for GatewayGate {
     }
 
     async fn allowed(&self, p: &Principal, db: &str, stream: &str, need: Need) -> bool {
-        let Some(cat) = self.data.catalog_of(p).await else {
-            return false;
+        self.check(p, db, stream, &[need])
+            .await
+            .is_ok_and(|v| v.first() == Some(&true))
+    }
+
+    async fn check(
+        &self,
+        p: &Principal,
+        db: &str,
+        stream: &str,
+        needs: &[Need],
+    ) -> Result<Vec<bool>, TopicError> {
+        let cat = match self.data.catalog_res(p).await {
+            Ok(c) => c,
+            Err(e) => return catalog_unreadable(&e, needs.len()),
         };
-        let action = match need {
-            Need::Read => Action::Select,
-            Need::Write => Action::Insert,
-            Need::Create => Action::Create,
-            Need::Alter => Action::Alter,
-            Need::Drop => Action::Drop,
-        };
-        self.data.allowed_named(p, &cat, db, stream, action)
+        Ok(needs
+            .iter()
+            .map(|n| self.data.allowed_named(p, &cat, db, stream, action_of(*n)))
+            .collect())
     }
 
     async fn limits(&self, p: &Principal) -> sprig_proto_kafka::broker::data::Limits {
         self.data.limits(p).await
     }
+}
+
+/// The grant a stream need asks for.
+fn action_of(need: Need) -> Action {
+    match need {
+        Need::Read => Action::Select,
+        Need::Write => Action::Insert,
+        Need::Create => Action::Create,
+        Need::Alter => Action::Alter,
+        Need::Drop => Action::Drop,
+    }
+}
+
+/// The tenant's catalog couldn't be read. While it moves with its unit's
+/// leader (a retryable error: the replica doesn't lead the unit, or can't
+/// yet confirm what it holds) the client gets a retriable answer that sends
+/// it back to Metadata; any other failure denies every need, as before.
+fn catalog_unreadable(e: &SprigError, needs: usize) -> Result<Vec<bool>, TopicError> {
+    if e.code() == Some(SprigCode::ShardMoved) {
+        return Err(TopicError::new(err::NOT_LEADER_OR_FOLLOWER, e.to_string()));
+    }
+    if e.retryable {
+        return Err(TopicError::new(err::LEADER_NOT_AVAILABLE, e.to_string()));
+    }
+    Ok(vec![false; needs])
 }
 
 /// Puts engine-stored topics in front of `d`'s stores when the node has an
@@ -189,6 +226,30 @@ pub fn wrap(d: &mut super::KafkaDeps) {
 #[cfg(test)]
 mod tests {
     use super::Tenants;
+
+    /// A catalog that can't be read while it moves with its unit's leader
+    /// answers a retriable Kafka error, never a denial; other failures deny.
+    #[test]
+    fn an_unreadable_catalog_is_retriable_while_it_moves() {
+        use sprig_common::{SprigCode, SprigError};
+        use sprig_proto_kafka::protocol::err;
+        let code = |e: SprigError| super::catalog_unreadable(&e, 2).map_err(|t| t.code);
+        assert_eq!(
+            code(SprigError::new(
+                SprigCode::ShardMoved,
+                "no leader reachable"
+            )),
+            Err(err::NOT_LEADER_OR_FOLLOWER)
+        );
+        assert_eq!(
+            code(SprigError::new(
+                SprigCode::CatalogUnavailable,
+                "doesn't lead the unit"
+            )),
+            Err(err::LEADER_NOT_AVAILABLE)
+        );
+        assert_eq!(code(SprigError::internal("broken")), Ok(vec![false, false]));
+    }
 
     #[test]
     fn tenant_lists_parse() {

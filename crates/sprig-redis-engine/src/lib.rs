@@ -11,6 +11,7 @@
 //! - [`exec`]: the commands;
 //! - [`db`]: one database: a pipeline's commands as one batch;
 //! - [`sweep`]: active expiry;
+//! - [`notify`]: keyspace notifications' events, recorded with each batch;
 //! - [`backend`]: which tenants are on the engine;
 //! - [`engine_unit`]: the engine's transactions as a unit;
 //! - [`mem`]: an in-memory unit for tests.
@@ -43,6 +44,7 @@ pub mod engine_unit;
 pub mod exec;
 pub mod layout;
 pub mod mem;
+pub mod notify;
 pub mod store;
 pub mod sweep;
 

@@ -105,18 +105,23 @@ impl GatewayData {
 
     /// The tenant's catalog.
     pub(crate) async fn catalog_of(&self, p: &Principal) -> Option<Arc<TenantCatalog>> {
-        match self
+        self.catalog_res(p).await.ok()
+    }
+
+    /// The tenant's catalog, or why it can't be read now.
+    pub(crate) async fn catalog_res(
+        &self,
+        p: &Principal,
+    ) -> Result<Arc<TenantCatalog>, sprig_common::SprigError> {
+        let got = self
             .svc
             .cache
             .get(TenantId(p.tenant_id), Freshness::Latest)
-            .await
-        {
-            Ok(c) => Some(c),
-            Err(e) => {
-                tracing::debug!(tenant = p.tenant_id, error = %e, "kafka: tenant catalog unavailable");
-                None
-            }
+            .await;
+        if let Err(e) = &got {
+            tracing::debug!(tenant = p.tenant_id, error = %e, "kafka: tenant catalog unavailable");
         }
+        got
     }
 
     /// Whether `p`'s tenant has a database `db` stored on the engine.

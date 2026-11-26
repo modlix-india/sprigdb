@@ -28,6 +28,26 @@ use crate::exec::{self, Cx};
 use crate::layout::{SCRIPT_CACHE, SCRIPT_FUNCTIONS, Space};
 use crate::store::{Batch, StoreError, Ticket, Unit};
 
+/// Runs one command of a script, adding its keyspace events.
+fn notified<B: Batch>(
+    cx: &mut Cx<'_, B>,
+    name: &str,
+    a: &[Bytes],
+    flags: u16,
+    events: &mut Vec<crate::notify::Event>,
+    misses: &mut Vec<crate::notify::Event>,
+) -> exec::Out {
+    let mut absent = Vec::new();
+    crate::notify::keymiss(cx, name, a, flags, &mut absent)?;
+    let before = crate::notify::before(cx, name, a)?;
+    let r = exec::run(cx, name, a)?;
+    crate::notify::after(cx, before, name, a, &r, flags, events)?;
+    if !r.is_error() {
+        misses.append(&mut absent);
+    }
+    Ok(r)
+}
+
 /// A script's failure from an engine error.
 fn script_failed(e: &StoreError) -> ScriptFailed {
     ScriptFailed {
@@ -51,6 +71,11 @@ pub struct ScriptTxn<U: Unit> {
     epoch: u64,
     touched: Vec<Bytes>,
     flushed: bool,
+    /// Keyspace notifications' flags, read when the script began (0: off),
+    /// and the events of its commands so far.
+    flags: u16,
+    events: Vec<crate::notify::Event>,
+    misses: Vec<crate::notify::Event>,
 }
 
 impl<U: Unit> std::fmt::Debug for ScriptTxn<U> {
@@ -111,6 +136,9 @@ impl<U: Unit> EngineDb<U> {
             epoch: 0,
             touched: Vec::new(),
             flushed: false,
+            flags: self.recording(),
+            events: Vec::new(),
+            misses: Vec::new(),
         }))
     }
 
@@ -291,6 +319,9 @@ impl<U: Unit> EngineScript for ScriptTxn<U> {
         let now = self.now;
         let db = Arc::clone(&self.db);
         let mut uids = std::mem::take(&mut self.uids);
+        let flags = self.flags;
+        let mut events = std::mem::take(&mut self.events);
+        let mut misses = std::mem::take(&mut self.misses);
         let b = self.batch()?;
         let mut cx = Cx {
             b,
@@ -301,8 +332,14 @@ impl<U: Unit> EngineScript for ScriptTxn<U> {
             resp3,
             touched: Vec::new(),
         };
-        let r = exec::run(&mut cx, &name, a);
+        let r = if flags == 0 {
+            exec::run(&mut cx, &name, a)
+        } else {
+            notified(&mut cx, &name, a, flags, &mut events, &mut misses)
+        };
         let touched = std::mem::take(&mut cx.touched);
+        self.events = events;
+        self.misses = misses;
         self.uids = uids;
         self.touched.extend(touched);
         if name.starts_with("flush") {
@@ -323,8 +360,12 @@ impl<U: Unit> EngineScript for ScriptTxn<U> {
         if self.flushed {
             self.db.versions.flushed();
         }
+        let mut b = b;
+        crate::notify::add_note(&mut b, self.db.space.tenant, &self.events)
+            .map_err(|e| script_failed(&e))?;
         let ticket = b.commit().map_err(|e| script_failed(&e))?;
         self.db.waiters.wake(&touched);
+        self.db.direct(std::mem::take(&mut self.misses));
         // Once queued, the commit may have happened: never run it again.
         ticket.durable().await.map_err(|e| ScriptFailed {
             reply: failed(&e),

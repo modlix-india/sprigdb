@@ -49,23 +49,44 @@ pub trait KeyspaceFeed: Send + Sync + std::fmt::Debug {
     fn watch(&self, scope: &str);
 }
 
-/// Flag bits.
-const GENERIC: u16 = 1;
-const STRING: u16 = 2;
-const LIST: u16 = 4;
-const SET: u16 = 8;
-const HASH: u16 = 16;
-const ZSET: u16 = 32;
-const EXPIRED: u16 = 64;
-const EVICTED: u16 = 128;
-const STREAM: u16 = 256;
-const MODULE: u16 = 512;
-const NEW: u16 = 1024;
-const KEYSPACE: u16 = 2048;
-const KEYEVENT: u16 = 4096;
-const KEYMISS: u16 = 8192;
+/// Flag bits: `g`.
+pub const GENERIC: u16 = 1;
+/// `$`.
+pub const STRING: u16 = 2;
+/// `l`.
+pub const LIST: u16 = 4;
+/// `s`.
+pub const SET: u16 = 8;
+/// `h`.
+pub const HASH: u16 = 16;
+/// `z`.
+pub const ZSET: u16 = 32;
+/// `x`.
+pub const EXPIRED: u16 = 64;
+/// `e`.
+pub const EVICTED: u16 = 128;
+/// `t`.
+pub const STREAM: u16 = 256;
+/// `d`.
+pub const MODULE: u16 = 512;
+/// `n`.
+pub const NEW: u16 = 1024;
+/// `K`.
+pub const KEYSPACE: u16 = 2048;
+/// `E`.
+pub const KEYEVENT: u16 = 4096;
+/// `m`.
+pub const KEYMISS: u16 = 8192;
 /// `A`: Redis's `NOTIFY_ALL`.
-const ALL: u16 = GENERIC | STRING | LIST | SET | HASH | ZSET | EXPIRED | EVICTED | STREAM | MODULE;
+pub const ALL: u16 =
+    GENERIC | STRING | LIST | SET | HASH | ZSET | EXPIRED | EVICTED | STREAM | MODULE;
+
+/// Whether `flags` send anything: a class and a channel kind (`K` or `E`),
+/// as Redis requires both.
+#[must_use]
+pub const fn sends(flags: u16) -> bool {
+    flags & (KEYSPACE | KEYEVENT) != 0 && flags & !(KEYSPACE | KEYEVENT) != 0
+}
 
 /// Parses a flag string as Redis does; `None` for an unknown character.
 #[must_use]
@@ -127,6 +148,17 @@ pub fn flags_text(f: u16) -> String {
     }
     if f & KEYMISS != 0 {
         s.push('m');
+    }
+    s
+}
+
+/// The flags as text that parses back to the same flags: Redis's own text
+/// ([`flags_text`]) drops `n` beside `A`; this keeps it.
+#[must_use]
+pub fn flags_lossless(f: u16) -> String {
+    let mut s = flags_text(f);
+    if f & ALL == ALL && f & NEW != 0 {
+        s.push('n');
     }
     s
 }
@@ -224,11 +256,7 @@ pub fn covered(name: &str) -> bool {
 /// The publishes of `events` under `flags` in database `db`:
 /// (channel, message).
 #[must_use]
-pub fn publishes(
-    flags: u16,
-    db: u32,
-    events: &[(&'static str, u16, Bytes)],
-) -> Vec<(Bytes, Bytes)> {
+pub fn publishes(flags: u16, db: u32, events: &[(&str, u16, Bytes)]) -> Vec<(Bytes, Bytes)> {
     let mut out = Vec::new();
     for (ev, class, key) in events {
         if flags & class == 0 {
@@ -237,7 +265,7 @@ pub fn publishes(
         if flags & KEYSPACE != 0 {
             let mut c = format!("__keyspace@{db}__:").into_bytes();
             c.extend_from_slice(key);
-            out.push((Bytes::from(c), Bytes::from_static(ev.as_bytes())));
+            out.push((Bytes::from(c), Bytes::copy_from_slice(ev.as_bytes())));
         }
         if flags & KEYEVENT != 0 {
             out.push((Bytes::from(format!("__keyevent@{db}__:{ev}")), key.clone()));
@@ -281,6 +309,11 @@ mod tests {
         assert_eq!(parse_flags(b"Kg$").map(flags_text).as_deref(), Some("g$K"));
         assert_eq!(parse_flags(b"").map(flags_text).as_deref(), Some(""));
         assert_eq!(parse_flags(b"Kq"), None);
+        // Redis shows `AKEn` as `AKE`; the stored text keeps `n`.
+        let f = parse_flags(b"AKEn").unwrap_or(0);
+        assert_eq!(flags_text(f), "AKE");
+        assert_eq!(parse_flags(flags_lossless(f).as_bytes()), Some(f));
+        assert_eq!(flags_lossless(parse_flags(b"g$nKE").unwrap_or(0)), "g$nKE");
     }
 
     #[test]

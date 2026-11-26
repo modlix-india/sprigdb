@@ -161,6 +161,17 @@ pub trait Batch: Send {
     /// batch, which holds every key its commands name before they run).
     fn read_latest(&mut self) {}
 
+    /// Adds an opaque note for `tenant`'s unit to the commit (keyspace
+    /// notifications' event notes): it goes with the batch's writes or not
+    /// at all.
+    ///
+    /// # Errors
+    /// The engine's.
+    fn note(&mut self, tenant: u64, note: Vec<u8>) -> StoreResult<()> {
+        let _ = (tenant, note);
+        Ok(())
+    }
+
     /// Queues the batch's writes as one commit and releases its keys. The
     /// ticket says when the writes, and every version the batch read, are
     /// durable: only then may a reply go out.

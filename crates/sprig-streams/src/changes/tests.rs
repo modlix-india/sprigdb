@@ -303,3 +303,62 @@ fn consumer_holds_outlive_a_restart() {
     let later = (at >> 16) + 120_000;
     assert!(e.txn_shared().gc_watermark(later).0 >= at);
 }
+
+#[test]
+fn event_notes_are_records_and_redis_entries_are_not() {
+    let d = TempDir::new("chg-events");
+    let e = engine(d.path());
+    let log = ChangeLog::open(&e, d.path().join("changes"), cfg()).unwrap();
+    let start = log.head(unit()).0;
+    let redis = |k: &[u8]| keys::encode(T, 0, 0x5244_0003, kind::META, 0, k, None);
+    let ev_key = keys::encode(T, 0, 0x5244_0000, b'N', 0, b"", None);
+    // A Redis write with two event notes: the notes are the records.
+    let mut t = e.begin(TxnOptions::default()).unwrap();
+    t.add_note_for_tenant(T, sprig_engine::observe::event::encode(&ev_key, b"one"))
+        .unwrap();
+    t.put(redis(b"k"), b"meta".to_vec()).unwrap();
+    t.put(row(9), b"r".to_vec()).unwrap();
+    t.add_note_for_tenant(T, sprig_engine::observe::event::encode(&ev_key, b"two"))
+        .unwrap();
+    let c = t.commit().unwrap();
+    c.wait().unwrap();
+    settle(&e);
+    let cts = c.cts().0;
+    // A Redis write without notes leaves nothing.
+    let mut t = e.begin(TxnOptions::default()).unwrap();
+    t.put(redis(b"k2"), b"meta".to_vec()).unwrap();
+    t.commit().unwrap().wait().unwrap();
+    settle(&e);
+    let (all, _) = read_all(&log, start, 1 << 20);
+    assert_eq!(
+        all.iter()
+            .map(|c| (c.key.clone(), c.value.clone(), c.cts, c.seq, c.last))
+            .collect::<Vec<_>>(),
+        vec![
+            (row(9), Some(b"r".to_vec()), cts, 0, false),
+            (ev_key.clone(), Some(b"one".to_vec()), cts, 1, false),
+            (ev_key, Some(b"two".to_vec()), cts, 2, true),
+        ]
+    );
+}
+
+#[test]
+fn an_entry_of_event_notes_alone_is_recorded_at_the_units_last_timestamp() {
+    let d = TempDir::new("chg-events-only");
+    let e = engine(d.path());
+    let log = ChangeLog::open(&e, d.path().join("changes"), cfg()).unwrap();
+    let start = log.head(unit()).0;
+    let c1 = commit(&e, &[(1, Some(b"a"))]);
+    let ev_key = keys::encode(T, 0, 0x5244_0000, b'N', 0, b"", None);
+    let mut t = e.begin(TxnOptions::default()).unwrap();
+    t.add_note_for_tenant(T, sprig_engine::observe::event::encode(&ev_key, b"ltrim"))
+        .unwrap();
+    t.commit().unwrap().wait().unwrap();
+    settle(&e);
+    let (all, _) = read_all(&log, start, 1 << 20);
+    assert_eq!(all.len(), 2, "{all:?}");
+    assert_eq!(all[1].key, ev_key);
+    assert_eq!(all[1].value.as_deref(), Some(&b"ltrim"[..]));
+    assert_eq!(all[1].cts, c1);
+    assert!(all[1].last);
+}

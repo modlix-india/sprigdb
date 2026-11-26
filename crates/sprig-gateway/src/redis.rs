@@ -15,6 +15,7 @@
 
 pub mod engine;
 pub mod hub;
+mod keyspace_engine;
 mod keyspace_feed;
 pub mod logic;
 pub mod search;
@@ -89,12 +90,21 @@ key!(
     LOGICAL_DATABASE: Text = "redis.logical_database", Cow::Borrowed("redis"), HardBounds::NONE,
     "Home of the Redis databases' namespaces"
 );
-key!(
-    /// `redis.notify_keyspace_events`: Redis's flag string (`KEA`, `Kg$`,
-    /// ...); empty sends no keyspace notifications.
-    NOTIFY_KEYSPACE_EVENTS: Text = "redis.notify_keyspace_events", Cow::Borrowed(""), HardBounds::NONE,
-    "Keyspace notification classes (Redis's notify-keyspace-events)"
-);
+/// `redis.notify_keyspace_events`: Redis's flag string (`KEA`, `Kg$`, ...);
+/// empty sends no keyspace notifications. A tenant's value (`CONFIG SET
+/// notify-keyspace-events` writes it) turns them on for that tenant only.
+pub static NOTIFY_KEYSPACE_EVENTS: Setting<Text> = Setting {
+    key: "redis.notify_keyspace_events",
+    default: Cow::Borrowed(""),
+    // Tenant and global.
+    scopes: Scopes(0b10_0100),
+    hard: HardBounds::NONE,
+    apply: Apply::Live,
+    operator_only: false,
+    owner: 40,
+    doc: "Keyspace notification classes (Redis's notify-keyspace-events), per tenant",
+};
+sprig_settings::register!(NOTIFY_KEYSPACE_EVENTS);
 key!(
     /// `redis.default_user`: the login of one-argument `AUTH`.
     DEFAULT_USER: Text = "redis.default_user", Cow::Borrowed(""), HardBounds::NONE,
@@ -201,7 +211,7 @@ fn read_config(live: &LiveSettings, dc: &DcId) -> sprig_redis::Config {
         notify_keyspace_events: sprig_redis::keyspace::parse_flags(
             live.get(&NOTIFY_KEYSPACE_EVENTS, &cx).as_bytes(),
         )
-        .map(sprig_redis::keyspace::flags_text)
+        .map(sprig_redis::keyspace::flags_lossless)
         .unwrap_or_default(),
         ..sprig_redis::Config::default()
     }
@@ -277,10 +287,12 @@ pub struct RedisDeps {
 }
 
 impl RedisFrontend {
-    /// Starts keyspace notifications from the change feed for the tenants
-    /// of `svc`.
+    /// Starts keyspace notifications for the tenants of `svc`: from the
+    /// change log for databases on the engine, else from the change feed.
     #[must_use]
     pub fn with_feed(self, svc: Arc<crate::tenant::TenantServices>) -> Self {
+        // Databases on the engine: from the change log.
+        self.node.install_keyspace(&self.env, Arc::clone(&svc));
         keyspace_feed::FeedNotifier::install(&self.env, svc);
         self
     }
@@ -290,6 +302,7 @@ impl RedisFrontend {
 pub struct RedisFrontend {
     d: Arc<RedisDeps>,
     env: Arc<sprig_redis::Env>,
+    node: Arc<engine::NodeEngine>,
 }
 
 impl std::fmt::Debug for RedisFrontend {
@@ -314,12 +327,12 @@ impl RedisFrontend {
         // key.
         env.set_key_filter(Arc::new(KeyImages));
         // Tenants whose Redis databases live on the storage engine.
-        env.set_engine(Arc::new(engine::NodeEngine::from_env(
-            env.config().databases,
-        )));
+        let node = Arc::new(engine::NodeEngine::from_env(env.config().databases));
+        env.set_engine(Arc::clone(&node) as Arc<dyn sprig_redis::engine::EngineBackend>);
         Self {
             d: Arc::new(d),
             env,
+            node,
         }
     }
 

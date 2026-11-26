@@ -268,15 +268,25 @@ fn numkeys(a: &[Bytes], at: usize) -> &[Bytes] {
 /// linearizable.
 #[must_use]
 pub fn lock_keys(name: &str, a: &[Bytes], space: Space, all: &[Space]) -> Vec<Bytes> {
+    write_targets(name, a, space, all)
+        .into_iter()
+        .map(|(s, k)| s.meta(&k))
+        .collect()
+}
+
+/// The keys command `a` may write, each with its database, in the order
+/// the command names them (what [`lock_keys`] locks).
+#[must_use]
+pub fn write_targets(name: &str, a: &[Bytes], space: Space, all: &[Space]) -> Vec<(Space, Bytes)> {
     if !writes(name) {
         return Vec::new();
     }
-    let here = |k: &Bytes| space.meta(k);
+    let here = |k: &Bytes| (space, k.clone());
     match name {
         "move" => {
             let mut v = vec![here(&a[1])];
             if let Some(d) = db_arg(&a[2], all) {
-                v.push(all[d].meta(&a[1]));
+                v.push((all[d], a[1].clone()));
             }
             v
         }
@@ -291,7 +301,7 @@ pub fn lock_keys(name: &str, a: &[Bytes], space: Space, all: &[Space]) -> Vec<By
                 }
                 i += 1;
             }
-            vec![here(&a[1]), dst.meta(&a[2])]
+            vec![here(&a[1]), (dst, a[2].clone())]
         }
         "lmpop" | "zmpop" => numkeys(a, 1).iter().map(here).collect(),
         "blmpop" | "bzmpop" => numkeys(a, 2).iter().map(here).collect(),
@@ -801,6 +811,19 @@ pub fn expire_due<B: Batch>(
     now: i64,
     due: &[(i64, Bytes)],
 ) -> Result<usize, StoreError> {
+    expire_due_keys(b, space, now, due).map(|k| k.len())
+}
+
+/// [`expire_due`], returning the keys deleted.
+///
+/// # Errors
+/// The engine's.
+pub fn expire_due_keys<B: Batch>(
+    b: &mut B,
+    space: Space,
+    now: i64,
+    due: &[(i64, Bytes)],
+) -> Result<Vec<Bytes>, StoreError> {
     let mut none = Vec::new();
     let mut cx = Cx {
         b,
@@ -811,20 +834,20 @@ pub fn expire_due<B: Batch>(
         resp3: false,
         touched: Vec::new(),
     };
-    let mut n = 0;
+    let mut gone = Vec::new();
     for (at, key) in due {
         let raw = cx.raw(key)?;
         match &raw {
             Some(m) if m.exp == Some(*at) && m.expired(now) => {
                 cx.write(key, raw.as_ref(), None)?;
-                n += 1;
+                gone.push(key.clone());
             }
             Some(m) if m.exp == Some(*at) => {}
             // An entry its key no longer matches.
             _ => cx.b.delete(space.expiry(*at, key))?,
         }
     }
-    Ok(n)
+    Ok(gone)
 }
 
 /// Removes the due fields of the hashes in `due` (their hash-due entries,
@@ -853,4 +876,34 @@ pub fn expire_fields<B: Batch>(
         hashes::sweep_hash(&mut cx, *at, key)?;
     }
     Ok(due.len())
+}
+
+/// [`expire_fields`], returning the hashes whose fields it removed, each
+/// with whether the hash went.
+///
+/// # Errors
+/// The engine's.
+pub fn expire_fields_keys<B: Batch>(
+    b: &mut B,
+    space: Space,
+    now: i64,
+    due: &[(i64, Bytes)],
+) -> Result<Vec<(Bytes, bool)>, StoreError> {
+    let mut none = Vec::new();
+    let mut cx = Cx {
+        b,
+        space,
+        now,
+        all: &[],
+        uids: &mut none,
+        resp3: false,
+        touched: Vec::new(),
+    };
+    let mut out = Vec::new();
+    for (at, key) in due {
+        if let Some(gone) = hashes::sweep_hash(&mut cx, *at, key)? {
+            out.push((key.clone(), gone));
+        }
+    }
+    Ok(out)
 }

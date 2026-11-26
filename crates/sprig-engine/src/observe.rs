@@ -24,6 +24,59 @@ pub trait ApplyObserver: Send + Sync {
     fn applied(&self, unit: UnitId, entries: &[LogEntry]);
 }
 
+/// Event notes: payload notes that are change records of their own, not
+/// attached to a write (Redis keyspace notifications). The change log
+/// records each as a record of `key` (a logical key the writer chooses)
+/// with `value`, after the entry's changes, in note order.
+pub mod event {
+    /// The note prefix of an event note.
+    pub const MAGIC: &[u8; 4] = b"EVT1";
+
+    /// An event note of `key` (a logical key, without version) with `value`.
+    #[must_use]
+    pub fn encode(key: &[u8], value: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(key.len() + value.len() + 14);
+        out.extend_from_slice(MAGIC);
+        super::hint::put_varint(&mut out, key.len());
+        out.extend_from_slice(key);
+        super::hint::put_varint(&mut out, value.len());
+        out.extend_from_slice(value);
+        out
+    }
+
+    /// The key and value of an event note; `None` for any other note.
+    #[must_use]
+    pub fn decode(note: &[u8]) -> Option<(&[u8], &[u8])> {
+        let rest = note.strip_prefix(&MAGIC[..])?;
+        let (n, rest) = super::hint::varint(rest)?;
+        let key = rest.get(..n)?;
+        let (n, rest) = super::hint::varint(&rest[key.len()..])?;
+        let value = rest.get(..n)?;
+        (rest.len() == n).then_some((key, value))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn round_trip() {
+            let n = encode(&[7u8; 300], b"v");
+            assert_eq!(decode(&n), Some((&[7u8; 300][..], &b"v"[..])));
+            assert_eq!(decode(&encode(b"", b"")), Some((&b""[..], &b""[..])));
+            assert_eq!(decode(b"EVT1"), None);
+            assert_eq!(
+                decode(&super::super::hint::encode(
+                    b"k",
+                    super::super::hint::HintOp::Insert,
+                    b""
+                )),
+                None
+            );
+        }
+    }
+}
+
 /// Change hints: payload notes a writer adds beside a versioned write,
 /// saying what the write was in its model's terms (an insert, an update, a
 /// replacement or a delete) with an optional description. The change log
@@ -70,7 +123,7 @@ pub mod hint {
         }
     }
 
-    fn put_varint(out: &mut Vec<u8>, mut v: usize) {
+    pub(super) fn put_varint(out: &mut Vec<u8>, mut v: usize) {
         while v >= 0x80 {
             #[allow(clippy::cast_possible_truncation)]
             out.push((v as u8) | 0x80);
@@ -80,7 +133,7 @@ pub mod hint {
         out.push(v as u8);
     }
 
-    fn varint(b: &[u8]) -> Option<(usize, &[u8])> {
+    pub(super) fn varint(b: &[u8]) -> Option<(usize, &[u8])> {
         let mut v = 0usize;
         for (i, x) in b.iter().enumerate().take(10) {
             v |= usize::from(x & 0x7F) << (7 * i);

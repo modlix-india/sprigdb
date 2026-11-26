@@ -23,6 +23,21 @@ pub struct NodeEngine {
     tenants: Tenants,
     databases: u32,
     open: OnceLock<Option<Arc<Backend<EngineUnit>>>>,
+    /// Keyspace notifications (installed with the tenants' services).
+    keyspace: OnceLock<KeyspaceSetup>,
+}
+
+/// What keyspace notifications start from, once the engine opens.
+struct KeyspaceSetup {
+    env: std::sync::Weak<sprig_redis::Env>,
+    svc: Arc<crate::tenant::TenantServices>,
+    on: OnceLock<Arc<super::keyspace_engine::EngineKeyspace>>,
+}
+
+impl std::fmt::Debug for KeyspaceSetup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KeyspaceSetup").finish_non_exhaustive()
+    }
 }
 
 impl NodeEngine {
@@ -35,7 +50,35 @@ impl NodeEngine {
             tenants,
             databases,
             open: OnceLock::new(),
+            keyspace: OnceLock::new(),
         }
+    }
+
+    /// Keyspace notifications of the engine's databases, for the tenants
+    /// of `svc` (they start with the engine).
+    pub(crate) fn install_keyspace(
+        &self,
+        env: &Arc<sprig_redis::Env>,
+        svc: Arc<crate::tenant::TenantServices>,
+    ) {
+        let _ = self.keyspace.set(KeyspaceSetup {
+            env: Arc::downgrade(env),
+            svc,
+            on: OnceLock::new(),
+        });
+    }
+
+    /// The running notifications, started on first use.
+    fn keyspace(&self) -> Option<&Arc<super::keyspace_engine::EngineKeyspace>> {
+        let k = self.keyspace.get()?;
+        if let Some(on) = k.on.get() {
+            return Some(on);
+        }
+        let backend = Arc::clone(self.backend()?);
+        let env = k.env.upgrade()?;
+        Some(k.on.get_or_init(|| {
+            super::keyspace_engine::EngineKeyspace::start(&env, backend, Arc::clone(&k.svc))
+        }))
     }
 
     fn backend(&self) -> Option<&Arc<Backend<EngineUnit>>> {
@@ -72,12 +115,31 @@ impl EngineBackend for NodeEngine {
             return None;
         }
         match self.backend() {
-            Some(b) => b
-                .placed_db(tenant, db, true)
-                .map(|d| d as Arc<dyn EngineDatabase>),
+            Some(b) => {
+                // The tenant's keyspace notification flags.
+                if let Some(k) = self.keyspace() {
+                    k.touch(tenant);
+                }
+                b.placed_db(tenant, db, true)
+                    .map(|d| d as Arc<dyn EngineDatabase>)
+            }
             // The tenant's keys belong on the engine and it didn't open:
             // refuse, rather than let the session use the key-value tables.
             None => Some(Arc::new(Unavailable)),
+        }
+    }
+
+    fn set_keyspace_flags(&self, scope: &str, flags: u16) {
+        let Ok(tenant) = scope.parse::<u64>() else {
+            return;
+        };
+        match self.keyspace() {
+            Some(k) => k.config_set(tenant, flags),
+            None => {
+                if let Some(b) = self.backend() {
+                    b.set_flags(tenant, flags);
+                }
+            }
         }
     }
 }

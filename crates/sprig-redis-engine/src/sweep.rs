@@ -6,6 +6,7 @@ use bytes::Bytes;
 
 use crate::exec;
 use crate::layout::Space;
+use crate::notify::{self, Flags};
 use crate::store::{Batch, StoreResult, Ticket, Unit};
 
 /// Expiry entries handled per pass and database.
@@ -26,6 +27,20 @@ const DEAD_COMMITS_PER_PASS: usize = 25;
 /// # Errors
 /// The engine's.
 pub async fn pass<U: Unit>(unit: &U, space: Space, limit: usize) -> StoreResult<usize> {
+    pass_notifying(unit, space, limit, &Flags::default()).await
+}
+
+/// [`pass`], recording "expired" (and "hexpired") events with each
+/// commit while the tenant's `flags` record them.
+///
+/// # Errors
+/// The engine's.
+pub async fn pass_notifying<U: Unit>(
+    unit: &U,
+    space: Space,
+    limit: usize,
+    flags: &Flags,
+) -> StoreResult<usize> {
     let now = unit.now_ms();
     let (lo, hi) = space.expiry_due(now);
     // Only the unit's leader deletes: a replica that doesn't lead it
@@ -51,9 +66,13 @@ pub async fn pass<U: Unit>(unit: &U, space: Space, limit: usize) -> StoreResult<
         keys.sort_unstable();
         keys.dedup();
         let mut b = unit.begin(keys).await?;
-        let n = exec::expire_due(&mut b, space, now, chunk)?;
+        let gone = exec::expire_due_keys(&mut b, space, now, chunk)?;
+        let f = flags.recording();
+        if f != 0 {
+            notify::add_note(&mut b, space.tenant, &notify::swept(space, &gone, &[], f))?;
+        }
         b.commit()?.durable().await?;
-        deleted += n;
+        deleted += gone.len();
     }
     // Entries of big collections deleted earlier, a bounded batch at a
     // time.
@@ -80,7 +99,15 @@ pub async fn pass<U: Unit>(unit: &U, space: Space, limit: usize) -> StoreResult<
         keys.sort_unstable();
         keys.dedup();
         let mut b = unit.begin(keys).await?;
-        exec::expire_fields(&mut b, space, now, chunk)?;
+        let trimmed = exec::expire_fields_keys(&mut b, space, now, chunk)?;
+        let f = flags.recording();
+        if f != 0 {
+            notify::add_note(
+                &mut b,
+                space.tenant,
+                &notify::swept(space, &[], &trimmed, f),
+            )?;
+        }
         b.commit()?.durable().await?;
     }
     Ok(deleted)

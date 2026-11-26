@@ -227,6 +227,12 @@ impl Batch for EngineBatch {
         self.txn.delete(key).map_err(|e| conv(&e))
     }
 
+    fn note(&mut self, tenant: u64, note: Vec<u8>) -> StoreResult<()> {
+        self.txn
+            .add_note_for_tenant(tenant, note)
+            .map_err(|e| conv(&e))
+    }
+
     fn commit(self) -> StoreResult<EngineTicket> {
         self.txn.commit().map(EngineTicket).map_err(|e| conv(&e))
     }
