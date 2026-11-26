@@ -86,8 +86,20 @@ pub(crate) fn unsupported(what: &str) -> SqlError {
 /// and run once, when the rows are first read.
 pub(crate) struct Derived {
     block: RefCell<Option<Block>>,
+    /// A query that isn't one `SELECT` (a set operation, or one with its
+    /// own `ORDER BY ... LIMIT` over a set operation), resolved but not
+    /// planned yet.
+    query: RefCell<Option<crate::pushdown::LazyQuery>>,
     source: RefCell<Option<Box<dyn RowSource>>>,
     rows: RefCell<Option<Rc<Vec<Row>>>>,
+    /// Another reference to the same common table expression whose rows
+    /// this one reads: the expression is computed once for both.
+    shared: RefCell<Option<Rc<Derived>>>,
+    /// The common table expression this derived table is a reference to.
+    cte: RefCell<Option<Rc<crate::recursive::CteDef>>>,
+    /// A later reference to a common table expression, not resolved yet:
+    /// it is resolved only when it must be planned on its own.
+    deferred: RefCell<Option<Deferred>>,
     /// The column types.
     pub(crate) types: Vec<ExprType>,
     /// The planner's guess of the row count.
@@ -95,32 +107,105 @@ pub(crate) struct Derived {
 }
 
 impl Derived {
-    /// A derived table whose query is already planned.
-    pub(crate) fn new(source: Box<dyn RowSource>, est_rows: f64) -> Rc<Self> {
-        let types = source.types();
+    fn with(
+        block: Option<Block>,
+        query: Option<crate::pushdown::LazyQuery>,
+        source: Option<Box<dyn RowSource>>,
+        types: Vec<ExprType>,
+        est_rows: f64,
+    ) -> Rc<Self> {
         Rc::new(Self {
-            block: RefCell::new(None),
-            source: RefCell::new(Some(source)),
+            block: RefCell::new(block),
+            query: RefCell::new(query),
+            source: RefCell::new(source),
             rows: RefCell::new(None),
+            shared: RefCell::new(None),
+            cte: RefCell::new(None),
+            deferred: RefCell::new(None),
             types,
             est_rows: Cell::new(est_rows),
         })
     }
 
+    /// A derived table whose query is already planned.
+    pub(crate) fn new(source: Box<dyn RowSource>, est_rows: f64) -> Rc<Self> {
+        let types = source.types();
+        Self::with(None, None, Some(source), types, est_rows)
+    }
+
     /// A derived table whose query is resolved but not planned yet.
     pub(crate) fn lazy(block: Block, types: Vec<ExprType>) -> Rc<Self> {
-        Rc::new(Self {
-            block: RefCell::new(Some(block)),
-            source: RefCell::new(None),
-            rows: RefCell::new(None),
-            types,
-            est_rows: Cell::new(1000.0),
-        })
+        Self::with(Some(block), None, None, types, 1000.0)
+    }
+
+    /// A derived table whose query (not one `SELECT`) is resolved but not
+    /// planned yet.
+    pub(crate) fn lazy_query(query: crate::pushdown::LazyQuery, types: Vec<ExprType>) -> Rc<Self> {
+        Self::with(None, Some(query), None, types, 1000.0)
+    }
+
+    /// A reference to a common table expression to be resolved when it
+    /// is planned, with the column types its first reference had.
+    pub(crate) fn deferred(d: Deferred, types: Vec<ExprType>) -> Rc<Self> {
+        let out = Self::with(None, None, None, types, 1000.0);
+        *out.deferred.borrow_mut() = Some(d);
+        out
+    }
+
+    /// The reference still to be resolved, if any.
+    pub(crate) fn take_deferred(&self) -> Option<Deferred> {
+        self.deferred.borrow_mut().take()
+    }
+
+    /// Takes over `other`'s query still to be planned (`other` is this
+    /// reference, resolved now).
+    pub(crate) fn adopt(&self, other: &Derived) {
+        *self.block.borrow_mut() = other.block.borrow_mut().take();
+        *self.query.borrow_mut() = other.query.borrow_mut().take();
     }
 
     /// The query, if it is still to be planned.
     pub(crate) fn take_block(&self) -> Option<Block> {
         self.block.borrow_mut().take()
+    }
+
+    /// The query that isn't one `SELECT`, if it is still to be planned.
+    pub(crate) fn take_query(&self) -> Option<crate::pushdown::LazyQuery> {
+        self.query.borrow_mut().take()
+    }
+
+    /// Whether the query is still to be planned.
+    pub(crate) fn pending(&self) -> bool {
+        self.block.borrow().is_some()
+            || self.query.borrow().is_some()
+            || self.deferred.borrow().is_some()
+    }
+
+    /// Changes the query while it is still to be planned (one `SELECT`).
+    pub(crate) fn with_block(&self, f: impl FnOnce(&mut Block)) {
+        if let Some(b) = self.block.borrow_mut().as_mut() {
+            f(b);
+        }
+    }
+
+    /// Marks the derived table as a reference to `cte`.
+    pub(crate) fn set_cte(&self, cte: Rc<crate::recursive::CteDef>) {
+        *self.cte.borrow_mut() = Some(cte);
+    }
+
+    /// The common table expression this is a reference to.
+    pub(crate) fn cte(&self) -> Option<Rc<crate::recursive::CteDef>> {
+        self.cte.borrow().clone()
+    }
+
+    /// Reads `other`'s rows instead of planning its own query: both are
+    /// references to the same expression under the same conditions.
+    pub(crate) fn share(&self, other: &Rc<Derived>) {
+        self.block.borrow_mut().take();
+        self.query.borrow_mut().take();
+        self.deferred.borrow_mut().take();
+        self.est_rows.set(other.est_rows.get());
+        *self.shared.borrow_mut() = Some(other.clone());
     }
 
     /// Hands over the planned query.
@@ -131,6 +216,10 @@ impl Derived {
 
     /// The rows, running the derived query on the first call.
     pub(crate) fn rows(&self, ctx: &mut sprig_exec::Ctx<'_>) -> Result<Rc<Vec<Row>>> {
+        let shared = self.shared.borrow().clone();
+        if let Some(other) = shared {
+            return other.rows(ctx);
+        }
         if let Some(rows) = self.rows.borrow().as_ref() {
             return Ok(rows.clone());
         }
@@ -150,6 +239,17 @@ impl Derived {
         *self.rows.borrow_mut() = Some(rows.clone());
         Ok(rows)
     }
+}
+
+/// A reference to a common table expression whose resolving waits: the
+/// expression, the expressions in scope where it was defined, the column
+/// names the reference gives, and whether it is a left join's inner side.
+pub(crate) struct Deferred {
+    pub(crate) def: Rc<crate::recursive::CteDef>,
+    pub(crate) ctes: Vec<Rc<crate::recursive::CteDef>>,
+    pub(crate) columns: Vec<String>,
+    pub(crate) alias: String,
+    pub(crate) inner: bool,
 }
 
 /// What a `FROM` item reads.

@@ -35,7 +35,7 @@
 //! The rows are held in the statement's memory account: past its limit the
 //! statement fails with 1114 (nothing is written to disk).
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ops::ControlFlow;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -63,6 +63,23 @@ pub(crate) struct CteDef {
     /// A recursive expression's rows once made, shared by every reference
     /// of the statement (when no outer value was bound into them).
     rows: RefCell<Option<Rc<Vec<Row>>>>,
+    /// How many references to it the statement's text resolved so far.
+    pub(crate) refs: Cell<usize>,
+    /// Whether its query gives the same rows each time it runs in one
+    /// statement (computed on first use).
+    pure: Cell<Option<bool>>,
+    /// What the first reference that was planned on its own (not merged)
+    /// gave: a later reference is resolved only if it has to be planned.
+    pub(crate) shape: RefCell<Option<CteShape>>,
+}
+
+/// A common table expression's columns as a derived table, and the
+/// `EXPLAIN` number of its query.
+#[derive(Clone)]
+pub(crate) struct CteShape {
+    pub(crate) names: Vec<String>,
+    pub(crate) types: Vec<ExprType>,
+    pub(crate) id: Option<usize>,
 }
 
 impl CteDef {
@@ -72,11 +89,28 @@ impl CteDef {
             sees,
             recursive,
             rows: RefCell::new(None),
+            refs: Cell::new(0),
+            pure: Cell::new(None),
+            shape: RefCell::new(None),
         })
     }
 
     pub(crate) fn name(&self) -> &str {
         &self.cte.alias.name.value
+    }
+
+    /// Whether the expression's query gives the same rows each time it
+    /// runs within one statement: it calls no function whose value changes
+    /// between calls or that has an effect, and reads or sets no user
+    /// variable. Such an expression may be computed once for several
+    /// references.
+    pub(crate) fn pure(&self) -> bool {
+        if let Some(p) = self.pure.get() {
+            return p;
+        }
+        let p = crate::pushdown::pure_query(&self.cte.query);
+        self.pure.set(Some(p));
+        p
     }
 }
 

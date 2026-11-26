@@ -341,6 +341,7 @@ impl<'a> Planner<'a> {
             working: Vec::new(),
             bound_outer: None,
             recording: Vec::new(),
+            shared: Vec::new(),
         };
         let mut json = false;
         let (query, explain, extended) = match &statement {
@@ -480,6 +481,7 @@ impl Planner<'_> {
             working: Vec::new(),
             bound_outer: None,
             recording: Vec::new(),
+            shared: Vec::new(),
         };
         let cols = table
             .columns
@@ -560,6 +562,10 @@ pub(crate) struct Cx<'a> {
     pub(crate) bound_outer: Option<Rc<crate::dependent::BoundOuter>>,
     /// Dependent subqueries being resolved, innermost last.
     pub(crate) recording: Vec<crate::dependent::Recording>,
+    /// Common table expressions computed once for several references: the
+    /// expression, the key values pushed into it (as text), the reference
+    /// that computes it.
+    pub(crate) shared: Vec<(Rc<crate::recursive::CteDef>, String, Rc<Derived>)>,
 }
 
 impl<'a> Cx<'a> {
@@ -588,6 +594,7 @@ impl<'a> Cx<'a> {
             working: Vec::new(),
             bound_outer: Some(bound),
             recording: Vec::new(),
+            shared: Vec::new(),
         }
     }
 
@@ -618,6 +625,7 @@ impl<'a> Cx<'a> {
             working: Vec::new(),
             bound_outer: bound,
             recording: Vec::new(),
+            shared: Vec::new(),
         }
     }
 }
@@ -919,7 +927,7 @@ impl<'a> Cx<'a> {
 
     /// The value and type of a constant expression, when it can be
     /// computed now.
-    fn eval_const(&self, e: &Expr) -> Option<(Value, ExprType)> {
+    pub(crate) fn eval_const(&self, e: &Expr) -> Option<(Value, ExprType)> {
         let c = compile(e, &self.session).ok()?;
         let mut ctx = Ctx::new(&self.session);
         let v = c.eval(&mut ctx, &[]).ok()?;
@@ -937,8 +945,17 @@ impl<'a> Cx<'a> {
         if q.fetch.is_some() || q.for_clause.is_some() || !q.pipe_operators.is_empty() {
             return Err(unsupported("this query clause"));
         }
+        let cte_mark = self.open_with(q.with.as_ref())?;
+        let out = self.query_body(q, outer, select_type);
+        self.ctes.truncate(cte_mark);
+        out
+    }
+
+    /// Puts a `WITH` clause's expressions in scope. Returns the length of
+    /// the list before them, to cut it back to when the query is done.
+    pub(crate) fn open_with(&mut self, with: Option<&ast::With>) -> Result<usize> {
         let cte_mark = self.ctes.len();
-        if let Some(with) = &q.with {
+        if let Some(with) = with {
             let maria = self.session.persona.is_maria();
             for (i, cte) in with.cte_tables.iter().enumerate() {
                 let name = &cte.alias.name.value;
@@ -965,9 +982,7 @@ impl<'a> Cx<'a> {
                     .push(crate::recursive::CteDef::new(cte.clone(), sees, recursive));
             }
         }
-        let out = self.query_body(q, outer, select_type);
-        self.ctes.truncate(cte_mark);
-        out
+        Ok(cte_mark)
     }
 
     fn query_body(
@@ -1028,46 +1043,58 @@ impl<'a> Cx<'a> {
                 };
                 let l = self.set_expr(left, outer, select_type)?;
                 let r = self.set_expr(right, outer, label)?;
-                let (source, est_rows): (Box<dyn RowSource>, f64) = match kind {
-                    None => (
-                        Box::new(Union::new(
-                            vec![l.source, r.source],
-                            all,
-                            &self.session,
-                            self.memory.clone(),
-                        )?),
-                        l.est_rows + r.est_rows,
-                    ),
-                    Some(k) => {
-                        let est = match k {
-                            SetKind::Intersect => l.est_rows.min(r.est_rows),
-                            SetKind::Except => l.est_rows,
-                        };
-                        (
-                            Box::new(SetOp::new(
-                                l.source,
-                                r.source,
-                                k,
-                                all,
-                                &self.session,
-                                self.memory.clone(),
-                            )?),
-                            est,
-                        )
-                    }
-                };
-                let types = source.types();
-                Ok(Planned {
-                    source,
-                    names: l.names,
-                    types,
-                    est_rows,
-                    id: l.id,
-                })
+                self.combine(l, r, all, kind)
             }
             ast::SetExpr::Values(v) => self.values(v, outer, select_type),
             _ => Err(unsupported("this set operation")),
         }
+    }
+
+    /// Two planned parts of a set operation, joined by it (`kind` `None`
+    /// is `UNION`).
+    pub(crate) fn combine(
+        &mut self,
+        l: Planned,
+        r: Planned,
+        all: bool,
+        kind: Option<SetKind>,
+    ) -> Result<Planned> {
+        let (source, est_rows): (Box<dyn RowSource>, f64) = match kind {
+            None => (
+                Box::new(Union::new(
+                    vec![l.source, r.source],
+                    all,
+                    &self.session,
+                    self.memory.clone(),
+                )?),
+                l.est_rows + r.est_rows,
+            ),
+            Some(k) => {
+                let est = match k {
+                    SetKind::Intersect => l.est_rows.min(r.est_rows),
+                    SetKind::Except => l.est_rows,
+                };
+                (
+                    Box::new(SetOp::new(
+                        l.source,
+                        r.source,
+                        k,
+                        all,
+                        &self.session,
+                        self.memory.clone(),
+                    )?),
+                    est,
+                )
+            }
+        };
+        let types = source.types();
+        Ok(Planned {
+            source,
+            names: l.names,
+            types,
+            est_rows,
+            id: l.id,
+        })
     }
 
     /// A table value constructor, `VALUES (...), (...)` (MariaDB) or
@@ -1139,18 +1166,27 @@ impl<'a> Cx<'a> {
     /// columns.
     fn order_output(
         &mut self,
-        mut planned: Planned,
+        planned: Planned,
         order_by: Option<&ast::OrderBy>,
         limit: Option<&ast::LimitClause>,
     ) -> Result<Planned> {
-        let maria = self.session.persona.is_maria();
-        let empty = Scope {
-            rels: &[],
-            star: &[],
-            visible: 0..0,
-            outer: None,
+        let order = self.output_order(&planned.names, order_by)?;
+        let (lim, off) = match limit {
+            Some(l) => self.limit_clause(l)?,
+            None => (None, 0),
         };
-        let mut keys = Vec::new();
+        self.finish_output(planned, &order, lim, off)
+    }
+
+    /// The columns (by position) a set operation's `ORDER BY` names, and
+    /// whether each descends.
+    pub(crate) fn output_order(
+        &mut self,
+        names: &[String],
+        order_by: Option<&ast::OrderBy>,
+    ) -> Result<Vec<(usize, bool)>> {
+        let maria = self.session.persona.is_maria();
+        let mut order = Vec::new();
         if let Some(ob) = order_by {
             let ast::OrderByKind::Expressions(list) = &ob.kind else {
                 return Err(unsupported("ORDER BY ALL"));
@@ -1158,8 +1194,7 @@ impl<'a> Cx<'a> {
             for o in list {
                 let desc = o.options.sort == Some(ast::OrderBySort::Desc);
                 let at = match &o.expr {
-                    ast::Expr::Identifier(i) => planned
-                        .names
+                    ast::Expr::Identifier(i) => names
                         .iter()
                         .position(|n| n.eq_ignore_ascii_case(&i.value))
                         .ok_or_else(|| unknown_column(&i.value, Clause::OrderBy, maria))?,
@@ -1167,35 +1202,34 @@ impl<'a> Cx<'a> {
                         ast::Value::Number(n, _) => n
                             .parse::<usize>()
                             .ok()
-                            .filter(|p| *p >= 1 && *p <= planned.names.len())
+                            .filter(|p| *p >= 1 && *p <= names.len())
                             .map(|p| p - 1)
                             .ok_or_else(|| unknown_column(n, Clause::OrderBy, maria))?,
                         _ => continue,
                     },
                     _ => return Err(unsupported("an expression in a UNION's ORDER BY")),
                 };
-                let e = slot_ref(at, &planned.names[at], &planned.types[at]);
-                keys.push(SortKey {
-                    expr: compile(&e, &self.session)?,
-                    desc,
-                });
+                order.push((at, desc));
             }
         }
-        let (mut lim, mut off) = (None, 0u64);
-        match limit {
-            None => {}
-            Some(ast::LimitClause::LimitOffset { limit, offset, .. }) => {
-                if let Some(l) = limit {
-                    lim = Some(self.limit_value(l, &empty)?);
-                }
-                if let Some(o) = offset {
-                    off = self.limit_value(&o.value, &empty)?;
-                }
-            }
-            Some(ast::LimitClause::OffsetCommaLimit { offset, limit }) => {
-                off = self.limit_value(offset, &empty)?;
-                lim = Some(self.limit_value(limit, &empty)?);
-            }
+        Ok(order)
+    }
+
+    /// `ORDER BY` (columns by position) and `LIMIT` over a finished result.
+    pub(crate) fn finish_output(
+        &mut self,
+        mut planned: Planned,
+        order: &[(usize, bool)],
+        lim: Option<u64>,
+        off: u64,
+    ) -> Result<Planned> {
+        let mut keys = Vec::new();
+        for (at, desc) in order {
+            let e = slot_ref(*at, &planned.names[*at], &planned.types[*at]);
+            keys.push(SortKey {
+                expr: compile(&e, &self.session)?,
+                desc: *desc,
+            });
         }
         if !keys.is_empty() {
             planned.source = match lim {
@@ -1398,6 +1432,12 @@ impl<'a> Cx<'a> {
         let (late, mut filters): (Vec<Expr>, Vec<Expr>) =
             filters.into_iter().partition(reads_subquery);
 
+        // A subquery tied by `outer.k = inner.k` reads only the inner rows
+        // whose key the block's own conditions allow.
+        for semi in &block.semis {
+            self.push_semi(semi, &filters);
+        }
+
         // A subquery compared with a key column of a much larger table is
         // read first, made distinct, and joined like a table: the larger
         // table is then reached through its key instead of being scanned.
@@ -1555,6 +1595,7 @@ impl<'a> Cx<'a> {
                         .iter()
                         .flat_map(|a| a.keys.iter().map(|(e, _)| e)),
                 )
+                .chain(block.windows.iter().flat_map(|w| w.exprs()))
                 .chain(
                     block
                         .rels
@@ -1627,6 +1668,7 @@ impl<'a> Cx<'a> {
                     .iter()
                     .flat_map(|a| a.keys.iter().map(|(e, _)| e)),
             )
+            .chain(block.windows.iter().flat_map(|w| w.exprs()))
             .chain(
                 rels.iter()
                     .enumerate()
@@ -2669,37 +2711,73 @@ impl<'a> Cx<'a> {
         push: Option<(&Rel, &[Expr])>,
         select_type: &str,
     ) -> Result<()> {
-        let Some(mut block) = d.take_block() else {
+        if !d.pending() {
             return Ok(());
-        };
-        if let (Some((rel, local)), true) = (push, block.limit.is_none() && block.offset == 0) {
+        }
+        // The conditions on the derived table's own columns, over its
+        // column positions.
+        let mut conds = Vec::new();
+        if let Some((rel, local)) = push {
             for c in local {
-                if exprs::is_volatile(c) {
+                if crate::pushdown::unstable(c)
+                    || !exprs::slots(c)
+                        .iter()
+                        .all(|s| *s >= rel.base && *s < rel.base + rel.width)
+                {
                     continue;
                 }
-                let mut ok = true;
-                let pushed = exprs::rewrite(c, &mut |e| match e {
-                    Expr::Column(col)
-                        if col.slot >= rel.base && col.slot < rel.base + rel.width =>
-                    {
-                        let item = &block.items[col.slot - rel.base].expr;
-                        if block.grouped && !block.group_by.iter().any(|g| g == item) {
-                            ok = false;
-                        }
-                        if exprs::slots(item).iter().any(|s| *s >= SUBQ_BASE) {
-                            ok = false;
-                        }
-                        Some(item.clone())
-                    }
-                    _ => None,
-                });
-                if ok {
-                    block.filters.push(pushed);
-                }
+                conds.push(exprs::remap(c, &|s| s - rel.base));
             }
         }
-        let planned = self.plan_block(block, select_type)?;
-        d.set_source(planned.source, planned.est_rows);
+        // A common table expression named more than once is computed once
+        // for the references that push the same key values into it (or
+        // none at all), each reference keeping its own conditions.
+        if let Some(cte) = d.cte()
+            && cte.refs.get() > 1
+            && cte.pure()
+        {
+            let (fp, canon) = self.key_values(&conds);
+            if !canon.is_empty() || conds.is_empty() {
+                let found = self
+                    .shared
+                    .iter()
+                    .find(|(c, f, _)| Rc::ptr_eq(c, &cte) && *f == fp)
+                    .map(|(_, _, d)| d.clone());
+                if let Some(other) = found {
+                    d.share(&other);
+                    return Ok(());
+                }
+                self.plan_pending(d, &canon, select_type)?;
+                self.shared.push((cte, fp, d.clone()));
+                return Ok(());
+            }
+        }
+        self.plan_pending(d, &conds, select_type)
+    }
+
+    /// Plans a derived table's query with `conds` (over its columns'
+    /// positions) moved into it where that keeps its rows the same.
+    fn plan_pending(&mut self, d: &Rc<Derived>, conds: &[Expr], select_type: &str) -> Result<()> {
+        // A later reference to a common table expression is resolved now,
+        // in the scope it was defined in.
+        if let Some(r) = d.take_deferred() {
+            let saved = std::mem::replace(&mut self.ctes, r.ctes);
+            let rel = self.derived_rel(&r.def.cte.query, &r.columns, r.alias, false, r.inner);
+            self.ctes = saved;
+            match rel?.kind {
+                RelKind::Derived(fresh) => d.adopt(&fresh),
+                _ => return Err(unsupported("a common table expression read this way")),
+            }
+        }
+        if let Some(mut block) = d.take_block() {
+            self.push_into(&mut block, conds, None);
+            let planned = self.plan_block(block, select_type)?;
+            d.set_source(planned.source, planned.est_rows);
+        } else if let Some(query) = d.take_query() {
+            let types = d.types.clone();
+            let planned = self.plan_lazy(query, conds, &types, false)?;
+            d.set_source(planned.source, planned.est_rows);
+        }
         Ok(())
     }
 

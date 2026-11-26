@@ -623,3 +623,84 @@ fn a_leading_parenthesized_outer_join_is_written_out_flat() {
     let more_flat = "SELECT e.name, f.name FROM emp e LEFT JOIN dept d ON d.id = e.dept JOIN emp f ON f.id = e.id ORDER BY e.id";
     assert_eq!(run(more).0, run(more_flat).0);
 }
+
+/// A condition on a derived table's column reaches the tables inside it
+/// when the derived table's query starts with `WITH`, is a `UNION ALL`, or
+/// reads a `LEFT JOIN`'s kept side; a common table expression named twice
+/// under the same key is read once. Nothing moves past a `LIMIT` or into a
+/// query with window functions.
+#[test]
+fn conditions_reach_with_bodies_union_parts_and_overlays() {
+    // A `WITH` body that joins: the key reaches `emp` through `c`.
+    let (rows, sig, examined) = run(
+        "SELECT x.name FROM (WITH c AS (SELECT id, name FROM emp WHERE sal > 0 OR sal IS NULL) \
+         SELECT c.id, c.name FROM c LEFT JOIN dept d ON d.id = c.id) x WHERE x.id = 3",
+    );
+    assert_eq!(rows, ["Cy"]);
+    assert!(sig.contains("emp:const:PRIMARY"), "{sig}");
+    assert!(examined <= 2, "{examined}");
+    // Each `UNION ALL` part reads its table by key.
+    let (rows, sig, examined) = run(
+        "SELECT u.id FROM (SELECT id FROM emp UNION ALL SELECT id FROM dept) u WHERE u.id = 20",
+    );
+    assert_eq!(rows, ["20"]);
+    assert!(
+        sig.contains("emp:const:PRIMARY") && sig.contains("dept:const:PRIMARY"),
+        "{sig}"
+    );
+    assert_eq!(examined, 1);
+    // The overlay shape of a merged view: the parent's rows with a layer's
+    // fields over them, and the layer's own rows the parent hasn't. The
+    // parent's rows (`p`) are named twice and read once, by key.
+    let overlay = "SELECT v.id, v.name FROM (WITH p AS (SELECT id, name FROM emp WHERE id > 0), \
+         l AS (SELECT p.id, IF(d.id IS NULL, p.name, d.title) AS name FROM p LEFT JOIN dept d \
+         ON d.id = p.id UNION ALL SELECT d.id, d.title FROM dept d WHERE NOT EXISTS \
+         (SELECT 1 FROM p WHERE p.id = d.id)) SELECT id, name FROM l) v WHERE v.id";
+    let (rows, sig, examined) = run(&format!("{overlay} = 20"));
+    assert_eq!(rows, ["20|ops"]);
+    // (`<derivedN>:ALL` reads a derived table's rows, already cut.)
+    assert!(!sig.contains("emp:ALL") && !sig.contains("d:ALL"), "{sig}");
+    assert!(examined <= 2, "{examined}");
+    let (rows, _, examined) = run(&format!("{overlay} IN (2, 40) ORDER BY 1"));
+    assert_eq!(rows, ["2|bob", "40|hr"]);
+    assert!(examined <= 4, "{examined}");
+    let (rows, _, _) = run(&format!("{overlay} > 0 ORDER BY 1"));
+    assert_eq!(rows.len(), 9);
+    // Nothing moves past a part's LIMIT.
+    let (rows, _, _) = run(
+        "SELECT u.id FROM ((SELECT id FROM emp ORDER BY id LIMIT 2) UNION ALL \
+         (SELECT id FROM dept ORDER BY id LIMIT 1)) u WHERE u.id IN (2, 3, 10, 20) ORDER BY 1",
+    );
+    assert_eq!(rows, ["2", "10"]);
+    // Nor past the whole query's LIMIT.
+    let (rows, _, _) = run(
+        "SELECT u.id FROM (SELECT id FROM emp UNION ALL SELECT id FROM dept ORDER BY id LIMIT 3) u \
+         WHERE u.id = 3",
+    );
+    assert_eq!(rows, ["3"]);
+    let (rows, _, _) = run(
+        "SELECT u.id FROM (SELECT id FROM emp UNION ALL SELECT id FROM dept ORDER BY id LIMIT 2) u \
+         WHERE u.id = 3",
+    );
+    assert!(rows.is_empty());
+    // Nor into a query with a window function.
+    let (rows, _, _) = run("SELECT x.id, x.rn FROM (WITH c AS (SELECT id FROM emp) \
+         SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS rn FROM c) x WHERE x.id = 3");
+    assert_eq!(rows, ["3|3"]);
+    // A window function's argument is a column the block reads: no index
+    // that lacks it is chosen.
+    let (rows, _, _) = run("SELECT id, SUM(sal) OVER (ORDER BY id) FROM emp");
+    assert_eq!(
+        rows,
+        [
+            "1|100.00", "2|300.00", "3|300.00", "4|350.00", "5|650.00", "6|800.00"
+        ]
+    );
+    // A union of a string and a number column compares as strings: the
+    // condition stays outside the number part.
+    let (rows, _, _) = run(
+        "SELECT u.v FROM (SELECT name AS v FROM emp UNION ALL SELECT id FROM dept) u \
+         WHERE u.v = 'ann' ORDER BY 1",
+    );
+    assert_eq!(rows.len(), 2);
+}

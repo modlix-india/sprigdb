@@ -67,6 +67,7 @@ mod jsontable;
 mod keyval;
 pub mod mem;
 mod plan;
+mod pushdown;
 mod range;
 mod recursive;
 mod resolve;

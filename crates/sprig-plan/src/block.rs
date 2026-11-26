@@ -9,9 +9,9 @@ use sqlparser::ast::{self, Value as SqlValue};
 use crate::exprs;
 use crate::plan::Cx;
 use crate::resolve::{
-    AGG_BASE, AggSpec, Apply, Block, Clause, Derived, ExprCx, Item, OUTER_BASE, Rel, RelCol,
-    RelKind, Scope, SemiJoin, SimpleInner, StarCol, WinSpec, derived_cols, object_name, table_col,
-    unknown_column, unsupported,
+    AGG_BASE, AggSpec, Apply, Block, Clause, Deferred, Derived, ExprCx, Item, OUTER_BASE, Rel,
+    RelCol, RelKind, Scope, SemiJoin, SimpleInner, StarCol, WinSpec, derived_cols, object_name,
+    table_col, unknown_column, unsupported,
 };
 
 /// The `FROM` clause as it is built up.
@@ -125,6 +125,42 @@ impl Cx<'_> {
                             .iter()
                             .map(|c| c.name.value.clone())
                             .collect();
+                        // A later reference to an expression whose first
+                        // reference was planned on its own: resolved only
+                        // if it isn't read from another reference's rows.
+                        let shape = def.shape.borrow().clone();
+                        if let Some(shape) = shape
+                            && self.working.is_empty()
+                        {
+                            def.refs.set(def.refs.get() + 1);
+                            let sees = def.sees.min(self.ctes.len());
+                            let derived = Derived::deferred(
+                                Deferred {
+                                    def: def.clone(),
+                                    ctes: self.ctes[..sees].to_vec(),
+                                    columns,
+                                    alias: shown.clone(),
+                                    inner,
+                                },
+                                shape.types.clone(),
+                            );
+                            derived.set_cte(def.clone());
+                            let cols = derived_cols(0, &shape.names, &derived.types);
+                            return Ok(Rel {
+                                alias: shown.clone(),
+                                shown,
+                                qualified: None,
+                                width: cols.len(),
+                                kind: RelKind::Derived(derived),
+                                cols,
+                                base: 0,
+                                outer_on: None,
+                                outer_dep: None,
+                                pending: Vec::new(),
+                                hidden: false,
+                                derived_id: shape.id,
+                            });
+                        }
                         // Its query sees only the expressions defined
                         // before it.
                         let later = self.ctes.split_off(def.sees.min(self.ctes.len()));
@@ -137,6 +173,28 @@ impl Cx<'_> {
                                     .map(|()| rel)
                             });
                         self.ctes.extend(later);
+                        // Counted, so that an expression named more than
+                        // once can be computed once (not while a recursive
+                        // expression's passes are made: each pass is
+                        // planned on its own).
+                        def.refs.set(def.refs.get() + 1);
+                        if let Ok(Rel {
+                            kind: RelKind::Derived(d),
+                            cols,
+                            derived_id,
+                            ..
+                        }) = &rel
+                            && self.working.is_empty()
+                        {
+                            d.set_cte(def.clone());
+                            if def.pure() {
+                                *def.shape.borrow_mut() = Some(crate::recursive::CteShape {
+                                    names: cols.iter().map(|c| c.name.clone()).collect(),
+                                    types: d.types.clone(),
+                                    id: *derived_id,
+                                });
+                            }
+                        }
                         return rel;
                     }
                 }
@@ -208,7 +266,7 @@ impl Cx<'_> {
     /// is merged: the relation is that table, with the query's columns as
     /// names for expressions over it, so the table's keys stay usable.
     /// Anything else is planned on its own and its rows are held.
-    fn derived_rel(
+    pub(crate) fn derived_rel(
         &mut self,
         q: &ast::Query,
         columns: &[String],
@@ -235,16 +293,35 @@ impl Cx<'_> {
         };
         let simple = match &*q.body {
             ast::SetExpr::Select(select)
-                if q.with.is_none()
-                    && q.fetch.is_none()
-                    && q.for_clause.is_none()
-                    && q.pipe_operators.is_empty() =>
+                if q.fetch.is_none() && q.for_clause.is_none() && q.pipe_operators.is_empty() =>
             {
                 Some(select)
             }
             _ => None,
         };
         let Some(select) = simple else {
+            // A set operation (or one in parentheses with its own `ORDER
+            // BY`/`LIMIT`) is resolved now and planned with its block, so
+            // that the block's conditions can move into its parts.
+            if let Some((query, names, types, id)) = self.lazy_derived(q)? {
+                let names = rename(names)?;
+                let derived = Derived::lazy_query(query, types);
+                let cols = derived_cols(0, &names, &derived.types);
+                return Ok(Rel {
+                    shown: alias.clone(),
+                    alias,
+                    qualified: None,
+                    width: cols.len(),
+                    kind: RelKind::Derived(derived),
+                    cols,
+                    base: 0,
+                    outer_on: None,
+                    outer_dep: None,
+                    pending: Vec::new(),
+                    hidden: false,
+                    derived_id: Some(id),
+                });
+            }
             let planned = self.query(q, None, "DERIVED")?;
             let names = rename(planned.names.clone())?;
             let id = planned.id;
@@ -265,21 +342,27 @@ impl Cx<'_> {
                 derived_id: Some(id),
             });
         };
+        // A `WITH` before the `SELECT`: its expressions are in scope while
+        // the `SELECT` is resolved (every reference is resolved now).
+        let mark = self.open_with(q.with.as_ref())?;
         let id = self.next_id();
-        let mut block = self.select_block(
+        let block = self.select_block(
             select,
             q.order_by.as_ref(),
             q.limit_clause.as_ref(),
             None,
             false,
             id,
-        )?;
+        );
+        self.ctes.truncate(mark);
+        let mut block = block?;
         let names = rename(block.items.iter().map(|i| i.name.clone()).collect())?;
         let plain = block.rels.len() == 1
             && matches!(block.rels[0].kind, RelKind::Table(_))
             && block.rels[0].outer_on.is_none()
             && block.semis.is_empty()
             && block.applies.is_empty()
+            && block.windows.is_empty()
             && !block.grouped
             && !block.distinct
             && block.limit.is_none()
@@ -1106,6 +1189,14 @@ fn flatten_nested(tables: &[ast::TableWithJoins]) -> Option<Vec<ast::TableWithJo
         } => Some((**table_with_joins).clone()),
         _ => None,
     };
+    // Nothing to write out: no copy (a derived table's query can be large).
+    let is_nested = |f: &TableFactor| matches!(f, TableFactor::NestedJoin { alias: None, .. });
+    if !tables
+        .iter()
+        .any(|t| is_nested(&t.relation) || t.joins.iter().any(|j| is_nested(&j.relation)))
+    {
+        return None;
+    }
     let mut changed = false;
     let mut out = Vec::with_capacity(tables.len());
     for twj in tables {
