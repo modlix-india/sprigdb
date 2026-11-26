@@ -108,7 +108,7 @@ fn q(name: &str) -> String {
 
 /// Runs `ALTER TABLE db.table <clause>` for the tenant through the
 /// catalog's DDL path; `online`: in the online-build mode.
-async fn alter(
+pub(crate) async fn alter(
     svc: &Arc<TenantServices>,
     tenant: TenantId,
     db: &str,

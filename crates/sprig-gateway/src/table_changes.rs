@@ -592,14 +592,19 @@ fn decimal(s: &str) -> J {
 /// before, after, ts_ms, value)` (JSON text in key, before, after and
 /// value; value is the whole envelope) and the token after the read as
 /// the reply's `next`. Opening a reader checks the caller's `SELECT` on
-/// each table (`check`, run as the caller), and refuses tables under
-/// row-level security (39366).
+/// each table (`check`, run as the caller). The changes of a table under
+/// row-level security are taken as the caller's `SELECT` policies show
+/// them (`images`, run as the caller: [`crate::exec::rls_images`]): a
+/// change whose row the caller can't see is left out, an update whose row
+/// became visible is sent as an insert, one whose row became hidden as a
+/// delete (as for after-commit triggers).
 ///
 /// # Errors
 /// 39223 for a table that is gone or not on the engine, a bad token or
-/// lost history; 39366; the privilege check's error; the read's.
+/// lost history; the privilege check's error; the image check's; the
+/// read's.
 #[allow(clippy::too_many_arguments)] // the request's fields
-pub(crate) async fn serve<F, Fut>(
+pub(crate) async fn serve<F, Fut, G, GFut>(
     svc: &crate::tenant::TenantServices,
     tenant: u64,
     objects: &[u64],
@@ -609,10 +614,13 @@ pub(crate) async fn serve<F, Fut>(
     wait_ms: u64,
     consumer: &str,
     check: F,
+    images: G,
 ) -> Result<(sprig_sinks::peer::SqlResult, String)>
 where
     F: Fn(String) -> Fut,
     Fut: std::future::Future<Output = Result<()>>,
+    G: Fn(crate::exec::rls_images::ImagesRequest) -> GFut,
+    GFut: std::future::Future<Output = Result<Vec<Vec<bool>>>>,
 {
     let lost = |m: String| SprigError::new(SprigCode::SinkSourceLost, m);
     let Some(log) = crate::changelog::changes() else {
@@ -633,6 +641,7 @@ where
     let ecat = crate::engine::catalog::of(&cat);
     let rls = sprig_auth::authz::rls::RlsState::of(&cat);
     let mut tables = HashMap::new();
+    let mut secured = HashSet::new();
     for &o in objects {
         let oid = sprig_common::ids::ObjectId(o);
         let def = ecat
@@ -645,15 +654,7 @@ where
                 ))
             })?;
         if rls.and_then(|s| s.security(oid)).is_some_and(|s| s.enabled) {
-            return Err(SprigError::new(
-                SprigCode::RlsUnsupported,
-                format!(
-                    "{}: table {} has row-level security, which change sinks on engine tables \
-                     don't apply yet",
-                    SprigCode::RlsUnsupported.name(),
-                    def.name
-                ),
-            ));
+            secured.insert(o);
         }
         let db = cat
             .databases
@@ -675,10 +676,13 @@ where
     }
     let wait = Duration::from_millis(wait_ms.min(10_000));
     let max = usize::try_from(max_bytes).unwrap_or(PAGE_BYTES);
-    let b = read(
+    let mut b = read(
         eng, &log, tenant, &tables, token, from_ms, max, wait, consumer,
     )
     .await?;
+    if !secured.is_empty() {
+        b.events = as_seen(b.events, &secured, &tables, &images).await?;
+    }
     let mut res = sprig_sinks::peer::SqlResult {
         columns: [
             "token", "object", "op", "key", "before", "after", "ts_ms", "value",
@@ -706,6 +710,88 @@ where
         );
     }
     Ok((res, b.next))
+}
+
+/// `events` as the caller's `SELECT` policies show them, for the tables
+/// `secured` (see [`serve`]); one image check for the whole batch.
+///
+/// # Errors
+/// The image check's.
+async fn as_seen<G, GFut>(
+    events: Vec<Event>,
+    secured: &HashSet<u64>,
+    tables: &HashMap<u32, Watched>,
+    images: &G,
+) -> Result<Vec<Event>>
+where
+    G: Fn(crate::exec::rls_images::ImagesRequest) -> GFut,
+    GFut: std::future::Future<Output = Result<Vec<Vec<bool>>>>,
+{
+    let obj = |v: &Option<J>| match v {
+        Some(J::Object(m)) => Some(m.clone()),
+        _ => None,
+    };
+    // One table entry per checked event: its [before, after] images.
+    let mut req = crate::exec::rls_images::ImagesRequest::default();
+    let mut slot = Vec::with_capacity(events.len());
+    for e in &events {
+        let w = u32::try_from(e.object)
+            .ok()
+            .and_then(|o| tables.get(&o))
+            .filter(|_| secured.contains(&e.object));
+        let Some(w) = w else {
+            slot.push(None);
+            continue;
+        };
+        // A delete whose before-image the version GC dropped: its key
+        // stands for the row.
+        let before =
+            obj(&e.before).or_else(|| (e.op == "d").then(|| obj(&Some(e.key.clone()))).flatten());
+        slot.push(Some(req.tables.len()));
+        req.tables.push(crate::exec::rls_images::TableImages {
+            db: w.db.clone(),
+            table: w.def.name.clone(),
+            images: vec![before, obj(&e.after)],
+        });
+    }
+    let seen = if req.tables.is_empty() {
+        Vec::new()
+    } else {
+        images(req).await?
+    };
+    let shown = |t: usize, i: usize| seen.get(t).and_then(|x| x.get(i)).copied().unwrap_or(false);
+    let mut out = Vec::with_capacity(events.len());
+    for (mut e, at) in events.into_iter().zip(slot) {
+        let Some(t) = at else {
+            out.push(e);
+            continue;
+        };
+        let has_before = e.before.is_some() || e.op == "d";
+        let (b, a) = (has_before && shown(t, 0), e.after.is_some() && shown(t, 1));
+        let op = match (e.op, b, a) {
+            ("c", _, true) | ("d", true, _) | ("u", true, true) => e.op,
+            ("u", true, false) => "d",
+            ("u", false, true) => "c",
+            _ => {
+                metrics::counter!("sprig_rls_feed_events_filtered_total", "protocol" => "sink")
+                    .increment(1);
+                continue;
+            }
+        };
+        if op != e.op {
+            e.op = op;
+            if op == "c" {
+                e.before = None;
+            } else {
+                e.after = None;
+            }
+            e.envelope["op"] = J::String(op.to_owned());
+            e.envelope["before"] = e.before.clone().unwrap_or(J::Null);
+            e.envelope["after"] = e.after.clone().unwrap_or(J::Null);
+        }
+        out.push(e);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

@@ -565,8 +565,7 @@ impl MsgEnv {
         // The source itself (a fan-in trigger's: its definition).
         let alive = match source.kind {
             // An after-commit trigger on an engine table reads the table's
-            // changes (its stream id carries the change-topic flag); triggers
-            // on streams ran only on streams kept in MariaDB.
+            // changes (its stream id carries the change-topic flag).
             SourceKind::Stream if source.object_id & CHANGE_FLAG != 0 => {
                 let object = sprig_common::ids::ObjectId(source.object_id & !CHANGE_FLAG);
                 let mut rec = crate::sinks::catalog_records().begin(tenant).await?;
@@ -577,7 +576,10 @@ impl MsgEnv {
                         && o.db_id.0 == source.db_id
                 })
             }
-            SourceKind::Stream => false,
+            // A trigger on an engine stream: the gateway's run finds a
+            // dropped stream and orphans the binding, which ends the job.
+            // A FAN IN trigger's (inherited streams) isn't built.
+            SourceKind::Stream => source.fanin_definition().is_none(),
             SourceKind::Queue => {
                 // Durable queues are catalog records on the engine node.
                 let mut rec = crate::sinks::catalog_records().begin(tenant).await?;
@@ -820,9 +822,10 @@ impl JobHandler for QueueTrigger {
 }
 
 /// The `logic_stream_trigger` job, for after-commit triggers on engine
-/// tables: `logic.trigger_lanes` loops, each asking for its key lane's
-/// next change (the gateway picks it after that lane's position, so a
-/// row key's changes run in commit order).
+/// tables and triggers on engine streams: `logic.trigger_lanes` loops, each
+/// asking for its lane's next change or record (the gateway picks it after
+/// that lane's position, so a row key's changes, or a partition's records,
+/// run in order).
 pub struct ChangeTrigger(pub MsgEnv);
 
 #[async_trait]
@@ -860,15 +863,23 @@ async fn run_job(env: &MsgEnv, cx: &JobCtx, changes: bool) -> std::result::Resul
     let mut t = t;
     let started = if changes {
         // Key lanes: each loop asks for its lane's next change; a key's
-        // changes run in commit order.
+        // changes run in commit order. On a stream, lane j runs the
+        // partitions p with p % lanes == j, each in offset order.
         t.req.lanes = u32::try_from(opts.lanes.max(1)).unwrap_or(1);
-        format!(
-            "after-commit trigger on {}.{} started (job {}, {} key lanes)",
-            l.source.db_name,
-            l.source.name.trim_end_matches(".changes"),
-            cx.job_id,
-            t.req.lanes
-        )
+        if l.source.object_id & CHANGE_FLAG == 0 {
+            format!(
+                "trigger on stream {}.{} started (job {}, {} lanes over its partitions)",
+                l.source.db_name, l.source.name, cx.job_id, t.req.lanes
+            )
+        } else {
+            format!(
+                "after-commit trigger on {}.{} started (job {}, {} key lanes)",
+                l.source.db_name,
+                l.source.name.trim_end_matches(".changes"),
+                cx.job_id,
+                t.req.lanes
+            )
+        }
     } else {
         format!(
             "trigger on queue {} of vhost {} started (job {}, {} lanes)",

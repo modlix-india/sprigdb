@@ -707,6 +707,23 @@ impl PassSession {
                 return Ok(step);
             }
         }
+        // `ALTER SCHEDULE [db.]name PAUSE | RESUME`.
+        if self
+            .tenant
+            .as_deref()
+            .is_some_and(|ts| !ts.principal.must_change_password)
+            && text
+                .iter()
+                .position(|b| !b.is_ascii_whitespace())
+                .is_some_and(|i| {
+                    text.len() > i + 15 && text[i..i + 6].eq_ignore_ascii_case(b"alter ")
+                })
+        {
+            let s = status(self.status());
+            if let Some(step) = Box::pin(self.tenant_alter_schedule(text, s, out)).await? {
+                return Ok(step);
+            }
+        }
         // `SHOW DEPENDENTS OF FUNCTION | PROCEDURE`, what that DROP
         // would find, as rows.
         if self

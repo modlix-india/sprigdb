@@ -904,6 +904,48 @@ impl VisitorMut for EnumLits<'_> {
                     self.safe.insert(std::ptr::from_ref(&**x));
                 }
             }
+            // The servers give an `ENUM` column's member text where a
+            // string value is wanted: the value arguments of these
+            // functions, a `CASE`'s operand and results.
+            Expr::Function(f) => {
+                let name = f.name.to_string().to_ascii_uppercase();
+                let skip = match name.as_str() {
+                    "IF" => 1,
+                    "IFNULL" | "COALESCE" | "NULLIF" | "CONCAT" | "CONCAT_WS" => 0,
+                    _ => return ControlFlow::Continue(()),
+                };
+                if let FunctionArguments::List(l) = &mut f.args {
+                    for a in l.args.iter_mut().skip(skip) {
+                        if let FunctionArg::Unnamed(FunctionArgExpr::Expr(x)) = a
+                            && let Some(t) = self.member_text(x, None)
+                        {
+                            *x = t;
+                        }
+                    }
+                }
+            }
+            Expr::Case {
+                operand,
+                conditions,
+                else_result,
+                ..
+            } => {
+                if let Some(o) = operand
+                    && let Some(t) = self.member_text(o, None)
+                {
+                    **o = t;
+                }
+                for w in conditions.iter_mut() {
+                    if let Some(t) = self.member_text(&w.result, None) {
+                        w.result = t;
+                    }
+                }
+                if let Some(o) = else_result
+                    && let Some(t) = self.member_text(o, None)
+                {
+                    **o = t;
+                }
+            }
             _ => {}
         }
         ControlFlow::Continue(())
@@ -917,7 +959,7 @@ fn enum_literals(
     foreign: &[Arc<sprig_catalog::TenantCatalog>],
     stmt: &mut Statement,
     texts: bool,
-) -> HashSet<*const Expr> {
+) -> (HashSet<*const Expr>, HashSet<String>) {
     struct Collect<'a, 'b> {
         cx: &'a BindCtx<'b>,
         foreign: &'a [Arc<sprig_catalog::TenantCatalog>],
@@ -1038,9 +1080,10 @@ fn enum_literals(
     };
     let _ = Visit::visit(&*stmt, &mut c);
     if c.tables.is_empty() {
-        return HashSet::new();
+        return (HashSet::new(), HashSet::new());
     }
     let top = query_of(stmt).map(std::ptr::from_ref::<Query>);
+    let derived = c.derived.clone();
     let mut e = EnumLits {
         tables: c.tables,
         derived: c.derived,
@@ -1053,7 +1096,7 @@ fn enum_literals(
         _cx: std::marker::PhantomData,
     };
     let _ = VisitMut::visit(stmt, &mut e);
-    e.safe
+    (e.safe, derived)
 }
 
 /// A column the text names, or a run of them.
@@ -1063,6 +1106,10 @@ enum Mark {
         qual: Option<String>,
         name: String,
         plain: bool,
+        /// An unqualified name in a `FROM` of derived tables and common
+        /// table expressions only, one of which gives a column that name:
+        /// theirs, not a base table's elsewhere in the statement.
+        derived_only: bool,
     },
     /// Every column of these tables (`*`, or a `NATURAL` join's); `plain`
     /// as above; `star`: a select list's `*`.
@@ -1109,6 +1156,9 @@ struct Walk<'a, 'b> {
     foreign: Vec<Arc<sprig_catalog::TenantCatalog>>,
     /// The `FROM` names of each `SELECT` being visited, innermost last.
     scopes: Vec<Scope>,
+    /// The column names the statement's derived tables and common table
+    /// expressions give (when it reads an `ENUM` column).
+    derived_cols: HashSet<String>,
 }
 
 impl Walk<'_, '_> {
@@ -1125,6 +1175,16 @@ impl Walk<'_, '_> {
             }
         }
         false
+    }
+
+    /// Whether unqualified column `name` is read where the nearest `FROM`
+    /// has derived tables or common table expressions only, one of which
+    /// gives a column that name (see [`Mark::Column`]).
+    fn derived_only(&self, name: &str) -> bool {
+        self.scopes
+            .last()
+            .is_some_and(|sc| sc.base.is_empty() && !sc.derived.is_empty())
+            && self.derived_cols.contains(name)
     }
 
     fn fail(&mut self, e: SprigError) {
@@ -1410,6 +1470,7 @@ impl Walk<'_, '_> {
                                 qual: None,
                                 name,
                                 plain: false,
+                                derived_only: false,
                             });
                         }
                     }
@@ -1532,23 +1593,32 @@ impl Visitor for Walk<'_, '_> {
             return ControlFlow::Continue(());
         }
         match e {
-            Expr::Identifier(i) => self.marks.push(Mark::Column {
-                qual: None,
-                name: i.value.to_lowercase(),
-                plain,
-            }),
+            Expr::Identifier(i) => {
+                let name = i.value.to_lowercase();
+                let derived_only = self.derived_only(&name);
+                self.marks.push(Mark::Column {
+                    qual: None,
+                    name,
+                    plain,
+                    derived_only,
+                });
+            }
             Expr::CompoundIdentifier(p) => {
                 if let [.., q, c] = p.as_slice() {
                     self.marks.push(Mark::Column {
                         qual: Some(q.value.to_lowercase()),
                         name: c.value.to_lowercase(),
                         plain,
+                        derived_only: false,
                     });
                 } else if let [c] = p.as_slice() {
+                    let name = c.value.to_lowercase();
+                    let derived_only = self.derived_only(&name);
                     self.marks.push(Mark::Column {
                         qual: None,
-                        name: c.value.to_lowercase(),
+                        name,
                         plain,
+                        derived_only,
                     });
                 }
             }
@@ -1564,6 +1634,7 @@ impl Visitor for Walk<'_, '_> {
                             qual: None,
                             name,
                             plain: false,
+                            derived_only: false,
                         });
                     }
                 }
@@ -1741,7 +1812,7 @@ fn analyze_in(
     let _ = VisitMut::visit(&mut stmt, &mut Logical { cx });
     let views = expand_views(cx, &mut stmt)?;
     let tableless = tableless || !views.uses.is_empty();
-    let safe = enum_literals(cx, &views.foreign, &mut stmt, texts);
+    let (safe, derived_cols) = enum_literals(cx, &views.foreign, &mut stmt, texts);
     let Some(query) = query_of(&stmt) else {
         return Ok(None);
     };
@@ -1764,6 +1835,7 @@ fn analyze_in(
         safe,
         foreign: views.foreign.clone(),
         scopes: Vec::new(),
+        derived_cols,
     };
     let _ = Visit::visit(&stmt, &mut w);
     // Sequence functions are the engine's: such a statement needs no table.
@@ -1797,12 +1869,22 @@ fn analyze_in(
     let mut other = computed.clone();
     for m in &w.marks {
         match m {
-            Mark::Column { qual, name, plain } => {
+            Mark::Column {
+                qual,
+                name,
+                plain,
+                derived_only,
+            } => {
                 for (ti, t) in w.tables.iter_mut().enumerate() {
                     if qual.as_ref().is_some_and(|q| !t.aliases.contains(q)) {
                         continue;
                     }
                     if let Some(c) = t.def.column(name) {
+                        // A derived table's `ENUM` column (its own query
+                        // reads the base column).
+                        if *derived_only && matches!(t.def.columns[c].ty, ColType::Enum { .. }) {
+                            continue;
+                        }
                         t.mark(c);
                         computed[ti][c] |= !plain;
                         other[ti][c] = true;

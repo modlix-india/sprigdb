@@ -1976,6 +1976,7 @@ impl<'a> Cx<'a> {
                         match exprs::and_all(kept.take().unwrap_or_default()) {
                             Some(cond) => {
                                 *using_where = true;
+                                counters.set_filtered();
                                 Box::new(TableFilter {
                                     scan,
                                     cond: cx.compile_at(&cond, &local_map)?,
@@ -2235,7 +2236,19 @@ impl<'a> Cx<'a> {
             if let Some(cond) = exprs::and_all(now) {
                 using_where = true;
                 if let Some(s) = source.take() {
-                    source = Some(Box::new(Filter::new(s, self.compile_at(&cond, &map_here)?)));
+                    let f: Box<dyn RowSource> =
+                        Box::new(Filter::new(s, self.compile_at(&cond, &map_here)?));
+                    // A table step counts what its conditions pass
+                    // (`ANALYZE`'s `r_filtered`).
+                    source = Some(if matches!(rel.kind, RelKind::Table(_)) {
+                        counters.set_filtered();
+                        Box::new(crate::sources::Counted {
+                            src: f,
+                            counters: counters.clone(),
+                        })
+                    } else {
+                        f
+                    });
                 }
             }
             if on_cond.is_some() && !matches!(step.method, Method::Scan) {

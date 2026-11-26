@@ -331,9 +331,10 @@ fn table(
             t.push(("r_other_time_ms", J::Num("0".into())));
         }
         t.push(("filtered", J::Num("100".into())));
-        if r.actual.is_some() {
-            t.push(("r_total_filtered", J::Num("100".into())));
-            t.push(("r_filtered", J::Num("100".into())));
+        if let Some(a) = r.actual {
+            let f = format!("{}", (a.filtered() * 1e8).round() / 1e8);
+            t.push(("r_total_filtered", J::Num(f.clone())));
+            t.push(("r_filtered", J::Num(f)));
         }
         if using_index {
             t.push(("using_index", J::Bool(true)));

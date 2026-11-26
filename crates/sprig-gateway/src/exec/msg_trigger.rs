@@ -5,8 +5,8 @@
 //! deploying user needs `SELECT` and `DELETE` on the queue's vhost and
 //! `CREATE ROUTINE` on the trigger's database.
 //! [`sprig_logic::messages::deploy`] records it, and the index entry that
-//! makes the controller start its job is written. `ON STREAM` answers 1235:
-//! streams are stored on the engine, whose triggers aren't built yet.
+//! makes the controller start its job is written. `ON STREAM` is
+//! [`super::stream_trigger`]'s (streams are stored on the engine).
 //!
 //! **Running.** A worker sends each run to a gateway over the peer service
 //! ([`crate::triggers`]), which opens a session as the trigger's definer
@@ -151,6 +151,10 @@ impl PassSession {
             .source
             .clone()
             .ok_or_else(|| SprigError::internal("no source"))?;
+        // Streams are stored on the engine (`exec::stream_trigger`).
+        if src.kind == SourceKind::Stream {
+            return Box::pin(self.logic_deploy_stream_trigger(decl)).await;
+        }
         let current = self.current_logical();
         let ts = self
             .tenant
@@ -216,12 +220,7 @@ impl PassSession {
         let source_db = src.db.clone().unwrap_or_else(|| db.clone());
         let (source_db_row, object_id) = match src.kind {
             SourceKind::Stream => {
-                return Err(SprigError::standard(
-                    1235,
-                    *b"42000",
-                    "This version of SprigDB doesn't yet support 'triggers on streams': streams \
-                     are stored on the SprigDB engine, whose triggers aren't built yet",
-                ));
+                return Err(SprigError::internal("a stream trigger's deploy came here"));
             }
             SourceKind::Queue => {
                 let r = cat
@@ -352,10 +351,9 @@ impl PassSession {
         } else if super::change_trigger::is_change_source(&req.source) {
             // An after-commit trigger on an engine table.
             self.run_change_trigger(cx, &req).await
-        } else if req.record.is_some() {
-            RunReply::failed(&SprigError::internal(
-                "triggers on streams aren't served: streams are stored on the engine",
-            ))
+        } else if req.source.kind == SourceKind::Stream {
+            // A trigger on an engine stream.
+            self.run_stream_trigger(cx, &req).await
         } else {
             self.run_queue_trigger(cx, &req).await
         };

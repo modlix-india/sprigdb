@@ -263,6 +263,27 @@ async fn serve_inner(
                 let caller = caller.clone();
                 async move { run(engine, &caller, "", sql, None, caps).await.map(|_| ()) }
             };
+            // Tables under row-level security: each change's images as the
+            // owner's policies show them.
+            let images = |ireq: crate::exec::rls_images::ImagesRequest| {
+                let caller = caller.clone();
+                async move {
+                    let sql = crate::exec::rls_images::statement(&ireq);
+                    let r = run(engine, &caller, "", sql, None, caps).await?;
+                    let rows: Vec<Vec<Option<String>>> = r
+                        .first()
+                        .map(|x| {
+                            x.rows
+                                .iter()
+                                .map(|row| {
+                                    (0..row.len()).map(|i| SqlResult::text(row, i)).collect()
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    Ok(crate::exec::rls_images::answer(&ireq, &rows))
+                }
+            };
             let (result, next) = crate::table_changes::serve(
                 &svc,
                 req.tenant,
@@ -273,6 +294,7 @@ async fn serve_inner(
                 wait_ms,
                 &consumer,
                 check,
+                images,
             )
             .await?;
             Ok(SqlReply {

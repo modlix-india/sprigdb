@@ -735,8 +735,24 @@ fn run(d: &mut Def, clauses: Vec<Clause>, cx: &Ctx) -> Result<(), Fail> {
                 d.keys[i].ignored = ig;
             }
             Clause::Add(raw) => {
-                for k in raw.keys {
+                for mut k in raw.keys {
+                    // A plain index a user's statement builds online
+                    // (`engine::ddl::USER_ONLINE`): published ignored, made
+                    // public once its entries are written.
+                    let online = k.kind == KeyKind::Plain
+                        && !k.ignored
+                        && crate::engine::ddl::USER_ONLINE.try_with(|_| ()).is_ok();
+                    if online {
+                        k.ignored = true;
+                    }
                     add_key(d, k)?;
+                    if online && let Some(name) = d.keys.last().map(|k| k.name.clone()) {
+                        let _ = crate::engine::ddl::USER_ONLINE.try_with(|v| {
+                            v.lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .push(name);
+                        });
+                    }
                 }
                 for f in raw.fks {
                     add_fk(d, f)?;

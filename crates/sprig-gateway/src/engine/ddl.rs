@@ -59,6 +59,28 @@ tokio::task_local! {
     pub(crate) static ONLINE_BUILD: ();
 }
 
+tokio::task_local! {
+    /// Set while a user's statement adds plain indexes online
+    /// (`exec::engine_seam::online_index`): the definition marks each new
+    /// plain index `IGNORED` and records its name here, the change publishes
+    /// them without entries (every later write keeps them), and the
+    /// statement then writes the entries with [`Engine::backfill_index`]
+    /// and makes the indexes public.
+    pub(crate) static USER_ONLINE: Arc<std::sync::Mutex<Vec<String>>>;
+}
+
+/// Whether `name` is one of the user's online-built indexes of this task.
+fn user_online(name: &str) -> bool {
+    USER_ONLINE
+        .try_with(|v| {
+            v.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .any(|n| n.eq_ignore_ascii_case(name))
+        })
+        .unwrap_or(false)
+}
+
 /// Whether `name` is an automatic index's.
 fn auto_named(name: &str) -> bool {
     name.len() >= 11 && name[..11].eq_ignore_ascii_case("sprig_auto_")
@@ -831,14 +853,20 @@ impl Engine {
             };
             // An online build adds its index without entries: writes keep
             // it from the publish on, and the backfill writes the rest.
-            let online = ONLINE_BUILD.try_with(|()| ()).is_ok()
+            let auto = ONLINE_BUILD.try_with(|()| ()).is_ok();
+            let online = (auto || USER_ONLINE.try_with(|_| ()).is_ok())
                 && !copy
                 && cv.validate.is_empty()
                 && !fresh.is_empty()
                 && fresh.iter().all(|&q| {
-                    d1.indexes[q].ignored
-                        && !d1.indexes[q].unique
-                        && auto_named(&d1.indexes[q].name)
+                    let x = &d1.indexes[q];
+                    x.ignored
+                        && !x.unique
+                        && if auto {
+                            auto_named(&x.name)
+                        } else {
+                            user_online(&x.name)
+                        }
                 });
             let carried = if online {
                 Ok(0)

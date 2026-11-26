@@ -91,6 +91,7 @@ pub(crate) mod msg_trigger;
 // After-commit triggers on engine tables, run from the change log.
 mod change_trigger;
 mod offsets;
+mod stream_trigger;
 // Row images checked against a subscriber's
 // privileges and row-level security (gRPC, SSE and WebSocket change
 // streams, Redis keyspace notifications).

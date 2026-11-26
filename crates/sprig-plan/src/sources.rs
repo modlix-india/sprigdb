@@ -150,6 +150,7 @@ impl RowSource for TableFilter {
     fn next(&mut self, ctx: &mut Ctx<'_>) -> Result<Option<Row>> {
         while let Some(row) = RowSource::next(&mut self.scan, ctx)? {
             if self.cond.eval_bool(ctx, &row)? {
+                self.scan.counters.add_pass();
                 return Ok(Some(row));
             }
             self.scan.refused();
@@ -159,6 +160,27 @@ impl RowSource for TableFilter {
 
     fn types(&self) -> Vec<ExprType> {
         RowSource::types(&self.scan)
+    }
+}
+
+/// Rows of `src` (a join's rows filtered by the conditions attached to its
+/// last table), each counted as passed for that table's access.
+pub(crate) struct Counted {
+    pub(crate) src: Box<dyn RowSource>,
+    pub(crate) counters: Arc<Counters>,
+}
+
+impl RowSource for Counted {
+    fn next(&mut self, ctx: &mut Ctx<'_>) -> Result<Option<Row>> {
+        let r = self.src.next(ctx)?;
+        if r.is_some() {
+            self.counters.add_pass();
+        }
+        Ok(r)
+    }
+
+    fn types(&self) -> Vec<ExprType> {
+        self.src.types()
     }
 }
 

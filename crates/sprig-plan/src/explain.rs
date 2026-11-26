@@ -57,6 +57,20 @@ pub struct Actual {
     pub rows: u64,
     /// Its share of the statement's time, in microseconds.
     pub micros: u64,
+    /// The rows its attached conditions passed (`None`: none attached).
+    pub passed: Option<u64>,
+}
+
+impl Actual {
+    /// The percentage of its rows its attached conditions passed
+    /// (`r_filtered`; 100 with none, or no rows).
+    #[must_use]
+    pub fn filtered(&self) -> f64 {
+        match self.passed {
+            Some(p) if self.rows > 0 => p.min(self.rows) as f64 * 100.0 / self.rows as f64,
+            _ => 100.0,
+        }
+    }
 }
 
 impl ExplainRow {
@@ -343,6 +357,7 @@ pub fn analyzed(rows: &[ExplainRow], accesses: &[AccessStat], micros: u64) -> Ve
                     loops: a.counters.seeks().max(1),
                     rows: n,
                     micros: micros.saturating_mul(n) / read,
+                    passed: a.counters.passed(),
                 });
             }
             r
@@ -353,8 +368,8 @@ pub fn analyzed(rows: &[ExplainRow], accesses: &[AccessStat], micros: u64) -> Ve
 /// `ANALYZE`'s answer for `rows` (see [`analyzed`]): MariaDB's table
 /// (the tabular columns with `r_rows` and `r_filtered`) or its JSON
 /// document with the `r_` members (`json`), which the MySQL port draws as
-/// `EXPLAIN ANALYZE`'s tree. The planner keeps no count of the rows a
-/// condition passes, so `r_filtered` is always 100.
+/// `EXPLAIN ANALYZE`'s tree. `r_filtered` is the share of a table's rows
+/// its attached conditions passed.
 #[must_use]
 pub fn analyze_answer(
     rows: &[ExplainRow],
@@ -403,7 +418,7 @@ pub fn analyze_answer(
         let (r_rows, r_filtered) = match r.actual {
             Some(a) => (
                 Value::str(&format!("{:.2}", a.rows as f64 / a.loops.max(1) as f64)),
-                Value::Double(100.0),
+                Value::Double(a.filtered()),
             ),
             None => (Value::Null, Value::Null),
         };

@@ -363,8 +363,8 @@ impl PassSession {
         };
         if src.kind != sprig_logic::declare::SourceKind::Queue {
             return Err(not_built(
-                "FOR EACH TENANT on a trigger on a stream: streams are stored on the SprigDB \
-                 engine, whose triggers aren't built yet",
+                "FOR EACH TENANT on a trigger on a stream: it reads a FOR EACH TENANT stream, \
+                 and inherited streams aren't built on the SprigDB engine yet",
             ));
         }
         let src_kind = DefKind::Queue;

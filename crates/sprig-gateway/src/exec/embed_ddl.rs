@@ -444,6 +444,10 @@ impl PassSession {
     async fn embedded_of(&self, object: u64) -> Result<Vec<EmbeddedColumn>> {
         let (svc, tenant, _) = self.services_and_tenant()?;
         let ep = svc.locator.writer(tenant).await?;
+        // A records-only catalog (no MariaDB schema) keeps no embedded columns.
+        if sprig_catalog::migrate::records_catalog(ep.store.schema()).await? {
+            return Ok(Vec::new());
+        }
         let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
             SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
         })?;

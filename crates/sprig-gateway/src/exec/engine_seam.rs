@@ -81,6 +81,7 @@ mod general;
 // `SET` of session variables kept in the gateway.
 /// `LOAD DATA LOCAL INFILE` into engine tables.
 mod loaddata;
+mod online_index;
 mod routine;
 mod setvars;
 /// `PREPARE`, `EXECUTE` and `DEALLOCATE PREPARE` as statements.

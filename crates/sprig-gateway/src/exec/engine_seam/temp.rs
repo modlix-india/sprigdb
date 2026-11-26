@@ -100,6 +100,10 @@ impl PassSession {
         if let Some(r) = Box::pin(self.engine_event_prepare(cx, target, text, status, out)).await {
             return Some(r);
         }
+        // Plain indexes added to an engine table: built online.
+        if let Some(r) = Box::pin(self.engine_online_index(cx, target, text, status, out)).await {
+            return Some(r);
+        }
         let ours = match target {
             DdlTarget::CreateObject {
                 kind: DdlKind::Table,

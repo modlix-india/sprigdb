@@ -718,7 +718,7 @@ async fn what_the_planner_does_not_run_is_refused() {
         "SELECT tier, COUNT(*) FROM customers GROUP BY tier",
         // (`tier = 'gold'` runs: a member-number comparison.)
         "SELECT id FROM customers WHERE tier > 'gold' ORDER BY name",
-        "SELECT CONCAT(tier, '!') FROM customers",
+        "SELECT UPPER(tier) FROM customers",
     ] {
         let (code, msg) = refused(&f, sql);
         assert_eq!(code, NOT_ON_ENGINE, "{sql}: {msg}");
@@ -951,10 +951,11 @@ async fn enum_columns_compare_with_their_members_on_the_engine() {
     .await
     .unwrap();
     assert!(none.is_empty(), "{none:?}");
-    // Computing with the member text is still refused.
+    // Computing with the member text is still refused (but `CONCAT`,
+    // `IF`, `CASE` and `COALESCE` read it as text).
     let (code, msg) = refused(
         &f,
-        "SELECT CONCAT(c.tier, 'x') FROM customers c JOIN customers d ON d.id = c.id",
+        "SELECT UPPER(c.tier) FROM customers c JOIN customers d ON d.id = c.id",
     );
     assert_eq!(code, NOT_ON_ENGINE, "{msg}");
     let (code, msg) = refused(
@@ -1597,6 +1598,41 @@ async fn enum_columns_read_through_derived_tables_compare_as_text() {
     .await
     .unwrap();
     assert_eq!(got, ["1", "2", "4", "5"]);
+    // A common table expression's column read unqualified outside it.
+    let got = run(
+        "WITH c AS (SELECT id, tier FROM customers WHERE id <= 3) SELECT id, tier FROM c \
+         WHERE tier <> 'none' ORDER BY id",
+    )
+    .await
+    .unwrap();
+    assert_eq!(got, ["1|silver", "3|gold"]);
+}
+
+/// An `ENUM` column as a string value (`IF`, `CASE`, `COALESCE`, `CONCAT`)
+/// reads as its member text, as the servers give it.
+#[tokio::test]
+async fn enum_columns_are_member_text_as_string_values() {
+    let (e, f, _d) = shop().await;
+    let run = |sql: &'static str| {
+        let (e, f) = (&e, &f);
+        async move { select(e, f, sql, &[]).await }
+    };
+    // ids 1..3: silver, none, gold.
+    let got = run(
+        "SELECT IF(id > 1, tier, 'x'), COALESCE(tier, tier), IFNULL(NULL, tier), \
+         CASE WHEN id = 2 THEN tier ELSE CONCAT(tier, '!') END, \
+         CASE tier WHEN 'gold' THEN 'g' ELSE 'o' END FROM customers WHERE id <= 3 ORDER BY id",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        got,
+        [
+            "x|silver|silver|silver!|o",
+            "none|none|none|none|o",
+            "gold|gold|gold|gold!|g"
+        ]
+    );
 }
 
 /// `ANALYZE` runs the statement and answers its plan with what it read.

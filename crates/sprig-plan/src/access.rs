@@ -3,7 +3,7 @@
 
 use std::ops::Bound;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use sprig_engine::row::Value;
 use sprig_exec::Result;
@@ -98,6 +98,10 @@ pub struct Counters {
     rows: AtomicU64,
     entries: AtomicU64,
     seeks: AtomicU64,
+    /// Rows the access's attached conditions passed (with `filtered`).
+    passed: AtomicU64,
+    /// Conditions are attached to the access.
+    filtered: AtomicBool,
 }
 
 impl Counters {
@@ -138,6 +142,25 @@ impl Counters {
     #[must_use]
     pub fn seeks(&self) -> u64 {
         self.seeks.load(Ordering::Relaxed)
+    }
+
+    /// Conditions are attached to this access (`ANALYZE`'s `r_filtered`
+    /// counts what they pass).
+    pub fn set_filtered(&self) {
+        self.filtered.store(true, Ordering::Relaxed);
+    }
+
+    /// One more row the attached conditions passed.
+    pub fn add_pass(&self) {
+        self.passed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Rows the attached conditions passed; `None` when none are attached.
+    #[must_use]
+    pub fn passed(&self) -> Option<u64> {
+        self.filtered
+            .load(Ordering::Relaxed)
+            .then(|| self.passed.load(Ordering::Relaxed))
     }
 }
 
