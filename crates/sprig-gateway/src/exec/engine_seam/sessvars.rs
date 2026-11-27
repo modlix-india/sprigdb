@@ -350,6 +350,9 @@ fn default_of(persona: Persona, name: &str) -> Option<(Kind, &'static str)> {
     v.map(|v| (*kind, v))
 }
 
+/// Whole-number variables both servers report as signed.
+const SIGNED_NUMS: &[&str] = &["innodb_autoinc_lock_mode"];
+
 fn kind_of(name: &str) -> Kind {
     DEFAULTS
         .iter()
@@ -564,10 +567,26 @@ pub(super) fn rewrite(sql: &[u8], opts: LexOptions, src: &dyn VarSource) -> Opti
                 }
                 let (name, global) = sysvar_name(t.bytes(sql));
                 let v = src.sysvar(&name, global)?;
-                // Text in a query: held as both servers hold a variable's
-                // text (see the expression engine's `SPRIG_SYSVAR`).
+                let kind = kind_of(&name);
+                // In a query: typed as both servers type a variable (see
+                // the expression engine's `SPRIG_SYSVAR`): text in
+                // `utf8mb3`, switches as `BIGINT` of one digit, whole
+                // numbers as `BIGINT` of 21 (unsigned but for a few).
                 if select && (v.starts_with('\'') || v.starts_with("CONVERT(")) {
                     format!("SPRIG_SYSVAR({v})")
+                } else if select && kind == Kind::Bool && (v == "1" || v == "0") {
+                    format!("SPRIG_SYSVAR_BOOL({v})")
+                } else if select
+                    && kind == Kind::Num
+                    && !v.is_empty()
+                    && v.bytes().all(|b| b.is_ascii_digit())
+                {
+                    let sign = if SIGNED_NUMS.contains(&name.as_str()) {
+                        "SIGNED"
+                    } else {
+                        "UNSIGNED"
+                    };
+                    format!("SPRIG_SYSVAR(CAST({v} AS {sign}))")
                 } else {
                     v
                 }
@@ -1070,13 +1089,19 @@ impl PassSession {
         let mut persona_vars = self.persona_vars();
         persona_vars = persona_vars.with_tenant_globals(self.tenant_globals());
         let handshake = cx.proto.collation;
+        // The engine keeps the session's lock wait itself.
+        let lock_wait = self.eng.lock_wait;
         let bs = self.bs(cx);
         let v = bs.vars();
+        let mut vars = v.vars.clone();
+        if let Some(n) = lock_wait {
+            vars.insert("innodb_lock_wait_timeout".to_owned(), n.to_string());
+        }
         Snapshot {
             persona,
             nbe,
             persona_vars,
-            vars: v.vars.clone(),
+            vars,
             gateway_vars: v.gateway_vars.clone(),
             users: v.user_vars.clone(),
             handshake,
@@ -1407,7 +1432,9 @@ mod tests {
     fn reads_become_literals() {
         assert_eq!(
             rw("SELECT @@autocommit, @@session.sql_mode AS m"),
-            Some("SELECT 1 AS `@@autocommit`, SPRIG_SYSVAR('STRICT') AS m".into())
+            Some(
+                "SELECT SPRIG_SYSVAR_BOOL(1) AS `@@autocommit`, SPRIG_SYSVAR('STRICT') AS m".into()
+            )
         );
         assert_eq!(
             rw("select @x + 1, @`x`"),

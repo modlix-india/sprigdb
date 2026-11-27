@@ -84,6 +84,15 @@ impl Spliced {
     }
 
     /// What the accepting node's front end had established with the
+    /// client (its protocol's JSON), left in place.
+    pub fn peek_resume(&self) -> Option<String> {
+        self.resume
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// What the accepting node's front end had established with the
     /// client (its protocol's JSON); taken once.
     pub fn take_resume(&self) -> Option<String> {
         self.resume

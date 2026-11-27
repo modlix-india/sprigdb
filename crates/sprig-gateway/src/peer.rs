@@ -35,6 +35,12 @@
 //! loopback address; a non-loopback `listener.peer.bind` without `[tls]`
 //! leaves the peer service off.
 //!
+//! **Raft on this listener** (`SPRIGDB_ENGINE_RAFT_TRANSPORT=peer`): a
+//! connection whose TLS hello offers Raft's ALPN protocol is finished with
+//! the Raft transport's own certificates (node identity, revocation) and
+//! handed to it; a plaintext one starting with Raft's preface likewise.
+//! Every other connection is the gRPC services' as before.
+//!
 //! **An off peer service is reported** ([`report_off`]): `/readyz?verbose`
 //! shows check `peer`, failing while workers are registered (they run
 //! triggers and sinks by calling a gateway here), and the registration
@@ -303,6 +309,20 @@ impl GatewayPeer for Service {
         req: tonic::Request<KillRequest>,
     ) -> std::result::Result<tonic::Response<KillReply>, tonic::Status> {
         let r = req.into_inner();
+        // A connection this node greeted and handed to another node: the
+        // session (same id) is there.
+        let tenant_of = (r.tenant_id != 0).then_some(TenantId(r.tenant_id));
+        if let Some(out) =
+            crate::forward::kill_handed(ConnId(r.connection_id), r.query_only, tenant_of, &r.user)
+                .await
+        {
+            let (found, killed) = match out {
+                Ok(KillOutcome::Done) => (true, true),
+                Ok(KillOutcome::NotOwner) => (true, false),
+                Ok(KillOutcome::Unknown) | Err(_) => (false, false),
+            };
+            return Ok(tonic::Response::new(KillReply { found, killed }));
+        }
         let sessions = self.host.sessions();
         let Some(target) = sessions.get(ConnId(r.connection_id)) else {
             return Ok(tonic::Response::new(KillReply::default()));
@@ -441,6 +461,7 @@ impl GatewayPeer for Service {
 ///
 /// # Errors
 /// 39998 if `[tls]` doesn't load or the address can't be bound.
+#[allow(clippy::too_many_lines)] // the listener and its accept loop
 pub async fn serve(
     bind: SocketAddr,
     tls: Option<PeerTls>,
@@ -449,13 +470,13 @@ pub async fn serve(
 ) -> Result<Option<(SocketAddr, tokio::task::JoinHandle<()>)>> {
     if tls.is_none() && !bind.ip().is_loopback() {
         tracing::warn!(%bind, "no [tls]: the peer service needs mutual TLS off loopback; it stays off (cross-gateway KILL, drain, forwarding and the queue relay are unavailable)");
+        if crate::node_engine::raft_on_peer().is_some() {
+            tracing::error!(%bind, "Raft traffic is set to arrive on the peer listener, which stays off: this node gets none (set [tls], or SPRIGDB_ENGINE_RAFT_TRANSPORT=tcp)");
+        }
         return Ok(None);
     }
-    let acceptor = tls
-        .as_ref()
-        .map(PeerTls::server_config)
-        .transpose()?
-        .map(TlsAcceptor::from);
+    let server_cfg = tls.as_ref().map(PeerTls::server_config).transpose()?;
+    let acceptor = server_cfg.clone().map(TlsAcceptor::from);
     let listener = TcpListener::bind(bind).await.map_err(|e| {
         SprigError::new(
             SprigCode::ConfigInvalid,
@@ -503,16 +524,33 @@ pub async fn serve(
             };
             let routes = routes.clone();
             let acceptor = acceptor.clone();
+            let server_cfg = server_cfg.clone();
             let stop = stop.clone();
             tracker.spawn(async move {
                 let _ = sock.set_nodelay(true);
+                // Raft traffic on this listener: told apart by its first
+                // bytes (a TLS hello offering Raft's protocol, or Raft's
+                // plaintext preface).
+                let conn = match crate::node_engine::raft_on_peer() {
+                    Some((t, node)) => {
+                        match raft_or_tls(sock, &t, &node, server_cfg, &stop).await {
+                            Some(c) => c,
+                            None => return,
+                        }
+                    }
+                    None => PeerConn::Plain(sock),
+                };
                 let svc = hyper_util::service::TowerToHyperService::new(routes);
                 let builder = hyper_util::server::conn::auto::Builder::new(
                     hyper_util::rt::TokioExecutor::new(),
                 )
                 .http2_only();
-                let r = if let Some(a) = acceptor {
-                    match a.accept(sock).await {
+                let r = match (conn, acceptor) {
+                    (PeerConn::Tls(tls), _) => {
+                        let conn = builder.serve_connection(hyper_util::rt::TokioIo::new(tls), svc);
+                        tokio::select! { r = conn => r, () = stop.cancelled() => Ok(()) }
+                    }
+                    (PeerConn::Plain(sock), Some(a)) => match a.accept(sock).await {
                         Ok(tls) => {
                             let conn =
                                 builder.serve_connection(hyper_util::rt::TokioIo::new(tls), svc);
@@ -522,10 +560,12 @@ pub async fn serve(
                             tracing::debug!(%peer, error = %e, "peer TLS handshake failed");
                             return;
                         }
+                    },
+                    (PeerConn::Plain(sock), None) => {
+                        let conn =
+                            builder.serve_connection(hyper_util::rt::TokioIo::new(sock), svc);
+                        tokio::select! { r = conn => r, () = stop.cancelled() => Ok(()) }
                     }
-                } else {
-                    let conn = builder.serve_connection(hyper_util::rt::TokioIo::new(sock), svc);
-                    tokio::select! { r = conn => r, () = stop.cancelled() => Ok(()) }
                 };
                 if let Err(e) = r {
                     tracing::debug!(%peer, error = %e, "peer connection ended");
@@ -536,6 +576,58 @@ pub async fn serve(
         tracker.wait().await;
     });
     Ok(Some((local, task)))
+}
+
+/// A peer connection after its first bytes were read: still plain, or
+/// with its TLS handshake finished.
+enum PeerConn {
+    Plain(tokio::net::TcpStream),
+    Tls(Box<tokio_rustls::server::TlsStream<tokio::net::TcpStream>>),
+}
+
+/// With Raft on the peer listener: serves `sock` as a Raft connection when
+/// its first bytes say so, until it ends or `stop` (returns `None`);
+/// otherwise hands it back, its TLS handshake finished under `server_cfg`
+/// when it began one (`None` when that fails, or without `[tls]`).
+async fn raft_or_tls(
+    sock: tokio::net::TcpStream,
+    t: &Arc<sprig_raft::tcp::TcpTransport>,
+    node: &sprig_raft::Node,
+    server_cfg: Option<Arc<rustls::ServerConfig>>,
+    stop: &CancellationToken,
+) -> Option<PeerConn> {
+    let mut b = [0u8; 1];
+    if sock.peek(&mut b).await.ok() != Some(1) {
+        return None;
+    }
+    if b[0] == sprig_raft::tcp::PREFACE[0] {
+        tokio::select! {
+            () = t.serve_plain(sock, node) => {}
+            () = stop.cancelled() => {}
+        }
+        return None;
+    }
+    // Not a TLS hello: the gRPC services' plaintext.
+    if b[0] != 0x16 {
+        return Some(PeerConn::Plain(sock));
+    }
+    let start = tokio_rustls::LazyConfigAcceptor::new(rustls::server::Acceptor::default(), sock)
+        .await
+        .ok()?;
+    let raft = start
+        .client_hello()
+        .alpn()
+        .is_some_and(|mut a| a.any(|p| p == sprig_raft::tcp::ALPN));
+    if raft {
+        let s = start.into_stream(t.server_config()?).await.ok()?;
+        tokio::select! {
+            () = t.serve_tls(s, node) => {}
+            () = stop.cancelled() => {}
+        }
+        return None;
+    }
+    let tls = start.into_stream(server_cfg?).await.ok()?;
+    Some(PeerConn::Tls(Box::new(tls)))
 }
 
 /// What a remote `KILL` did.
@@ -632,7 +724,42 @@ impl Peers {
         let Some(rec) = registry::slot_holder(self.store.as_ref(), slot_of(id)).await? else {
             return Ok(KillOutcome::Unknown);
         };
-        let mut c = self.client(&rec)?;
+        self.kill_at(&rec, id, query_only, tenant, user).await
+    }
+
+    /// `KILL [QUERY] id` on the gateway running engine node `node` (a
+    /// connection another gateway greeted and handed there).
+    ///
+    /// # Errors
+    /// 39788 when it can't be reached.
+    pub async fn kill_on_node(
+        &self,
+        node: u64,
+        id: ConnId,
+        query_only: bool,
+        tenant: Option<TenantId>,
+        user: &str,
+    ) -> Result<KillOutcome> {
+        let Some(rec) = self
+            .gateways()
+            .await?
+            .into_iter()
+            .find(|r| r.raft_node == Some(node))
+        else {
+            return Ok(KillOutcome::Unknown);
+        };
+        self.kill_at(&rec, id, query_only, tenant, user).await
+    }
+
+    async fn kill_at(
+        &self,
+        rec: &GatewayRecord,
+        id: ConnId,
+        query_only: bool,
+        tenant: Option<TenantId>,
+        user: &str,
+    ) -> Result<KillOutcome> {
+        let mut c = self.client(rec)?;
         let r = c
             .kill(KillRequest {
                 connection_id: id.0,

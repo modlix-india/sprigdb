@@ -126,6 +126,28 @@ async fn kill(
     let unknown = || SprigError::standard(1094, *b"HY000", format!("Unknown thread id: {id}"));
     let not_owner =
         || SprigError::standard(1095, *b"HY000", format!("You are not owner of thread {id}"));
+    // A connection this gateway greeted and handed to the node serving its
+    // tenant: that node's session has the same id.
+    if id != me.id
+        && let Some(user) = user.as_deref()
+    {
+        let user = if env.connection_admin && tenant.is_some() {
+            ""
+        } else {
+            user
+        };
+        if let Some(out) = crate::forward::kill_handed(id, query_only, tenant, user).await {
+            return match out {
+                Ok(crate::peer::KillOutcome::Done) => sink.ok(OkPacket::new(env.status)).await,
+                Ok(crate::peer::KillOutcome::NotOwner) => sink.error(&not_owner()).await,
+                Ok(crate::peer::KillOutcome::Unknown) => sink.error(&unknown()).await,
+                Err(e) => {
+                    tracing::warn!(%id, error = %e, "KILL of a handed-off connection failed");
+                    sink.error(&unknown()).await
+                }
+            };
+        }
+    }
     let Some(target) = env.sessions.get(id) else {
         // Another gateway's slot: ask it.
         if crate::session::slot_of(id) != env.sessions.slot()

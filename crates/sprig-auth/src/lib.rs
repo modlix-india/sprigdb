@@ -74,6 +74,7 @@ pub mod ratelimit;
 pub mod rec;
 pub mod revoke;
 pub mod scram;
+pub mod sealed;
 pub mod settings;
 pub mod sni;
 pub mod store;

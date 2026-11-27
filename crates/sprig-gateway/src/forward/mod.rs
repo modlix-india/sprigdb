@@ -76,6 +76,74 @@ pub(crate) fn host() -> Option<&'static Host> {
     HOST.get()
 }
 
+/// Connection ids this node greeted and handed to another node, with that
+/// node: `KILL` of such an id is relayed there (the serving node's session
+/// has the same id).
+static HANDED: OnceLock<Mutex<HashMap<u32, u64>>> = OnceLock::new();
+
+fn handed() -> &'static Mutex<HashMap<u32, u64>> {
+    HANDED.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Records a connection id as handed to node `to` until dropped.
+pub(crate) struct HandedOff(u32);
+
+impl HandedOff {
+    pub(crate) fn new(id: u32, to: u64) -> Self {
+        handed()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(id, to);
+        Self(id)
+    }
+}
+
+impl Drop for HandedOff {
+    fn drop(&mut self) {
+        handed()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.0);
+    }
+}
+
+/// `KILL [QUERY] id` of a connection this node handed to another node:
+/// relayed to that node, whose session has the same id. `None` when `id`
+/// wasn't handed away.
+pub(crate) async fn kill_handed(
+    id: sprig_common::ids::ConnId,
+    query_only: bool,
+    tenant: Option<sprig_common::ids::TenantId>,
+    user: &str,
+) -> Option<Result<crate::peer::KillOutcome>> {
+    let node = handed()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(&id.0)
+        .copied()?;
+    let host = HOST.get()?;
+    Some(
+        host.peers
+            .kill_on_node(node, id, query_only, tenant, user)
+            .await,
+    )
+}
+
+/// Whether forwarded bytes that are ready together travel together (one
+/// down frame, one flush to the client): `SPRIGDB_FORWARD_COALESCE`,
+/// default on; `off` sends each write as it comes (for comparisons).
+pub(crate) fn coalesce() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !std::env::var("SPRIGDB_FORWARD_COALESCE").is_ok_and(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "off" | "false" | "0"
+            )
+        })
+    })
+}
+
 /// Where a tenant's sessions are served.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Route {
@@ -407,10 +475,31 @@ where
         // client's end of file.
     };
     let downward = async move {
-        while let Ok(Some(m)) = down.message().await {
+        'down: while let Ok(Some(m)) = down.message().await {
             if let Some(splice_down::Msg::Data(d)) = m.msg
-                && (wr.write_all(&d).await.is_err() || wr.flush().await.is_err())
+                && wr.write_all(&d).await.is_err()
             {
+                break;
+            }
+            // Frames already here go out with this one: one flush (one TLS
+            // record) for a result set the serving node wrote in pieces.
+            while coalesce() {
+                match futures::FutureExt::now_or_never(down.message()) {
+                    Some(Ok(Some(m))) => {
+                        if let Some(splice_down::Msg::Data(d)) = m.msg
+                            && wr.write_all(&d).await.is_err()
+                        {
+                            break 'down;
+                        }
+                    }
+                    Some(Ok(None) | Err(_)) => {
+                        let _ = wr.flush().await;
+                        break 'down;
+                    }
+                    None => break,
+                }
+            }
+            if wr.flush().await.is_err() {
                 break;
             }
         }
@@ -426,4 +515,25 @@ where
         () = &mut downward => {}
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn handed_off_ids_are_known_while_the_splice_lasts() {
+        let at = |id| {
+            handed()
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(&id)
+                .copied()
+        };
+        {
+            let _h = HandedOff::new(0x0010_0077, 3);
+            assert_eq!(at(0x0010_0077), Some(3));
+        }
+        assert_eq!(at(0x0010_0077), None);
+    }
 }

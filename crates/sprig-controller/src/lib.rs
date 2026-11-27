@@ -85,6 +85,8 @@ pub mod docs_loader;
 pub mod drain;
 pub mod failover;
 pub mod inherit_loop;
+// The internal CA: node certificates for the links between nodes.
+pub mod internal_ca;
 pub mod latency;
 // Least-busy DC placement.
 pub mod least_busy;
@@ -610,6 +612,10 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
             dc.clone(),
         )))))
         .with_loop(Loop::new(doc_ttl_loop::DocTtlLoop))
+        // Node certificates, with SPRIGDB_CA_KEY_FILE.
+        .with_loop(Loop::new(internal_ca::CaLoop::new(
+            internal_ca::InternalCa::from_env()?,
+        )))
         .with_loop(Loop::new(sinks_loop::SinksLoop::default()))
         // The docs pack on every cluster, with its own connections.
         .with_loop(Loop::new(docs_loader::DocsLoader::new(

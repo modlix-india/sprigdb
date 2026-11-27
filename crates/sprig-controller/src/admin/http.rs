@@ -157,6 +157,10 @@ fn routes(app: Arc<App>) -> Router {
         .route("/admin/v1/catalog/contracts", get(contracts_status))
         .route("/admin/v1/catalog/contracts:run", post(contracts_run))
         .route("/admin/v1/txns/{dtid}", get(show_txn).post(txn_method))
+        // The internal CA (`sprigctl ca`).
+        .route("/admin/v1/ca", get(ca_show))
+        .route("/admin/v1/ca:init", post(ca_init))
+        .route("/admin/v1/ca/nodes/{id}", post(ca_node))
         .route("/admin/v1/settings", get(list_setting_keys))
         .route(
             "/admin/v1/settings/{key}",
@@ -1357,6 +1361,39 @@ async fn contracts_run(State(app): State<Arc<App>>, headers: HeaderMap, body: By
         authorize(&app, &headers)?;
         let req: crate::contracts::RunContractsRequest = parse_required(&body)?;
         app.svc.contracts_run(req).await
+    };
+    respond(r.await)
+}
+
+/// `GET /admin/v1/ca`: the internal CA and the nodes' certificates.
+async fn ca_show(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
+    let r = async {
+        authorize(&app, &headers)?;
+        app.svc.ca_show().await
+    };
+    respond(r.await)
+}
+
+/// `POST /admin/v1/ca:init`: the root and this DC's issuing CA.
+async fn ca_init(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
+    let r = async {
+        authorize(&app, &headers)?;
+        app.svc.ca_init().await
+    };
+    respond(r.await)
+}
+
+/// `POST /admin/v1/ca/nodes/{id}` `{action, reason?}`.
+async fn ca_node(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    UrlPath(id): UrlPath<String>,
+    body: Bytes,
+) -> Response {
+    let r = async {
+        authorize(&app, &headers)?;
+        let req: super::ca_admin::CaNodeRequest = parse_required(&body)?;
+        app.svc.ca_node(&id, req).await
     };
     respond(r.await)
 }

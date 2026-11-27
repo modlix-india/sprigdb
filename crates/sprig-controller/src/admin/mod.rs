@@ -52,6 +52,8 @@ pub mod http;
 pub mod jobs;
 pub mod mover;
 pub mod placement_admin;
+// The internal CA (`sprigctl ca`).
+pub mod ca_admin;
 // An operator's errant_extract and node_rebuild.
 pub mod graph_admin;
 pub mod logic_admin;

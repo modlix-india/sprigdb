@@ -8,8 +8,22 @@
 //! every frame queued for the peer into one write, so the frames of several
 //! driver turns travel together under load. A full queue (a peer that is
 //! down) drops new frames: Raft resends what matters.
+//!
+//! Certificates change without a restart: [`TcpTransport::set_tls`] puts
+//! a new configuration in place, and every outgoing connection reconnects
+//! with it after its current write (frames queued meanwhile go on the new
+//! connection). [`TcpTransport::set_revoked`] lists revoked certificates
+//! by serial number: a peer presenting one is refused, and every live
+//! connection to or from it is closed at once.
+//!
+//! The listener may be shared with other protocols (the gateway's peer
+//! listener): a Raft connection offers the ALPN protocol [`ALPN`] over TLS,
+//! or writes [`PREFACE`] first in plaintext ([`TcpTransport::set_preface`]),
+//! and the shared listener hands it over with [`TcpTransport::serve_tls`]
+//! or [`TcpTransport::serve_plain`]. The bytes after that are the same.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
@@ -18,11 +32,16 @@ use std::time::Duration;
 use rustls::pki_types::ServerName;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::NodeId;
 use crate::node::Node;
 use crate::transport::Transport;
+
+/// The ALPN protocol a Raft connection offers over TLS.
+pub const ALPN: &[u8] = b"sprig-raft/1";
+/// What a plaintext Raft connection to a shared listener writes first.
+pub const PREFACE: &[u8] = b"SPRIG-RAFT/1\n";
 
 /// The largest frame accepted.
 pub const MAX_FRAME: usize = 64 << 20;
@@ -109,18 +128,21 @@ impl TlsConfig {
         )
         .build()
         .map_err(|e| bad("the client verifier", &e))?;
-        let server = rustls::ServerConfig::builder_with_provider(Arc::clone(&provider))
+        let mut server = rustls::ServerConfig::builder_with_provider(Arc::clone(&provider))
             .with_safe_default_protocol_versions()
             .map_err(|e| bad("the server config", &e))?
             .with_client_cert_verifier(verifier)
             .with_single_cert(certs.clone(), key()?)
             .map_err(|e| bad("the server config", &e))?;
-        let client = rustls::ClientConfig::builder_with_provider(provider)
+        server.alpn_protocols = vec![ALPN.to_vec()];
+        let mut client = rustls::ClientConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()
             .map_err(|e| bad("the client config", &e))?
             .with_root_certificates(roots)
             .with_client_auth_cert(certs, key()?)
             .map_err(|e| bad("the client config", &e))?;
+        // A shared listener tells Raft connections apart by it.
+        client.alpn_protocols = vec![ALPN.to_vec()];
         Ok(Self {
             client: Arc::new(client),
             server: Arc::new(server),
@@ -204,16 +226,65 @@ pub fn cert_node_id(der: &[u8]) -> Option<NodeId> {
     None
 }
 
+/// The serial number of a DER certificate: its TBS's INTEGER contents.
+#[must_use]
+pub fn cert_serial(der: &[u8]) -> Option<Vec<u8>> {
+    let (_, cert, _) = tlv(der)?;
+    let (_, tbs, _) = tlv(cert)?;
+    let (mut tag, mut body, rest) = tlv(tbs)?;
+    if tag == 0xa0 {
+        (tag, body, _) = tlv(rest)?;
+    }
+    (tag == 0x02).then(|| body.to_vec())
+}
+
+/// What live connections must follow: the TLS configuration's generation
+/// (a connection made under an older one reconnects) and the revoked
+/// certificates' serial numbers.
+#[derive(Debug, Clone, Default)]
+struct Policy {
+    generation: u64,
+    revoked: Arc<BTreeSet<Vec<u8>>>,
+}
+
+/// Resolves once `serial` is revoked (never for a connection without a
+/// certificate).
+async fn revoked(mut rx: watch::Receiver<Policy>, serial: Option<Vec<u8>>) {
+    stale(&mut rx, None, serial.as_deref()).await;
+}
+
+/// Resolves once the TLS configuration is no longer generation `generation`
+/// (when given) or `serial` is revoked.
+async fn stale(rx: &mut watch::Receiver<Policy>, generation: Option<u64>, serial: Option<&[u8]>) {
+    loop {
+        {
+            let p = rx.borrow_and_update();
+            if generation.is_some_and(|g| g != p.generation)
+                || serial.is_some_and(|s| p.revoked.contains(s))
+            {
+                return;
+            }
+        }
+        if rx.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
 /// The TCP transport of one node.
 pub struct TcpTransport {
     me: NodeId,
     handle: tokio::runtime::Handle,
-    tls: Option<TlsConfig>,
+    tls: Arc<RwLock<Option<TlsConfig>>>,
+    policy: watch::Sender<Policy>,
     peers: Mutex<BTreeMap<NodeId, SocketAddr>>,
     queues: Mutex<BTreeMap<NodeId, mpsc::Sender<Vec<u8>>>>,
     /// Peers cut off (a test's network partition): frames to them and
     /// from them are dropped.
     cut: Arc<RwLock<BTreeSet<NodeId>>>,
+    /// Plaintext connections start with [`PREFACE`] (peers listen on a
+    /// shared listener).
+    preface: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for TcpTransport {
@@ -231,11 +302,116 @@ impl TcpTransport {
         Arc::new(Self {
             me,
             handle,
-            tls,
+            tls: Arc::new(RwLock::new(tls)),
+            policy: watch::Sender::new(Policy::default()),
             peers: Mutex::new(BTreeMap::new()),
             queues: Mutex::new(BTreeMap::new()),
             cut: Arc::new(RwLock::new(BTreeSet::new())),
+            preface: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// Peers listen on a listener shared with other protocols: plaintext
+    /// connections start with [`PREFACE`] (TLS ones offer [`ALPN`]
+    /// anyway). Set before the first frame is sent.
+    pub fn set_preface(&self, on: bool) {
+        self.preface.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The TLS server configuration in place, for a shared listener to
+    /// finish the handshake of a connection that offered [`ALPN`]; `None`
+    /// without TLS.
+    #[must_use]
+    pub fn server_config(&self) -> Option<Arc<rustls::ServerConfig>> {
+        self.tls
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .map(|t| Arc::clone(&t.server))
+    }
+
+    /// Whether the transport runs with TLS.
+    #[must_use]
+    pub fn has_tls(&self) -> bool {
+        self.tls
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some()
+    }
+
+    /// Serves a Raft connection a shared listener accepted over TLS (its
+    /// handshake finished with [`Self::server_config`]): frames go to
+    /// `node` until the connection ends or its certificate is revoked.
+    pub async fn serve_tls<S: AsyncRead + AsyncWrite + Unpin>(
+        &self,
+        s: tokio_rustls::server::TlsStream<S>,
+        node: &Node,
+    ) {
+        let node_names = self
+            .tls
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|t| t.node_names);
+        serve_accepted(s, node, node_names, self.policy.subscribe(), &self.cut).await;
+    }
+
+    /// Serves a plaintext Raft connection a shared listener accepted: it
+    /// must start with [`PREFACE`]; refused when this transport runs with
+    /// TLS.
+    pub async fn serve_plain<S: AsyncRead + Unpin>(&self, mut s: S, node: &Node) {
+        if self.has_tls() {
+            tracing::warn!(
+                node = node.id(),
+                "raft: a plaintext connection to a node that runs Raft over TLS; refused"
+            );
+            return;
+        }
+        let mut pre = [0u8; PREFACE.len()];
+        if s.read_exact(&mut pre).await.is_err() || pre != PREFACE {
+            return;
+        }
+        read_frames(s, node, None, &self.cut, std::future::pending()).await;
+    }
+
+    /// Puts new certificates in place (renewed ones): new connections use
+    /// them, and every outgoing connection reconnects with them after its
+    /// current write.
+    ///
+    /// # Errors
+    /// The transport was started without TLS.
+    pub fn set_tls(&self, t: TlsConfig) -> io::Result<()> {
+        {
+            let mut cur = self.tls.write().unwrap_or_else(PoisonError::into_inner);
+            if cur.is_none() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "raft tcp: the transport runs without TLS",
+                ));
+            }
+            *cur = Some(t);
+        }
+        self.policy.send_modify(|p| p.generation += 1);
+        Ok(())
+    }
+
+    /// How many times [`Self::set_tls`] has replaced the configuration.
+    #[must_use]
+    pub fn tls_generation(&self) -> u64 {
+        self.policy.borrow().generation
+    }
+
+    /// Revoked certificates by serial number ([`cert_serial`]): peers
+    /// presenting one are refused, and live connections to or from them
+    /// close at once. Replaces the previous list.
+    pub fn set_revoked(&self, serials: BTreeSet<Vec<u8>>) {
+        self.policy.send_if_modified(|p| {
+            if *p.revoked == serials {
+                return false;
+            }
+            p.revoked = Arc::new(serials);
+            true
+        });
     }
 
     /// Cuts this node off from `peers` (and heals every other link): from
@@ -271,7 +447,8 @@ impl TcpTransport {
     pub async fn listen(self: &Arc<Self>, addr: SocketAddr, node: Node) -> io::Result<SocketAddr> {
         let l = TcpListener::bind(addr).await?;
         let bound = l.local_addr()?;
-        let tls = self.tls.clone();
+        let tls = Arc::clone(&self.tls);
+        let policy = self.policy.clone();
         let cut = Arc::clone(&self.cut);
         self.handle.spawn(async move {
             loop {
@@ -281,7 +458,10 @@ impl TcpTransport {
                 };
                 let _ = s.set_nodelay(true);
                 let node = node.clone();
-                let tls = tls.clone();
+                // The configuration in place now (certificates are renewed
+                // while the node runs).
+                let tls = tls.read().unwrap_or_else(PoisonError::into_inner).clone();
+                let policy = policy.subscribe();
                 let cut = Arc::clone(&cut);
                 tokio::spawn(async move {
                     match tls {
@@ -290,26 +470,11 @@ impl TcpTransport {
                             let Ok(s) = acc.accept(s).await else {
                                 return;
                             };
-                            // With node identity, the peer is the node its
-                            // certificate names, and only that node.
-                            let peer = if t.node_names {
-                                let named = s
-                                    .get_ref()
-                                    .1
-                                    .peer_certificates()
-                                    .and_then(|c| c.first())
-                                    .and_then(|c| cert_node_id(c));
-                                let Some(id) = named else {
-                                    tracing::warn!(node = node.id(), "raft tcp: a peer's certificate names no node; connection refused");
-                                    return;
-                                };
-                                Some(id)
-                            } else {
-                                None
-                            };
-                            read_frames(s, &node, peer, &cut).await;
+                            serve_accepted(s, &node, t.node_names, policy, &cut).await;
                         }
-                        None => read_frames(s, &node, None, &cut).await,
+                        None => {
+                            read_frames(s, &node, None, &cut, std::future::pending()).await;
+                        }
                     }
                 });
             }
@@ -318,6 +483,7 @@ impl TcpTransport {
     }
 
     fn queue(&self, to: NodeId) -> Option<mpsc::Sender<Vec<u8>>> {
+        let preface = self.preface.load(std::sync::atomic::Ordering::Relaxed);
         let mut qs = self.queues.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(q) = qs.get(&to)
             && !q.is_closed()
@@ -331,8 +497,13 @@ impl TcpTransport {
             .get(&to)?;
         let (tx, rx) = mpsc::channel(QUEUE);
         qs.insert(to, tx.clone());
-        self.handle
-            .spawn(write_frames(addr, self.tls.clone(), rx, self.me, to));
+        self.handle.spawn(write_frames(
+            addr,
+            Arc::clone(&self.tls),
+            self.policy.subscribe(),
+            rx,
+            (self.me, to, preface),
+        ));
         Some(tx)
     }
 }
@@ -353,30 +524,79 @@ impl Transport for TcpTransport {
     }
 }
 
+/// An accepted TLS connection: refused when its certificate is revoked or,
+/// with node identity, names no node; otherwise its frames go to `node`.
+async fn serve_accepted<S: AsyncRead + AsyncWrite + Unpin>(
+    s: tokio_rustls::server::TlsStream<S>,
+    node: &Node,
+    node_names: bool,
+    policy: watch::Receiver<Policy>,
+    cut: &RwLock<BTreeSet<NodeId>>,
+) {
+    let leaf = s
+        .get_ref()
+        .1
+        .peer_certificates()
+        .and_then(|c| c.first())
+        .map(|c| c.to_vec());
+    let serial = leaf.as_deref().and_then(cert_serial);
+    if let Some(sn) = &serial
+        && policy.borrow().revoked.contains(sn)
+    {
+        tracing::warn!(node = node.id(), peer = ?leaf.as_deref().and_then(cert_node_id),
+            "raft tcp: a peer's certificate is revoked; connection refused");
+        return;
+    }
+    // With node identity, the peer is the node its certificate names, and
+    // only that node.
+    let peer = if node_names {
+        let Some(id) = leaf.as_deref().and_then(cert_node_id) else {
+            tracing::warn!(
+                node = node.id(),
+                "raft tcp: a peer's certificate names no node; connection refused"
+            );
+            return;
+        };
+        Some(id)
+    } else {
+        None
+    };
+    read_frames(s, node, peer, cut, revoked(policy, serial)).await;
+}
+
 /// The sender a frame claims (its header's `from`).
 fn frame_sender(frame: &[u8]) -> Option<NodeId> {
     let b: [u8; 8] = frame.get(2..10)?.try_into().ok()?;
     Some(NodeId::from_le_bytes(b))
 }
 
+/// Reads frames until the connection ends or `gone` resolves (its
+/// certificate was revoked).
 async fn read_frames<S: AsyncRead + Unpin>(
     mut s: S,
     node: &Node,
     peer: Option<NodeId>,
     cut: &RwLock<BTreeSet<NodeId>>,
+    gone: impl Future<Output = ()>,
 ) {
+    tokio::pin!(gone);
     let mut len = [0u8; 4];
     loop {
-        if s.read_exact(&mut len).await.is_err() {
-            return;
+        tokio::select! {
+            r = s.read_exact(&mut len) => if r.is_err() { return },
+            () = &mut gone => {
+                tracing::warn!(node = node.id(), ?peer, "raft tcp: a peer's certificate was revoked; connection closed");
+                return;
+            }
         }
         let n = u32::from_le_bytes(len) as usize;
         if n > MAX_FRAME {
             return;
         }
         let mut buf = vec![0u8; n];
-        if s.read_exact(&mut buf).await.is_err() {
-            return;
+        tokio::select! {
+            r = s.read_exact(&mut buf) => if r.is_err() { return },
+            () = &mut gone => return,
         }
         if let Some(p) = peer
             && frame_sender(&buf) != Some(p)
@@ -396,9 +616,17 @@ async fn read_frames<S: AsyncRead + Unpin>(
     }
 }
 
-async fn connect(addr: SocketAddr, tls: Option<&TlsConfig>, to: NodeId) -> io::Result<Conn> {
-    let s = TcpStream::connect(addr).await?;
+async fn connect(
+    addr: SocketAddr,
+    tls: Option<&TlsConfig>,
+    to: NodeId,
+    preface: bool,
+) -> io::Result<Conn> {
+    let mut s = TcpStream::connect(addr).await?;
     s.set_nodelay(true)?;
+    if preface && tls.is_none() {
+        s.write_all(PREFACE).await?;
+    }
     Ok(match tls {
         Some(t) => {
             let c = tokio_rustls::TlsConnector::from(Arc::clone(&t.client));
@@ -421,6 +649,19 @@ enum Conn {
 }
 
 impl Conn {
+    /// The serial number of the peer's certificate.
+    fn peer_serial(&self) -> Option<Vec<u8>> {
+        match self {
+            Conn::Plain(_) => None,
+            Conn::Tls(s) => s
+                .get_ref()
+                .1
+                .peer_certificates()
+                .and_then(|c| c.first())
+                .and_then(|c| cert_serial(c)),
+        }
+    }
+
     async fn write_all(&mut self, b: &[u8]) -> io::Result<()> {
         match self {
             Conn::Plain(s) => write_flush(s, b).await,
@@ -436,15 +677,30 @@ async fn write_flush<S: AsyncWrite + Unpin>(s: &mut S, b: &[u8]) -> io::Result<(
 
 async fn write_frames(
     addr: SocketAddr,
-    tls: Option<TlsConfig>,
+    tls: Arc<RwLock<Option<TlsConfig>>>,
+    mut policy: watch::Receiver<Policy>,
     mut rx: mpsc::Receiver<Vec<u8>>,
-    me: NodeId,
-    to: NodeId,
+    (me, to, preface): (NodeId, NodeId, bool),
 ) {
     let mut backoff = Duration::from_millis(50);
     let mut buf = Vec::with_capacity(64 << 10);
     loop {
-        let mut conn = match connect(addr, tls.as_ref(), to).await {
+        let generation = policy.borrow_and_update().generation;
+        let t = tls.read().unwrap_or_else(PoisonError::into_inner).clone();
+        let connected = connect(addr, t.as_ref(), to, preface).await.and_then(|c| {
+            let serial = c.peer_serial();
+            if serial
+                .as_ref()
+                .is_some_and(|s| policy.borrow().revoked.contains(s))
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "the peer's certificate is revoked",
+                ));
+            }
+            Ok((c, serial))
+        });
+        let (mut conn, serial) = match connected {
             Ok(c) => {
                 backoff = Duration::from_millis(50);
                 c
@@ -458,8 +714,16 @@ async fn write_frames(
                 continue;
             }
         };
+        // Renewed certificates (reconnect with them) or the peer's revoked.
+        let mut watch = policy.clone();
+        let renewed = stale(&mut watch, Some(generation), serial.as_deref());
+        tokio::pin!(renewed);
         loop {
-            let Some(f) = rx.recv().await else {
+            let f = tokio::select! {
+                f = rx.recv() => f,
+                () = &mut renewed => break,
+            };
+            let Some(f) = f else {
                 return;
             };
             buf.clear();

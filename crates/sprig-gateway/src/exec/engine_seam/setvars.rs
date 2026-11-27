@@ -6,7 +6,7 @@
 //! | `SET [SESSION \| LOCAL] v = ON \| OFF \| TRUE \| FALSE \| 1 \| 0`, `SET @@[session.]v = ...` (a switch below) | `ON` / `OFF` |
 //! | `SET [SESSION] transaction_isolation \| tx_isolation = 'READ-COMMITTED'` (and the other three) | both names, upper case |
 //! | `SET [SESSION] transaction_read_only \| tx_read_only = ...` | both names, `ON` / `OFF` |
-//! | `SET [SESSION] innodb_lock_wait_timeout = n` (1 to 1073741824), `= DEFAULT` | the engine's lock wait |
+//! | `SET [SESSION] innodb_lock_wait_timeout = n` (1 to 1073741824; 0 too on 3307, where it fails a wait at once), `= DEFAULT` | the engine's lock wait |
 //! | `SET SESSION TRANSACTION ISOLATION LEVEL ... \| READ ONLY \| READ WRITE` | the two variables above |
 //! | `SET [SESSION] sql_mode = '...'` | 3306: MySQL 8.4's rules (the client's view, and the backend value); 3307: MariaDB's member names (combination modes such as `ANSI` stay MariaDB's) |
 //! | `SET [SESSION] time_zone = 'SYSTEM' \| '+HH:MM'` (-12:00 to +14:00) | as the servers show it |
@@ -447,7 +447,9 @@ fn assignment(name: &str, value: &Token, sql: &[u8], opts: LexOptions) -> Option
             return None;
         }
         let n: u64 = std::str::from_utf8(value.bytes(sql)).ok()?.parse().ok()?;
-        return (1..=LOCK_WAIT_MAX)
+        // 0 is MariaDB's (fail at once); MySQL raises it to 1 with a
+        // warning, so the persona decides in `engine_set`.
+        return (0..=LOCK_WAIT_MAX)
             .contains(&n)
             .then_some(Assign::LockWait(Some(n)));
     }
@@ -583,22 +585,28 @@ impl PassSession {
             return Ok(None);
         }
         if let Some(on) = assigns.iter().filter_map(Assign::autocommit).next_back() {
-            // Inside an XA branch turning autocommit on is refused by the
-            // transaction-control path.
-            if self.eng.txn.xa_phase().is_some() {
-                return Ok(None);
-            }
-            // Turning autocommit on (from off) commits.
-            if on
+            if let Some(ph) = self.eng.txn.xa_phase() {
+                // Inside an XA branch turning autocommit on (from off) would
+                // commit: 1399 with the branch's state, as both servers
+                // answer. Turning it off, or on while on, is kept.
+                if on && self.engine_vars(cx).autocommit_off {
+                    let e = crate::engine::session::xa_rmfail(ph.name());
+                    return self.fail(out, &e).await.map(Some);
+                }
+            } else if on
                 && open
                 && self.engine_vars(cx).autocommit_off
                 && let Err(e) = self.engine_implicit_commit().await
             {
+                // Turning autocommit on (from off) commits.
                 return self.fail(out, &e).await.map(Some);
             }
         }
         // Each persona's own variables, and `sql_mode` as each reads it.
         let on_mysql = self.persona == sprig_proto_mysql::Persona::MySql84;
+        if on_mysql && assigns.contains(&Assign::LockWait(Some(0))) {
+            return Ok(None);
+        }
         let mut new_sql_mode: Option<(Option<String>, String)> = None;
         for a in &assigns {
             match a {
@@ -781,7 +789,10 @@ mod tests {
             p("SET SESSION innodb_lock_wait_timeout = DEFAULT"),
             Some(vec![Assign::LockWait(None)])
         );
-        assert_eq!(p("SET innodb_lock_wait_timeout=0"), None);
+        assert_eq!(
+            p("SET innodb_lock_wait_timeout=0"),
+            Some(vec![Assign::LockWait(Some(0))])
+        );
         assert_eq!(p("SET innodb_lock_wait_timeout=1073741825"), None);
     }
 

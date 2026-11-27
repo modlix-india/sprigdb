@@ -60,6 +60,17 @@
 //!   with node identity: a node dials only the node it means and accepts
 //!   frames only from the node a peer's certificate names. Unset: plain
 //!   TCP (development).
+//! - `SPRIGDB_ENGINE_RAFT_TRANSPORT=peer`: Raft traffic arrives on the
+//!   peer listener instead of a listener of its own; then
+//!   `SPRIGDB_ENGINE_RAFT_PEERS` names every node's peer listener. A Raft
+//!   connection offers its own ALPN protocol over TLS (or a preface in
+//!   plaintext), and the peer listener hands it to the transport; the
+//!   bytes, node identity and revocation are the same. `tcp` (the
+//!   default): its own listener, as before.
+//! - `SPRIGDB_ENGINE_RAFT_TLS_ISSUED=on`: the files in that directory come
+//!   from the internal CA (`crate::node_certs`): the node makes its key,
+//!   the controller issues and renews its certificate, and the transport
+//!   reloads renewed ones and drops revoked peers without a restart.
 //! - `SPRIGDB_ENGINE_RAFT_SYNC_PIPELINE`: with the log writer thread, how
 //!   many syncs of the Raft log may run at once while the thread goes on
 //!   writing (default 8; 0 on macOS, where each sync flushes the whole
@@ -124,6 +135,24 @@ pub const PLACEMENT_VAR: &str = "SPRIGDB_ENGINE_PLACEMENT";
 pub const FAILURE_DOMAIN_VAR: &str = "SPRIGDB_ENGINE_FAILURE_DOMAIN";
 /// The variable naming the directory of the Raft transport's certificates.
 pub const RAFT_TLS_DIR_VAR: &str = "SPRIGDB_ENGINE_RAFT_TLS_DIR";
+/// The variable choosing where Raft traffic arrives: `tcp` (the default,
+/// its own listener) or `peer` (the peer listener).
+pub const RAFT_TRANSPORT_VAR: &str = "SPRIGDB_ENGINE_RAFT_TRANSPORT";
+
+/// Whether Raft traffic arrives on the peer listener ([`RAFT_TRANSPORT_VAR`]).
+fn raft_on_peer_from(lookup: impl Fn(&str) -> Option<String>) -> Result<bool> {
+    match lookup(RAFT_TRANSPORT_VAR)
+        .map(|v| v.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        None | Some("" | "tcp") => Ok(false),
+        Some("peer") => Ok(true),
+        Some(other) => Err(SprigError::internal(format!(
+            "{RAFT_TRANSPORT_VAR} must be tcp or peer, not '{other}'"
+        ))),
+    }
+}
+
 /// The variable naming a fault test's file of Raft ids to cut off.
 pub const RAFT_CUT_FILE_VAR: &str = "SPRIGDB_ENGINE_RAFT_CUT_FILE";
 
@@ -808,6 +837,7 @@ pub fn engine() -> Result<Engine> {
 /// Joins this node's engine to its replicas: the Raft log beside the
 /// engine, the TCP transport on its own small runtime, the listener and the
 /// driver thread. They live as long as the process.
+#[allow(clippy::too_many_lines)] // start-up, step by step
 fn start_raft(engine: &Engine, r: &RaftSetup, dir: PathBuf) -> Result<()> {
     let raft_err = |m: String| SprigError::internal(format!("engine replication: {m}"));
     // Runs once per process (inside `engine()`'s initialisation); the
@@ -822,7 +852,9 @@ fn start_raft(engine: &Engine, r: &RaftSetup, dir: PathBuf) -> Result<()> {
     ));
     let tls = raft_tls(r.id)?;
     let mtls = tls.is_some();
+    let on_peer = raft_on_peer_from(|k| std::env::var(k).ok())?;
     let transport = sprig_raft::tcp::TcpTransport::new(r.id, rt.handle().clone(), tls);
+    transport.set_preface(on_peer);
     for (pid, addr) in &r.peers {
         transport.set_peer(*pid, *addr);
     }
@@ -888,12 +920,18 @@ fn start_raft(engine: &Engine, r: &RaftSetup, dir: PathBuf) -> Result<()> {
     // The listener is async; bind it from a plain thread so this works
     // whether or not the caller runs inside a runtime.
     let (listen, raft_node, handle) = (r.listen, node.node().clone(), rt.handle().clone());
-    let bound = std::thread::scope(|s| {
-        s.spawn(|| handle.block_on(transport.listen(listen, raft_node)))
-            .join()
-            .map_err(|_| raft_err("the listener thread panicked".into()))
-    })?
-    .map_err(|e| raft_err(format!("raft listener on {listen}: {e}")))?;
+    // On the peer listener, which binds later: peers retry until it does.
+    let bound = if on_peer {
+        "peer listener".to_owned()
+    } else {
+        std::thread::scope(|s| {
+            s.spawn(|| handle.block_on(transport.listen(listen, raft_node)))
+                .join()
+                .map_err(|_| raft_err("the listener thread panicked".into()))
+        })?
+        .map_err(|e| raft_err(format!("raft listener on {listen}: {e}")))?
+        .to_string()
+    };
     node.spawn().map_err(|e| raft_err(e.to_string()))?;
     let mut voters: Vec<u64> = r.peers.iter().map(|(p, _)| *p).collect();
     voters.sort_unstable();
@@ -911,8 +949,37 @@ fn start_raft(engine: &Engine, r: &RaftSetup, dir: PathBuf) -> Result<()> {
         transport,
         voters,
         placed,
+        on_peer,
     });
     Ok(())
+}
+
+/// Loads the Raft certificates again from [`RAFT_TLS_DIR_VAR`] (renewed
+/// ones) into the running transport: new connections use them, and
+/// outgoing ones reconnect with them. `Ok(false)` when Raft doesn't run
+/// with TLS.
+///
+/// # Errors
+/// The files don't load, or the certificate doesn't name this node.
+pub fn reload_raft_tls() -> Result<bool> {
+    let (Some(raft), Some(id)) = (RAFT.get(), raft_id_from_env()) else {
+        return Ok(false);
+    };
+    let Some(tls) = raft_tls(id)? else {
+        return Ok(false);
+    };
+    raft.transport
+        .set_tls(tls)
+        .map(|()| true)
+        .map_err(|e| SprigError::internal(format!("{RAFT_TLS_DIR_VAR}: {e}")))
+}
+
+/// Revoked node certificates by serial number: the Raft transport refuses
+/// peers presenting one and closes their connections.
+pub fn set_raft_revoked(serials: std::collections::BTreeSet<Vec<u8>>) {
+    if let Some(raft) = RAFT.get() {
+        raft.transport.set_revoked(serials);
+    }
 }
 
 /// The process's Raft node and transport, once started.
@@ -923,6 +990,17 @@ struct Raft {
     voters: Vec<u64>,
     /// Units are placed per tenant ([`PLACEMENT_VAR`]).
     placed: bool,
+    /// Raft traffic arrives on the peer listener ([`RAFT_TRANSPORT_VAR`]).
+    on_peer: bool,
+}
+
+/// With Raft on the peer listener: the transport and the node its
+/// connections feed, for the peer listener to hand Raft connections to.
+#[must_use]
+pub fn raft_on_peer() -> Option<(Arc<sprig_raft::tcp::TcpTransport>, sprig_raft::Node)> {
+    RAFT.get()
+        .filter(|r| r.on_peer)
+        .map(|r| (Arc::clone(&r.transport), r.node.node().clone()))
 }
 
 /// For the catalog peer service: `Ok` when this node may run `tenant`'s

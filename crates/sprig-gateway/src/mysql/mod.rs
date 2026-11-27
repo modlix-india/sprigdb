@@ -231,7 +231,12 @@ impl Frontend for MySqlFrontend {
     }
 
     async fn serve(&self, mut conn: ClientConn, ctx: Arc<GatewayContext>) -> Result<()> {
-        let session = match ctx.sessions.open(&conn, self.protocol()) {
+        // A connection another node greeted keeps the greeting's id.
+        let opened = match handoff::greeting_id(&conn) {
+            Some(id) => ctx.sessions.open_as(&conn, self.protocol(), id),
+            None => ctx.sessions.open(&conn, self.protocol()),
+        };
+        let session = match opened {
             Ok(s) => s,
             Err(e) => {
                 // 1040 in place of the greeting, without a SQLSTATE: the
@@ -471,7 +476,11 @@ async fn login_phase(
         *handoff = Some(handoff::Pending {
             conn,
             to,
-            resume: handoff::MysqlResume::new(nonce, server, seq, policy),
+            resume: {
+                let mut r = handoff::MysqlResume::new(nonce, server, seq, policy);
+                r.conn_id = session.id.0;
+                r
+            },
             login_packet: resp_raw,
             caps,
         });

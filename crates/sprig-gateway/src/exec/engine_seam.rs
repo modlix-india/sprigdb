@@ -2323,6 +2323,18 @@ impl PassSession {
             .await;
         }
         if let Some(ctl) = control::parse(sql) {
+            // An xid part over 64 bytes: both servers' syntax error, quoting
+            // what follows it; answered here when no MariaDB would.
+            if matches!(ctl, Control::Xa(Xa::Other))
+                && sessvars::all_engine(cat)
+                && let Some(e) = long_xid_error(
+                    sql,
+                    self.lex_opts().0,
+                    self.persona == sprig_proto_mysql::Persona::MySql84,
+                )
+            {
+                return self.fail(out, &e).await.map(Some);
+            }
             return Box::pin(self.engine_control(cx, cat, current, ctl, more, out)).await;
         }
         // The MySQL port's `SHOW COLUMNS` and `SHOW INDEX`, as queries over
@@ -3507,6 +3519,60 @@ fn analyze_as_explain(t: &str) -> Option<String> {
     let query = matches!(next.as_str(), "SELECT" | "WITH" | "VALUES")
         || (next.is_empty() && after.trim_start().starts_with('('));
     query.then(|| format!("EXPLAIN {rest}"))
+}
+
+
+/// The syntax error both servers answer for an XA statement whose xid has
+/// a part over 64 bytes: 1064 quoting the text after that part.
+fn long_xid_error(
+    sql: &[u8],
+    opts: sprig_sql::lex::LexOptions,
+    mysql: bool,
+) -> Option<SprigError> {
+    use sprig_sql::lex::TokenKind;
+    let toks = sprig_sql::lex::lex(sql, &opts).ok()?;
+    let long = toks.iter().find(|t| {
+        let n = t.bytes(sql).len();
+        match t.kind {
+            TokenKind::String => n.saturating_sub(2) > 64,
+            TokenKind::HexString => n.saturating_sub(3) / 2 > 64,
+            TokenKind::HexNumber => n.saturating_sub(2) / 2 > 64,
+            _ => false,
+        }
+    })?;
+    let rest = String::from_utf8_lossy(&sql[long.end as usize..]);
+    let near: String = rest.trim_start().chars().take(80).collect();
+    let line = String::from_utf8_lossy(&sql[..long.end as usize])
+        .matches('\n')
+        .count()
+        + 1;
+    let server = if mysql { "MySQL" } else { "MariaDB" };
+    Some(SprigError::standard(
+        1064,
+        *b"42000",
+        format!(
+            "You have an error in your SQL syntax; check the manual that corresponds to your {server} server version for the right syntax to use near '{near}' at line {line}"
+        ),
+    ))
+}
+
+#[cfg(test)]
+mod long_xid_tests {
+    use super::*;
+
+    #[test]
+    fn an_xid_part_over_64_bytes_is_a_syntax_error_quoting_what_follows() {
+        let long = format!("XA START '{}'", "a".repeat(84));
+        let opts = sprig_sql::lex::LexOptions::mariadb();
+        let e = long_xid_error(long.as_bytes(), opts, false).expect("refused");
+        assert!(e.message.ends_with("near '' at line 1"), "{}", e.message);
+        let join = format!("XA START '{}' JOIN", "a".repeat(65));
+        let e = long_xid_error(join.as_bytes(), opts, true).expect("refused");
+        assert!(e.message.contains("MySQL server version"));
+        assert!(e.message.ends_with("near 'JOIN' at line 1"), "{}", e.message);
+        let ok = format!("XA START '{}'", "a".repeat(64));
+        assert!(long_xid_error(ok.as_bytes(), opts, false).is_none());
+    }
 }
 
 #[cfg(test)]

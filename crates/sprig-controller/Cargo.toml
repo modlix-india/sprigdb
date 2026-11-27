@@ -72,10 +72,10 @@ sprig-txn.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+# The internal CA's certificates (also tests/live_node_rebuild.rs's test PKI).
+rcgen.workspace = true
 
 [dev-dependencies]
-# tests/live_node_rebuild.rs's test PKI, already in the tree.
-rcgen.workspace = true
 # The approval webhook tests: an HTTPS receiver in process.
 rustls.workspace = true
 tokio-rustls.workspace = true

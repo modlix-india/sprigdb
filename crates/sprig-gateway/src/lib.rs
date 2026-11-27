@@ -93,6 +93,8 @@ pub mod mongo;
 pub mod mysql;
 // The node's one storage engine, shared by the front ends whose data it holds.
 pub mod node_engine;
+// Node certificates from the internal CA for the Raft transport.
+pub mod node_certs;
 pub mod observe;
 pub mod offload;
 // The feed-driven outbox forwarder's gateway side.
@@ -156,6 +158,21 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
     // newest formats; a missing catalog (a tenant being deleted) is never
     // made again here, without its owner mark.
     sprig_catalog::migrate::never_create_schemas();
+    // Issued node certificates: the node's key, and its certificate from
+    // the controller, before Raft starts (the control plane first).
+    let early_stores = if node_engine::replicated_from_env() && node_certs::issued_from_env() {
+        let s = settings_stores(&ctx).await?;
+        node_certs::obtain(
+            Arc::clone(&s.dc),
+            Arc::clone(&s.global),
+            &ctx.config.node.id(),
+            &ctx.shutdown,
+        )
+        .await?;
+        Some(s)
+    } else {
+        None
+    };
     // One replica of several takes part in replication from the start,
     // not from its first client.
     // Opening it blocks (the store, the Raft log): off the runtime's
@@ -185,7 +202,13 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
     };
     let lifecycle = lifecycle::Lifecycle::new();
 
-    let live = LiveSettings::start(registry, settings_stores(&ctx).await?)?;
+    let live = LiveSettings::start(
+        registry,
+        match early_stores {
+            Some(s) => s,
+            None => settings_stores(&ctx).await?,
+        },
+    )?;
     tokio::select! {
         () = ctx.shutdown.cancelled() => return Ok(()),
         () = live.ready() => {}
@@ -259,6 +282,14 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
         gateway_id.clone(),
         registrar.record().addr,
     );
+    if node_engine::replicated_from_env() && node_certs::issued_from_env() {
+        node_certs::follow(
+            Arc::clone(&stores.dc),
+            Arc::clone(&stores.global),
+            gateway_id.clone(),
+            stop.clone(),
+        );
+    }
     let lease_live = live.clone();
     let lease_dc = dc.clone();
     let registration = registrar

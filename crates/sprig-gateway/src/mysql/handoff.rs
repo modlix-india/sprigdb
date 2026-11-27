@@ -28,6 +28,10 @@ pub(crate) struct MysqlResume {
     pub(crate) policy: u8,
     /// The client switched to TLS there before its login packet.
     pub(crate) tls: bool,
+    /// The connection id the greeting gave (the serving node's session
+    /// takes it, so `CONNECTION_ID()` and `KILL` agree with the greeting).
+    #[serde(default)]
+    pub(crate) conn_id: u32,
 }
 
 impl MysqlResume {
@@ -43,6 +47,7 @@ impl MysqlResume {
                 TlsPolicy::Required => 2,
             },
             tls: false,
+            conn_id: 0,
         }
     }
 
@@ -54,6 +59,16 @@ impl MysqlResume {
             _ => TlsPolicy::Required,
         }
     }
+}
+
+/// The greeting's connection id of a connection handed here, if this is
+/// one that carries it.
+pub(crate) fn greeting_id(conn: &ClientConn) -> Option<sprig_common::ids::ConnId> {
+    let MaybeTls::Forwarded(f) = &conn.stream else {
+        return None;
+    };
+    let r: MysqlResume = serde_json::from_str(&f.peek_resume()?).ok()?;
+    (r.conn_id != 0).then_some(sprig_common::ids::ConnId(r.conn_id))
 }
 
 /// The resume of a connection handed here, if this is one.
@@ -127,6 +142,8 @@ pub(crate) async fn hand_over(shared: &Shared, p: Pending) {
         to,
     };
     let stream: &mut MaybeTls<TcpStream> = &mut conn.stream;
+    // While it lasts, `KILL` of the greeting's id goes to the serving node.
+    let _handed = (resume.conn_id != 0).then(|| crate::forward::HandedOff::new(resume.conn_id, to));
     if let Err(e) = crate::forward::splice(&mut *stream, h).await {
         tracing::debug!(error = %e, to, "MySQL connection not handed over");
         let mut seq = resume.seq.wrapping_add(1);

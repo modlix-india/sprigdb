@@ -49,6 +49,7 @@
 // AI providers.
 mod ai;
 mod backup;
+mod ca;
 mod catalog;
 mod check;
 mod client;
@@ -516,6 +517,7 @@ fn cli() -> Command {
         .subcommand(inherit::group())
         .subcommand(txn::group())
         .subcommand(catalog::group())
+        .subcommand(ca::group())
         .subcommand(ai::group())
         .subcommand(sink::group())
         .subcommand(graph::group())
@@ -576,7 +578,7 @@ fn main() -> ExitCode {
         "dc" | "cluster" | "settings" | "index" | "job" | "gateway" | "unit" | "check"
         | "advisor" | "shard" | "space" | "txn" | "sink" | "graph" | "search"
         | "recommendations" | "inherit" | "login" | "logout" | "whoami" | "operator" | "token"
-        | "ai" | "catalog" => true,
+        | "ai" | "catalog" | "ca" => true,
         "explain" => matches!(name.as_str(), "query" | "decision" | "placement"),
         "tenant" => !TENANT_LATER.contains(&name.as_str()),
         "logic" => logic::implemented(&name),
@@ -652,6 +654,9 @@ fn main() -> ExitCode {
                 .await
                 .map(|()| ExitCode::SUCCESS),
             "txn" => txn::run(&client, sub, output(&matches))
+                .await
+                .map(|()| ExitCode::SUCCESS),
+            "ca" => ca::run(&client, sub, output(&matches))
                 .await
                 .map(|()| ExitCode::SUCCESS),
             "catalog" => catalog::run(&client, sub, output(&matches))

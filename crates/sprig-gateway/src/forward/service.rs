@@ -145,9 +145,87 @@ impl NodeForward for ForwardService {
             return refuse(e.code().unwrap_or(SprigCode::ForwardFailed), e.to_string());
         }
         tracing::debug!(tenant = open.tenant_id, from = open.from_node, listener = %open.listener, %peer, "serving a forwarded connection");
-        Ok(tonic::Response::new(Box::pin(futures::stream::unfold(
-            rx,
-            |mut rx| async move { rx.recv().await.map(|m| (m, rx)) },
-        ))))
+        if !super::coalesce() {
+            return Ok(tonic::Response::new(Box::pin(futures::stream::unfold(
+                rx,
+                |mut rx| async move { rx.recv().await.map(|m| (m, rx)) },
+            ))));
+        }
+        Ok(tonic::Response::new(coalesced(rx)))
+    }
+}
+
+/// The most bytes merged into one down frame.
+const COALESCE_MAX: usize = 64 * 1024;
+
+/// The down stream: data the front end wrote while the previous frame was
+/// being sent goes out as one frame (fewer gRPC messages for a result the
+/// front end writes packet by packet), never waiting for more.
+fn coalesced(rx: mpsc::Receiver<Down>) -> DownStream {
+    Box::pin(futures::stream::unfold(
+        (rx, None::<Down>),
+        |(mut rx, held)| async move {
+            let mut m = match held {
+                Some(m) => m,
+                None => rx.recv().await?,
+            };
+            let mut next = None;
+            if let Ok(SpliceDown {
+                msg: Some(splice_down::Msg::Data(d)),
+            }) = &mut m
+            {
+                while d.len() < COALESCE_MAX {
+                    match rx.try_recv() {
+                        Ok(Ok(SpliceDown {
+                            msg: Some(splice_down::Msg::Data(more)),
+                        })) => d.extend_from_slice(&more),
+                        Ok(other) => {
+                            next = Some(other);
+                            break;
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+            Some((m, (rx, next)))
+        },
+    ))
+}
+
+#[cfg(test)]
+mod coalesce_tests {
+    use futures::StreamExt as _;
+
+    use super::*;
+
+    fn data(b: &[u8]) -> Down {
+        down(splice_down::Msg::Data(b.to_vec()))
+    }
+
+    #[tokio::test]
+    async fn waiting_data_goes_out_as_one_frame_in_order() {
+        let (tx, rx) = mpsc::channel(16);
+        tx.send(down(splice_down::Msg::Accepted(true)))
+            .await
+            .unwrap();
+        for p in [&b"ab"[..], b"cd", b"ef"] {
+            tx.send(data(p)).await.unwrap();
+        }
+        drop(tx);
+        let got: Vec<Down> = coalesced(rx).collect().await;
+        assert_eq!(got.len(), 2);
+        assert!(matches!(
+            &got[0],
+            Ok(SpliceDown {
+                msg: Some(splice_down::Msg::Accepted(true))
+            })
+        ));
+        let Ok(SpliceDown {
+            msg: Some(splice_down::Msg::Data(d)),
+        }) = &got[1]
+        else {
+            panic!("no data")
+        };
+        assert_eq!(d, b"abcdef");
     }
 }

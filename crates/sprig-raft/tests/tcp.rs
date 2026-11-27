@@ -99,7 +99,52 @@ impl Pki {
     }
 }
 
+/// A listener shared with other protocols, as the gateway's peer listener
+/// is: Raft connections are told apart by their ALPN protocol or preface
+/// and handed to the transport; anything else is dropped here.
+async fn shared_listener(t: Arc<TcpTransport>, node: Node) -> SocketAddr {
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((s, _)) = l.accept().await else {
+                continue;
+            };
+            let (t, node) = (Arc::clone(&t), node.clone());
+            tokio::spawn(async move {
+                let mut b = [0u8; 1];
+                if s.peek(&mut b).await.ok() != Some(1) {
+                    return;
+                }
+                if b[0] == tcp::PREFACE[0] {
+                    t.serve_plain(s, &node).await;
+                } else if b[0] == 0x16 {
+                    let acc = tokio_rustls::LazyConfigAcceptor::new(
+                        rustls::server::Acceptor::default(),
+                        s,
+                    );
+                    let Ok(start) = acc.await else { return };
+                    let raft = start
+                        .client_hello()
+                        .alpn()
+                        .is_some_and(|mut a| a.any(|p| p == tcp::ALPN));
+                    if let (true, Some(cfg)) = (raft, t.server_config())
+                        && let Ok(tls) = start.into_stream(cfg).await
+                    {
+                        t.serve_tls(tls, &node).await;
+                    }
+                }
+            });
+        }
+    });
+    addr
+}
+
 fn run_cluster(tls: impl Fn(u64) -> Option<TlsConfig>) {
+    run_cluster_on(tls, false);
+}
+
+fn run_cluster_on(tls: impl Fn(u64) -> Option<TlsConfig>, shared: bool) {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -122,9 +167,13 @@ fn run_cluster(tls: impl Fn(u64) -> Option<TlsConfig>) {
             seed: id,
         })
         .unwrap();
-        let addr = rt
-            .block_on(t.listen("127.0.0.1:0".parse().unwrap(), node.clone()))
-            .unwrap();
+        let addr = if shared {
+            t.set_preface(true);
+            rt.block_on(shared_listener(Arc::clone(&t), node.clone()))
+        } else {
+            rt.block_on(t.listen("127.0.0.1:0".parse().unwrap(), node.clone()))
+                .unwrap()
+        };
         addrs.push(addr);
         transports.push(t);
         threads.push(node.spawn().unwrap());
@@ -265,6 +314,17 @@ fn certificates_name_their_node() {
 fn replicates_over_mutual_tls_with_node_identity() {
     let pki = Pki::new();
     run_cluster(|id| Some(identity(&pki, id, id)));
+}
+
+#[test]
+fn replicates_through_a_shared_listener_in_plaintext() {
+    run_cluster_on(|_| None, true);
+}
+
+#[test]
+fn replicates_through_a_shared_listener_with_node_identity() {
+    let pki = Pki::new();
+    run_cluster_on(|id| Some(identity(&pki, id, id)), true);
 }
 
 #[test]
@@ -410,6 +470,135 @@ fn a_cut_off_leader_is_replaced_and_rejoins_when_healed() {
         assert!(Instant::now() < deadline, "the healed node didn't catch up");
         std::thread::sleep(Duration::from_millis(10));
     }
+    for n in &nodes {
+        n.close();
+    }
+    for t in threads {
+        t.join().unwrap();
+    }
+    rt.shutdown_timeout(Duration::from_secs(1));
+}
+
+/// Certificates renewed while the cluster runs take over without a
+/// restart, with no failed write; then a revoked node is cut off at once:
+/// its live connections close, it is refused, and the other two go on.
+#[test]
+#[allow(clippy::too_many_lines)] // one scenario, step by step
+fn renewed_certificates_take_over_and_a_revoked_node_is_cut_off() {
+    let pki = Pki::new();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let serial_of =
+        |chain: &[u8]| tcp::cert_serial(&CertificateDer::from_pem_slice(chain).unwrap()).unwrap();
+    let mut nodes = Vec::new();
+    let mut transports = Vec::new();
+    let mut threads = Vec::new();
+    let mut addrs: Vec<SocketAddr> = Vec::new();
+    // Every certificate node 3 has held: revocation lists them all, as the
+    // CA's does (a peer's connection may still be on an older one).
+    let mut held_by_3 = std::collections::BTreeSet::new();
+    for id in 1..=3u64 {
+        let (ca, chain, key) = pki.node_pems(id);
+        if id == 3 {
+            held_by_3.insert(serial_of(&chain));
+        }
+        let tls = TlsConfig::node_identity(id, &ca, &chain, &key).unwrap();
+        let t = TcpTransport::new(id, rt.handle().clone(), Some(tls));
+        let node = Node::open(NodeOptions {
+            id,
+            config: fast(),
+            store: MemLogStore::new(),
+            transport: Arc::clone(&t) as Arc<dyn sprig_raft::Transport>,
+            clock: Arc::new(SystemClock),
+            machines: Arc::new(KvMachine::factory()),
+            observer: None,
+            seed: id,
+        })
+        .unwrap();
+        addrs.push(
+            rt.block_on(t.listen("127.0.0.1:0".parse().unwrap(), node.clone()))
+                .unwrap(),
+        );
+        transports.push(t);
+        threads.push(node.spawn().unwrap());
+        nodes.push(node);
+    }
+    for t in &transports {
+        for (i, a) in addrs.iter().enumerate() {
+            t.set_peer(i as u64 + 1, *a);
+        }
+    }
+    for n in &nodes {
+        let s = n.create_group(1, &[1, 2, 3]).unwrap();
+        assert_eq!(s.wait_timeout(Duration::from_secs(5)), Some(Ok(())));
+    }
+    let leader = |among: &[u64]| {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            assert!(Instant::now() < deadline, "no leader");
+            if let Some(n) = nodes
+                .iter()
+                .find(|n| among.contains(&n.id()) && n.status(1).is_some_and(|s| s.is_leader))
+            {
+                return n.clone();
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    let mut v = 0u64;
+    let mut write = |among: &[u64]| {
+        v += 1;
+        let l = leader(among);
+        l.propose(1, toy::put(1, v), Durability::Strict)
+            .unwrap()
+            .wait_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+    };
+    for _ in 0..10 {
+        write(&[1, 2, 3]);
+    }
+    // Renew every node's certificate, twice, writing all along.
+    for round in 1..=2u64 {
+        for (i, t) in transports.iter().enumerate() {
+            let id = i as u64 + 1;
+            let (ca, chain, key) = pki.node_pems(id);
+            if id == 3 {
+                held_by_3.insert(serial_of(&chain));
+            }
+            t.set_tls(TlsConfig::node_identity(id, &ca, &chain, &key).unwrap())
+                .unwrap();
+            write(&[1, 2, 3]);
+        }
+        for t in &transports {
+            assert_eq!(t.tls_generation(), round);
+        }
+        for _ in 0..10 {
+            write(&[1, 2, 3]);
+        }
+    }
+    // Revoke node 3's certificate on nodes 1 and 2.
+    assert_eq!(held_by_3.len(), 3);
+    transports[0].set_revoked(held_by_3.clone());
+    transports[1].set_revoked(held_by_3);
+    std::thread::sleep(Duration::from_millis(300));
+    let before = nodes[2].stats().frames_received;
+    for _ in 0..10 {
+        write(&[1, 2]);
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        nodes[2].stats().frames_received,
+        before,
+        "the revoked node still hears its peers"
+    );
+    assert!(
+        !nodes[2].status(1).unwrap().is_leader,
+        "the revoked node leads"
+    );
     for n in &nodes {
         n.close();
     }

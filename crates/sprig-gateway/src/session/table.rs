@@ -92,6 +92,28 @@ impl SessionTable {
         )
     }
 
+    /// [`SessionTable::open`] under `id` (a connection another gateway
+    /// greeted with `id` and handed here, so `CONNECTION_ID()` and `KILL`
+    /// agree with its greeting); a new id of this slot when `id` is in use
+    /// here.
+    ///
+    /// # Errors
+    /// As [`SessionTable::open`].
+    pub fn open_as(
+        self: &Arc<Self>,
+        conn: &ClientConn,
+        protocol: Protocol,
+        id: ConnId,
+    ) -> Result<Session> {
+        self.open_with(
+            protocol,
+            (conn.listener.name, conn.generation),
+            conn.peer,
+            conn.tls_info(),
+            Some(id),
+        )
+    }
+
     /// [`SessionTable::open`] from parts, for callers without a
     /// [`ClientConn`] (tests, the HTTP front end's per-connection sessions).
     ///
@@ -105,6 +127,17 @@ impl SessionTable {
         peer: SocketAddr,
         tls: Option<TlsInfo>,
     ) -> Result<Session> {
+        self.open_with(protocol, (listener, listener_gen), peer, tls, None)
+    }
+
+    fn open_with(
+        self: &Arc<Self>,
+        protocol: Protocol,
+        (listener, listener_gen): (&'static str, u64),
+        peer: SocketAddr,
+        tls: Option<TlsInfo>,
+        want: Option<ConnId>,
+    ) -> Result<Session> {
         let slot = self.slot();
         let mut sessions = self
             .sessions
@@ -113,8 +146,11 @@ impl SessionTable {
         let mut counter = self.counter.lock().unwrap_or_else(PoisonError::into_inner);
         // Counters run 1..=MAX_COUNTER and wrap, skipping ids in use; 0 is
         // never used, so no session has id 0.
-        let mut id = None;
+        let mut id = want.filter(|w| w.0 != 0 && !sessions.contains_key(w));
         for _ in 0..MAX_COUNTER {
+            if id.is_some() {
+                break;
+            }
             *counter = if *counter >= MAX_COUNTER {
                 1
             } else {

@@ -315,9 +315,11 @@ impl PassSession {
             return Err(engine_in_other_txn());
         }
         let e = engine::engine()?;
-        // An XA branch takes statements only while it is active.
+        // An XA branch takes statements only while it is active; one that
+        // reads no table (`SELECT 1`) runs, as on both servers.
         if let Some(ph) = self.eng.txn.xa_phase()
             && ph != XaPhase::Active
+            && !g.tables.is_empty()
         {
             return Err(Self::xa_refusal(ph, sv.mysql));
         }

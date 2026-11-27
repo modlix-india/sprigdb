@@ -181,6 +181,23 @@ pub(crate) fn build(name: &str, args: &[Expr], env: Env<'_>) -> Result<Node> {
                     a.ty.len = 21845;
                 }
             }
+            // A whole number (the gateway writes it in as a `CAST` that
+            // says its sign): `BIGINT`, 21 digits wide.
+            if a.ty.kind == crate::types::Kind::Int {
+                a.ty.width = 8;
+                a.ty.len = 21;
+            }
+            a.ty.nullable = true;
+            Ok(a)
+        }
+        // A switch variable's value (`0` or `1`): both servers report it as
+        // a nullable `BIGINT` one digit wide.
+        "SPRIG_SYSVAR_BOOL" => {
+            let [mut a] = take(name, nodes)?;
+            if a.ty.kind == crate::types::Kind::Int {
+                a.ty.width = 8;
+                a.ty.len = 1;
+            }
             a.ty.nullable = true;
             Ok(a)
         }

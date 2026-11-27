@@ -61,6 +61,7 @@ pub mod cache;
 pub mod ddl;
 pub mod infoschema;
 pub mod migrate;
+pub mod node_ca;
 pub mod placement;
 pub mod pool_wait;
 pub mod readers;
