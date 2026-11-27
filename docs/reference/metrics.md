@@ -9,7 +9,7 @@ source: the metric macros in the source tree, and docs/metrics-help.toml
 
 Every metric SprigDB records, as exported on each process's telemetry port (`/metrics`, Prometheus text) and through OTLP. Counters end in `_total`; durations are histograms in seconds.
 
-476 metrics in 55 groups.
+477 metrics in 56 groups.
 
 ## `sprig_advisor_*`
 
@@ -732,6 +732,12 @@ Every metric SprigDB records, as exported on each process's telemetry port (`/me
 | Metric | Type | Labels | Recorded by | Description |
 |---|---|---|---|---|
 | `sprig_types_statements_total` | counter | `kind`, `plan` | sprig-types | Statements on typed and hierarchical tables; `kind` is `insert`, `update`, `delete` or `select`, `plan` how it ran (such as `hierarchy`). Unit: count. |
+
+## `sprig_unit_*`
+
+| Metric | Type | Labels | Recorded by | Description |
+|---|---|---|---|---|
+| `sprig_unit_follower_reads_total` | counter | `served` | sprig-gateway | Reads served on this node's copies of tenant units (reader sessions), by how they were let through: `served` is `local` (at once: the copy held the session's token and was fresh within the bound), `waited` (after a short wait for the copy to catch up) or `barrier` (after the leader confirmed its commits). Unit: count. |
 
 ## `sprig_vector_*`
 

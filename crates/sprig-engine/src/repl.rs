@@ -65,6 +65,27 @@ pub trait ReplicatedLog: Consensus {
         Ok(())
     }
 
+    /// Before a bounded read of `unit` on a replica that doesn't lead it
+    /// ([`crate::reads::ReadMode::Bounded`]): returns once the read may be
+    /// served here, that is when `holds_token()` and this replica is known
+    /// to be at most `max_lag` behind the leader, or once a read barrier
+    /// that started after the call completed. Waits up to `wait` for the
+    /// first before it runs the barrier. A read barrier by default.
+    ///
+    /// # Errors
+    /// No leader confirmed in time (retryable).
+    fn bounded_barrier(
+        &self,
+        unit: UnitId,
+        max_lag: std::time::Duration,
+        wait: std::time::Duration,
+        holds_token: &dyn Fn() -> bool,
+    ) -> Result<crate::reads::Served> {
+        let _ = (max_lag, wait, holds_token);
+        self.read_barrier(unit)
+            .map(|()| crate::reads::Served::Barrier)
+    }
+
     /// Asks `unit`'s current leader to hand the leadership to this node
     /// (a commit across units needs every unit led where it runs). Returns
     /// at once; nothing by default.

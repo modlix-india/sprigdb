@@ -200,6 +200,61 @@ pub async fn route(tenant: u64, protocol: Protocol) -> Route {
     }
 }
 
+/// Whether this node holds a replica (a voter or a learner) of
+/// `tenant`'s unit: where a reader session may be served. True where units
+/// aren't placed per tenant (every node holds every unit) and on a node
+/// that doesn't replicate.
+#[must_use]
+pub fn holds_replica(tenant: u64) -> bool {
+    let Some(me) = node_engine::raft_id_from_env() else {
+        return true;
+    };
+    match node_engine::unit_directory().and_then(|d| d.get(tenant)) {
+        Some(d) => d.voters.contains(&me) || d.learners.contains(&me),
+        None => node_engine::unit_directory().is_none(),
+    }
+}
+
+/// Where a reader session of `tenant` (one that reads from copies:
+/// [`crate::reader`]) is served: here when this node holds a replica of
+/// the tenant's unit; otherwise a replica that doesn't lead it, chosen by
+/// `pick` (the client's port, so connections spread over the copies), or
+/// the leader when it is the only replica known.
+pub async fn route_reader(tenant: u64, protocol: Protocol, pick: u64) -> Route {
+    if !enabled() || tenant == 0 || holds_replica(tenant) {
+        return Route::Here;
+    }
+    match reader_target(tenant, pick) {
+        Some(n) => Route::Node(n),
+        None => route(tenant, protocol).await,
+    }
+}
+
+/// A replica of `tenant`'s unit other than its leader (learners first),
+/// chosen by `pick`; `None` when no such replica is known.
+#[must_use]
+pub fn reader_target(tenant: u64, pick: u64) -> Option<u64> {
+    let me = node_engine::raft_id_from_env()?;
+    let d = node_engine::unit_directory()?.get(tenant)?;
+    let leader = match node_engine::tenant_leader(tenant) {
+        UnitLeader::Node(n) => Some(n),
+        UnitLeader::Here => Some(me),
+        UnitLeader::Any | UnitLeader::Unknown => None,
+    };
+    let copies: Vec<u64> = d
+        .learners
+        .iter()
+        .chain(d.voters.iter())
+        .copied()
+        .filter(|n| Some(*n) != leader && *n != me)
+        .collect();
+    if copies.is_empty() {
+        return None;
+    }
+    let i = usize::try_from(pick % copies.len() as u64).unwrap_or(0);
+    Some(copies[i])
+}
+
 /// A connection to hand over.
 #[derive(Debug)]
 pub struct Handoff {

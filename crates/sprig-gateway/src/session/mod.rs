@@ -315,6 +315,9 @@ struct Activity {
     tenant: Option<TenantId>,
     /// The logged-in catalog user, for revocation.
     user_id: Option<UserId>,
+    /// A reader session ([`crate::reader`]): it doesn't follow its
+    /// tenant's leader, so leadership moves don't close it.
+    reader: bool,
 }
 
 /// A session's shared half: what the [`SessionTable`] holds and other tasks
@@ -390,6 +393,17 @@ impl SessionHandle {
 
     fn activity(&self) -> std::sync::MutexGuard<'_, Activity> {
         self.activity.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Marks the session a reader session ([`crate::reader`]).
+    pub fn set_reader(&self) {
+        self.activity().reader = true;
+    }
+
+    /// Whether the session is a reader session.
+    #[must_use]
+    pub fn is_reader(&self) -> bool {
+        self.activity().reader
     }
 
     /// The `SHOW PROCESSLIST` row as of `now`.
@@ -492,6 +506,9 @@ pub struct Session {
     /// `program_name`, ...), as kept after `gateway.max_connect_attrs_bytes`:
     /// 3306's `performance_schema.session_connect_attrs`.
     pub connect_attrs: Vec<(String, String)>,
+    /// A reader session's read rules and token ([`crate::reader`]);
+    /// `None` for a session on its tenant's leader.
+    pub reader: Option<Arc<crate::reader::Reader>>,
     state: SessionState,
     handle: Arc<SessionHandle>,
     registration: Arc<Registration>,

@@ -9,7 +9,7 @@
 //! it. A proposal on a replica that doesn't lead fails at once, retryable.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use raft::prelude::Entry;
@@ -18,6 +18,7 @@ use sprig_engine::log::{
     Consensus, Durability, LogEntry, ProposalProgress, StateMachine as EngineMachine, Ticket,
     UnitId,
 };
+use sprig_engine::reads::Served;
 use sprig_engine::repl::ReplicatedLog;
 
 use crate::error::RaftError;
@@ -46,6 +47,191 @@ fn blocking<T>(f: impl FnOnce() -> T) -> T {
             tokio::task::block_in_place(f)
         }
         _ => f(),
+    }
+}
+
+/// Read barriers per unit, shared by every reader of the unit on this
+/// replica: at most one is in flight per unit, and a read that arrives
+/// while one runs waits for the next one (a barrier only covers commits
+/// acknowledged before it started). Each completed barrier marks the unit
+/// fresh as of its start, which bounded reads use without asking again.
+struct Barriers {
+    node: Node,
+    units: Mutex<HashMap<UnitId, UnitBarrier>>,
+    changed: Condvar,
+    /// Each unit's `fresh_at`, as nanoseconds after `base`, readable by
+    /// every bounded read without taking `units`.
+    fresh: std::sync::RwLock<HashMap<UnitId, Arc<std::sync::atomic::AtomicU64>>>,
+    base: Instant,
+}
+
+#[derive(Default)]
+struct UnitBarrier {
+    /// A barrier is running (started at this instant).
+    running: Option<Instant>,
+    /// The start of the latest barrier that completed: this replica held
+    /// every commit acknowledged before then.
+    fresh_at: Option<Instant>,
+    /// The latest barrier that failed: its start and what went wrong.
+    failed: Option<(Instant, String)>,
+}
+
+fn lock_units(b: &Barriers) -> MutexGuard<'_, HashMap<UnitId, UnitBarrier>> {
+    b.units.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+impl Barriers {
+    /// Returns once a barrier of `unit` that started at or after `arrived`
+    /// has completed: running one itself when none is in flight, else
+    /// waiting for the one in flight (and, if that one started earlier, for
+    /// the next).
+    fn since(&self, unit: UnitId, arrived: Instant) -> Result<()> {
+        let mut g = lock_units(self);
+        loop {
+            let b = g.entry(unit).or_default();
+            if b.fresh_at.is_some_and(|f| f >= arrived) {
+                return Ok(());
+            }
+            if let Some((at, msg)) = &b.failed
+                && *at >= arrived
+            {
+                return Err(sprig_common::SprigError::new(
+                    sprig_common::SprigCode::ShardMoved,
+                    msg.clone(),
+                ));
+            }
+            if b.running.is_some() {
+                g = self
+                    .changed
+                    .wait_timeout(g, READ_BARRIER_TRY)
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .0;
+                continue;
+            }
+            let started = Instant::now();
+            b.running = Some(started);
+            drop(g);
+            let r = self.run(unit);
+            let mut g = lock_units(self);
+            let b = g.entry(unit).or_default();
+            b.running = None;
+            match &r {
+                Ok(()) => {
+                    b.fresh_at = Some(b.fresh_at.map_or(started, |f| f.max(started)));
+                    self.publish_fresh(unit, started);
+                }
+                Err(e) => b.failed = Some((started, e.to_string())),
+            }
+            drop(g);
+            self.changed.notify_all();
+            return r;
+        }
+    }
+
+    /// The start of the latest barrier of `unit` that completed.
+    fn fresh_at(&self, unit: UnitId) -> Option<Instant> {
+        let n = self
+            .fresh
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&unit)?
+            .load(std::sync::atomic::Ordering::Acquire);
+        (n > 0).then(|| self.base + Duration::from_nanos(n))
+    }
+
+    fn publish_fresh(&self, unit: UnitId, at: Instant) {
+        let n = u64::try_from(at.saturating_duration_since(self.base).as_nanos())
+            .unwrap_or(u64::MAX)
+            .max(1);
+        let cell = {
+            let r = self.fresh.read().unwrap_or_else(PoisonError::into_inner);
+            r.get(&unit).cloned()
+        };
+        let cell = cell.unwrap_or_else(|| {
+            Arc::clone(
+                self.fresh
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .entry(unit)
+                    .or_default(),
+            )
+        });
+        cell.fetch_max(n, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// One read barrier: asks the leader, again every short while, until it
+    /// answers or the wait runs out.
+    fn run(&self, unit: UnitId) -> Result<()> {
+        let deadline = Instant::now() + READ_BARRIER_WAIT;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let failed = match self.node.read_barrier(unit.0) {
+                // Units placed per unit: a member that doesn't hold its
+                // replica yet starts it and asks the leader as any replica
+                // does; a node the unit isn't placed on holds no copy, so
+                // it must not answer as if the unit were empty.
+                Err(RaftError::NoGroup(_)) if self.node.placed() => {
+                    match self.node.start_voters(unit.0) {
+                        Some(voters) => {
+                            self.node.create_group(unit.0, &voters)?;
+                            continue;
+                        }
+                        None => {
+                            return Err(sprig_common::SprigError::new(
+                                sprig_common::SprigCode::ShardMoved,
+                                "this node holds no copy of the unit; its replicas are on \
+                                 other nodes; retry there",
+                            ));
+                        }
+                    }
+                }
+                // No replica of the unit here: nothing was replicated to
+                // this node yet (a unit nobody wrote reads as empty).
+                Err(RaftError::NoGroup(_)) => return Ok(()),
+                Err(e) if e.is_retryable() => e,
+                Err(e) => return Err(e.into()),
+                // One attempt waits a short while only: a request sent to a
+                // leader that just died is never answered, and asking again
+                // reaches whichever leader this replica knows by then.
+                Ok(slot) => match slot.wait_timeout(left.min(READ_BARRIER_TRY)) {
+                    Some(Ok(_)) => return Ok(()),
+                    Some(Err(e)) if e.is_retryable() => e,
+                    Some(Err(e)) => return Err(e.into()),
+                    None => RaftError::Dropped,
+                },
+            };
+            if Instant::now() >= deadline {
+                tracing::debug!(unit = unit.0, error = %failed, "raft: read barrier gave up");
+                return Err(sprig_common::SprigError::new(
+                    sprig_common::SprigCode::ShardMoved,
+                    "this replica could not confirm it holds the unit's latest commits (no \
+                     leader reachable); retry",
+                ));
+            }
+            std::thread::sleep(left.min(Duration::from_millis(10)));
+        }
+    }
+
+    /// Starts a barrier of `unit` in the background unless one is in
+    /// flight: bounded reads keep the unit fresh without waiting for it.
+    fn refresh(self: &Arc<Self>, unit: UnitId) {
+        {
+            let g = lock_units(self);
+            if g.get(&unit).is_some_and(|b| b.running.is_some()) {
+                return;
+            }
+        }
+        let me = Arc::clone(self);
+        let spawned = std::thread::Builder::new()
+            .name("raft-read-refresh".into())
+            .spawn(move || {
+                if let Err(e) = me.since(unit, Instant::now()) {
+                    tracing::debug!(unit = unit.0, error = %e, "raft: background read barrier failed");
+                }
+            });
+        if let Err(e) = spawned {
+            tracing::debug!(error = %e, "raft: could not start a background read barrier");
+        }
     }
 }
 
@@ -149,6 +335,8 @@ pub struct RaftConsensus {
     barriers: bool,
     /// Units whose last read barrier gave up, and when.
     barrier_failed: Mutex<HashMap<UnitId, Instant>>,
+    /// Read barriers per unit (coalesced) and each unit's freshness.
+    reads: Arc<Barriers>,
 }
 
 impl std::fmt::Debug for RaftConsensus {
@@ -170,65 +358,54 @@ impl RaftConsensus {
     /// this node doesn't hold yet starts its group with `voters`.
     #[must_use]
     pub fn with_voters(node: Node, voters: Vec<u64>) -> Self {
+        let reads = Arc::new(Barriers {
+            node: node.clone(),
+            units: Mutex::new(HashMap::new()),
+            changed: Condvar::new(),
+            fresh: std::sync::RwLock::new(HashMap::new()),
+            // Before any barrier can start, so every start is after it.
+            base: Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .unwrap_or_else(Instant::now),
+        });
         Self {
             node,
             voters,
             epochs: Mutex::new(HashMap::new()),
             barriers: true,
             barrier_failed: Mutex::new(HashMap::new()),
+            reads,
         }
     }
 
-    /// One read barrier: asks the leader, again every short while, until it
-    /// answers or the wait runs out.
-    fn wait_barrier(&self, unit: UnitId) -> Result<()> {
-        let deadline = Instant::now() + READ_BARRIER_WAIT;
-        loop {
-            let left = deadline.saturating_duration_since(Instant::now());
-            let failed = match self.node.read_barrier(unit.0) {
-                // Units placed per unit: a member that doesn't hold its
-                // replica yet starts it and asks the leader as any replica
-                // does; a node the unit isn't placed on holds no copy, so
-                // it must not answer as if the unit were empty.
-                Err(RaftError::NoGroup(_)) if self.node.placed() => {
-                    match self.node.start_voters(unit.0) {
-                        Some(voters) => {
-                            self.node.create_group(unit.0, &voters)?;
-                            continue;
-                        }
-                        None => {
-                            return Err(sprig_common::SprigError::new(
-                                sprig_common::SprigCode::ShardMoved,
-                                "this node holds no copy of the unit; its replicas are on \
-                                 other nodes; retry there",
-                            ));
-                        }
-                    }
-                }
-                // No replica of the unit here: nothing was replicated to
-                // this node yet (a unit nobody wrote reads as empty).
-                Err(RaftError::NoGroup(_)) => return Ok(()),
-                Err(e) if e.is_retryable() => e,
-                Err(e) => return Err(e.into()),
-                // One attempt waits a short while only: a request sent to a
-                // leader that just died is never answered, and asking again
-                // reaches whichever leader this replica knows by then.
-                Ok(slot) => match slot.wait_timeout(left.min(READ_BARRIER_TRY)) {
-                    Some(Ok(_)) => return Ok(()),
-                    Some(Err(e)) if e.is_retryable() => e,
-                    Some(Err(e)) => return Err(e.into()),
-                    None => RaftError::Dropped,
-                },
-            };
-            if Instant::now() >= deadline {
-                tracing::debug!(unit = unit.0, error = %failed, "raft: read barrier gave up");
-                return Err(sprig_common::SprigError::new(
-                    sprig_common::SprigCode::ShardMoved,
-                    "this replica could not confirm it holds the unit's latest commits (no \
-                     leader reachable); retry",
-                ));
-            }
-            std::thread::sleep(left.min(Duration::from_millis(10)));
+    /// When the latest completed read barrier of `unit` on this replica
+    /// started (this replica held every commit acknowledged before then).
+    #[must_use]
+    pub fn fresh_at(&self, unit: UnitId) -> Option<Instant> {
+        self.reads.fresh_at(unit)
+    }
+
+    /// Whether a read barrier of `unit` gave up in the last second.
+    fn barrier_backing_off(&self, unit: UnitId) -> bool {
+        self.barrier_failed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&unit)
+            .is_some_and(|at| at.elapsed() < READ_BARRIER_BACKOFF)
+    }
+
+    /// Notes a barrier's outcome for the back-off.
+    fn note_barrier(&self, unit: UnitId, r: &Result<()>) {
+        let mut failed = self
+            .barrier_failed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if r.as_ref()
+            .is_err_and(|e| e.code() == Some(sprig_common::SprigCode::ShardMoved))
+        {
+            failed.insert(unit, Instant::now());
+        } else {
+            failed.remove(&unit);
         }
     }
 
@@ -405,31 +582,72 @@ impl ReplicatedLog for RaftConsensus {
         if !self.barriers {
             return Ok(());
         }
-        if self
-            .barrier_failed
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&unit)
-            .is_some_and(|at| at.elapsed() < READ_BARRIER_BACKOFF)
-        {
-            return Err(sprig_common::SprigError::new(
-                sprig_common::SprigCode::ShardMoved,
-                "this replica could not confirm it holds the unit's latest commits (no \
-                 leader reachable lately); retry",
-            ));
+        if self.barrier_backing_off(unit) {
+            return Err(backing_off());
         }
-        let r = blocking(|| self.wait_barrier(unit));
-        let mut failed = self
-            .barrier_failed
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if r.as_ref()
-            .is_err_and(|e| e.code() == Some(sprig_common::SprigCode::ShardMoved))
-        {
-            failed.insert(unit, Instant::now());
-        } else {
-            failed.remove(&unit);
+        let arrived = Instant::now();
+        let r = blocking(|| self.reads.since(unit, arrived));
+        self.note_barrier(unit, &r);
+        r
+    }
+
+    fn bounded_barrier(
+        &self,
+        unit: UnitId,
+        max_lag: Duration,
+        wait: Duration,
+        holds_token: &dyn Fn() -> bool,
+    ) -> Result<Served> {
+        if !self.barriers {
+            return Ok(Served::Local);
         }
+        let arrived = Instant::now();
+        // Servable: a barrier that started after this read arrived has
+        // completed (the read is exact), or this replica holds the token
+        // and its latest barrier is recent enough.
+        let servable = |now: Instant| match self.reads.fresh_at(unit) {
+            Some(f) if f >= arrived => true,
+            Some(f) => now.saturating_duration_since(f) <= max_lag && holds_token(),
+            None => false,
+        };
+        if servable(arrived) {
+            // Keep the unit fresh ahead of the bound, in the background.
+            if self
+                .reads
+                .fresh_at(unit)
+                .is_some_and(|f| arrived.saturating_duration_since(f) > max_lag / 2)
+            {
+                self.reads.refresh(unit);
+            }
+            return Ok(Served::Local);
+        }
+        if self.barrier_backing_off(unit) {
+            return Err(backing_off());
+        }
+        let r = blocking(|| {
+            self.reads.refresh(unit);
+            let deadline = arrived + wait;
+            loop {
+                let now = Instant::now();
+                if servable(now) {
+                    return Ok(Served::Waited);
+                }
+                if now >= deadline {
+                    break;
+                }
+                // Woken by a barrier's end; the token is checked again at
+                // least every millisecond (its commit may be applying).
+                let g = lock_units(&self.reads);
+                let left = deadline.saturating_duration_since(now);
+                let _ = self
+                    .reads
+                    .changed
+                    .wait_timeout(g, left.min(Duration::from_millis(1)))
+                    .unwrap_or_else(PoisonError::into_inner);
+            }
+            self.reads.since(unit, arrived).map(|()| Served::Barrier)
+        });
+        self.note_barrier(unit, &r.as_ref().map(|_| ()).map_err(clone_err));
         r
     }
 
@@ -460,5 +678,20 @@ impl ReplicatedLog for RaftConsensus {
         {
             tracing::debug!(unit = unit.0, error = %e, "raft: could not start a unit");
         }
+    }
+}
+
+fn backing_off() -> sprig_common::SprigError {
+    sprig_common::SprigError::new(
+        sprig_common::SprigCode::ShardMoved,
+        "this replica could not confirm it holds the unit's latest commits (no leader reachable \
+         lately); retry",
+    )
+}
+
+fn clone_err(e: &sprig_common::SprigError) -> sprig_common::SprigError {
+    match e.code() {
+        Some(c) => sprig_common::SprigError::new(c, e.to_string()),
+        None => sprig_common::SprigError::internal(e.to_string()),
     }
 }

@@ -32,6 +32,10 @@ pub(crate) struct MysqlResume {
     /// takes it, so `CONNECTION_ID()` and `KILL` agree with the greeting).
     #[serde(default)]
     pub(crate) conn_id: u32,
+    /// A reader session ([`crate::reader`]): served on a node holding a
+    /// replica, not only on the leader.
+    #[serde(default)]
+    pub(crate) reader: bool,
 }
 
 impl MysqlResume {
@@ -48,6 +52,7 @@ impl MysqlResume {
             },
             tls: false,
             conn_id: 0,
+            reader: false,
         }
     }
 
@@ -80,7 +85,13 @@ pub(crate) fn resume_of(conn: &ClientConn) -> Option<MysqlResume> {
 }
 
 /// The node to hand this login to and the login's tenant, if not this one.
-pub(crate) async fn target(shared: &Shared, conn: &ClientConn, user: &[u8]) -> Option<(u64, u64)> {
+/// A reader session's login (`reader`) stays on any node holding a replica.
+pub(crate) async fn target(
+    shared: &Shared,
+    conn: &ClientConn,
+    user: &[u8],
+    reader: bool,
+) -> Option<(u64, u64)> {
     let persona = shared.cfg.persona;
     let sni = conn.tls_info().and_then(|t| t.sni);
     let tenant = shared
@@ -92,7 +103,13 @@ pub(crate) async fn target(shared: &Shared, conn: &ClientConn, user: &[u8]) -> O
             sprig_auth::mysql::max_user_len(persona),
         )
         .await?;
-    match crate::forward::route(tenant.0, protocol_of(persona)).await {
+    let route = if reader {
+        crate::forward::route_reader(tenant.0, protocol_of(persona), u64::from(conn.peer.port()))
+            .await
+    } else {
+        crate::forward::route(tenant.0, protocol_of(persona)).await
+    };
+    match route {
         crate::forward::Route::Node(n) => Some((n, tenant.0)),
         crate::forward::Route::Here => None,
     }

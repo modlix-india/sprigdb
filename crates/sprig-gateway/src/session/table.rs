@@ -198,6 +198,7 @@ impl SessionTable {
             local_questions: 0,
             local_selects: 0,
             connect_attrs: Vec::new(),
+            reader: None,
             backend: None,
             mem: None,
             state: SessionState::Handshake,
@@ -310,7 +311,7 @@ impl SessionTable {
     /// yet, because another node leads its unit now. Returns how many.
     pub fn close_moved(&self, tenant: TenantId) -> usize {
         self.mark(CloseReason::Moved, |h| {
-            !h.flags().close_requested() && h.activity().tenant == Some(tenant)
+            !h.flags().close_requested() && h.activity().tenant == Some(tenant) && !h.is_reader()
         })
     }
 

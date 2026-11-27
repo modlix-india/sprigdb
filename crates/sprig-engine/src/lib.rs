@@ -28,6 +28,7 @@ pub mod leader;
 pub mod locks;
 pub mod log;
 pub mod observe;
+pub mod reads;
 pub mod repl;
 pub mod row;
 pub mod snapshot;

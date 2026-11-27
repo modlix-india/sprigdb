@@ -30,6 +30,8 @@ mod ai_fn;
 mod capture;
 mod compat_sink;
 mod dc;
+// Reads from copies: `SET @sprig_read_token`, `SET sprig.read_from`.
+mod read_from;
 // A dropped database's sinks and logic modules go with it.
 mod dropdb;
 // Embedded columns in table DDL.
@@ -1165,6 +1167,27 @@ impl SessionExec for PassSession {
         if let Some(r) = self.sprig_dc_set(cx, &req, out).await {
             return r;
         }
+        // So are `SET @sprig_read_token` and `SET sprig.read_from`, and a
+        // statement reading the token sees the session's current one.
+        if let Some(r) = self.read_token_set(cx, &req, out).await {
+            return r;
+        }
+        // A reader session's statement reads its copy under the session's
+        // rules (or its `READ_FROM` hint): the request runs again inside
+        // them.
+        if let Some(reader) = cx.session.reader.clone()
+            && sprig_engine::reads::current().is_none()
+        {
+            let hint = match &req {
+                Request::Query { sql, .. } => crate::reader::hint(sql),
+                _ => None,
+            };
+            return Box::pin(sprig_engine::reads::scope(
+                reader.policy(hint),
+                <Self as SessionExec>::execute(self, cx, req, out),
+            ))
+            .await;
+        }
         // Queue acknowledgements held for this transaction learn how
         // it ended (the commit hook, after the request).
         let txn_word = queues::txn_word(&req);
@@ -1202,6 +1225,13 @@ impl SessionExec for PassSession {
         params: &sprig_proto_mysql::command::ExecuteParams,
     ) -> Result<crate::pipeline::PointRead> {
         self.packet_limit = u64::try_from(cx.proto.max_packet).ok();
+        if let Some(reader) = cx.session.reader.clone() {
+            return Box::pin(sprig_engine::reads::scope(
+                reader.policy(None),
+                PassSession::point_read(self, cx, stmt, params),
+            ))
+            .await;
+        }
         Box::pin(PassSession::point_read(self, cx, stmt, params)).await
     }
 

@@ -682,7 +682,10 @@ impl PassSession {
             SessVars {
                 handshake,
                 opts,
-                read_only: on(get("transaction_read_only")) || on(get("tx_read_only")),
+                // A reader session reads a copy: read-only throughout.
+                read_only: on(get("transaction_read_only"))
+                    || on(get("tx_read_only"))
+                    || cx.session.reader.is_some(),
                 autocommit_off,
                 mysql: persona == sprig_proto_mysql::Persona::MySql84,
                 status,

@@ -120,6 +120,7 @@ impl StateMachine for StoreMachine {
             .unwrap_or_else(PoisonError::into_inner);
         let mut batch = StoreBatch::new();
         let mut lasts = Vec::with_capacity(parts.len());
+        let mut maxes = Vec::with_capacity(parts.len());
         for (unit, entries) in parts {
             let Some(last) = entries.last() else {
                 continue;
@@ -143,12 +144,7 @@ impl StateMachine for StoreMachine {
                 last.index.to_be_bytes(),
             );
             if let Some(m) = part_max {
-                self.unit_ts
-                    .write()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .entry(*unit)
-                    .and_modify(|t| *t = (*t).max(m.0))
-                    .or_insert(m.0);
+                maxes.push((*unit, m.0));
                 let top = self.max_ts.fetch_max(m.0, Ordering::AcqRel).max(m.0);
                 batch.put(
                     Cf::Data,
@@ -162,6 +158,15 @@ impl StateMachine for StoreMachine {
             return Ok(());
         }
         self.store.write(&batch, WalMode::Off)?;
+        // Published only once the batch is in the store: a read on a copy
+        // that finds a unit's timestamp at or above its token reads the
+        // store without waiting for anything else.
+        if !maxes.is_empty() {
+            let mut ut = self.unit_ts.write().unwrap_or_else(PoisonError::into_inner);
+            for (u, m) in maxes {
+                ut.entry(u).and_modify(|t| *t = (*t).max(m)).or_insert(m);
+            }
+        }
         {
             let mut la = self
                 .last_applied
@@ -575,7 +580,22 @@ impl Engine {
                 "this node's replication hasn't started yet; retry",
             ));
         };
-        r.read_barrier(unit)?;
+        // A reader session's statement says how fresh its reads must be
+        // (see `crate::reads`); anything else reads exactly.
+        let policy = crate::reads::current();
+        let bounded = policy.as_ref().and_then(|p| match p.mode {
+            crate::reads::ReadMode::Bounded { max_lag } => Some((max_lag, p.wait, p.token())),
+            crate::reads::ReadMode::Exact => None,
+        });
+        let served = if let Some((max_lag, wait, token)) = bounded {
+            r.bounded_barrier(unit, max_lag, wait, &|| {
+                token == 0 || self.unit_readable_ts(unit) >= token
+            })?
+        } else {
+            r.read_barrier(unit)?;
+            crate::reads::Served::Barrier
+        };
+        crate::reads::stats().count(served);
         let ts = self
             .inner
             .sm
@@ -590,7 +610,30 @@ impl Engine {
         let ts = keys::Ts(ts);
         // The node's clock and views move past what it now holds.
         self.txn_shared().observe(ts);
+        // The token moves to what this replica is known to hold of the
+        // unit (the view's timestamp may be the node's highest when the
+        // unit applied nothing since the engine opened, which says nothing
+        // about the unit's own commits).
+        if let Some(p) = &policy {
+            p.raise(self.unit_readable_ts(unit));
+        }
         Ok(Some(ts))
+    }
+
+    /// The highest version timestamp applied to `unit` since the engine
+    /// opened, published once it is in the store (0: nothing applied
+    /// yet). Within a unit commit timestamps follow log order, so this
+    /// replica holds every commit of `unit` at or below it.
+    #[must_use]
+    pub fn unit_readable_ts(&self, unit: UnitId) -> u64 {
+        self.inner
+            .sm
+            .unit_ts
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&unit)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Attaches the replicated log tenant units commit through. Once only,

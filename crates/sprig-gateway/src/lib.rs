@@ -101,6 +101,10 @@ pub mod offload;
 pub mod outbox_feed;
 pub mod peer;
 pub mod pipeline;
+// Reader sessions: reads served on copies of a tenant's data.
+pub mod reader;
+// Extra read-only copies (learners) per unit descriptor.
+pub mod read_copies;
 pub mod reads;
 pub mod redis;
 pub mod registry;

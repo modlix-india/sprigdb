@@ -78,11 +78,28 @@ fn tls_info(t: &SpliceTls) -> TlsInfo {
     }
 }
 
+/// Whether a hand-off is a reader session's (its resume says
+/// `"reader": true`): served on any node holding a replica of the tenant.
+fn is_reader(resume_json: &str) -> bool {
+    resume_json.contains("\"reader\"")
+        && serde_json::from_str::<serde_json::Value>(resume_json)
+            .ok()
+            .and_then(|v| v.get("reader")?.as_bool())
+            == Some(true)
+}
+
 /// Whether this node should serve `tenant`'s connection that has already
-/// been handed on `hops` times, or send it to the leader it knows.
-fn redirect_to(tenant: u64, hops: u32) -> Option<u64> {
+/// been handed on `hops` times, or send it to the leader it knows (a
+/// reader session: to a replica, when this node holds none).
+fn redirect_to(tenant: u64, hops: u32, reader: bool) -> Option<u64> {
     if hops + 1 >= super::MAX_HOPS {
         return None;
+    }
+    if reader {
+        if super::holds_replica(tenant) {
+            return None;
+        }
+        return super::reader_target(tenant, u64::from(hops));
     }
     let me = node_engine::raft_id_from_env()?;
     match node_engine::tenant_leader(tenant) {
@@ -120,7 +137,7 @@ impl NodeForward for ForwardService {
                 "the node is still starting; retry".into(),
             );
         };
-        if let Some(n) = redirect_to(open.tenant_id, open.hops) {
+        if let Some(n) = redirect_to(open.tenant_id, open.hops, is_reader(&open.resume_json)) {
             return Ok(tonic::Response::new(one(splice_down::Msg::Redirect(n))));
         }
         let peer: SocketAddr = open

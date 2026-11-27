@@ -306,8 +306,17 @@ pub fn start_placement(
             global,
             stop.clone(),
         ));
+        // Extra read copies: the leader keeps its units' learners equal to
+        // their descriptors'.
+        tokio::spawn(crate::read_copies::follow(Arc::clone(&dir), stop.clone()));
         tokio::spawn(dir.follow(dc, stop));
     }
+}
+
+/// This node's Raft node, once replication started.
+#[must_use]
+pub fn raft_node() -> Option<sprig_raft::Node> {
+    RAFT.get().map(|r| r.node.node().clone())
 }
 
 /// Drops this node's replicas of `tenant`'s units (its own and its

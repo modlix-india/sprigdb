@@ -466,21 +466,23 @@ async fn login_phase(
             .increment(dropped as u64);
     }
 
-    // Served by another node (the one leading the tenant's unit): the
-    // connection goes there from its login packet on, before any of the
-    // tenant's credentials are read here.
+    // A login asking to read from copies (a reader session).
+    let reader = crate::reader::mysql_login(resp.database.as_deref(), &attrs);
+    // Served by another node (the one leading the tenant's unit; for a
+    // reader session, one holding a replica): the connection goes there
+    // from its login packet on, before any of the tenant's credentials are
+    // read here.
     if resumed.is_none()
         && crate::forward::enabled()
-        && let Some(to) = handoff::target(shared, &conn, &resp.user).await
+        && let Some(to) = handoff::target(shared, &conn, &resp.user, reader.is_some()).await
     {
+        let mut resume = handoff::MysqlResume::new(nonce, server, seq, policy);
+        resume.conn_id = session.id.0;
+        resume.reader = reader.is_some();
         *handoff = Some(handoff::Pending {
             conn,
             to,
-            resume: {
-                let mut r = handoff::MysqlResume::new(nonce, server, seq, policy);
-                r.conn_id = session.id.0;
-                r
-            },
+            resume,
             login_packet: resp_raw,
             caps,
         });
@@ -596,10 +598,19 @@ async fn login_phase(
     // SPRIG_CLAIM() and token roles: the claims of the issuer's token the
     // login used, here or in the DC it was handed to.
     exec.set_claims(login.token().map(|t| std::sync::Arc::clone(&t.claims)));
-    let db = resp
-        .database
-        .as_ref()
-        .map(|d| String::from_utf8_lossy(d).into_owned());
+    let db = match &reader {
+        // `<db>@replica`: the database without its suffix.
+        Some((from, db)) => {
+            let r = std::sync::Arc::new(crate::reader::Reader::new(*from));
+            session.handle().set_reader();
+            session.reader = Some(r);
+            db.clone()
+        }
+        None => resp
+            .database
+            .as_ref()
+            .map(|d| String::from_utf8_lossy(d).into_owned()),
+    };
     if let Some(schema) = &db {
         let mut cx = ExecCtx {
             session: &mut *session,
