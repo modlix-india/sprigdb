@@ -126,6 +126,13 @@ pub async fn handle(core: &Arc<Core>, info: &ConnInfo, req: Request<Incoming>) -
     if method == Method::GET && path == "/admin/v1/openapi.json" {
         return json_response(200, &routes::openapi(true));
     }
+    if method == Method::GET && path == crate::node_engine::UNITS_PATH {
+        let auth = header(&req, "authorization");
+        return match core.admin.authorized(auth.as_deref()).await {
+            Ok(()) => json_response(200, &crate::node_engine::units_report()),
+            Err(e) => error_response(&e),
+        };
+    }
     if method == Method::POST && path == crate::node_engine::REPLACE_PATH {
         return replace_replica(core, req)
             .await

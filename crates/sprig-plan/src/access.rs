@@ -189,6 +189,22 @@ pub trait Storage: Send + Sync {
     /// parts of `key`; `None` when storage keeps no such figure.
     fn rows_per_key(&self, table: &TableDef, key: KeyId, parts: usize) -> Option<f64>;
 
+    /// The share of the table's rows (0 to 1) whose value of `column` lies
+    /// in `ranges`: ranges of a key made of that column alone, ascending,
+    /// `NULL` first. `None` when storage keeps no statistics of the
+    /// column; the planner then guesses.
+    fn column_share(&self, table: &TableDef, column: usize, ranges: &[KeyRange]) -> Option<f64> {
+        let _ = (table, column, ranges);
+        None
+    }
+
+    /// Distinct non-`NULL` values of `column`, from storage's statistics;
+    /// `None` when it keeps none.
+    fn column_distinct(&self, table: &TableDef, column: usize) -> Option<f64> {
+        let _ = (table, column);
+        None
+    }
+
     /// The row with this complete primary key.
     fn get(&self, table: &TableDef, key: &[Value], counters: &Counters) -> Result<Option<Row>>;
 

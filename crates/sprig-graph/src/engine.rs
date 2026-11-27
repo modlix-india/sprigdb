@@ -51,6 +51,15 @@ use crate::store::{
     SchemaCounts, StoreStats, not_implicit, rk_of,
 };
 
+/// Whether far nodes and scanned nodes are read in batches (benchmarks
+/// compare both).
+static BATCHED_READS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Turns batched node reads on or off for this process (benchmarks).
+pub fn set_batched_reads(on: bool) {
+    BATCHED_READS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Ids taken from a counter at a time.
 pub const ID_BLOCK: u64 = 1000;
 
@@ -146,6 +155,13 @@ impl Dict {
         self.set_labels.get(&set).cloned().unwrap_or_default()
     }
 
+    /// Whether label set `set` holds `label`.
+    fn set_has(&self, set: u32, label: u32) -> bool {
+        self.set_labels
+            .get(&set)
+            .is_some_and(|ls| ls.contains(&label))
+    }
+
     /// The label sets holding `label`.
     fn sets_with(&self, label: u32) -> Vec<u32> {
         let mut v: Vec<u32> = self
@@ -190,6 +206,17 @@ pub struct EngineGraph {
     indexes: RwLock<Vec<IndexDef>>,
     /// `DROP GRAPH` began: no transaction may write it any more.
     dropped: std::sync::atomic::AtomicBool,
+    /// Ids of the indexes whose keys are ordered ([`crate::ordkey`]); the
+    /// others have equality-only typed-text keys.
+    ordered: RwLock<HashSet<u32>>,
+    /// The planner's statistics ([`stats`]); `None` until the first pass.
+    stats: RwLock<Option<stats::GraphStats>>,
+    /// Elements changed since the last statistics pass.
+    changes: std::sync::atomic::AtomicU64,
+    /// A statistics pass is running.
+    collecting: std::sync::atomic::AtomicBool,
+    /// This graph, for background passes.
+    me: std::sync::Weak<EngineGraph>,
 }
 
 impl std::fmt::Debug for EngineGraph {
@@ -228,7 +255,7 @@ impl EngineGraph {
             ));
         }
         let object = GRAPH_OBJECT_BASE + u32::try_from(graph_id).unwrap_or(0);
-        let g = Self {
+        let g = Arc::new_cyclic(|me| Self {
             path,
             space: GraphSpace { tenant, object },
             graph_id,
@@ -238,9 +265,25 @@ impl EngineGraph {
             ids: Mutex::new([IdBlock::default(); 2]),
             indexes: RwLock::new(Vec::new()),
             dropped: std::sync::atomic::AtomicBool::new(false),
-        };
+            ordered: RwLock::new(HashSet::new()),
+            stats: RwLock::new(None),
+            changes: std::sync::atomic::AtomicU64::new(0),
+            collecting: std::sync::atomic::AtomicBool::new(false),
+            me: me.clone(),
+        });
         g.reload()?;
-        Ok(Arc::new(g))
+        if stats::enabled() {
+            match g.load_stats()? {
+                Some(st) => *g.stats.write().unwrap_or_else(poisoned) = Some(st),
+                // A new graph's counters start at zero and stay exact;
+                // an older one gets a pass in the background.
+                None if g.is_empty()? => {
+                    *g.stats.write().unwrap_or_else(poisoned) = Some(stats::GraphStats::default());
+                }
+                None => g.analyze_in_background(),
+            }
+        }
+        Ok(g)
     }
 
     /// Reads the dictionary and index definitions again.
@@ -266,14 +309,19 @@ impl EngineGraph {
             .prefix(0, sprig_engine::keys::kind::META, k::INDEX_DEFS);
         let rows = t.scan_current(&KeyRange::prefix(&p), ScanDir::Forward, usize::MAX)?;
         let mut defs = Vec::new();
+        let mut ordered = HashSet::new();
         for (_, v) in rows {
-            if let Some(def) = decode_def(&v) {
+            if let Some((def, fmt)) = decode_def(&v) {
+                if fmt >= 1 {
+                    ordered.insert(def.id);
+                }
                 defs.push(def);
             }
         }
         t.rollback();
         *self.dict.write().unwrap_or_else(poisoned) = d;
         *self.indexes.write().unwrap_or_else(poisoned) = defs;
+        *self.ordered.write().unwrap_or_else(poisoned) = ordered;
         Ok(())
     }
 
@@ -307,6 +355,7 @@ impl EngineGraph {
             implicit,
             tickets: Vec::new(),
             schema_shared: false,
+            delta: stats::Delta::default(),
         }
     }
 
@@ -693,7 +742,7 @@ impl EngineGraph {
                             Entity::Relationship => k::split_edge(&v)?.3,
                         };
                         let (props, types) = self.decode(rec, Some(&d.props))?;
-                        let Some(key) = unique_key(d, &props, types.as_ref()).map(|v2| k::index_key(&v2)) else {
+                        let Some(key) = self.key_for(d, &props, types.as_ref()) else {
                             continue;
                         };
                         if d.unique {
@@ -741,46 +790,92 @@ impl EngineGraph {
     fn defs(&self) -> Vec<IndexDef> {
         self.indexes.read().unwrap_or_else(poisoned).clone()
     }
+
+    /// Whether index `id` has ordered keys.
+    pub(crate) fn is_ordered(&self, id: u32) -> bool {
+        self.ordered.read().unwrap_or_else(poisoned).contains(&id)
+    }
+
+    /// The key an element has in index `def` (`None`: none). Ordered
+    /// indexes use [`crate::ordkey`] keys (a text index only strings);
+    /// older ones the typed texts.
+    pub(crate) fn key_for(
+        &self,
+        def: &IndexDef,
+        props: &Json,
+        types: Option<&Json>,
+    ) -> Option<Vec<u8>> {
+        if self.is_ordered(def.id) {
+            let key = crate::ordkey::element_key(props, types, &def.props)?;
+            if def.kind == IndexKind::Text && key.first() != Some(&crate::ordkey::C_STRING) {
+                return None;
+            }
+            Some(key)
+        } else {
+            unique_key(def, props, types).map(|v| k::index_key(&v))
+        }
+    }
+
+    /// The key of one wanted value in index `def` (`None`: no element can
+    /// have it).
+    pub(crate) fn value_key_for(&self, def: &IndexDef, v: &Json) -> Option<Vec<u8>> {
+        if self.is_ordered(def.id) {
+            let key = crate::ordkey::value_key(&crate::value::from_json(v))?;
+            if def.kind == IndexKind::Text && key.first() != Some(&crate::ordkey::C_STRING) {
+                return None;
+            }
+            Some(key)
+        } else {
+            index_value(v, def.kind).map(|t| k::index_key(&[t]))
+        }
+    }
 }
 
-/// An index definition as stored.
-fn encode_def(d: &IndexDef) -> Vec<u8> {
+/// An index definition as stored; `ordered` marks [`crate::ordkey`] keys
+/// (`fmt` 1).
+fn encode_def(d: &IndexDef, ordered: bool) -> Vec<u8> {
     serde_json::json!({
         "id": d.id, "name": d.name, "unique": d.unique,
         "kind": if d.kind == IndexKind::Text { "text" } else { "range" },
         "entity": if d.entity == Entity::Node { "node" } else { "relationship" },
         "token": d.token, "token_id": d.token_id, "props": d.props, "state": d.state,
+        "fmt": u8::from(ordered),
     })
     .to_string()
     .into_bytes()
 }
 
-fn decode_def(v: &[u8]) -> Option<IndexDef> {
+/// A stored definition and its key format.
+fn decode_def(v: &[u8]) -> Option<(IndexDef, u64)> {
     let j: Json = serde_json::from_slice(v).ok()?;
-    Some(IndexDef {
-        id: u32::try_from(j.get("id")?.as_u64()?).ok()?,
-        name: j.get("name")?.as_str()?.to_owned(),
-        unique: j.get("unique")?.as_bool()?,
-        kind: if j.get("kind")?.as_str()? == "text" {
-            IndexKind::Text
-        } else {
-            IndexKind::Range
+    let fmt = j.get("fmt").and_then(Json::as_u64).unwrap_or(0);
+    Some((
+        IndexDef {
+            id: u32::try_from(j.get("id")?.as_u64()?).ok()?,
+            name: j.get("name")?.as_str()?.to_owned(),
+            unique: j.get("unique")?.as_bool()?,
+            kind: if j.get("kind")?.as_str()? == "text" {
+                IndexKind::Text
+            } else {
+                IndexKind::Range
+            },
+            entity: if j.get("entity")?.as_str()? == "node" {
+                Entity::Node
+            } else {
+                Entity::Relationship
+            },
+            token: j.get("token")?.as_str()?.to_owned(),
+            token_id: u32::try_from(j.get("token_id")?.as_u64()?).ok()?,
+            props: j
+                .get("props")?
+                .as_array()?
+                .iter()
+                .filter_map(|p| p.as_str().map(str::to_owned))
+                .collect(),
+            state: j.get("state")?.as_str()?.to_owned(),
         },
-        entity: if j.get("entity")?.as_str()? == "node" {
-            Entity::Node
-        } else {
-            Entity::Relationship
-        },
-        token: j.get("token")?.as_str()?.to_owned(),
-        token_id: u32::try_from(j.get("token_id")?.as_u64()?).ok()?,
-        props: j
-            .get("props")?
-            .as_array()?
-            .iter()
-            .filter_map(|p| p.as_str().map(str::to_owned))
-            .collect(),
-        state: j.get("state")?.as_str()?.to_owned(),
-    })
+        fmt,
+    ))
 }
 
 /// One engine transaction over a graph: a Bolt transaction, or one
@@ -797,6 +892,9 @@ pub struct GraphTxn {
     tickets: Vec<CommitTicket>,
     /// The current engine transaction holds the schema lock shared.
     schema_shared: bool,
+    /// What the current engine transaction changed in the statistics'
+    /// counters (added to them when it commits).
+    delta: stats::Delta,
 }
 
 impl std::fmt::Debug for GraphTxn {
@@ -871,6 +969,7 @@ impl GraphTxn {
         for tk in &self.tickets {
             tk.wait_async().await?;
         }
+        g.apply_delta(&std::mem::take(&mut self.delta));
         Ok(())
     }
 
@@ -1243,11 +1342,6 @@ impl EngineStore<'_> {
         be32(&a.value, 0)
     }
 
-    /// Index entries of `def` for an element (`None`: it has none).
-    fn index_key_of(def: &IndexDef, props: &Json, types: Option<&Json>) -> Option<Vec<u8>> {
-        unique_key(def, props, types).map(|vals| k::index_key(&vals))
-    }
-
     fn applies(def: &IndexDef, labels: &[u32], rtype: Option<u32>) -> bool {
         match (def.entity, rtype) {
             (Entity::Node, None) => labels.contains(&def.token_id),
@@ -1268,7 +1362,7 @@ impl EngineStore<'_> {
             .defs()
             .iter()
             .filter(|def| Self::applies(def, labels, rtype))
-            .filter_map(|def| Self::index_key_of(def, props, types).map(|k2| (def.id, k2)))
+            .filter_map(|def| self.g.key_for(def, props, types).map(|k2| (def.id, k2)))
             .collect()
     }
 
@@ -1302,7 +1396,7 @@ impl EngineStore<'_> {
             if !Self::applies(&def, labels, rtype) {
                 continue;
             }
-            let Some(key) = Self::index_key_of(&def, props, types) else {
+            let Some(key) = self.g.key_for(&def, props, types) else {
                 continue;
             };
             if except.iter().any(|(i, k2)| *i == def.id && *k2 == key) {
@@ -1356,7 +1450,7 @@ impl EngineStore<'_> {
             if !Self::applies(&def, labels, rtype) {
                 continue;
             }
-            let Some(key) = Self::index_key_of(&def, props, types) else {
+            let Some(key) = self.g.key_for(&def, props, types) else {
                 continue;
             };
             if except.iter().any(|(i, k2)| *i == def.id && *k2 == key) {
@@ -1380,13 +1474,56 @@ impl EngineStore<'_> {
         Ok(())
     }
 
-    /// Node ids an index finds for `s`, when one serves it.
+    /// The online index on `label` whose leading property is `key`
+    /// (alone, when `alone`), with ordered keys.
+    fn ordered_def(&self, label: u32, key: &str, alone: bool) -> Option<IndexDef> {
+        self.g.defs().into_iter().find(|d| {
+            d.entity == Entity::Node
+                && d.token_id == label
+                && d.state == "online"
+                && d.props.first().is_some_and(|p| p == key)
+                && (!alone || d.props.len() == 1)
+                && self.g.is_ordered(d.id)
+        })
+    }
+
+    /// The key-space prefixes of index `def`'s entries: `(shard, prefix,
+    /// entries end with the element id)`.
+    fn index_spaces(&self, def: &IndexDef) -> Vec<(u32, Vec<u8>, bool)> {
+        let n = u16::try_from(def.id).unwrap_or(u16::MAX);
+        if def.unique {
+            vec![(
+                0,
+                self.g.space.prefix(0, sprig_engine::keys::kind::UNIQUE, n),
+                false,
+            )]
+        } else {
+            self.g
+                .all_shards()
+                .map(|d| (d, self.g.space.index_prefix(d, n, &[]), true))
+                .collect()
+        }
+    }
+
+    /// The element id of an index entry.
+    fn entry_id(key: &[u8], value: &[u8], with_id: bool) -> Result<u64> {
+        if with_id {
+            be64(key, key.len() - 8)
+        } else {
+            be64(value, 0)
+        }
+    }
+
+    /// Node ids an index finds for `s`, when one serves it: equality (and
+    /// `IN`) on every property of an index, else a range (`<`, `>`,
+    /// `STARTS WITH`) on the first property of an ordered one, unless the
+    /// statistics say the range holds most of the label.
     fn index_ids(&mut self, s: &Scan) -> Result<Option<Vec<u64>>> {
         let Some(label) = s.label else {
             return Ok(None);
         };
         if s.props_eq.is_empty() {
-            return Ok(None);
+            return self.range_ids(label, s);
         }
         let defs = self.g.defs();
         let Some(def) = defs.iter().find(|d| {
@@ -1397,26 +1534,27 @@ impl EngineStore<'_> {
                     .iter()
                     .all(|p| s.props_eq.iter().any(|(k2, _)| k2 == p))
         }) else {
-            return Ok(None);
+            return self.range_ids(label, s);
         };
-        // Every combination of the wanted values, as index keys.
-        let mut keys: Vec<Vec<String>> = vec![Vec::new()];
+        // Every combination of the wanted values, as index keys (each
+        // value's key, one after another).
+        let mut keys: Vec<Vec<u8>> = vec![Vec::new()];
         for p in &def.props {
             let Some((_, vals)) = s.props_eq.iter().find(|(k2, _)| k2 == p) else {
                 return Ok(None);
             };
-            let mut texts = Vec::new();
+            let mut parts = Vec::new();
             for v in vals {
-                let Some(t) = index_value(v, def.kind) else {
-                    return Ok(None);
-                };
-                texts.push(t);
+                // A value no element can have in this index: no match.
+                if let Some(t) = self.g.value_key_for(def, v) {
+                    parts.push(t);
+                }
             }
             let mut next = Vec::new();
             for kk in &keys {
-                for t in &texts {
+                for t in &parts {
                     let mut x = kk.clone();
-                    x.push(t.clone());
+                    x.extend_from_slice(t);
                     next.push(x);
                 }
             }
@@ -1427,8 +1565,7 @@ impl EngineStore<'_> {
         }
         let n = u16::try_from(def.id).unwrap_or(u16::MAX);
         let mut ids = Vec::new();
-        for vals in keys {
-            let key = k::index_key(&vals);
+        for key in keys {
             self.stats.shard_queries += 1;
             if def.unique {
                 if let Some(v) = self.get(&self.g.space.unique(n, &key))? {
@@ -1446,6 +1583,170 @@ impl EngineStore<'_> {
         ids.sort_unstable();
         ids.dedup();
         Ok(Some(ids))
+    }
+
+    /// [`Self::index_ids`] for a range on an ordered index's first
+    /// property.
+    fn range_ids(&mut self, label: u32, s: &Scan) -> Result<Option<Vec<u64>>> {
+        for (key, pred) in &s.props_range {
+            let Some(def) = self.ordered_def(label, key, false) else {
+                continue;
+            };
+            let Some((start, end)) = pred.key_range() else {
+                // Nothing can pass (bounds of different types).
+                return Ok(Some(Vec::new()));
+            };
+            if self
+                .g
+                .est_prop(
+                    Some(label),
+                    key,
+                    &crate::store::PropPred::Range(pred.clone()),
+                )
+                .is_some_and(|share| share > 0.3)
+            {
+                continue;
+            }
+            let mut ids = Vec::new();
+            for (_, p, with_id) in self.index_spaces(&def) {
+                let mut a = p.clone();
+                a.extend_from_slice(&start);
+                let mut b = p.clone();
+                b.extend_from_slice(&end);
+                self.stats.shard_queries += 1;
+                for (ek, v) in self.scan_range(&a, &b, usize::MAX)? {
+                    ids.push(Self::entry_id(&ek, &v, with_id)?);
+                }
+            }
+            ids.sort_unstable();
+            ids.dedup();
+            return Ok(Some(ids));
+        }
+        Ok(None)
+    }
+
+    /// The first `n` nodes of `s` in the order of an ordered index
+    /// (`s.top`), with every node tied with the last, each passing the
+    /// scan's label and ranges exactly, in id order. `None` when no index
+    /// serves it, or when nodes without the property might belong (an
+    /// ascending order with no range that the index alone can't fill).
+    fn top_scan(&mut self, s: &Scan, read_keys: Option<&[String]>) -> Result<Option<Vec<NodeRow>>> {
+        const PAGE: usize = 256;
+        let (Some((key, asc, n)), Some(label)) = (&s.top, s.label) else {
+            return Ok(None);
+        };
+        if s.after.is_some()
+            || s.ids.is_some()
+            || !s.props_eq.is_empty()
+            || self.g.shards != 1
+            || *n == 0
+        {
+            return Ok(None);
+        }
+        if s.props_range.iter().any(|(k2, _)| k2 != key) {
+            return Ok(None);
+        }
+        let Some(def) = self.ordered_def(label, key, true) else {
+            return Ok(None);
+        };
+        let mut pred = crate::ordkey::RangePred::default();
+        for (_, p) in &s.props_range {
+            if !pred.merge(p.clone()) {
+                return Ok(None);
+            }
+        }
+        let ranged = !s.props_range.is_empty();
+        if !ranged && !*asc {
+            // Nodes without the property come first in a descending order.
+            return Ok(None);
+        }
+        let (start, end) = if ranged {
+            match pred.key_range() {
+                Some(r) => r,
+                None => return Ok(Some(Vec::new())),
+            }
+        } else {
+            (vec![0], vec![0xFF])
+        };
+        let Some((_, p, with_id)) = self.index_spaces(&def).into_iter().next() else {
+            return Ok(None);
+        };
+        let mut lo = p.clone();
+        lo.extend_from_slice(&start);
+        let mut hi = p.clone();
+        hi.extend_from_slice(&end);
+        let mut keys: Vec<String> = read_keys.map(<[String]>::to_vec).unwrap_or_default();
+        if read_keys.is_some() && !keys.contains(key) {
+            keys.push(key.clone());
+        }
+        let mut out: Vec<NodeRow> = Vec::new();
+        let mut tie: Option<Vec<u8>> = None;
+        'pages: loop {
+            self.stats.shard_queries += 1;
+            let dir = if *asc {
+                ScanDir::Forward
+            } else {
+                ScanDir::Reverse
+            };
+            let rows = self.t()?.scan(
+                &KeyRange::new(lo.as_slice(), hi.as_slice()),
+                dir,
+                PAGE,
+                ReadMode::Snapshot,
+            )?;
+            let full = rows.len() == PAGE;
+            for (ek, v) in &rows {
+                let vkey = if with_id {
+                    &ek[p.len()..ek.len() - 8]
+                } else {
+                    &ek[p.len()..]
+                };
+                let tl = crate::ordkey::tie_len(vkey);
+                if let Some(t) = &tie
+                    && vkey.get(..tl) != Some(t.as_slice())
+                {
+                    break 'pages;
+                }
+                let id = Self::entry_id(ek, v, with_id)?;
+                let Some(node) = self.read_node(id, read_keys.map(|_| keys.as_slice()))? else {
+                    continue;
+                };
+                if !node.labels.contains(&label) {
+                    continue;
+                }
+                let val = crate::ordkey::stored_value(&node.props, node.types.as_ref(), key);
+                if !val.is_some_and(|x| pred.passes(&x)) {
+                    continue;
+                }
+                out.push(node);
+                if out.len() >= *n && tie.is_none() {
+                    tie = Some(vkey[..tl].to_vec());
+                }
+            }
+            if !full {
+                break;
+            }
+            let Some((last, _)) = rows.last() else { break };
+            if *asc {
+                lo.clone_from(last);
+                lo.push(0);
+            } else {
+                hi.clone_from(last);
+            }
+        }
+        if out.len() < *n && !ranged {
+            // Nodes without the property may follow: not served.
+            return Ok(None);
+        }
+        if let Some(ks) = read_keys
+            && keys.len() != ks.len()
+        {
+            for x in &mut out {
+                x.props = only(&x.props, ks);
+            }
+        }
+        out.sort_by_key(|x| x.id);
+        Ok(Some(out))
     }
 
     /// The next ids of label `label` (`None`: every node) above `after`,
@@ -1491,11 +1792,38 @@ impl EngineStore<'_> {
     /// Reads node values by id (the statement's view); missing ids are
     /// skipped.
     fn read_nodes(&mut self, ids: &[u64], keys: Option<&[String]>) -> Result<Vec<NodeRow>> {
+        let vals = self.node_values(ids)?;
         let mut out = Vec::with_capacity(ids.len());
-        for &id in ids {
-            if let Some(n) = self.read_node(id, keys)? {
-                out.push(n);
+        for (&id, v) in ids.iter().zip(vals) {
+            if let Some(v) = v {
+                out.push(self.node_row(id, rk_of(id), &v, keys)?);
             }
+        }
+        Ok(out)
+    }
+
+    /// The stored values of nodes `ids` at the statement's view, in the
+    /// order given: one batched read (in key order, through one cursor)
+    /// past a few nodes.
+    fn node_values(&mut self, ids: &[u64]) -> Result<Vec<Option<Bytes>>> {
+        if ids.len() < 4 || !BATCHED_READS.load(std::sync::atomic::Ordering::Relaxed) {
+            return ids
+                .iter()
+                .map(|&id| {
+                    let (d, _) = self.g.home(id);
+                    let key = self.g.space.node(d, id);
+                    self.get(&key)
+                })
+                .collect();
+        }
+        let mut out = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(4096) {
+            let keys: Vec<Vec<u8>> = chunk
+                .iter()
+                .map(|&id| self.g.space.node(self.g.home(id).0, id))
+                .collect();
+            let refs: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
+            out.extend(self.t()?.get_snapshot_many(&refs)?);
         }
         Ok(out)
     }
@@ -1518,12 +1846,23 @@ impl EngineStore<'_> {
 
     /// Rewrites the label-set field of the adjacency entries naming node
     /// `n` (its neighbours' entries), after its labels changed.
-    async fn relabel(&mut self, n: u64, ls: u32) -> Result<()> {
+    async fn relabel(&mut self, n: u64, old_ls: u32, ls: u32) -> Result<()> {
         let (d, _) = self.g.home(n);
         for dir in [OUT, IN] {
             let p = self.g.space.adj_prefix(d, dir, n, None);
-            for (key, _) in self.scan_current(&p)? {
+            for (key, value) in self.scan_current(&p)? {
                 let (_, etype, far, edge) = adj_parts(&key)?;
+                // The counters move the relationship to the new label set
+                // (a self-loop's far side is rewritten by the time its
+                // incoming entry is read).
+                let far_ls = be32(&value, 0)?;
+                if dir == OUT {
+                    self.tx.delta.rel(old_ls, etype, far_ls, -1);
+                    self.tx.delta.rel(ls, etype, far_ls, 1);
+                } else {
+                    self.tx.delta.rel(far_ls, etype, old_ls, -1);
+                    self.tx.delta.rel(far_ls, etype, ls, 1);
+                }
                 let (fd, _) = self.g.home(far);
                 // The far node's entry for the same edge, the other way.
                 let other = if dir == OUT {
@@ -1620,7 +1959,9 @@ impl EngineStore<'_> {
                     )
                 })?;
             d.state = "building".into();
-            x.put(self.g.space.index_def(d.id), encode_def(&d))?;
+            // New indexes and constraints keep ordered keys.
+            self.g.ordered.write().unwrap_or_else(poisoned).insert(d.id);
+            x.put(self.g.space.index_def(d.id), encode_def(&d, true))?;
             Ok(())
         }
         .await;
@@ -1661,7 +2002,7 @@ impl EngineStore<'_> {
         }
         d.state = "online".into();
         let mut t = Txn::begin_on(Arc::clone(&self.g.path), self.g.opts);
-        t.put(self.g.space.index_def(d.id), encode_def(&d))?;
+        t.put(self.g.space.index_def(d.id), encode_def(&d, true))?;
         t.commit()?.wait_async().await?;
         let unique = d.unique;
         for y in self.g.indexes.write().unwrap_or_else(poisoned).iter_mut() {
@@ -1730,6 +2071,13 @@ impl GraphStore for EngineStore<'_> {
             }
             n
         };
+        // The first nodes in an index's order, when the statement keeps
+        // only those.
+        if s.top.is_some()
+            && let Some(rows) = self.top_scan(s, read_keys.as_deref())?
+        {
+            return Ok(rows);
+        }
         // By id, or through an index.
         let fixed: Option<Vec<u64>> = match &s.ids {
             Some(ids) => {
@@ -1786,10 +2134,15 @@ impl GraphStore for EngineStore<'_> {
                     }
                 }
             }
-            for id in &ids {
-                let (d, rk) = self.g.home(*id);
+            let mut batch: Vec<Option<Bytes>> = if dense.is_empty() {
+                self.node_values(&ids)?
+            } else {
+                Vec::new()
+            };
+            for (i, id) in ids.iter().enumerate() {
+                let rk = rk_of(*id);
                 let v = if dense.is_empty() {
-                    self.get(&self.g.space.node(d, *id))?
+                    batch.get_mut(i).and_then(Option::take)
                 } else {
                     dense.remove(id)
                 };
@@ -2103,6 +2456,7 @@ impl GraphStore for EngineStore<'_> {
                 .await?;
             self.put(self.g.space.label_entry(d, ls, r.id), Vec::new())
                 .await?;
+            self.tx.delta.node(ls, 1);
         }
         Ok(())
     }
@@ -2157,6 +2511,7 @@ impl GraphStore for EngineStore<'_> {
             ts.extend_from_slice(&r.dst.to_be_bytes());
             self.put(self.g.space.type_entry(sd, r.rtype, r.id), ts)
                 .await?;
+            self.tx.delta.rel(src_ls, r.rtype, dst_ls, 1);
         }
         Ok(())
     }
@@ -2205,12 +2560,15 @@ impl GraphStore for EngineStore<'_> {
         .await?;
         let rec = self.g.record(&row.props, row.types.as_ref())?;
         self.t()?.put(nk, k::node_value(ls, &rec))?;
+        self.tx.delta.changes += 1;
         if ls != old_ls {
+            self.tx.delta.node(old_ls, -1);
+            self.tx.delta.node(ls, 1);
             self.del(self.g.space.label_entry(d, old_ls, row.id))
                 .await?;
             self.put(self.g.space.label_entry(d, ls, row.id), Vec::new())
                 .await?;
-            self.relabel(row.id, ls).await?;
+            self.relabel(row.id, old_ls, ls).await?;
         }
         Ok(())
     }
@@ -2253,6 +2611,7 @@ impl GraphStore for EngineStore<'_> {
         .await?;
         let rec = self.g.record(&row.props, row.types.as_ref())?;
         self.t()?.put(ek, k::edge_value(src, rtype, dst, &rec))?;
+        self.tx.delta.changes += 1;
         let ok = self.g.space.adj(sd, OUT, src, rtype, dst, row.id);
         self.lock(&ok, true).await?;
         let far_ls = match self.current(&ok)? {
@@ -2279,10 +2638,14 @@ impl GraphStore for EngineStore<'_> {
                 .await?;
             let (dd, _) = self.g.home(dst);
             self.t()?.delete(ek)?;
-            self.del(self.g.space.adj(sd, OUT, src, rtype, dst, e.id))
-                .await?;
-            self.del(self.g.space.adj(dd, IN, dst, rtype, src, e.id))
-                .await?;
+            let ok = self.g.space.adj(sd, OUT, src, rtype, dst, e.id);
+            let ik = self.g.space.adj(dd, IN, dst, rtype, src, e.id);
+            // The ends' label sets, for the counters.
+            let dst_ls = self.current(&ok)?.map_or(Ok(0), |v| be32(&v, 0))?;
+            let src_ls = self.current(&ik)?.map_or(Ok(0), |v| be32(&v, 0))?;
+            self.del(ok).await?;
+            self.del(ik).await?;
+            self.tx.delta.rel(src_ls, rtype, dst_ls, -1);
             self.del(self.g.space.type_entry(sd, rtype, e.id)).await?;
             n += 1;
         }
@@ -2307,6 +2670,7 @@ impl GraphStore for EngineStore<'_> {
             self.t()?.delete(nk)?;
             self.del(self.g.space.label_entry(d, ls, id)).await?;
             self.tx.deleted.insert(id);
+            self.tx.delta.node(ls, -1);
             n += 1;
         }
         Ok(n)
@@ -2352,6 +2716,45 @@ impl GraphStore for EngineStore<'_> {
         self.g.dict().types.by_id.values().cloned().collect()
     }
 
+    fn est_nodes(&self, label: Option<u32>) -> Option<f64> {
+        self.g.est_nodes(label)
+    }
+
+    fn est_rels(
+        &self,
+        near: Option<u32>,
+        types: &[u32],
+        dir: Dir,
+        far: Option<u32>,
+    ) -> Option<f64> {
+        self.g.est_rels(near, types, dir, far)
+    }
+
+    fn est_prop(
+        &self,
+        label: Option<u32>,
+        key: &str,
+        pred: &crate::store::PropPred,
+    ) -> Option<f64> {
+        self.g.est_prop(label, key, pred)
+    }
+
+    fn ordered_index(&self, label: u32, key: &str) -> bool {
+        self.ordered_def(label, key, true).is_some()
+    }
+
+    fn analyze(&mut self) -> Result<(f64, f64)> {
+        if !stats::enabled() {
+            return Err(SprigError::new(
+                SprigCode::GraphUnsupported,
+                "graph statistics are switched off (SPRIGDB_GRAPH_STATS=off)",
+            ));
+        }
+        self.g.analyze()?;
+        let st = self.g.stats().unwrap_or_default();
+        Ok((st.sets.values().sum(), st.triples.values().sum()))
+    }
+
     async fn batches(&mut self) -> Result<()> {
         if self.tx.implicit {
             Ok(())
@@ -2375,6 +2778,7 @@ impl GraphStore for EngineStore<'_> {
             Ok(()) if ok => match t.commit() {
                 Ok(tk) => {
                     self.tx.tickets.push(tk);
+                    self.g.apply_delta(&self.tx.delta);
                     Ok(())
                 }
                 Err(e) => Err(e),
@@ -2390,6 +2794,7 @@ impl GraphStore for EngineStore<'_> {
         };
         self.tx.deleted.clear();
         self.tx.schema_shared = false;
+        self.tx.delta = stats::Delta::default();
         let mut nt = Txn::begin_on(Arc::clone(&self.tx.path), self.tx.opts);
         nt.begin_statement();
         self.tx.txn = Some(nt);
@@ -2429,6 +2834,27 @@ impl EngineStore<'_> {
                 Self::with_filter_keys(Some(ks), far.rel_filter)
             }
         });
+        // The far nodes the loop below reads, read together first.
+        let labels_only = far.keys.is_some_and(<[String]>::is_empty)
+            && far
+                .filter
+                .iter()
+                .all(|(key, _, _)| key.starts_with(LABEL_KEY));
+        let mut pre: HashMap<u64, Option<Bytes>> = HashMap::new();
+        if far.join {
+            let mut want: Vec<u64> = adj
+                .iter()
+                .filter(|a| only_set.is_empty() || only_set.contains(&a.far))
+                .filter(|a| !labels_only || self.tx.deleted.contains(&a.far))
+                .map(|a| a.far)
+                .collect();
+            want.sort_unstable();
+            want.dedup();
+            if want.len() >= 4 {
+                let vals = self.node_values(&want)?;
+                pre = want.into_iter().zip(vals).collect();
+            }
+        }
         let mut out = Vec::with_capacity(adj.len());
         for a in &adj {
             if !only_set.is_empty() && !only_set.contains(&a.far) {
@@ -2483,7 +2909,14 @@ impl EngineStore<'_> {
                         types: None,
                     })
                 } else {
-                    match self.read_node(a.far, node_keys.as_deref())? {
+                    let read = match pre.get(&a.far) {
+                        Some(v) => v
+                            .as_ref()
+                            .map(|v| self.node_row(a.far, rk_of(a.far), v, node_keys.as_deref()))
+                            .transpose()?,
+                        None => self.read_node(a.far, node_keys.as_deref())?,
+                    };
+                    match read {
                         Some(mut n) => {
                             if !passes(&n.labels, &n.props, far.filter) {
                                 continue;
@@ -2721,6 +3154,9 @@ impl EngineStore<'static> {
         self.element_counts().map_or(0, |c| c.1)
     }
 }
+
+#[path = "engine_stats.rs"]
+pub mod stats;
 
 #[cfg(test)]
 #[path = "engine_tests.rs"]

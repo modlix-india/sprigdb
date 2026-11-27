@@ -361,6 +361,9 @@ pub fn value_of(ty: ColumnType) -> BoxedStrategy<Value> {
         ColumnType::Json => proptest::collection::vec(any::<u8>(), 0..40)
             .prop_map(|b| Value::Json(Bytes::from(b)))
             .boxed(),
+        ColumnType::Fbt(f) => proptest::collection::vec(any::<u8>(), f.bytes())
+            .prop_map(|b| Value::Bytes(Bytes::from(b)))
+            .boxed(),
     }
 }
 

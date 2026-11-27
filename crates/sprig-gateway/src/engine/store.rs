@@ -62,6 +62,13 @@ pub(crate) struct Tx {
     /// a table's rows waits for it (as it waits for a metadata lock on
     /// the servers).
     held: Vec<(Arc<TableDef>, Space)>,
+    /// The engine's address: which node's engine the writes go to
+    /// (`ddl::note_write`).
+    eng: usize,
+    /// The document store's DDL lock, held shared from the first SQL write
+    /// of a MongoDB collection until the transaction ends, so no index
+    /// build or collection change runs between that write and the commit.
+    doc_guard: Option<sprig_doc::docstore::WriteGuard>,
 }
 
 impl std::fmt::Debug for Tx {
@@ -87,6 +94,8 @@ impl Tx {
             session: false,
             env: Env::STRICT,
             held: Vec::new(),
+            eng: std::ptr::from_ref(e).addr(),
+            doc_guard: None,
         })
     }
 
@@ -101,7 +110,28 @@ impl Tx {
             session: true,
             env: Env::STRICT,
             held: Vec::new(),
+            eng: std::ptr::from_ref(e).addr(),
+            doc_guard: None,
         })
+    }
+
+    /// A session's transaction over `t`, an engine transaction another front
+    /// end lent (a MongoDB transaction's, for an SQL statement on a table);
+    /// [`Tx::into_lent`] gives it back.
+    pub(crate) fn lent(e: &super::Engine, t: Txn) -> Self {
+        Self {
+            t,
+            session: true,
+            env: Env::STRICT,
+            held: Vec::new(),
+            eng: std::ptr::from_ref(&e.eng).addr(),
+            doc_guard: None,
+        }
+    }
+
+    /// The engine transaction [`Tx::lent`] took, back to its lender.
+    pub(crate) fn into_lent(self) -> Txn {
+        self.t
     }
 
     /// The session's rules for the statements that follow (its `sql_mode`
@@ -123,6 +153,23 @@ impl Tx {
     /// The transaction uses `def` through `sp` from now on.
     pub(crate) fn hold(&mut self, def: &Arc<TableDef>, sp: &Space) {
         self.held.push((Arc::clone(def), sp.clone()));
+    }
+
+    /// Whether the transaction holds the document store's DDL lock.
+    pub(crate) fn holds_doc_guard(&self) -> bool {
+        self.doc_guard.is_some()
+    }
+
+    /// Holds the document store's DDL lock until the transaction ends.
+    pub(crate) fn keep_doc_guard(&mut self, g: sprig_doc::docstore::WriteGuard) {
+        self.doc_guard = Some(g);
+    }
+
+    /// The request a locking access of a row makes in `mode`, waiting as
+    /// the session's statements wait (with the snapshot check where the
+    /// transaction makes it).
+    pub(crate) fn row_lock_request(&self, mode: LockMode, wait: Wait) -> LockRequest {
+        self.row_request(mode, wait)
     }
 
     /// The rules statements run under.
@@ -436,6 +483,8 @@ impl Tx {
     /// A lock error, or the transaction is too big.
     pub(crate) async fn put(&mut self, key: Bytes, value: Bytes) -> Result<()> {
         self.t.lock(&key, CURRENT).await?;
+        super::ddl::note_write(self.eng, &key);
+        super::stats::note_write(&key, 0);
         self.t.put(key, value)
     }
 
@@ -447,6 +496,7 @@ impl Tx {
     /// As for [`Tx::put`].
     pub(crate) async fn put_new(&mut self, key: Bytes, value: Bytes) -> Result<()> {
         self.t.lock_insert(&key, InsertLock::replace()).await?;
+        super::ddl::note_write(self.eng, &key);
         self.t.put(key, value)
     }
 
@@ -469,8 +519,29 @@ impl Tx {
         match self.t.lock_insert(&key, how).await? {
             InsertProbe::Exists(_) => Ok(false),
             InsertProbe::Free => {
+                super::ddl::note_write(self.eng, &key);
+                super::stats::note_write(&key, 1);
                 self.t.put(key, value)?;
                 Ok(true)
+            }
+        }
+    }
+
+    /// Writes `key` (an index entry) unless it exists: `None` when written,
+    /// else the value it holds (its lock is then kept).
+    ///
+    /// # Errors
+    /// As for [`Tx::put`].
+    pub(crate) async fn insert_or_get(
+        &mut self,
+        key: Bytes,
+        value: Bytes,
+    ) -> Result<Option<Bytes>> {
+        match self.t.lock_insert(&key, InsertLock::insert()).await? {
+            InsertProbe::Exists(v) => Ok(Some(v)),
+            InsertProbe::Free => {
+                self.t.put(key, value)?;
+                Ok(None)
             }
         }
     }
@@ -481,6 +552,8 @@ impl Tx {
     /// As for [`Tx::put`].
     pub(crate) async fn delete(&mut self, key: Bytes) -> Result<()> {
         self.t.lock(&key, CURRENT).await?;
+        super::ddl::note_write(self.eng, &key);
+        super::stats::note_write(&key, -1);
         self.t.delete(key)
     }
 

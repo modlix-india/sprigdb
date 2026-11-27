@@ -16,7 +16,8 @@
 //! | Fleet simulator | `sprig-testkit::fleet` |
 //! | Schema caps and the creation rate limit | [`model`], [`constraints`], [`ratelimit`] |
 //!
-//! Automatic split, merge and move are in [`shards`].
+//! Automatic split, merge and move are in [`shards`]. A new tenant's engine unit
+//! is placed on nodes by [`units`].
 //!
 //! The planner is pure and deterministic over a [`model::FleetView`]; the
 //! controller builds the view from etcd, probes, storage scans and gateway
@@ -38,6 +39,7 @@ pub mod schedule;
 pub mod settings;
 pub mod shards;
 pub mod thrash;
+pub mod units;
 pub mod writers;
 
 pub use decisions::{DECISIONS_MODULE, DecisionLog, MemDecisionLog, NewDecision, Outcome};

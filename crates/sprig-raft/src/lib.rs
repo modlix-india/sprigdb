@@ -66,7 +66,7 @@ pub type GroupId = u64;
 /// Raft peer ids are node ids.
 pub type NodeId = u64;
 
-pub use config::RaftConfig;
+pub use config::{PlacementLookup, RaftConfig, UnitPlacement};
 pub use consensus::{RaftConsensus, UnitMachine, UnitSnapshots};
 pub use engine_node::{EngineNode, EngineNodeOptions};
 pub use engine_snap::EngineSnapshots;

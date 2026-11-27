@@ -197,6 +197,9 @@ impl MemTable {
 pub struct MemDb {
     schema: String,
     tables: HashMap<(String, String), Arc<MemTable>>,
+    /// Answer [`Storage::column_share`] and [`Storage::column_distinct`]
+    /// from statistics of every row (see [`MemDb::with_stats`]).
+    stats: bool,
 }
 
 impl MemDb {
@@ -206,7 +209,37 @@ impl MemDb {
         Self {
             schema: schema.to_owned(),
             tables: HashMap::new(),
+            stats: false,
         }
+    }
+
+    /// The same database, answering the planner's statistics questions
+    /// from figures of every row (a histogram of each column), as storage
+    /// with statistics does.
+    #[must_use]
+    pub fn with_stats(mut self, on: bool) -> Self {
+        self.stats = on;
+        self
+    }
+
+    /// Statistics of `column` over every row of `table`.
+    fn column_stats(&self, table: &TableDef, column: usize) -> Option<crate::stats::TableStats> {
+        if !self.stats {
+            return None;
+        }
+        let t = self.mem(table).ok()?;
+        let col = t.def.columns.get(column)?;
+        let mut sample = crate::stats::ColumnSample::new(&col.ty);
+        for row in t.rows.values() {
+            sample.add(&row[column]);
+        }
+        let rows = t.rows.len() as u64;
+        Some(crate::stats::TableStats {
+            rows,
+            sampled: rows,
+            columns: vec![sample.finish(&col.name, rows, crate::stats::DEFAULT_BUCKETS, true)],
+            ..crate::stats::TableStats::default()
+        })
     }
 
     fn key(schema: &str, name: &str) -> (String, String) {
@@ -284,6 +317,16 @@ impl Storage for MemDb {
             Ok(Some((start, end))) => t.count(key, &start, end.as_deref()),
             _ => 0,
         }
+    }
+
+    fn column_share(&self, table: &TableDef, column: usize, ranges: &[KeyRange]) -> Option<f64> {
+        let st = self.column_stats(table, column)?;
+        let col = table.columns.get(column)?;
+        st.share(&col.name, &col.ty, ranges)
+    }
+
+    fn column_distinct(&self, table: &TableDef, column: usize) -> Option<f64> {
+        Some(self.column_stats(table, column)?.columns.first()?.distinct)
     }
 
     fn rows_per_key(&self, table: &TableDef, key: KeyId, parts: usize) -> Option<f64> {

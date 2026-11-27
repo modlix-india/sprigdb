@@ -55,7 +55,7 @@ impl DocStore {
             }
             for c in self.list(tenant, None)? {
                 for idx in &c.meta.indexes {
-                    let Some(secs) = idx.expire_after else {
+                    let Some(secs) = idx.expire_after.filter(|_| !idx.building) else {
                         continue;
                     };
                     if deleted >= budget {

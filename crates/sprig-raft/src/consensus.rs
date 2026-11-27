@@ -186,6 +186,25 @@ impl RaftConsensus {
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
             let failed = match self.node.read_barrier(unit.0) {
+                // Units placed per unit: a member that doesn't hold its
+                // replica yet starts it and asks the leader as any replica
+                // does; a node the unit isn't placed on holds no copy, so
+                // it must not answer as if the unit were empty.
+                Err(RaftError::NoGroup(_)) if self.node.placed() => {
+                    match self.node.start_voters(unit.0) {
+                        Some(voters) => {
+                            self.node.create_group(unit.0, &voters)?;
+                            continue;
+                        }
+                        None => {
+                            return Err(sprig_common::SprigError::new(
+                                sprig_common::SprigCode::ShardMoved,
+                                "this node holds no copy of the unit; its replicas are on \
+                                 other nodes; retry there",
+                            ));
+                        }
+                    }
+                }
                 // No replica of the unit here: nothing was replicated to
                 // this node yet (a unit nobody wrote reads as empty).
                 Err(RaftError::NoGroup(_)) => return Ok(()),
@@ -306,8 +325,18 @@ impl Consensus for RaftConsensus {
         });
         let (_, index) = match proposed {
             Err(RaftError::NoGroup(_)) => {
-                // A unit nobody wrote yet: on a fixed membership this node
-                // starts its group; the caller retries once it has a leader.
+                // A unit nobody wrote yet: on a fixed membership (the
+                // cluster's, or the unit's placement) a member starts its
+                // group; the caller retries once it has a leader. A node the
+                // unit isn't placed on answers "not the leader": its
+                // replicas are elsewhere.
+                if let Some(voters) = self.node.start_voters(unit.0) {
+                    self.start_unit(unit, &voters)?;
+                    return Err(RaftError::NotLeader { leader: None }.into());
+                }
+                if self.node.placed() {
+                    return Err(RaftError::NotLeader { leader: None }.into());
+                }
                 let voters = self.voters.clone();
                 if !voters.is_empty() {
                     self.start_unit(unit, &voters)?;
@@ -420,8 +449,14 @@ impl ReplicatedLog for RaftConsensus {
     }
 
     fn ensure_unit(&self, unit: UnitId) {
-        if !self.voters.is_empty()
-            && let Err(e) = self.start_unit(unit, &self.voters)
+        let voters = match self.node.start_voters(unit.0) {
+            Some(v) => v,
+            // Placed per unit, not here (or not known yet): nothing to start.
+            None if self.node.placed() => return,
+            None => self.voters.clone(),
+        };
+        if !voters.is_empty()
+            && let Err(e) = self.start_unit(unit, &voters)
         {
             tracing::debug!(unit = unit.0, error = %e, "raft: could not start a unit");
         }

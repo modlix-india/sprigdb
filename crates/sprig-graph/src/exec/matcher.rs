@@ -134,6 +134,11 @@ fn row_bound(e: &Expr, rows: &[Row]) -> bool {
 }
 
 /// Whether `e` uses no variables (constant for the statement).
+/// Whether `e` reads no variable (a constant or parameter expression).
+pub(super) fn is_const_expr(e: &Expr) -> bool {
+    is_const(e)
+}
+
 fn is_const(e: &Expr) -> bool {
     let mut ok = true;
     e.walk(&mut |x| {
@@ -189,6 +194,24 @@ impl Exec<'_> {
             })
             .collect();
         let conj: Vec<Expr> = where_.map(scan_conjuncts).unwrap_or_default();
+        // The statistics' order of the patterns, when it differs from the
+        // written one.
+        let reordered: Option<Vec<PathPattern>> =
+            match self.plan_order(&rows, patterns, &conj).await? {
+                Some(order) => {
+                    self.plan.push(format!(
+                        "Planner: patterns in the order {}",
+                        order
+                            .iter()
+                            .map(|i| (i + 1).to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                    Some(order.iter().map(|&i| patterns[i].clone()).collect())
+                }
+                None => None,
+            };
+        let patterns: &[PathPattern] = reordered.as_deref().unwrap_or(patterns);
         if self.late
             && let Some(w) = where_
         {
@@ -722,12 +745,17 @@ impl Exec<'_> {
                     _ => {}
                 }
             }
+            // Ranges a range index may read (a superset; the WHERE
+            // rechecks).
+            // `SPRIGDB_GRAPH_PLANNER=off` keeps the reads as they were.
+            if super::plan::planner_on() {
+                s.props_range = super::plan::ranges_of(conj, v, self.params);
+            }
         }
         Ok(Some(s))
     }
 
     /// One path pattern over `rows`.
-    #[allow(clippy::too_many_lines)] // the pattern walk, step by step
     pub(crate) async fn match_pattern(
         &mut self,
         rows: Vec<Row>,
@@ -742,14 +770,120 @@ impl Exec<'_> {
         if pat.kind != PathKind::Normal {
             return self.shortest(rows, pat).await;
         }
-        let (pat, rev) = match pat.steps.last() {
-            Some((_, last))
-                if Self::score(last, &rows, conj) > Self::score(&pat.start, &rows, conj) =>
-            {
-                (Self::reversed(pat), true)
+        // Where to start: the statistics' cheapest node, else the end with
+        // the better fixed score.
+        let planned = self.plan_start(&rows, pat, conj).await?;
+        let start = match planned {
+            Some((s, cost)) => {
+                self.plan.push(format!(
+                    "Planner: start {} (estimated cost {cost:.0})",
+                    match s {
+                        super::plan::Start::First => "at the first node".to_owned(),
+                        super::plan::Start::Last => "at the last node".to_owned(),
+                        super::plan::Start::Middle(i) =>
+                            format!("at node {i} of the pattern, both ways"),
+                    }
+                ));
+                s
             }
-            _ => (pat.clone(), false),
+            None => match pat.steps.last() {
+                Some((_, last))
+                    if Self::score(last, &rows, conj) > Self::score(&pat.start, &rows, conj) =>
+                {
+                    super::plan::Start::Last
+                }
+                _ => super::plan::Start::First,
+            },
         };
+        match start {
+            super::plan::Start::First => {
+                self.match_from(rows, pat.clone(), false, conj, mult_ok, others)
+                    .await
+            }
+            super::plan::Start::Last => {
+                self.match_from(rows, Self::reversed(pat), true, conj, mult_ok, others)
+                    .await
+            }
+            super::plan::Start::Middle(at) => {
+                self.match_split(rows, pat, at, conj, mult_ok, others).await
+            }
+        }
+    }
+
+    /// A pattern of single hops started at its node `at` (neither end): the
+    /// left part read right to left from it, then the right part from it,
+    /// bound. An anonymous middle node gets a hidden variable while the two
+    /// halves run. The row's relationship list keeps relationships unique
+    /// across both halves.
+    async fn match_split(
+        &mut self,
+        rows: Vec<Row>,
+        pat: &PathPattern,
+        at: usize,
+        conj: &[Expr],
+        mult_ok: bool,
+        others: &[&RelPat],
+    ) -> Result<Vec<Row>> {
+        let mut mid = pat.steps[at - 1].1.clone();
+        let hidden = mid.var.is_none();
+        if hidden {
+            mid.var = Some(format!(" mid{at}"));
+        }
+        let left = PathPattern {
+            var: None,
+            kind: pat.kind,
+            start: pat.start.clone(),
+            steps: pat.steps[..at - 1]
+                .iter()
+                .cloned()
+                .chain(std::iter::once((pat.steps[at - 1].0.clone(), mid.clone())))
+                .collect(),
+        };
+        let right = PathPattern {
+            var: None,
+            kind: pat.kind,
+            start: mid.clone(),
+            steps: pat.steps[at..].to_vec(),
+        };
+        // Each half sees the other's relationships as the clause's others.
+        let mut left_others: Vec<&RelPat> = others.to_vec();
+        left_others.extend(right.steps.iter().map(|(r, _)| r));
+        let mut right_others: Vec<&RelPat> = others.to_vec();
+        right_others.extend(left.steps.iter().map(|(r, _)| r));
+        let rows = Box::pin(self.match_from(
+            rows,
+            Self::reversed(&left),
+            true,
+            conj,
+            mult_ok,
+            &left_others,
+        ))
+        .await?;
+        let mut rows =
+            Box::pin(self.match_from(rows, right, false, conj, mult_ok, &right_others)).await?;
+        if hidden && let Some(v) = &mid.var {
+            for r in &mut rows {
+                r.remove(v);
+            }
+        }
+        Ok(rows)
+    }
+
+    /// One path pattern over `rows`, from its first node (`rev`: the
+    /// pattern as written is `pat` read backwards).
+    #[allow(clippy::too_many_lines)] // the pattern walk, step by step
+    async fn match_from(
+        &mut self,
+        rows: Vec<Row>,
+        pat: PathPattern,
+        rev: bool,
+        conj: &[Expr],
+        mult_ok: bool,
+        others: &[&RelPat],
+    ) -> Result<Vec<Row>> {
+        if rows.is_empty() {
+            return Ok(rows);
+        }
         // A property map on the start node compares its properties (and
         // maybe the rows' values): read them first.
         let mut rows = rows;
@@ -852,6 +986,8 @@ impl Exec<'_> {
                     "by id"
                 } else if !scan.props_eq.is_empty() {
                     "by property (pushed down, rechecked)"
+                } else if !scan.props_range.is_empty() {
+                    "by property range (pushed down, rechecked)"
                 } else if scan.label.is_some() {
                     "label table"
                 } else {
@@ -874,6 +1010,22 @@ impl Exec<'_> {
                     None
                 };
             scan.keys.clone_from(&keys);
+            // A statement that keeps only the first nodes in a property's
+            // order: a range index may read just those.
+            if join.is_none()
+                && rows.len() == 1
+                && super::plan::planner_on()
+                && let Some(pr) = &self.prune
+                && pat.start.var.as_ref() == Some(&pr.var)
+            {
+                scan.top.clone_from(&pr.scan_top);
+                if let Some((k, asc, n)) = &scan.top {
+                    self.plan.push(format!(
+                        "TopScan: the first {n} by .{k} {}, read in an ordered index's order when one serves it",
+                        if *asc { "ascending" } else { "descending" }
+                    ));
+                }
+            }
             let found = match self
                 .fuse_first_hop(&pat, &scan, join.is_none() && rows.len() == 1, track)
                 .await?

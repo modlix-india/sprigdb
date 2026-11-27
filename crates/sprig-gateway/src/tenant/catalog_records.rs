@@ -43,7 +43,7 @@ const EXCLUSIVE: LockRequest = LockRequest {
 };
 
 /// The prefix of `tenant`'s catalog records.
-fn catalog_prefix(tenant: u64) -> Vec<u8> {
+pub(crate) fn catalog_prefix(tenant: u64) -> Vec<u8> {
     let mut k = Vec::with_capacity(32);
     KeyPrefix {
         tenant,
@@ -107,6 +107,66 @@ impl EngineRecords {
 impl RecordStore for EngineRecords {
     async fn begin(&self, tenant: TenantId) -> Result<Box<dyn RecordTx>> {
         Ok(Box::new(self.begin_tx(tenant)?))
+    }
+}
+
+/// Catalog records for writers (auth changes, failed-login counters): a
+/// transaction runs on this node when it leads the tenant's unit (or the
+/// engine doesn't replicate), else on the unit's leader through its peer
+/// service, as the controller's do. A replica that doesn't lead a tenant
+/// can then still count a failed login or lock an account; cache loads
+/// keep reading this replica's own records.
+pub struct LeaderRecords {
+    local: std::sync::Arc<dyn RecordStore>,
+    dc: std::sync::Arc<dyn sprig_meta::MetaStore>,
+    remote: std::sync::OnceLock<std::sync::Arc<sprig_catalog::records::remote::RemoteRecords>>,
+}
+
+impl std::fmt::Debug for LeaderRecords {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LeaderRecords").finish_non_exhaustive()
+    }
+}
+
+impl LeaderRecords {
+    /// Writers' records over `local` (this node's), reaching other leaders
+    /// through the gateway registrations in `dc`.
+    #[must_use]
+    pub fn new(
+        local: std::sync::Arc<dyn RecordStore>,
+        dc: std::sync::Arc<dyn sprig_meta::MetaStore>,
+    ) -> Self {
+        Self {
+            local,
+            dc,
+            remote: std::sync::OnceLock::new(),
+        }
+    }
+
+    fn remote(&self) -> std::sync::Arc<sprig_catalog::records::remote::RemoteRecords> {
+        std::sync::Arc::clone(self.remote.get_or_init(|| {
+            std::sync::Arc::new(sprig_catalog::records::remote::RemoteRecords::new(
+                Some(std::sync::Arc::clone(&self.dc)),
+                crate::node_engine::peer_pems(),
+            ))
+        }))
+    }
+}
+
+#[async_trait::async_trait]
+impl RecordStore for LeaderRecords {
+    async fn begin(&self, tenant: TenantId) -> Result<Box<dyn RecordTx>> {
+        if !crate::node_engine::replicated_from_env() {
+            return self.local.begin(tenant).await;
+        }
+        let unit = sprig_engine::Engine::unit_of_tenant(tenant.0);
+        let leads = crate::node_engine::engine()
+            .map(|e| !e.is_replicated_unit(unit) || e.leader_epoch(unit) > 0)
+            .unwrap_or(true);
+        if leads {
+            return self.local.begin(tenant).await;
+        }
+        self.remote().begin(tenant).await
     }
 }
 
@@ -291,13 +351,23 @@ async fn run(
             _ => return,
         };
         let reply = match (op, tx.as_mut()) {
-            (Some(Op::BeginTenant(t)), None) => match records.begin_tx(TenantId(t)) {
-                Ok(t) => {
-                    tx = Some(t);
-                    Ok(CatalogReply::default())
+            (Some(Op::BeginTenant(t)), None) => {
+                // On one replica of several, only the node leading the
+                // tenant's unit runs its catalog transactions; another
+                // answers 39110 naming the leader, and the caller goes
+                // there.
+                let lead = match &records.eng {
+                    Some(_) => Ok(()),
+                    None => crate::node_engine::lead_catalog(t).await,
+                };
+                match lead.and_then(|()| records.begin_tx(TenantId(t))) {
+                    Ok(t) => {
+                        tx = Some(t);
+                        Ok(CatalogReply::default())
+                    }
+                    Err(e) => Err(e),
                 }
-                Err(e) => Err(e),
-            },
+            }
             (Some(Op::Get(k)), Some(t)) => t.get(&k).await.map(found),
             (Some(Op::GetForUpdate(k)), Some(t)) => t.get_for_update(&k).await.map(found),
             (Some(Op::Scan(s)), Some(t)) => {

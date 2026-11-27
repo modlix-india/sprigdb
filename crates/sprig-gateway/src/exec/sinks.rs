@@ -274,6 +274,37 @@ impl Host for GwHost<'_> {
         ) || g.allows(Action::Delete, Target::Database { db_key: &db_key })
     }
 
+    fn can_insert(&self, db_name: &str, name: &str) -> bool {
+        let Some(ts) = self.ts() else {
+            return false;
+        };
+        let g = crate::tenant::authz::privileges(ts, &self.cat);
+        if g.unrestricted() {
+            return true;
+        }
+        let lctn = self.lctn();
+        let db_key = database_key(db_name, lctn);
+        let name_key = object_key(ObjectKind::Table, name, lctn);
+        g.allows(
+            Action::Insert,
+            Target::Named {
+                db_key: &db_key,
+                name_key: &name_key,
+            },
+        ) || g.allows(Action::Insert, Target::Database { db_key: &db_key })
+    }
+
+    // An engine stream (`FROM STREAM s`, `DEAD LETTER TO STREAM d`):
+    // the node's stream log names it `<db>.<name>`.
+    fn stream(&self, db: u32, name: &str) -> Option<(u64, u32)> {
+        let db_name = self.cat.databases.get(DbId(db))?.name.clone();
+        let t = crate::kafka::engine::streams()?
+            .topic(self.cat.tenant.0, &format!("{db_name}.{name}"))
+            .ok()
+            .flatten()?;
+        Some((t.stream_id, u32::try_from(t.partitions.max(1)).unwrap_or(1)))
+    }
+
     // A durable queue of the database's vhost, from the
     // snapshot's `mq` module.
     fn queue(&self, db: u32, name: &str) -> Option<u64> {

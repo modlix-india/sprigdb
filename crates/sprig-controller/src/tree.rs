@@ -371,13 +371,17 @@ fn new_entry(
 #[derive(Clone)]
 pub struct Directory {
     global: Arc<dyn MetaStore>,
+    /// New tenants take turns here, in this process: they all move the
+    /// one id counter, so concurrent creations only beat each other's
+    /// compare-and-set (and run out of attempts) without it.
+    creating: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl std::fmt::Debug for Directory {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Directory")
             .field("tier", self.global.tier())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -390,7 +394,10 @@ impl Directory {
     /// a private tier in for `/sprig/g/`).
     #[must_use]
     pub fn new(global: Arc<dyn MetaStore>) -> Self {
-        Self { global }
+        Self {
+            global,
+            creating: Arc::new(tokio::sync::Mutex::new(())),
+        }
     }
 
     /// The store.
@@ -559,6 +566,7 @@ impl Directory {
         ids_allowed.check(None)?;
         let ids_key = self.global.tier().key("ids/tenant")?;
         let name_key = self.name_key(&req.name)?;
+        let _turn = self.creating.lock().await;
         for _ in 0..WRITE_ATTEMPTS {
             if self
                 .global

@@ -514,6 +514,38 @@ impl SortedStore for RocksStore {
         self.point_iters.clear();
     }
 
+    fn get_versions(
+        &self,
+        cf: Cf,
+        logicals: &[&[u8]],
+        at: Ts,
+        tier: ReadTier,
+    ) -> Result<Read<super::Versions>> {
+        // One cursor (taken and refreshed once) for every key: the keys'
+        // order makes neighbouring seeks share blocks.
+        let mut it = self.point_iter(cf, tier);
+        let mut out = Vec::with_capacity(logicals.len());
+        let mut seek = Vec::new();
+        for logical in logicals {
+            seek.clear();
+            seek.extend_from_slice(&keys::versioned(logical, at));
+            it.seek(&seek);
+            match it.key() {
+                Some(k) if k.len() == logical.len() + VERSION_LEN && k.starts_with(logical) => {
+                    let ts = keys::split_version(k).map(|(_, ts)| ts);
+                    out.push(ts.map(|ts| (ts, Bytes::copy_from_slice(it.value().unwrap_or(&[])))));
+                }
+                Some(_) => out.push(None),
+                None => match read_result(it.status(), "get")? {
+                    Read::Ready(()) => out.push(None),
+                    Read::WouldBlock => return Ok(Read::WouldBlock),
+                },
+            }
+        }
+        self.point_iters.keep(cf, tier, it);
+        Ok(Read::Ready(out))
+    }
+
     fn multi_get(
         &self,
         cf: Cf,

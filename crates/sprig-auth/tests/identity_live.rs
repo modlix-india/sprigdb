@@ -21,6 +21,13 @@
 //! The address-limit case runs last: it leaves 127.0.0.1 refused on A for
 //! `auth.ip_block_seconds` (300 s by default).
 //!
+//! **On the storage engine** (`SPRIG_IDENTITY_ENGINE=1`): no MariaDB. A and
+//! B are two replicas of the tenant's unit; auth changes go through the
+//! catalog peer service routed by tenant to the unit's leader (the DC
+//! tier `SPRIG_IDENTITY_DC`, default `dc-a`, on `SPRIG_TEST_ETCD`), and B
+//! sees them through replication. Tenant settings aren't written there
+//! (the settings writer is MariaDB's), so the strength check is skipped.
+//!
 //! Account changes are made the way the MySQL account statements make
 //! them: through `sprig_auth::admin` on the tenant's catalog, as auth
 //! changes. Every measured time is printed with `IDENTITY:` in front.
@@ -42,8 +49,8 @@ use sprig_auth::policy::AccountClauses;
 use sprig_catalog::records::remote::RemoteRecords;
 use sprig_catalog::settings::{FixedEtcd, SetRequest, Target};
 use sprig_catalog::{
-    AllowAll, AuthCatalog, CatalogEndpoint, DirectoryAllocator, RecBackend, LogDecisions, MariaBackend, MariaCatalog,
-    StaticLocator, Store, TenantSettingsWriter, Versioner,
+    AllowAll, AuthCatalog, CatalogEndpoint, DirectoryAllocator, LogDecisions, MariaBackend,
+    MariaCatalog, RecBackend, StaticLocator, Store, TenantSettingsWriter, Versioner,
 };
 use sprig_common::ids::{DcId, TenantId, UserId};
 use sprig_common::names::SchemaName;
@@ -61,7 +68,8 @@ fn env(k: &str, default: &str) -> String {
 struct World {
     tenant: String,
     tid: TenantId,
-    cat: MariaCatalog,
+    /// The MariaDB catalog (tenant settings); `None` on the engine.
+    cat: Option<MariaCatalog>,
     /// Auth changes: the engine node's catalog records, through gateway
     /// A's peer service (`SPRIG_IDENTITY_CATALOG_NODE`, default
     /// 127.0.0.1:7403).
@@ -129,10 +137,14 @@ impl World {
             .unwrap();
     }
 
-    async fn set_tenant_setting(&self, key: &str, v: Value) {
+    /// Sets a tenant setting; false (and nothing done) on the engine.
+    async fn set_tenant_setting(&self, key: &str, v: Value) -> bool {
+        let Some(cat) = &self.cat else {
+            return false;
+        };
         let registry = Registry::global().unwrap();
         let writer = TenantSettingsWriter::new(
-            self.cat.clone(),
+            cat.clone(),
             registry,
             Arc::new(FixedEtcd {
                 rows: Arc::new(MemSettings::new(registry)),
@@ -157,6 +169,7 @@ impl World {
             })
             .await
             .unwrap();
+        true
     }
 
     async fn login(&self, port: u16, user: &str, pw: &str) -> Result<Conn, (u16, String)> {
@@ -212,6 +225,33 @@ async fn world() -> Option<World> {
     }
     let tenant = env("SPRIG_IDENTITY_TENANT", "identity-t1");
     let tid = TenantId(env("SPRIG_IDENTITY_TENANT_ID", "0").parse().unwrap());
+    let etcd = EtcdConfig::new(vec![env("SPRIG_TEST_ETCD", "http://127.0.0.1:2379")]);
+    let global: Arc<dyn MetaStore> =
+        Arc::new(EtcdStore::connect(Tier::Global, &etcd).await.unwrap());
+    let ports = (
+        env("SPRIG_IDENTITY_GW_A", "15306").parse().unwrap(),
+        env("SPRIG_IDENTITY_GW_A_MARIA", "15307").parse().unwrap(),
+        env("SPRIG_IDENTITY_GW_B", "15316").parse().unwrap(),
+    );
+    if std::env::var("SPRIG_IDENTITY_ENGINE").ok().as_deref() == Some("1") {
+        let dc = DcId::new(env("SPRIG_IDENTITY_DC", "dc-a")).unwrap();
+        let dc_store: Arc<dyn MetaStore> =
+            Arc::new(EtcdStore::connect(Tier::Dc(dc), &etcd).await.unwrap());
+        let auth = Versioner::new(
+            RecBackend::new(Arc::new(RemoteRecords::new(Some(dc_store), None))),
+            Arc::new(DirectoryAllocator::new(Arc::clone(&global))),
+        );
+        return Some(World {
+            tenant,
+            tid,
+            cat: None,
+            auth,
+            global,
+            a: ports.0,
+            a_maria: ports.1,
+            b: ports.2,
+        });
+    }
     let url = env(
         "SPRIG_TEST_MARIADB_SINGLE",
         "mysql://root:sprig-dev-root@127.0.0.1:13301",
@@ -227,14 +267,6 @@ async fn world() -> Option<World> {
             },
         )
         .shared();
-    let global: Arc<dyn MetaStore> = Arc::new(
-        EtcdStore::connect(
-            Tier::Global,
-            &EtcdConfig::new(vec![env("SPRIG_TEST_ETCD", "http://127.0.0.1:2379")]),
-        )
-        .await
-        .unwrap(),
-    );
     let cat = Versioner::new(
         MariaBackend::new(locator),
         Arc::new(DirectoryAllocator::new(Arc::clone(&global))),
@@ -249,12 +281,12 @@ async fn world() -> Option<World> {
     Some(World {
         tenant,
         tid,
-        cat,
+        cat: Some(cat),
         auth,
         global,
-        a: env("SPRIG_IDENTITY_GW_A", "15306").parse().unwrap(),
-        a_maria: env("SPRIG_IDENTITY_GW_A_MARIA", "15307").parse().unwrap(),
-        b: env("SPRIG_IDENTITY_GW_B", "15316").parse().unwrap(),
+        a: ports.0,
+        a_maria: ports.1,
+        b: ports.2,
     })
 }
 
@@ -415,19 +447,23 @@ async fn identity_live() {
     let r = query(&mut c, &format!("SET PASSWORD = '{pw}'")).await;
     eprintln!("IDENTITY: history (MariaDB): {:?}", r.as_ref().err());
     assert_eq!(code(&r), 1819);
-    w.set_tenant_setting("auth.password_policy", Value::Str("medium".into()))
-        .await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    let mut c = w.login(w.a, "hist", pw).await.unwrap();
-    let weak = query(&mut c, "SET PASSWORD = 'weakweak'").await;
-    eprintln!("IDENTITY: strength medium: weak {:?}", weak.as_ref().err());
-    assert_eq!(code(&weak), 1819);
-    query(&mut c, "SET PASSWORD = 'Strong-pw-3!'")
+    if w.set_tenant_setting("auth.password_policy", Value::Str("medium".into()))
         .await
-        .unwrap();
-    eprintln!("IDENTITY: strength medium: 'Strong-pw-3!' accepted");
-    w.set_tenant_setting("auth.password_policy", Value::Str("<reset>".into()))
-        .await;
+    {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let mut c = w.login(w.a, "hist", pw).await.unwrap();
+        let weak = query(&mut c, "SET PASSWORD = 'weakweak'").await;
+        eprintln!("IDENTITY: strength medium: weak {:?}", weak.as_ref().err());
+        assert_eq!(code(&weak), 1819);
+        query(&mut c, "SET PASSWORD = 'Strong-pw-3!'")
+            .await
+            .unwrap();
+        eprintln!("IDENTITY: strength medium: 'Strong-pw-3!' accepted");
+        w.set_tenant_setting("auth.password_policy", Value::Str("<reset>".into()))
+            .await;
+    } else {
+        eprintln!("IDENTITY: strength: skipped (tenant settings aren't written on the engine)");
+    }
 
     // ---- 5. Revocation across two gateways ----
     for round in 0..3 {

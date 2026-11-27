@@ -69,10 +69,12 @@ fn indexable(ty: ColType) -> bool {
 }
 
 /// The generator's view of `def`: columns with distinct counts, the
-/// primary key, the indexes. The counts come from `cached` (the figures
-/// kept in the records) while they are fresh and of this definition, else
-/// from a sample of the table's first rows; the new figures are returned
-/// then, to be kept.
+/// primary key, the indexes. The counts come from the table's planner
+/// statistics when it has them (a sample of the whole table, see
+/// `crate::engine::stats`), else from `cached` (the figures kept in the
+/// records) while they are fresh and of this definition, else from a sample
+/// of the table's first rows; the new figures are returned then, to be
+/// kept.
 pub(crate) async fn table_info(
     tenant: TenantId,
     db: &str,
@@ -80,6 +82,8 @@ pub(crate) async fn table_info(
     cached: Option<&TableStats>,
     now_us: u64,
 ) -> Result<(TableInfo, Option<TableStats>)> {
+    let planner = planner_figures(tenant, db, def, now_us);
+    let cached = planner.as_ref().or(cached);
     let fresh = cached.filter(|st| {
         st.version == def.version
             && now_us.saturating_sub(st.at_us) < STATS_MAX_AGE_US
@@ -175,6 +179,37 @@ pub(crate) async fn table_info(
         rows: count,
     };
     Ok((info, taken))
+}
+
+/// The table's planner statistics as the generator's figures (distinct
+/// values per column, a `NULL` counting as one more value, and rows);
+/// `None` when the table has none.
+fn planner_figures(tenant: TenantId, db: &str, def: &TableDef, now_us: u64) -> Option<TableStats> {
+    let object = u32::try_from(def.object.0).ok()?;
+    let st = crate::engine::stats::cached(tenant.0, object).or_else(|| {
+        let eng = engine::engine().ok()?;
+        crate::engine::stats::collect::stored(eng, tenant.0, object)
+            .ok()
+            .flatten()
+            .map(Arc::new)
+    })?;
+    Some(TableStats {
+        table: format!("{db}.{}", def.name).to_lowercase(),
+        version: def.version,
+        rows: st.rows,
+        distinct: def
+            .columns
+            .iter()
+            .map(|c| {
+                let d = st
+                    .column(&c.name)
+                    .map_or(0.0, |s| s.distinct + if s.nulls > 0.0 { 1.0 } else { 0.0 });
+                (c.name.clone(), d)
+            })
+            .collect(),
+        // Fresh for the check below: the statistics refresh themselves.
+        at_us: now_us,
+    })
 }
 
 /// A value as SQL literal text.

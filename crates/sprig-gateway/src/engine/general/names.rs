@@ -200,6 +200,39 @@ struct Expand<'a, 'b> {
     err: Option<SprigError>,
 }
 
+/// A share's query parsed, kept per (tenant, share) while its text stays
+/// the same: a read through a share parses it once, not once per
+/// statement.
+fn share_query(
+    tenant: u64,
+    share: u64,
+    sql: &str,
+) -> std::result::Result<Box<sqlparser::ast::Query>, sqlparser::parser::ParserError> {
+    type Parsed = std::collections::HashMap<(u64, u64), (Arc<str>, Box<sqlparser::ast::Query>)>;
+    static PARSED: std::sync::LazyLock<std::sync::Mutex<Parsed>> =
+        std::sync::LazyLock::new(std::sync::Mutex::default);
+    let lock = || {
+        PARSED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    };
+    if let Some((text, q)) = lock().get(&(tenant, share))
+        && &**text == sql
+    {
+        return Ok(q.clone());
+    }
+    let q = sqlparser::parser::Parser::new(&sprig_plan::dialect::SprigMySql)
+        .try_with_sql(sql)
+        .and_then(|mut p| p.parse_query())?;
+    let mut m = lock();
+    // Bounded: shares are few per process; a churn of them starts over.
+    if m.len() >= 4096 {
+        m.clear();
+    }
+    m.insert((tenant, share), (Arc::from(sql), q.clone()));
+    Ok(q)
+}
+
 impl Expand<'_, '_> {
     /// A share read in process: `__sprig_share_<id>` in the session's
     /// schema (or, inside a share's query, in a parent's) as the derived
@@ -251,10 +284,7 @@ impl Expand<'_, '_> {
                 format!("Table '{}' doesn't exist", table.value),
             )));
         };
-        let parsed = sqlparser::parser::Parser::new(&sprig_plan::dialect::SprigMySql)
-            .try_with_sql(&sh.sql)
-            .and_then(|mut p| p.parse_query());
-        let q = match parsed {
+        let q = match share_query(tenant.0, id, &sh.sql) {
             Ok(q) => q,
             Err(e) => {
                 return Some(Err(SprigError::internal(format!(
@@ -1326,8 +1356,8 @@ impl Walk<'_, '_> {
         } else {
             let db_name = self.cx.names.db_name(db);
             self.tables.push(TableUse {
-                plan: Arc::new(if coll.is_some() {
-                    crate::engine::collection::plan_table(&def, &db_name)
+                plan: Arc::new(if let Some(c) = &coll {
+                    crate::engine::collection::plan_table_of(c, &db_name)
                 } else {
                     plan_table(&def, &db_name)
                 }),

@@ -142,6 +142,9 @@ pub struct NodeStats {
     pub writes: u64,
     /// Log store syncs.
     pub syncs: u64,
+    /// Time the log writer spent in synced writes and syncs, in
+    /// microseconds (the log writer thread only).
+    pub sync_micros: u64,
     /// Frames sent.
     pub frames_sent: u64,
     /// Frames received.
@@ -165,6 +168,7 @@ struct Counters {
     turns: AtomicU64,
     writes: AtomicU64,
     syncs: AtomicU64,
+    sync_micros: AtomicU64,
     frames_sent: AtomicU64,
     frames_received: AtomicU64,
     messages_sent: AtomicU64,
@@ -175,6 +179,11 @@ struct Counters {
 
 fn bump(c: &AtomicU64, n: u64) {
     c.fetch_add(n, Ordering::Relaxed);
+}
+
+/// Microseconds since `t`.
+fn micros(t: Instant) -> u64 {
+    u64::try_from(t.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -318,10 +327,35 @@ struct WriterState {
     failed: Option<RaftError>,
 }
 
+/// A write group of the pipelined log writer on its way to persisted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SyncWait {
+    /// Written; waits for a sync that begins after now.
+    Sync,
+    /// A sync (by number) that began after it was written is running.
+    Syncing(u64),
+    /// Durable, or it needed no sync.
+    Done,
+}
+
+/// The pipelined log writer's write groups, in write order, and its syncs.
+#[derive(Default)]
+struct SyncQueue {
+    /// (the group's last job, its state), oldest first.
+    groups: VecDeque<(u64, SyncWait)>,
+    /// Syncs begun.
+    begun: u64,
+    /// No more groups come: the sync workers finish what waits and exit.
+    stop: bool,
+    /// A sync failed: nothing more is synced.
+    failed: bool,
+}
+
 /// Log writes on a thread of their own ([`RaftConfig::log_writer_thread`]):
 /// the loop hands each pass's batch over and goes on stepping groups while
 /// the write and sync run; jobs queued meanwhile go out together, with one
-/// sync.
+/// sync. With a store that overlaps syncs ([`LogStore::sync_pipeline`]) the
+/// thread only writes, and sync workers beside it sync what was written.
 #[derive(Default)]
 struct Writer {
     tx: Mutex<Option<std::sync::mpsc::Sender<LogJob>>>,
@@ -1025,6 +1059,20 @@ impl Node {
         g.raw.raft.prs().get(peer).map(|p| p.matched)
     }
 
+    /// The voters this node starts `group` with if it doesn't hold it yet
+    /// ([`RaftConfig::start_voters`]): `None` when this node isn't one of
+    /// them, or the unit's placement isn't known here.
+    #[must_use]
+    pub fn start_voters(&self, group: GroupId) -> Option<Vec<NodeId>> {
+        self.inner.cfg.start_voters(self.inner.id, group)
+    }
+
+    /// Whether units are placed per unit here ([`RaftConfig::placement`]).
+    #[must_use]
+    pub fn placed(&self) -> bool {
+        self.inner.cfg.placement.is_some()
+    }
+
     /// The groups hosted here.
     #[must_use]
     pub fn groups(&self) -> Vec<GroupId> {
@@ -1099,6 +1147,50 @@ impl Node {
         true
     }
 
+    /// Removes this node's replica of `group` on its own, as a membership
+    /// change that removed it would: its pending proposals and reads fail,
+    /// its log is deleted and a tombstone at its applied index kept, so no
+    /// message (nor the placement lookup) brings it back; only
+    /// [`Node::create_group`] does. For a unit whose owner is gone (a
+    /// deleted tenant), which every member drops this way. Returns whether
+    /// this node held it.
+    ///
+    /// # Errors
+    /// [`RaftError::Closed`].
+    pub fn drop_group(&self, group: GroupId) -> Result<bool, RaftError> {
+        if self.inner.closed.load(Ordering::Acquire) {
+            return Err(RaftError::Closed);
+        }
+        let Some(cell) = self.cell(group) else {
+            return Ok(false);
+        };
+        let mut g = lock(&cell.g);
+        let at = g.applied;
+        let (term, role) = g.role;
+        fail_pending(&mut g, 0, &RaftError::NoGroup(group));
+        fail_reads(&mut g, &RaftError::NoGroup(group));
+        for (_, r) in g.waiting.drain(..) {
+            r.slot.set(Err(RaftError::NoGroup(group)));
+        }
+        self.write_groups().remove(&group);
+        lock(&self.inner.active).remove(&group);
+        lock(&self.inner.tombstones).insert(group, at);
+        lock(&self.inner.inbox).writes.push(GroupWrite {
+            group,
+            remove: Some(at),
+            ..GroupWrite::default()
+        });
+        drop(g);
+        cell.progress.close();
+        if role == StateRole::Leader {
+            let now = self.inner.clock.now();
+            self.inner.observer.on_lease_end(group, term, now);
+            self.inner.observer.on_role(group, term, false);
+        }
+        self.inner.wake.notify_one();
+        Ok(true)
+    }
+
     /// Counters.
     #[must_use]
     pub fn stats(&self) -> NodeStats {
@@ -1108,6 +1200,7 @@ impl Node {
             turns: ld(&c.turns),
             writes: ld(&c.writes),
             syncs: ld(&c.syncs),
+            sync_micros: ld(&c.sync_micros),
             frames_sent: ld(&c.frames_sent),
             frames_received: ld(&c.frames_received),
             messages_sent: ld(&c.messages_sent),
@@ -1213,6 +1306,7 @@ impl Node {
         let spawned = std::thread::Builder::new()
             .name(format!("sprig-raft-maint-{}", self.inner.id))
             .spawn(move || {
+                let mut last = node.stats();
                 loop {
                     for _ in 0..100 {
                         if node.is_closed() {
@@ -1221,6 +1315,19 @@ impl Node {
                         std::thread::sleep(Duration::from_millis(100));
                     }
                     node.inner.store.maintain();
+                    let now = node.stats();
+                    if now.writes != last.writes {
+                        let syncs = now.syncs - last.syncs;
+                        tracing::debug!(
+                            node = node.inner.id,
+                            writes = now.writes - last.writes,
+                            syncs,
+                            sync_avg_us = (now.sync_micros - last.sync_micros) / syncs.max(1),
+                            turns = now.turns - last.turns,
+                            "raft log in the last 10 s"
+                        );
+                    }
+                    last = now;
                 }
             });
         match spawned {
@@ -1255,6 +1362,14 @@ impl Node {
     /// The log writer thread: writes jobs in order; jobs that queued up
     /// while the last write ran go out together, synced once.
     fn write_loop(&self, rx: &std::sync::mpsc::Receiver<LogJob>) {
+        match self.inner.store.sync_pipeline() {
+            0 => self.write_loop_serial(rx),
+            depth => self.write_loop_pipelined(rx, depth),
+        }
+    }
+
+    /// [`Node::write_loop`] with each write synced before the next begins.
+    fn write_loop_serial(&self, rx: &std::sync::mpsc::Receiver<LogJob>) {
         while let Ok(first) = rx.recv() {
             let mut jobs = vec![first];
             while let Ok(j) = rx.try_recv() {
@@ -1263,6 +1378,7 @@ impl Node {
             let sync = jobs.iter().any(|j| j.sync);
             let n = jobs.len();
             let batches: Vec<&WriteBatch> = jobs.iter().map(|j| &j.batch).collect();
+            let began = Instant::now();
             let res = match self.inner.store.write_all(&batches, sync) {
                 Ok(()) => {
                     bump(&self.inner.counters.writes, n as u64);
@@ -1275,6 +1391,7 @@ impl Node {
             };
             if sync && res.is_ok() {
                 bump(&self.inner.counters.syncs, 1);
+                bump(&self.inner.counters.sync_micros, micros(began));
             }
             let failed = res.is_err();
             {
@@ -1290,6 +1407,131 @@ impl Node {
                 return;
             }
         }
+    }
+
+    /// [`Node::write_loop`] with syncs overlapped: this thread only writes
+    /// ([`LogStore::write_unsynced`]), and up to `depth` sync workers each
+    /// sync everything written before they begin
+    /// ([`LogStore::sync_written`]). A write group counts as persisted once
+    /// a sync that began after it was written has returned and every group
+    /// before it counts too, so the persisted mark only moves over a
+    /// durable prefix. While syncs run, the next writes go to the file.
+    fn write_loop_pipelined(&self, rx: &std::sync::mpsc::Receiver<LogJob>, depth: usize) {
+        let q = (Mutex::new(SyncQueue::default()), Condvar::new());
+        std::thread::scope(|s| {
+            let mut workers = 0;
+            for i in 0..depth {
+                let q = &q;
+                let spawned = std::thread::Builder::new()
+                    .name(format!("sprig-raft-sync-{}-{i}", self.inner.id))
+                    .spawn_scoped(s, move || self.sync_worker(q));
+                workers += usize::from(spawned.is_ok());
+            }
+            if workers == 0 {
+                tracing::warn!(
+                    node = self.inner.id,
+                    "raft log: no sync worker started; each write is synced before the next"
+                );
+                self.write_loop_serial(rx);
+                return;
+            }
+            while let Ok(first) = rx.recv() {
+                if lock(&q.0).failed {
+                    break;
+                }
+                let mut jobs = vec![first];
+                while let Ok(j) = rx.try_recv() {
+                    jobs.push(j);
+                }
+                let sync = jobs.iter().any(|j| j.sync);
+                let n = jobs.len();
+                let last = jobs[n - 1].seq;
+                let batches: Vec<&WriteBatch> = jobs.iter().map(|j| &j.batch).collect();
+                if let Err((done, e)) = self.inner.store.write_unsynced(&batches, sync) {
+                    bump(&self.inner.counters.writes, done as u64);
+                    self.writer_failed(e);
+                    break;
+                }
+                bump(&self.inner.counters.writes, n as u64);
+                let mut g = lock(&q.0);
+                let wait = if sync { SyncWait::Sync } else { SyncWait::Done };
+                g.groups.push_back((last, wait));
+                self.publish_persisted(&mut g);
+                drop(g);
+                q.1.notify_all();
+            }
+            lock(&q.0).stop = true;
+            q.1.notify_all();
+        });
+    }
+
+    /// One sync worker of [`Node::write_loop_pipelined`].
+    fn sync_worker(&self, q: &(Mutex<SyncQueue>, Condvar)) {
+        let mut g = lock(&q.0);
+        loop {
+            if g.failed {
+                return;
+            }
+            if g.groups.iter().any(|(_, w)| *w == SyncWait::Sync) {
+                g.begun += 1;
+                let id = g.begun;
+                for (_, w) in &mut g.groups {
+                    if *w == SyncWait::Sync {
+                        *w = SyncWait::Syncing(id);
+                    }
+                }
+                drop(g);
+                let began = Instant::now();
+                let res = self.inner.store.sync_written();
+                g = lock(&q.0);
+                match res {
+                    Ok(()) => {
+                        bump(&self.inner.counters.syncs, 1);
+                        bump(&self.inner.counters.sync_micros, micros(began));
+                        for (_, w) in &mut g.groups {
+                            if *w == SyncWait::Syncing(id) {
+                                *w = SyncWait::Done;
+                            }
+                        }
+                        self.publish_persisted(&mut g);
+                    }
+                    Err(e) => {
+                        g.failed = true;
+                        self.writer_failed(e);
+                    }
+                }
+                q.1.notify_all();
+                continue;
+            }
+            if g.stop {
+                return;
+            }
+            g = q.1.wait(g).unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
+    /// Moves the persisted mark over the done groups at the front.
+    fn publish_persisted(&self, g: &mut SyncQueue) {
+        let mut upto = None;
+        while let Some(&(seq, SyncWait::Done)) = g.groups.front() {
+            g.groups.pop_front();
+            upto = Some(seq);
+        }
+        if let Some(seq) = upto {
+            {
+                let mut st = lock(&self.inner.writer.state);
+                st.persisted = st.persisted.max(seq);
+            }
+            self.inner.writer.cv.notify_all();
+            self.inner.wake.notify_one();
+        }
+    }
+
+    /// A log write or sync failed: the loop stops the node.
+    fn writer_failed(&self, e: RaftError) {
+        lock(&self.inner.writer.state).failed = Some(e);
+        self.inner.writer.cv.notify_all();
+        self.inner.wake.notify_one();
     }
 
     /// Whether a write handed to the writer thread is done and waits for
@@ -1606,6 +1848,10 @@ impl Node {
         for it in frame.items {
             match it {
                 Item::Raft(gid, sender_applied, m) => {
+                    // A frame speaks for its sender only.
+                    if m.from != frame.from {
+                        continue;
+                    }
                     let t = m.get_msg_type();
                     if grace
                         && matches!(
@@ -1744,11 +1990,13 @@ impl Node {
         if let Some(c) = self.cell(gid) {
             return Some(c);
         }
-        let statics = &self.inner.cfg.static_voters;
-        if statics.contains(&self.inner.id) && !lock(&self.inner.tombstones).contains_key(&gid) {
-            // A fixed membership: every member starts the group the same
-            // way, whoever hears of it first.
-            return match self.create_group(gid, statics) {
+        if let Some(voters) = self.inner.cfg.start_voters(self.inner.id, gid)
+            && !lock(&self.inner.tombstones).contains_key(&gid)
+        {
+            // A fixed membership (the cluster's, or the unit's placement):
+            // every member starts the group the same way, whoever hears of
+            // it first.
+            return match self.create_group(gid, &voters) {
                 Ok(_) => self.cell(gid),
                 Err(e) => {
                     tracing::warn!(group = gid, error = %e, "raft: could not create a group");

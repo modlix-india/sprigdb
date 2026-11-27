@@ -183,6 +183,77 @@ pub enum Pred {
     True,
 }
 
+/// Variables every expression may read.
+const SYSTEM_VARS: [&str; 10] = [
+    "ROOT",
+    "CURRENT",
+    "NOW",
+    "CLUSTER_TIME",
+    "REMOVE",
+    "DESCEND",
+    "PRUNE",
+    "KEEP",
+    "SEARCH_META",
+    "USER_ROLES",
+];
+
+/// 17276 for a `$$name` in `$expr` that nothing defines, as MongoDB
+/// refuses when it parses the filter (even if no document is read).
+/// `bound` holds the names the enclosing `$let`, `$map`, `$filter` and
+/// `$reduce` define (a command's `let` is already bound to literals).
+fn check_vars(e: &Bson, bound: &mut Vec<String>) -> Result<(), MongoError> {
+    match e {
+        Bson::String(s) if s.starts_with("$$") => {
+            let name = s[2..].split('.').next().unwrap_or_default();
+            if !SYSTEM_VARS.contains(&name) && !bound.iter().any(|b| b == name) {
+                return Err(MongoError::new(
+                    17276,
+                    format!("Use of undefined variable: {name}"),
+                ));
+            }
+            Ok(())
+        }
+        Bson::Array(a) => a.iter().try_for_each(|x| check_vars(x, bound)),
+        Bson::Document(d) => {
+            let n = bound.len();
+            match d.iter().next().map(|(k, _)| k.as_str()) {
+                Some("$literal") => return Ok(()),
+                Some("$let") => {
+                    if let Some(Bson::Document(vars)) =
+                        d.get_document("$let").ok().and_then(|l| l.get("vars"))
+                    {
+                        for x in vars.values() {
+                            check_vars(x, bound)?;
+                        }
+                        bound.extend(vars.keys().cloned());
+                    }
+                    if let Some(i) = d.get_document("$let").ok().and_then(|l| l.get("in")) {
+                        check_vars(i, bound)?;
+                    }
+                    bound.truncate(n);
+                    return Ok(());
+                }
+                Some("$map" | "$filter" | "$reduce" | "$sortArray") => {
+                    let op = d.keys().next().cloned().unwrap_or_default();
+                    if let Ok(spec) = d.get_document(&op) {
+                        let name = spec.get_str("as").unwrap_or("this").to_owned();
+                        bound.push(name);
+                        if op == "$reduce" {
+                            bound.push("value".to_owned());
+                        }
+                        let r = spec.values().try_for_each(|x| check_vars(x, bound));
+                        bound.truncate(n);
+                        return r;
+                    }
+                }
+                _ => {}
+            }
+            d.values().try_for_each(|x| check_vars(x, bound))
+        }
+        _ => Ok(()),
+    }
+}
+
 fn bad(msg: impl Into<String>) -> MongoError {
     MongoError::new(code::BAD_VALUE, msg)
 }
@@ -223,7 +294,10 @@ pub fn parse(filter: &Document) -> Result<Pred, MongoError> {
                         _ => Pred::Nor(kids),
                     });
                 }
-                "expr" => all.push(Pred::Expr(v.clone())),
+                "expr" => {
+                    check_vars(v, &mut Vec::new())?;
+                    all.push(Pred::Expr(v.clone()));
+                }
                 "jsonSchema" => {
                     let Bson::Document(d) = v else {
                         return Err(MongoError::new(

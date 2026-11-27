@@ -31,7 +31,9 @@
 //! that touches no row is over at once; one that copies rows or builds an
 //! index holds the others back for as long as that takes.
 
-use std::sync::{Arc, PoisonError};
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -84,6 +86,126 @@ fn user_online(name: &str) -> bool {
 /// Whether `name` is an automatic index's.
 fn auto_named(name: &str) -> bool {
     name.len() >= 11 && name[..11].eq_ignore_ascii_case("sprig_auto_")
+}
+
+/// The row keys written to a table whose rows a definition change is
+/// copying online ([`Engine::alter_stage`]).
+#[derive(Default)]
+struct Noted {
+    /// The prefix of the rows copied (their generation's).
+    rows: Vec<u8>,
+    /// The keys written under it.
+    keys: Mutex<HashSet<Bytes>>,
+}
+
+impl Noted {
+    fn add(&self, k: Bytes) {
+        self.keys
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(k);
+    }
+
+    fn len(&self) -> usize {
+        self.keys
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
+
+    fn take(&self) -> Vec<Bytes> {
+        self.keys
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .drain()
+            .collect()
+    }
+}
+
+type Written = Arc<Noted>;
+
+/// A table being copied online: (engine address, tenant, object).
+type CopyAt = (usize, u64, u32);
+
+/// The tables being copied online.
+fn copying() -> &'static Mutex<HashMap<CopyAt, Written>> {
+    static COPYING: OnceLock<Mutex<HashMap<CopyAt, Written>>> = OnceLock::new();
+    COPYING.get_or_init(Mutex::default)
+}
+
+/// How many tables are being copied online: writes look no further while
+/// it is 0.
+static COPYING_NOW: AtomicUsize = AtomicUsize::new(0);
+
+/// Every write of a key goes past here (`store::Tx`): a row key of a table
+/// being copied online is noted, so the copy writes that row again.
+pub(crate) fn note_write(eng: usize, key: &[u8]) {
+    if COPYING_NOW.load(Ordering::SeqCst) == 0 || key.len() < 19 || key[16] != kind::PRIMARY {
+        return;
+    }
+    let (Ok(t), Ok(o)) = (key[..8].try_into(), key[12..16].try_into()) else {
+        return;
+    };
+    let at = (eng, u64::from_be_bytes(t), u32::from_be_bytes(o));
+    let set = copying()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(&at)
+        .cloned();
+    if let Some(set) = set
+        && key.starts_with(&set.rows)
+    {
+        set.add(Bytes::copy_from_slice(key));
+    }
+}
+
+/// Starts noting the keys written to table `at` under row prefix `rows`;
+/// `None` when it is being copied already.
+fn start_noting(at: CopyAt, rows: Vec<u8>) -> Option<Written> {
+    let mut m = copying().lock().unwrap_or_else(PoisonError::into_inner);
+    if m.contains_key(&at) {
+        return None;
+    }
+    let set = Arc::new(Noted {
+        rows,
+        keys: Mutex::default(),
+    });
+    m.insert(at, Arc::clone(&set));
+    COPYING_NOW.fetch_add(1, Ordering::SeqCst);
+    Some(set)
+}
+
+/// Stops noting the row keys written to table `at`.
+fn stop_noting(at: CopyAt) {
+    if copying()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .remove(&at)
+        .is_some()
+    {
+        COPYING_NOW.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// A table's online build mark: its object number, the mark's owner (node
+/// and process) and the indexes' names.
+pub(crate) type OnlineMark = (u32, Vec<u8>, Vec<String>);
+
+/// Changed rows a round of catching up leaves to the final, held round.
+const CATCH_UP_LEFT: usize = 500;
+
+/// Rows an online copy reads per transaction (tests: small batches, and a
+/// short pause after each, so the writers they run alongside interleave).
+#[cfg(not(test))]
+const COPY_BATCH: usize = WALK_BATCH;
+#[cfg(test)]
+const COPY_BATCH: usize = 100;
+
+/// Between an online copy's batches the worker goes back to the runtime.
+async fn between_batches() {
+    tokio::task::yield_now().await;
+    #[cfg(test)]
+    tokio::time::sleep(Duration::from_millis(1)).await;
 }
 
 /// What a change needs from the session that asked for it.
@@ -357,6 +479,52 @@ impl Convert<'_> {
             }
         })
     }
+}
+
+/// Writes the copy of row `new` and its entries in every index of `cv`'s
+/// new definition: `false` (nothing written) when another row holds its
+/// primary key or a unique value and `strict` is off; 1062 when it is on.
+async fn put_copy(
+    tx: &mut super::store::Tx,
+    sp1: &Space,
+    cv: &Convert<'_>,
+    new: &[Datum],
+    strict: bool,
+) -> Result<bool> {
+    let d1 = cv.d1;
+    let undo = tx.savepoint();
+    let key = keys::row_key_of(sp1, d1, new)
+        .ok_or_else(|| SprigError::internal("engine: a key value of the wrong type"))?;
+    if !tx
+        .insert(Bytes::from(key), row::encode(d1, sp1, new)?, false)
+        .await?
+    {
+        if strict {
+            return Err(duplicate(cv, &d1.pk, new, &d1.pk_name));
+        }
+        tx.rollback_to(undo);
+        return Ok(false);
+    }
+    for ix in 0..d1.indexes.len() {
+        let x = &d1.indexes[ix];
+        let Some((k, val)) = keys::index_entry(sp1, d1, ix, new) else {
+            return Err(SprigError::internal(
+                "engine: an index value of the wrong type",
+            ));
+        };
+        if x.unique && !x.cols.iter().any(|&c| new[c].is_null()) {
+            if !tx.insert(Bytes::from(k), val, false).await? {
+                if strict {
+                    return Err(duplicate(cv, &x.cols, new, &x.name));
+                }
+                tx.rollback_to(undo);
+                return Ok(false);
+            }
+        } else {
+            tx.put_new(Bytes::from(k), val).await?;
+        }
+    }
+    Ok(true)
 }
 
 impl Engine {
@@ -661,6 +829,8 @@ impl Engine {
             rec.discard();
             self.collect(tenant, object, &mut rec).await?;
         }
+        // What an online copy a stopped process of this node ran wrote.
+        self.copy_leftovers(tenant, object, &mut rec).await?;
         let now = temporal::now();
         let tz = assign::zone(sess.env).unwrap_or(0);
         let env = sess.env;
@@ -797,13 +967,30 @@ impl Engine {
             .map(|(id, x)| (*id, x.unique))
             .collect();
         let new_gen = copy.then_some(rec.next_gen);
+        // A change that copies the rows under the same primary key, or only
+        // checks them against new constraints, does so without holding the
+        // table: writes go on, and the rows they change are copied again
+        // (see `carry_online`). `LOCK = SHARED | EXCLUSIVE` asks for the
+        // table to be held, and online index builds have their own way.
+        let index_build =
+            ONLINE_BUILD.try_with(|()| ()).is_ok() || USER_ONLINE.try_with(|_| ()).is_ok();
+        let copy_online = !index_build
+            && !matches!(alter.lock.as_deref(), Some("SHARED" | "EXCLUSIVE"))
+            && if copy {
+                !rekey && !sp0.first_format && d0.hidden == d1.hidden
+            } else {
+                built.is_empty() && !validate.is_empty()
+            };
         // What this step is about to write is garbage until the change is
         // recorded as pending (a crash in between leaves nothing behind
-        // that the next change wouldn't delete).
+        // that the next change wouldn't delete). An online copy lists it
+        // in its own record instead: the table's statements go on meanwhile,
+        // and they delete the garbage the layout record names.
         if !built.is_empty() || copy || !validate.is_empty() {
             let mut reserve = rec.clone();
+            let mut ranges = Vec::new();
             for (id, unique) in &built {
-                reserve.garbage.push((
+                ranges.push((
                     if *unique {
                         kind::UNIQUE
                     } else {
@@ -813,9 +1000,12 @@ impl Engine {
                 ));
             }
             if let Some(g) = new_gen {
-                reserve.garbage.push((kind::PRIMARY, g));
+                ranges.push((kind::PRIMARY, g));
                 reserve.next_gen = g.saturating_add(1);
                 rec.next_gen = g.saturating_add(1);
+            }
+            if !copy_online {
+                reserve.garbage.extend(ranges.iter().copied());
             }
             let mut tx = self.begin(TxnOptions::default())?;
             tx.put_new(
@@ -823,6 +1013,18 @@ impl Engine {
                 reserve.encode(),
             )
             .await?;
+            if copy_online && !ranges.is_empty() {
+                let mut v = super::temp::owner();
+                for (k, id) in &ranges {
+                    v.push(*k);
+                    v.extend_from_slice(&id.to_be_bytes());
+                }
+                tx.put_new(
+                    Bytes::from(keys::copying_key(tenant, object)),
+                    Bytes::from(v),
+                )
+                .await?;
+            }
             tx.put_new(
                 rk,
                 Record {
@@ -875,23 +1077,31 @@ impl Engine {
                 && fresh.iter().all(|&q| {
                     let x = &d1.indexes[q];
                     x.ignored
-                        && !x.unique
                         && if auto {
-                            auto_named(&x.name)
+                            !x.unique && auto_named(&x.name)
                         } else {
                             user_online(&x.name)
                         }
                 });
-            let carried = if online {
-                Ok(0)
+            // A user's build is marked as unfinished until its indexes are
+            // public: a later process of this node finishes it.
+            if online && !auto {
+                let names: Vec<&str> = fresh.iter().map(|&q| d1.indexes[q].name.as_str()).collect();
+                self.mark_online(tenant, object, &names).await?;
+            }
+            let (n, guard) = if online {
+                (0, guard)
+            } else if copy_online {
+                let expect = reserve.clone();
+                self.carry_online(guard, &sp0, &sp1, &mut cv, copy, &expect, &ranges)
+                    .await?
             } else {
-                self.carry(&sp0, &sp1, &mut cv, copy, &fresh).await
-            };
-            let n = match carried {
-                Ok(n) => n,
-                Err(e) => {
-                    self.collect(tenant, object, &mut reserve).await?;
-                    return Err(e);
+                match self.carry(&sp0, &sp1, &mut cv, copy, &fresh).await {
+                    Ok(n) => (n, guard),
+                    Err(e) => {
+                        self.collect(tenant, object, &mut reserve).await?;
+                        return Err(e);
+                    }
                 }
             };
             let conds = std::mem::take(&mut cv.conds);
@@ -904,7 +1114,16 @@ impl Engine {
                 built,
                 dropped,
             });
-            self.write_layout(tenant, object, &rec).await?;
+            // The pending change owns what the copy wrote from here on: the
+            // online copy's record goes in the same transaction.
+            let mut tx = self.begin(TxnOptions::default())?;
+            tx.put_new(Bytes::from(keys::layout_key(tenant, object)), rec.encode())
+                .await?;
+            if copy_online && !ranges.is_empty() {
+                tx.delete(Bytes::from(keys::copying_key(tenant, object)))
+                    .await?;
+            }
+            tx.finish().await?;
             return Ok(Staged {
                 _guard: guard,
                 tenant,
@@ -938,6 +1157,286 @@ impl Engine {
         })
     }
 
+    /// This engine's address, as its transactions report it to
+    /// [`note_write`].
+    fn id(&self) -> usize {
+        std::ptr::from_ref(&self.eng).addr()
+    }
+
+    /// What an online copy of table `object` that a stopped process of
+    /// this node ran left (its record names the key ranges it wrote):
+    /// deleted, with the record. The caller holds the table and its users
+    /// are gone, so no copy of this process is running.
+    async fn copy_leftovers(&self, tenant: u64, object: u32, rec: &mut LayoutRecord) -> Result<()> {
+        let k = keys::copying_key(tenant, object);
+        let raw = {
+            let mut tx = self.begin(TxnOptions::default())?;
+            let v = tx.get(&k)?;
+            tx.rollback();
+            v
+        };
+        let Some(raw) = raw else {
+            return Ok(());
+        };
+        // A copy this process runs now.
+        if copying()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains_key(&(self.id(), tenant, object))
+        {
+            return Err(lock_wait_timeout());
+        }
+        let node = super::temp::owner();
+        if raw.get(..8) != node.get(..8) {
+            // Another node's copy: left to it.
+            return Ok(());
+        }
+        for c in raw.get(16..).unwrap_or_default().chunks_exact(3) {
+            rec.garbage.push((c[0], u16::from_be_bytes([c[1], c[2]])));
+        }
+        self.collect(tenant, object, rec).await?;
+        let mut tx = self.begin(TxnOptions::default())?;
+        tx.delete(Bytes::from(k)).await?;
+        tx.finish().await
+    }
+
+    /// [`Self::carry`] without holding the table, for a change that keeps
+    /// the primary key (`copy`: the rows are copied to `sp1`, else only
+    /// checked against the constraints the change adds). The caller holds
+    /// the table (`guard`) and its users are gone; `expect` is the layout
+    /// record as the caller wrote it.
+    ///
+    /// ```text
+    /// note     every row key written to the table from now on is noted
+    ///          (`note_write`); the table is let go
+    /// copy     the rows, a batch per transaction, as they are committed; a
+    ///          row whose unique value a copied row holds is left for later
+    ///          (that row may have changed since)
+    /// catch up the noted rows: their copies deleted, then copied again from
+    ///          their latest values; again while many were noted
+    /// hold     the table taken back, its users waited for (as a change
+    ///          always does), the layout checked unchanged; the last noted
+    ///          rows copied again, now with duplicates as errors
+    /// ```
+    ///
+    /// Gives the rows the copy holds, and the table's lock.
+    ///
+    /// # Errors
+    /// As for [`Self::carry`]; 1412 when the table changed meanwhile.
+    /// What the copy wrote is deleted then.
+    #[allow(clippy::too_many_arguments)]
+    async fn carry_online(
+        &self,
+        guard: tokio::sync::OwnedMutexGuard<()>,
+        sp0: &Space,
+        sp1: &Space,
+        cv: &mut Convert<'_>,
+        copy: bool,
+        expect: &LayoutRecord,
+        ranges: &[(u8, u16)],
+    ) -> Result<(u64, tokio::sync::OwnedMutexGuard<()>)> {
+        let at = (self.id(), sp0.tenant, sp0.object);
+        let Some(noted) = start_noting(at, sp0.rows()) else {
+            return Err(lock_wait_timeout());
+        };
+        drop(guard);
+        let mut held = None;
+        let r = self
+            .copy_unheld(sp0, sp1, cv, copy, expect, &noted, &mut held)
+            .await;
+        stop_noting(at);
+        match r {
+            Ok(n) => match held {
+                Some(g) => Ok((n, g)),
+                None => Err(SprigError::internal("engine: an online copy lost its lock")),
+            },
+            Err(e) => {
+                let _g = match held {
+                    Some(g) => g,
+                    None => self.table_lock(at.1, at.2).lock_owned().await,
+                };
+                if !ranges.is_empty() {
+                    let mut rec = self
+                        .read_layout(at.1, at.2)?
+                        .unwrap_or_else(|| expect.clone());
+                    rec.garbage.extend(ranges.iter().copied());
+                    self.collect(at.1, at.2, &mut rec).await?;
+                    let mut tx = self.begin(TxnOptions::default())?;
+                    tx.delete(Bytes::from(keys::copying_key(at.1, at.2)))
+                        .await?;
+                    tx.finish().await?;
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// The phases of [`Self::carry_online`] after the table is let go;
+    /// `held` gets the table's lock when the last phase takes it.
+    #[allow(clippy::too_many_arguments)]
+    async fn copy_unheld(
+        &self,
+        sp0: &Space,
+        sp1: &Space,
+        cv: &mut Convert<'_>,
+        copy: bool,
+        expect: &LayoutRecord,
+        noted: &Written,
+        held: &mut Option<tokio::sync::OwnedMutexGuard<()>>,
+    ) -> Result<u64> {
+        let d0 = cv.d0;
+        let p = sp0.rows();
+        let end = keys::prefix_end(&p);
+        let mut lo = p.clone();
+        // The rows the copy holds, and the rows read (messages' row numbers).
+        let (mut n, mut seq) = (0u64, 0u64);
+        loop {
+            let mut tx = self.begin(TxnOptions::default())?;
+            let batch = tx.scan(&lo, &end, false, COPY_BATCH)?;
+            for (k, v) in &batch {
+                seq += 1;
+                let old = row::decode(d0, sp0, k, v)?;
+                let new = Self::converted(cv, &old, seq)?;
+                if copy {
+                    if put_copy(&mut tx, sp1, cv, &new, false).await? {
+                        n += 1;
+                    } else {
+                        noted.add(k.clone());
+                    }
+                }
+            }
+            tx.finish().await?;
+            between_batches().await;
+            match batch.last() {
+                Some((k, _)) if batch.len() == COPY_BATCH => lo = keys::prefix_end(k),
+                _ => break,
+            }
+        }
+        // Catching up while writes go on.
+        for _ in 0..8 {
+            if noted.len() <= CATCH_UP_LEFT {
+                break;
+            }
+            let keys = noted.take();
+            self.copy_again(sp0, sp1, cv, copy, &keys, false, noted, &mut n, &mut seq)
+                .await?;
+        }
+        // The last round holds the table, as the change always did.
+        *held = Some(self.table_lock(sp0.tenant, sp0.object).lock_owned().await);
+        // The statements since the table was let go took a keyspace of
+        // their own (the first hold removed `sp0`'s): its users are waited
+        // for. With none cached, no statement uses the table.
+        if let Some(sp) = self.cached(sp0.tenant, sp0.object, d0) {
+            self.quiesce(&sp, cv.sess.wait).await?;
+        }
+        let now = self.read_layout(sp0.tenant, sp0.object)?;
+        let same = now.is_some_and(|r| {
+            r.at == expect.at
+                && r.truncated == expect.truncated
+                && r.row_gen == expect.row_gen
+                && r.next_gen == expect.next_gen
+                && r.current.version == expect.current.version
+                && r.pending.is_none()
+        });
+        if !same {
+            return Err(definition_changed());
+        }
+        let keys = noted.take();
+        self.copy_again(sp0, sp1, cv, copy, &keys, true, noted, &mut n, &mut seq)
+            .await?;
+        if !copy {
+            // Only checked: the rows there are now.
+            n = self.count_rows(sp0).await?;
+        }
+        Ok(n)
+    }
+
+    /// The new definition's row for `old`.
+    fn converted(cv: &mut Convert<'_>, old: &[Datum], n: u64) -> Result<Vec<Datum>> {
+        let d1 = cv.d1;
+        let hidden = d1.hidden.then(|| match old.get(cv.d0.columns.len()) {
+            Some(h) => h.clone(),
+            None => Datum::UInt(n),
+        });
+        let mut new = if cv.unchanged {
+            old.to_vec()
+        } else {
+            cv.row(old, n)?
+        };
+        new.truncate(d1.columns.len());
+        if let Some(h) = hidden {
+            new.push(h);
+        }
+        Ok(new)
+    }
+
+    /// Copies the rows at `keys` (row keys of `sp0`'s generation) again:
+    /// first every old copy of them goes, then each row's latest value is
+    /// copied (or checked). `last`: a duplicate is the change's error;
+    /// before that such a row is noted for a later round.
+    #[allow(clippy::too_many_arguments)]
+    async fn copy_again(
+        &self,
+        sp0: &Space,
+        sp1: &Space,
+        cv: &mut Convert<'_>,
+        copy: bool,
+        keys: &[Bytes],
+        last: bool,
+        noted: &Written,
+        n: &mut u64,
+        seq: &mut u64,
+    ) -> Result<()> {
+        let (d0, d1) = (cv.d0, cv.d1);
+        let p0 = sp0.rows();
+        let p1 = sp1.rows();
+        let ours: Vec<&Bytes> = keys.iter().filter(|k| k.starts_with(&p0)).collect();
+        if copy {
+            for chunk in ours.chunks(WALK_BATCH) {
+                let mut tx = self.begin(TxnOptions::default())?;
+                for k in chunk {
+                    let mut k1 = p1.clone();
+                    k1.extend_from_slice(&k[p0.len()..]);
+                    let k1 = Bytes::from(k1);
+                    let Some(v) = tx.get(&k1)? else {
+                        continue;
+                    };
+                    let row = row::decode(d1, sp1, &k1, &v)?;
+                    for ix in 0..d1.indexes.len() {
+                        if let Some((ik, _)) = keys::index_entry(sp1, d1, ix, &row) {
+                            tx.delete(Bytes::from(ik)).await?;
+                        }
+                    }
+                    tx.delete(k1).await?;
+                    *n = n.saturating_sub(1);
+                }
+                tx.finish().await?;
+            }
+        }
+        for chunk in ours.chunks(COPY_BATCH) {
+            let mut tx = self.begin(TxnOptions::default())?;
+            for k in chunk {
+                let Some(v) = tx.get(k)? else {
+                    continue;
+                };
+                *seq += 1;
+                let old = row::decode(d0, sp0, k, &v)?;
+                let new = Self::converted(cv, &old, *seq)?;
+                if !copy {
+                    continue;
+                }
+                if put_copy(&mut tx, sp1, cv, &new, last).await? {
+                    *n += 1;
+                } else {
+                    noted.add((*k).clone());
+                }
+            }
+            tx.finish().await?;
+            between_batches().await;
+        }
+        Ok(())
+    }
+
     /// The backfill of an online index build: writes index `name`'s entry
     /// for every row of the table, a batch of `batch` rows per transaction,
     /// pausing `pause` between batches. Each batch reads its rows with
@@ -959,6 +1458,32 @@ impl Engine {
         pause: Duration,
         current: &(dyn Fn() -> Option<u64> + Send + Sync),
     ) -> Result<(u64, u64)> {
+        self.backfill(tenant, def, name, batch, pause, current, false)
+            .await
+    }
+
+    /// [`Self::backfill_index`] for any secondary index. A unique index's
+    /// entry is written only where no other row holds its values: the
+    /// index was published before the backfill, so the writes since then
+    /// kept it and refused duplicates among themselves, and the backfill
+    /// finds the rest. Two rows with the same values give 1062, named as
+    /// the session's server names the key (`mysql`: with the table's name).
+    /// A batch that meets a deadlock or a lock wait timeout is tried again.
+    ///
+    /// # Errors
+    /// 1062 for a duplicate; 1412 when the definition changed; lock waits
+    /// after the retries; the store's.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn backfill(
+        &self,
+        tenant: u64,
+        def: &TableDef,
+        name: &str,
+        batch: usize,
+        pause: Duration,
+        current: &(dyn Fn() -> Option<u64> + Send + Sync),
+        mysql: bool,
+    ) -> Result<(u64, u64)> {
         let Some(ix) = def
             .indexes
             .iter()
@@ -971,6 +1496,7 @@ impl Engine {
         let batch = batch.max(1);
         let (mut rows, mut batches) = (0u64, 0u64);
         let mut lo: Option<Vec<u8>> = None;
+        let mut tries = 0u32;
         loop {
             if current() != Some(def.version) {
                 return Err(definition_changed());
@@ -979,25 +1505,25 @@ impl Engine {
             let p = sp.rows();
             let end = keys::prefix_end(&p);
             let from = lo.clone().unwrap_or(p);
-            let mut tx = self.begin(TxnOptions::default())?;
-            let got = tx
-                .scan_lock_entries(&from, &end, batch, LockMode::Shared, Wait::Block)
-                .await?;
-            for (k, v) in &got {
-                let row = row::decode(def, &sp, k, v)?;
-                let Some((ik, iv)) = keys::index_entry(&sp, def, ix, &row) else {
-                    return Err(SprigError::internal(
-                        "engine: an index value of the wrong type",
-                    ));
-                };
-                tx.put(Bytes::from(ik), iv).await?;
-            }
-            tx.finish().await?;
+            let got = match self
+                .backfill_batch(&sp, def, ix, &from, &end, batch, mysql)
+                .await
+            {
+                Ok(got) => got,
+                Err(e) if matches!(errno(&e), Some(1205 | 1213)) && tries < 20 => {
+                    tries += 1;
+                    drop(sp);
+                    tokio::time::sleep(Duration::from_millis(5 * u64::from(tries))).await;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            tries = 0;
             drop(sp);
-            rows += got.len() as u64;
+            rows += got.0 as u64;
             batches += 1;
-            match got.last() {
-                Some((k, _)) if got.len() == batch => lo = Some(keys::prefix_end(k)),
+            match got.1 {
+                Some(k) if got.0 == batch => lo = Some(keys::prefix_end(&k)),
                 _ => return Ok((rows, batches)),
             }
             if pause.is_zero() {
@@ -1006,6 +1532,111 @@ impl Engine {
                 tokio::time::sleep(pause).await;
             }
         }
+    }
+
+    /// One batch of a backfill: the entries of index `ix` for up to `batch`
+    /// rows from `from`, in one transaction. Gives the number of rows and
+    /// the last row's key.
+    #[allow(clippy::too_many_arguments)]
+    async fn backfill_batch(
+        &self,
+        sp: &Space,
+        def: &TableDef,
+        ix: usize,
+        from: &[u8],
+        end: &[u8],
+        batch: usize,
+        mysql: bool,
+    ) -> Result<(usize, Option<Bytes>)> {
+        let x = &def.indexes[ix];
+        let mut tx = self.begin(TxnOptions::default())?;
+        let got = tx
+            .scan_lock_entries(from, end, batch, LockMode::Shared, Wait::Block)
+            .await?;
+        for (k, v) in &got {
+            let row = row::decode(def, sp, k, v)?;
+            let Some((ik, iv)) = keys::index_entry(sp, def, ix, &row) else {
+                return Err(SprigError::internal(
+                    "engine: an index value of the wrong type",
+                ));
+            };
+            if x.unique && !x.cols.iter().any(|&c| row[c].is_null()) {
+                // Keyed by its values alone: another row's entry there is
+                // a duplicate; this row's own (a write kept it) is not.
+                if let Some(held) = tx.insert_or_get(Bytes::from(ik), iv.clone()).await?
+                    && held != iv
+                {
+                    let key = if mysql {
+                        format!("{}.{}", def.name, x.name)
+                    } else {
+                        x.name.clone()
+                    };
+                    return Err(exec::duplicate(def, &x.cols, &row, &key));
+                }
+            } else {
+                tx.put(Bytes::from(ik), iv).await?;
+            }
+        }
+        tx.finish().await?;
+        Ok((got.len(), got.last().map(|(k, _)| k.clone())))
+    }
+
+    /// Records that a user's statement builds indexes `names` of table
+    /// `object` online: the mark stays until they are public (or dropped),
+    /// so a later process can finish a build its process didn't.
+    ///
+    /// # Errors
+    /// The store's.
+    pub(crate) async fn mark_online(&self, tenant: u64, object: u32, names: &[&str]) -> Result<()> {
+        let mut v = super::temp::owner();
+        v.extend_from_slice(names.join("\n").as_bytes());
+        let mut tx = self.begin(TxnOptions::default())?;
+        tx.put_new(
+            Bytes::from(keys::online_mark(tenant, object)),
+            Bytes::from(v),
+        )
+        .await?;
+        tx.finish().await
+    }
+
+    /// Forgets the online build mark of table `object`.
+    ///
+    /// # Errors
+    /// The store's.
+    pub(crate) async fn unmark_online(&self, tenant: u64, object: u32) -> Result<()> {
+        let k = Bytes::from(keys::online_mark(tenant, object));
+        let mut tx = self.begin(TxnOptions::default())?;
+        if tx.get(&k)?.is_none() {
+            tx.rollback();
+            return Ok(());
+        }
+        tx.delete(k).await?;
+        tx.finish().await
+    }
+
+    /// The online build marks of `tenant`: per table, the mark's owner
+    /// (node and process) and the indexes' names.
+    ///
+    /// # Errors
+    /// The store's.
+    pub(crate) fn online_marks(&self, tenant: u64) -> Result<Vec<OnlineMark>> {
+        let p = keys::online_prefix(tenant);
+        let mut tx = self.begin(TxnOptions::default())?;
+        let rows = tx.scan(&p, &keys::prefix_end(&p), false, 1 << 16)?;
+        tx.rollback();
+        Ok(rows
+            .iter()
+            .filter_map(|(k, v)| {
+                let o = u32::from_be_bytes(k.get(p.len()..p.len() + 4)?.try_into().ok()?);
+                let owner = v.get(..16)?.to_vec();
+                let names = String::from_utf8_lossy(&v[16..])
+                    .split('\n')
+                    .filter(|n| !n.is_empty())
+                    .map(str::to_owned)
+                    .collect();
+                Some((o, owner, names))
+            })
+            .collect())
     }
 
     /// Step 3: the catalog published `def`, the definition the staged
@@ -1027,6 +1658,8 @@ impl Engine {
     /// The store's (the next change of the table deletes it then).
     pub(crate) async fn alter_abandon(&self, staged: Staged) -> Result<()> {
         let (tenant, object) = (staged.tenant, staged.object);
+        // An online build the change would have started.
+        self.unmark_online(tenant, object).await?;
         if let Some(mut rec) = self.read_layout(tenant, object)? {
             rec.discard();
             self.collect(tenant, object, &mut rec).await?;

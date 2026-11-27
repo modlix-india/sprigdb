@@ -537,6 +537,43 @@ impl EngineMsgStore {
         Ok(out)
     }
 
+    /// Up to `limit` of the messages `queue` holds now, in lane, priority
+    /// class and sequence order, after `after` (`None`: from the first).
+    /// A plain read of the store, as messages aren't versioned: what is
+    /// stored when it runs, delivered but unacknowledged messages included
+    /// (SQL reads a queue as a table this way).
+    ///
+    /// # Errors
+    /// The store's; a message that doesn't decode.
+    pub fn browse(
+        &self,
+        queue: u64,
+        after: Option<(u16, u8, u64)>,
+        limit: usize,
+    ) -> Result<Vec<StoredMsg>, StoreError> {
+        let p = self.queue_p(MSGS, queue);
+        let lo = match after {
+            None => p.clone(),
+            Some((lane, pclass, seq)) => {
+                prefix_end(&self.msg_key(queue, lane, pclass, seq)).unwrap_or_default()
+            }
+        };
+        let hi = prefix_end(&p).unwrap_or_default();
+        let mut out = Vec::new();
+        for (k, v) in self.scan(&lo, &hi, limit)? {
+            let rest = k.get(p.len()..).unwrap_or_default();
+            if rest.len() != 11 {
+                continue;
+            }
+            let lane = u16::from_be_bytes([rest[0], rest[1]]);
+            let pclass = rest[2];
+            let mut sb = [0u8; 8];
+            sb.copy_from_slice(&rest[3..11]);
+            out.push(dec_msg(lane, pclass, u64::from_be_bytes(sb), &v)?);
+        }
+        Ok(out)
+    }
+
     fn prefix_scan(&self, p: &[u8], limit: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StoreError> {
         let end = prefix_end(p).unwrap_or_default();
         self.scan(p, &end, limit)

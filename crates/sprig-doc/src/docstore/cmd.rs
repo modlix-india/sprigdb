@@ -58,6 +58,16 @@ pub struct TxnSlot {
     txn_number: i64,
     state: TxnState,
     started: std::time::Instant,
+    /// Collections and indexes the transaction created (at once, outside
+    /// it): an abort drops them again.
+    created: Vec<Created>,
+}
+
+/// A collection or index a transaction created.
+#[derive(Debug, Clone)]
+enum Created {
+    Coll(Name),
+    Index(Name, String),
 }
 
 #[derive(Debug)]
@@ -71,23 +81,29 @@ enum TxnState {
 #[derive(Debug, Default)]
 pub struct TxnTable {
     map: Mutex<Slots>,
+    /// What each open transaction created, by tenant and `lsid`: other
+    /// sessions' listings leave it out until the commit.
+    hidden: Mutex<Hidden>,
 }
 
 type Slots = HashMap<(u64, Vec<u8>), Arc<tokio::sync::Mutex<TxnSlot>>>;
+/// What open transactions created, by tenant and `lsid`.
+type Hidden = HashMap<(u64, Vec<u8>), Vec<Created>>;
+type SlotEntry = ((u64, Vec<u8>), Arc<tokio::sync::Mutex<TxnSlot>>);
 
 impl TxnTable {
     /// Aborts every open transaction older than `lifetime` (MongoDB's
     /// `transactionLifetimeLimitSeconds`, 60 by default). Returns how many.
     pub fn reap(&self, lifetime: std::time::Duration) -> usize {
-        let all: Vec<Arc<tokio::sync::Mutex<TxnSlot>>> = self
+        let all: Vec<SlotEntry> = self
             .map
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .values()
-            .cloned()
+            .iter()
+            .map(|(k, v)| (k.clone(), Arc::clone(v)))
             .collect();
         let mut n = 0;
-        for s in all {
+        for (k, s) in all {
             // A slot busy with a command is in use: not idle.
             let Ok(mut g) = s.try_lock() else { continue };
             if g.started.elapsed() < lifetime || !matches!(g.state, TxnState::Active(..)) {
@@ -96,9 +112,43 @@ impl TxnTable {
             if let TxnState::Active(t, _) = std::mem::replace(&mut g.state, TxnState::Aborted) {
                 t.rollback();
                 n += 1;
+                // What it created stays, now visible (nothing drops it here).
+                g.created.clear();
+                self.set_hidden(k.0, &k.1, &[]);
             }
         }
         n
+    }
+
+    /// Records what the open transaction of `lsid` has created so far
+    /// (nothing: it ended).
+    fn set_hidden(&self, tenant: u64, lsid: &[u8], created: &[Created]) {
+        let mut h = self.hidden.lock().unwrap_or_else(PoisonError::into_inner);
+        if created.is_empty() {
+            h.remove(&(tenant, lsid.to_vec()));
+        } else {
+            h.insert((tenant, lsid.to_vec()), created.to_vec());
+        }
+    }
+
+    /// The collections of `db` and the indexes of `ns` that open
+    /// transactions created: `(collections, indexes of ns)`.
+    fn hidden(&self, tenant: u64, db: &str, ns: Option<&Name>) -> (Vec<String>, Vec<String>) {
+        let h = self.hidden.lock().unwrap_or_else(PoisonError::into_inner);
+        let (mut colls, mut idx) = (Vec::new(), Vec::new());
+        for ((t, _), list) in h.iter() {
+            if *t != tenant {
+                continue;
+            }
+            for c in list {
+                match c {
+                    Created::Coll(n) if n.db == db => colls.push(n.coll.clone()),
+                    Created::Index(n, i) if Some(n) == ns => idx.push(i.clone()),
+                    _ => {}
+                }
+            }
+        }
+        (colls, idx)
     }
 
     fn get(&self, tenant: u64, lsid: &[u8]) -> Option<Arc<tokio::sync::Mutex<TxnSlot>>> {
@@ -118,19 +168,55 @@ impl TxnTable {
         a
     }
 
+    /// Ends every session of `user` of `tenant` (`killAllSessions`):
+    /// their open transactions roll back. Returns how many were open.
+    async fn kill_owner(&self, tenant: u64, user: &str, undo: &mut Vec<Created>) -> usize {
+        let all: Vec<SlotEntry> = self
+            .map
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter(|((t, _), _)| *t == tenant)
+            .map(|(k, v)| (k.clone(), Arc::clone(v)))
+            .collect();
+        let mut n = 0;
+        for (k, s) in all {
+            let mut g = s.lock().await;
+            if g.owner != user {
+                continue;
+            }
+            if let TxnState::Active(t, _) = std::mem::replace(&mut g.state, TxnState::Aborted) {
+                t.rollback();
+                n += 1;
+                undo.extend(std::mem::take(&mut g.created));
+            }
+            drop(g);
+            self.set_hidden(k.0, &k.1, &[]);
+            self.map
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&k);
+        }
+        n
+    }
+
     /// Ends session `lsid` of `tenant`: an open transaction rolls back.
-    pub async fn end_session(&self, tenant: u64, lsid: &[u8]) {
+    /// Returns what it created, to drop.
+    async fn end_session(&self, tenant: u64, lsid: &[u8]) -> Vec<Created> {
         let s = self
             .map
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&(tenant, lsid.to_vec()));
+        self.set_hidden(tenant, lsid, &[]);
         if let Some(s) = s {
             let mut g = s.lock().await;
             if let TxnState::Active(t, _) = std::mem::replace(&mut g.state, TxnState::Aborted) {
                 t.rollback();
+                return std::mem::take(&mut g.created);
             }
         }
+        Vec::new()
     }
 }
 
@@ -157,6 +243,9 @@ pub fn shell(v: &Bson) -> String {
                 .map(|(k, x)| format!("{k}: {}", shell(x)))
                 .collect::<Vec<_>>()
                 .join(", ");
+            if inner.is_empty() {
+                return "{}".to_owned();
+            }
             format!("{{ {inner} }}")
         }
         Bson::Array(a) => {
@@ -249,7 +338,87 @@ impl DocStore {
 
     /// Ends session `lsid` of `tenant`: its open transaction rolls back.
     pub async fn end_session(&self, tenant: u64, lsid: &[u8]) {
-        self.txns.end_session(tenant, lsid).await;
+        let undo = self.txns.end_session(tenant, lsid).await;
+        self.undo_created(tenant, undo).await;
+    }
+
+    /// Ends every session `user` of `tenant` has here
+    /// (`killAllSessions`): their open transactions roll back.
+    pub async fn kill_sessions_of(&self, tenant: u64, user: &str) -> usize {
+        let mut undo = Vec::new();
+        let n = self.txns.kill_owner(tenant, user, &mut undo).await;
+        self.undo_created(tenant, undo).await;
+        n
+    }
+
+    /// Drops what an aborted transaction created: its indexes, and its
+    /// collections while they hold no documents.
+    async fn undo_created(&self, tenant: u64, list: Vec<Created>) {
+        if list.is_empty() {
+            return;
+        }
+        let _g = self.ddl_guard(tenant).await;
+        for c in list.into_iter().rev() {
+            match c {
+                Created::Index(n, i) => {
+                    let _ =
+                        Box::pin(self.drop_indexes_locked(tenant, &n, &[Bson::String(i)])).await;
+                }
+                Created::Coll(n) => {
+                    let Ok(Some(c)) = self.coll(tenant, &n) else {
+                        continue;
+                    };
+                    let p = c.space.docs();
+                    let mut t = self.begin(false);
+                    let empty = t
+                        .scan(
+                            &p,
+                            &super::layout::after_prefix(&p),
+                            sprig_engine::txn::Dir::Forward,
+                            1,
+                        )
+                        .is_ok_and(|r| r.is_empty());
+                    t.rollback();
+                    if empty {
+                        let _ = Box::pin(self.drop_locked(tenant, &n)).await;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Aborts session `lsid`'s open transaction, keeping its slot: the
+    /// next statement or commit answers `NoSuchTransaction` (251).
+    pub async fn abort_session_txn(&self, tenant: u64, lsid: &[u8]) {
+        let Some(s) = self.txns.get(tenant, lsid) else {
+            return;
+        };
+        let mut g = s.lock().await;
+        if let TxnState::Active(t, guard) = std::mem::replace(&mut g.state, TxnState::Aborted) {
+            t.rollback();
+            drop(guard);
+            let undo = std::mem::take(&mut g.created);
+            drop(g);
+            self.txns.set_hidden(tenant, lsid, &[]);
+            self.undo_created(tenant, undo).await;
+        }
+    }
+
+    /// A read (`find`, `aggregate`, `count`, `distinct`) at a kept
+    /// snapshot: `t` is a read-only transaction opened for it
+    /// (`readConcern: snapshot` outside a multi-document transaction).
+    ///
+    /// # Errors
+    /// The command's.
+    pub async fn snapshot_read(
+        &self,
+        tenant: u64,
+        db: &str,
+        name: &str,
+        body: &Document,
+        t: &mut DocTxn,
+    ) -> Result<Reply, MongoError> {
+        Box::pin(self.run(tenant, db, name, body, Some(t))).await
     }
 
     /// Aborts open transactions older than `lifetime`.
@@ -257,6 +426,11 @@ impl DocStore {
     pub fn reap_transactions(&self, lifetime: std::time::Duration) -> usize {
         self.txns.reap(lifetime)
     }
+}
+
+/// Whether `name` is a write command (`bulkWrite` included).
+fn is_write(name: &str) -> bool {
+    name == "bulkWrite" || WRITES.contains(&name)
 }
 
 const WRITES: [&str; 5] = [
@@ -297,11 +471,17 @@ impl DocStore {
             if let Ok(a) = body.get_array(name) {
                 for s in a {
                     if let Some(Bson::Binary(b)) = s.as_document().and_then(|d| d.get("id")) {
-                        self.txns.end_session(tenant, &b.bytes).await;
+                        self.end_session(tenant, &b.bytes).await;
                     }
                 }
             }
             return Ok(Reply::Doc(doc! {"ok": 1.0}));
+        }
+        if name == "bulkWrite" && db != "admin" {
+            return Err(MongoError::new(
+                code::UNAUTHORIZED,
+                "bulkWrite may only be run against the admin database.",
+            ));
         }
         if body.get_bool("autocommit") == Ok(false) {
             let (Some(l), Some(n)) = (lsid, txn_number) else {
@@ -313,10 +493,10 @@ impl DocStore {
             return self.in_txn(tenant, user, db, name, body, &l, n).await;
         }
         let retry = match (&lsid, txn_number) {
-            (Some(l), Some(n)) if WRITES.contains(&name) => Some((l.clone(), n)),
+            (Some(l), Some(n)) if is_write(name) => Some((l.clone(), n)),
             _ => None,
         };
-        if WRITES.contains(&name) {
+        if is_write(name) {
             return self.write_command(tenant, db, name, body, retry).await;
         }
         self.run(tenant, db, name, body, None).await
@@ -342,6 +522,8 @@ impl DocStore {
                 if commit {
                     let r = t.commit().await;
                     drop(guard);
+                    g.created.clear();
+                    self.txns.set_hidden(tenant, lsid, &[]);
                     g.state = if r.is_ok() {
                         TxnState::Committed
                     } else {
@@ -351,6 +533,10 @@ impl DocStore {
                 } else {
                     t.rollback();
                     drop(guard);
+                    let undo = std::mem::take(&mut g.created);
+                    drop(g);
+                    self.txns.set_hidden(tenant, lsid, &[]);
+                    self.undo_created(tenant, undo).await;
                     Ok(Reply::Doc(doc! {"ok": 1.0}))
                 }
             }
@@ -393,6 +579,8 @@ impl DocStore {
                 | "findandmodify"
                 | "killCursors"
                 | "bulkWrite"
+                | "create"
+                | "createIndexes"
         ) {
             return Err(MongoError::new(
                 code::OPERATION_NOT_SUPPORTED_IN_TRANSACTION,
@@ -423,6 +611,8 @@ impl DocStore {
                     }
                     let guard = self.write_guard(tenant).await;
                     g.state = TxnState::Active(Box::new(self.begin(true)), guard);
+                    g.created.clear();
+                    self.txns.set_hidden(tenant, lsid, &[]);
                     g.txn_number = n;
                     g.started = std::time::Instant::now();
                 } else if g.txn_number != n || !matches!(g.state, TxnState::Active(..)) {
@@ -441,33 +631,83 @@ impl DocStore {
                         txn_number: n,
                         state: TxnState::Active(Box::new(self.begin(true)), guard),
                         started: std::time::Instant::now(),
+                        created: Vec::new(),
                     },
                 )
             }
             None => return Err(no_txn(n)),
         };
         let mut g = slot.lock().await;
+        if !matches!(g.state, TxnState::Active(..)) {
+            return Err(no_txn(n));
+        }
+        // A collection a write creates is created at once, outside the
+        // transaction; an abort drops it again.
+        let bulk = if name == "bulkWrite" {
+            Some(super::bulk::parse(body)?)
+        } else {
+            None
+        };
+        let mut wanted = Vec::new();
+        if let Some(ops) = &bulk {
+            wanted = super::bulk::creates(ops);
+        } else if WRITES.contains(&name) || matches!(name, "create" | "createIndexes") {
+            wanted.push(Name::new(db, &coll_of(body, name)?));
+        }
+        let mut made = Vec::new();
+        for ns in wanted {
+            if self.coll(tenant, &ns)?.is_none() {
+                made.push(Created::Coll(ns.clone()));
+                if name != "create" {
+                    let _ = self.coll_or_create(tenant, &ns).await?;
+                }
+            }
+        }
+        let indexes_before: Vec<String> = if name == "createIndexes" {
+            let ns = Name::new(db, &coll_of(body, name)?);
+            self.coll(tenant, &ns)?
+                .map(|c| c.meta.indexes.iter().map(|i| i.name.clone()).collect())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let TxnState::Active(t, _) = &mut g.state else {
             return Err(no_txn(n));
         };
-        // A collection a write creates is created at once, outside the
-        // transaction.
-        if WRITES.contains(&name) {
-            let c = coll_of(body, name)?;
-            let _ = self.coll_or_create(tenant, &Name::new(db, &c)).await?;
-        }
-        let r = if WRITES.contains(&name) {
-            self.write_body(tenant, db, name, body, t, true).await
+        let r = if is_write(name) {
+            self.write_any(tenant, db, name, body, bulk.as_deref(), t, true)
+                .await
         } else {
             self.run(tenant, db, name, body, Some(t)).await
         };
-        if let Err(e) = &r {
+        if r.is_ok() && name == "createIndexes" {
+            let ns = Name::new(db, &coll_of(body, name)?);
+            if !made
+                .iter()
+                .any(|m| matches!(m, Created::Coll(x) if *x == ns))
+                && let Some(c) = self.coll(tenant, &ns)?
+            {
+                for i in &c.meta.indexes {
+                    if !indexes_before.contains(&i.name) {
+                        made.push(Created::Index(ns.clone(), i.name.clone()));
+                    }
+                }
+            }
+        }
+        if r.is_ok() || name != "create" {
+            g.created.extend(made);
+            self.txns.set_hidden(tenant, lsid, &g.created);
+        }
+        if r.is_err() {
             // A failed command ends the transaction.
             if let TxnState::Active(t, guard) = std::mem::replace(&mut g.state, TxnState::Aborted) {
                 t.rollback();
                 drop(guard);
             }
-            let _ = e;
+            let undo = std::mem::take(&mut g.created);
+            drop(g);
+            self.txns.set_hidden(tenant, lsid, &[]);
+            self.undo_created(tenant, undo).await;
         }
         r.map_err(|e| {
             if e.code == code::WRITE_CONFLICT {
@@ -488,17 +728,30 @@ impl DocStore {
         body: &Document,
         retry: Option<(Vec<u8>, i64)>,
     ) -> Result<Reply, MongoError> {
-        let c = coll_of(body, name)?;
-        let ns = Name::new(db, &c);
-        let creates = match name {
-            "insert" => true,
-            "update" => docs_of(body, "updates")
-                .iter()
-                .any(|u| u.get_bool("upsert") == Ok(true)),
-            "findAndModify" | "findandmodify" => body.get_bool("upsert") == Ok(true),
-            _ => false,
+        let bulk = if name == "bulkWrite" {
+            Some(super::bulk::parse(body)?)
+        } else {
+            None
         };
-        if creates {
+        let creates = if let Some(ops) = &bulk {
+            super::bulk::creates(ops)
+        } else {
+            let c = coll_of(body, name)?;
+            let creates = match name {
+                "insert" => true,
+                "update" => docs_of(body, "updates")
+                    .iter()
+                    .any(|u| u.get_bool("upsert") == Ok(true)),
+                "findAndModify" | "findandmodify" => body.get_bool("upsert") == Ok(true),
+                _ => false,
+            };
+            if creates {
+                vec![Name::new(db, &c)]
+            } else {
+                Vec::new()
+            }
+        };
+        for ns in creates {
             let _ = self.coll_or_create(tenant, &ns).await?;
         }
         let rk = retry
@@ -519,7 +772,10 @@ impl DocStore {
                     return Ok(Reply::Doc(d));
                 }
             }
-            match self.write_body(tenant, db, name, body, &mut t, false).await {
+            match self
+                .write_any(tenant, db, name, body, bulk.as_deref(), &mut t, false)
+                .await
+            {
                 Ok(Reply::Doc(d)) => {
                     if let Some(k) = rk {
                         let mut v = Vec::new();
@@ -548,10 +804,42 @@ impl DocStore {
         Err(MongoError::new(code::WRITE_CONFLICT, "write conflict"))
     }
 
+    /// A write command (`bulkWrite`: its parsed `ops`) in `t`, with
+    /// validation bypassed when it asks.
+    #[allow(clippy::too_many_arguments)]
+    async fn write_any(
+        &self,
+        tenant: u64,
+        db: &str,
+        name: &str,
+        body: &Document,
+        bulk: Option<&[super::bulk::BulkOp]>,
+        t: &mut DocTxn,
+        multi: bool,
+    ) -> Result<Reply, MongoError> {
+        let bypass = body.get_bool("bypassDocumentValidation").unwrap_or(false);
+        match bulk {
+            Some(ops) => {
+                crate::validate::bypass(
+                    bypass,
+                    Box::pin(self.bulk_body(tenant, body, ops, t, multi)),
+                )
+                .await
+            }
+            None => {
+                crate::validate::bypass(
+                    bypass,
+                    Box::pin(self.write_body(tenant, db, name, body, t, multi)),
+                )
+                .await
+            }
+        }
+    }
+
     /// A write command's statements in `t`. Statement errors become
     /// `writeErrors` (each statement's writes undone alone); a write
     /// conflict fails the whole command.
-    async fn write_body(
+    pub(super) async fn write_body(
         &self,
         tenant: u64,
         db: &str,
@@ -607,6 +895,12 @@ impl DocStore {
                 Ok(Reply::Doc(d))
             }
             "update" => {
+                if super::bulk::sorted_multi(body) {
+                    return Err(MongoError::new(
+                        code::FAILED_TO_PARSE,
+                        super::bulk::SORT_WITH_MULTI,
+                    ));
+                }
                 let mut n = 0i64;
                 let mut modified = 0i64;
                 let mut upserted = Vec::new();
@@ -634,6 +928,8 @@ impl DocStore {
                         } else {
                             self.coll(tenant, &ns)?
                         };
+                        let coll =
+                            coll.or_else(|| c.as_ref().and_then(|c| c.meta.collation_for(&u)));
                         crate::collation::scope(coll, self.update(t, c.as_deref(), &st)).await
                     }
                     .await;
@@ -696,7 +992,8 @@ impl DocStore {
                             crate::filter::parse(&q)?;
                             return Ok(0usize);
                         };
-                        let coll = crate::collation::Collation::of(&s)?;
+                        let coll = crate::collation::Collation::of(&s)?
+                            .or_else(|| c.meta.collation_for(&s));
                         let hint = s.get("hint").filter(|h| !is_empty_hint(h)).cloned();
                         crate::collation::scope(
                             coll,
@@ -725,10 +1022,15 @@ impl DocStore {
                 d.insert("ok", 1.0);
                 Ok(Reply::Doc(d))
             }
-            _ => self
-                .find_and_modify(tenant, &ns, body, t)
-                .await
-                .map(Reply::Doc),
+            _ => {
+                // A command naming no collation uses the collection's.
+                let dc = self
+                    .coll(tenant, &ns)?
+                    .and_then(|c| c.meta.collation_for(body));
+                crate::collation::scope(dc, Box::pin(self.find_and_modify(tenant, &ns, body, t)))
+                    .await
+                    .map(Reply::Doc)
+            }
         }
     }
 
@@ -945,9 +1247,32 @@ impl DocStore {
         Ok(())
     }
 
-    /// Commands that read or change the catalog, and reads.
-    #[allow(clippy::too_many_lines)]
+    /// Commands that read or change the catalog, and reads. A read that
+    /// names no collation uses its collection's default one.
     async fn run(
+        &self,
+        tenant: u64,
+        db: &str,
+        name: &str,
+        body: &Document,
+        txn: Option<&mut DocTxn>,
+    ) -> Result<Reply, MongoError> {
+        if matches!(name, "find" | "aggregate" | "count" | "distinct")
+            && let Some(Bson::String(cname)) = body.get(name)
+            && let Some(c) = self.coll(tenant, &Name::new(db, cname))?
+            && let Some(dc) = c.meta.collation_for(body)
+        {
+            return crate::collation::scope(
+                Some(dc),
+                Box::pin(self.run_cmd(tenant, db, name, body, txn)),
+            )
+            .await;
+        }
+        Box::pin(self.run_cmd(tenant, db, name, body, txn)).await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn run_cmd(
         &self,
         tenant: u64,
         db: &str,
@@ -1032,7 +1357,13 @@ impl DocStore {
                     ));
                 }
                 let batch = batch_of(body, "aggregate")?.unwrap_or(101);
-                let docs = self.aggregate(tenant, db, &coll, &pipeline, txn).await?;
+                // `hint` picks the index of the pipeline's first read.
+                let hint = body.get("hint").filter(|h| !is_empty_hint(h)).cloned();
+                let docs = super::pipeline::with_hint(
+                    hint,
+                    Box::pin(self.aggregate(tenant, db, &coll, &pipeline, txn)),
+                )
+                .await?;
                 let ns = if coll.is_empty() {
                     format!("{db}.$cmd.aggregate")
                 } else {
@@ -1087,6 +1418,18 @@ impl DocStore {
                     } else if k == "changeStreamPreAndPostImages" {
                         super::check_pre_post(v)?;
                         opts.insert(k.clone(), v.clone());
+                    } else if k == "collation" && !body.contains_key("viewOn") {
+                        // Kept with every field, as `listCollections` shows
+                        // it; the simple collation is no option at all.
+                        let Bson::Document(c) = v else {
+                            return Err(MongoError::new(
+                                code::TYPE_MISMATCH,
+                                "BSON field 'create.collation' is the wrong type, expected type 'object'",
+                            ));
+                        };
+                        if let Some(n) = crate::collation::Collation::normalize(c)? {
+                            opts.insert("collation", n);
+                        }
                     } else if matches!(
                         k.as_str(),
                         "capped" | "size" | "max" | "timeseries" | "clusteredIndex" | "collation"
@@ -1104,7 +1447,14 @@ impl DocStore {
                 } else {
                     crate::validate::check_create(&opts)?;
                 }
-                let _g = self.ddl_guard(tenant).await;
+                // Inside a transaction (which holds the writers' side of
+                // the lock) a new collection is created at once, outside
+                // it, as a write creates one.
+                let _g = if txn.is_none() {
+                    Some(self.ddl_guard(tenant).await)
+                } else {
+                    None
+                };
                 let ns = Name::new(db, &cname);
                 match self.create_locked(tenant, &ns, opts.clone()).await? {
                     Some(_) => Ok(Reply::Doc(doc! {"ok": 1.0})),
@@ -1153,8 +1503,14 @@ impl DocStore {
                 let f = body.get_document("filter").cloned().unwrap_or_default();
                 let pred = crate::filter::parse(&f)?;
                 let names_only = body.get_bool("nameOnly").unwrap_or(false);
+                // Collections an open transaction created are seen by
+                // others only after its commit.
+                let (hidden, _) = self.txns.hidden(tenant, db, None);
                 let mut out = Vec::new();
                 for c in self.list(tenant, Some(db))? {
+                    if hidden.contains(&c.meta.name) {
+                        continue;
+                    }
                     let view = c.meta.view().is_some();
                     let d = if names_only {
                         doc! {"name": c.meta.name.clone(), "type": if view { "view" } else { "collection" }}
@@ -1171,7 +1527,7 @@ impl DocStore {
                             "type": "collection",
                             "options": c.meta.options.clone(),
                             "info": {"readOnly": false, "uuid": c.meta.uuid_bson()},
-                            "idIndex": {"v": 2, "key": {"_id": 1}, "name": "_id_"},
+                            "idIndex": c.meta.id_index_spec(),
                         }
                     };
                     if pred.matches(&d) {
@@ -1191,21 +1547,27 @@ impl DocStore {
             "listIndexes" => {
                 let cname = coll_of(body, "listIndexes")?;
                 let ns = Name::new(db, &cname);
-                let Some(c) = self.coll(tenant, &ns)? else {
+                let (hidden_colls, hidden) = self.txns.hidden(tenant, db, Some(&ns));
+                let Some(c) = self
+                    .coll(tenant, &ns)?
+                    .filter(|_| !hidden_colls.contains(&cname))
+                else {
                     return Err(MongoError::new(
                         code::NAMESPACE_NOT_FOUND,
                         format!("ns does not exist: {ns}"),
                     ));
                 };
                 let batch = batch_of(body, "listIndexes")?.unwrap_or(usize::MAX);
-                self.buffered(
-                    tenant,
-                    db,
-                    &cname,
-                    ns.to_string(),
-                    c.meta.index_specs(),
-                    batch,
-                )
+                let specs = c
+                    .meta
+                    .index_specs()
+                    .into_iter()
+                    .filter(|s| {
+                        s.get_str("name")
+                            .is_ok_and(|n| !hidden.iter().any(|h| h == n))
+                    })
+                    .collect();
+                self.buffered(tenant, db, &cname, ns.to_string(), specs, batch)
             }
             "createIndexes" => {
                 let cname = coll_of(body, "createIndexes")?;
@@ -1234,10 +1596,14 @@ impl DocStore {
                         "Must specify at least one index to create",
                     ));
                 }
-                let _g = self.ddl_guard(tenant).await;
-                let (before, after, created) = self
-                    .create_indexes_locked(tenant, &Name::new(db, &cname), &specs)
-                    .await?;
+                // Built online (no DDL lock held while documents are read);
+                // inside a transaction, only on a new or empty collection.
+                let (before, after, created) = if txn.is_some() {
+                    Box::pin(self.create_indexes_in_txn(tenant, &Name::new(db, &cname), &specs))
+                        .await?
+                } else {
+                    Box::pin(self.create_indexes(tenant, &Name::new(db, &cname), &specs)).await?
+                };
                 let mut d = doc! {
                     "numIndexesBefore": i32::try_from(before).unwrap_or(0),
                     "numIndexesAfter": i32::try_from(after).unwrap_or(0),
@@ -1249,6 +1615,12 @@ impl DocStore {
                 d.insert("ok", 1.0);
                 Ok(Reply::Doc(d))
             }
+            "collStats" => {
+                let cname = coll_of(body, "collStats")?;
+                self.coll_stats_command(tenant, db, &cname, body)
+                    .map(Reply::Doc)
+            }
+            "dbStats" => self.db_stats(tenant, db, body).map(Reply::Doc),
             "dropIndexes" | "deleteIndexes" => {
                 let cname = coll_of(body, name)?;
                 let which = match body.get("index") {
@@ -1347,7 +1719,11 @@ impl DocStore {
                             hint: inner.get("hint"),
                             natural: None,
                         };
-                        let p = super::read::plan(&c, &pred, &want)?;
+                        let coll = crate::collation::Collation::of(inner)?
+                            .or_else(|| c.meta.collation_for(inner));
+                        let p = crate::collation::sync_scope(coll, || {
+                            super::read::plan(&c, &pred, &want)
+                        })?;
                         match p.index {
                             Some(i) => format!("IXSCAN:{i}"),
                             None => p.stage().to_owned(),
@@ -1473,4 +1849,123 @@ fn is_empty_hint(h: &Bson) -> bool {
 /// A count as MongoDB answers it: int32 when it fits.
 fn int(n: i64) -> Bson {
     i32::try_from(n).map_or(Bson::Int64(n), Bson::Int32)
+}
+
+/// A multi-document transaction held for a command the store doesn't run
+/// itself (an SQL table read or written from the MongoDB port), from
+/// [`DocStore::txn_loan`]: its engine transaction can be lent out and
+/// given back ([`DocTxn::swap_engine_txn`]). Nothing else uses the
+/// transaction while the loan is held.
+#[derive(Debug)]
+pub struct TxnLoan {
+    slot: tokio::sync::OwnedMutexGuard<TxnSlot>,
+    tenant: u64,
+}
+
+impl TxnLoan {
+    /// The transaction's document side.
+    pub fn txn(&mut self) -> Option<&mut DocTxn> {
+        match &mut self.slot.state {
+            TxnState::Active(t, _) => Some(t.as_mut()),
+            _ => None,
+        }
+    }
+}
+
+impl DocStore {
+    /// The open multi-document transaction `n` of session `lsid` of `user`
+    /// (`body`'s `lsid`, `txnNumber` and `startTransaction`; one is started
+    /// when `startTransaction` says so), held for a command the store
+    /// doesn't run itself; `None` when `body` isn't in a transaction.
+    /// A command that fails ends the transaction ([`DocStore::loan_failed`]).
+    ///
+    /// # Errors
+    /// No such transaction (251, with `TransientTransactionError`), an old
+    /// `txnNumber`, a session of another user.
+    pub async fn txn_loan(
+        &self,
+        tenant: u64,
+        user: &str,
+        body: &Document,
+    ) -> Result<Option<TxnLoan>, MongoError> {
+        if body.get_bool("autocommit") != Ok(false) {
+            return Ok(None);
+        }
+        let (Some(lsid), Some(n)) = (lsid_of(body), i64_of(body, "txnNumber")) else {
+            return Err(MongoError::new(
+                code::INVALID_OPTIONS,
+                "autocommit: false needs lsid and txnNumber",
+            ));
+        };
+        let start = body.get_bool("startTransaction") == Ok(true);
+        // As the store's own commands open or continue a transaction.
+        let slot = match self.txns.get(tenant, &lsid) {
+            Some(s) => {
+                let mut g = s.lock().await;
+                if g.owner != user {
+                    return Err(no_txn(n));
+                }
+                if start {
+                    if n <= g.txn_number {
+                        return Err(MongoError::new(
+                            code::TRANSACTION_TOO_OLD,
+                            format!(
+                                "txnNumber {n} is less than or equal to the last txnNumber {} seen in session",
+                                g.txn_number
+                            ),
+                        ));
+                    }
+                    if let TxnState::Active(t, _) =
+                        std::mem::replace(&mut g.state, TxnState::Aborted)
+                    {
+                        t.rollback();
+                    }
+                    let guard = self.write_guard(tenant).await;
+                    g.state = TxnState::Active(Box::new(self.begin(true)), guard);
+                    g.created.clear();
+                    g.txn_number = n;
+                    g.started = std::time::Instant::now();
+                } else if g.txn_number != n || !matches!(g.state, TxnState::Active(..)) {
+                    return Err(no_txn(n));
+                }
+                drop(g);
+                s
+            }
+            None if start => {
+                let guard = self.write_guard(tenant).await;
+                self.txns.put(
+                    tenant,
+                    &lsid,
+                    TxnSlot {
+                        owner: user.to_owned(),
+                        txn_number: n,
+                        state: TxnState::Active(Box::new(self.begin(true)), guard),
+                        started: std::time::Instant::now(),
+                        created: Vec::new(),
+                    },
+                )
+            }
+            None => return Err(no_txn(n)),
+        };
+        let g = slot.lock_owned().await;
+        if !matches!(g.state, TxnState::Active(..)) {
+            return Err(no_txn(n));
+        }
+        Ok(Some(TxnLoan { slot: g, tenant }))
+    }
+
+    /// The command holding `loan` failed: the transaction ends (rolled
+    /// back, what it created dropped), as after a failed store command.
+    pub async fn loan_failed(&self, mut loan: TxnLoan) {
+        if let TxnState::Active(t, guard) =
+            std::mem::replace(&mut loan.slot.state, TxnState::Aborted)
+        {
+            t.rollback();
+            drop(guard);
+        }
+        let undo = std::mem::take(&mut loan.slot.created);
+        let tenant = loan.tenant;
+        drop(loan);
+        self.undo_created(tenant, undo).await;
+    }
 }

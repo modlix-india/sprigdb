@@ -60,6 +60,7 @@ mod gateway;
 mod graph;
 mod index;
 mod inherit;
+mod unit;
 // Token issuers (external tokens).
 mod issuer;
 mod search;
@@ -508,6 +509,7 @@ fn cli() -> Command {
         .subcommand(mover::shard_group())
         .subcommand(mover::job_group())
         .subcommand(gateway::group())
+        .subcommand(unit::group())
         .subcommand(check::group())
         .subcommand(logic::group())
         .subcommand(space::group())
@@ -571,11 +573,10 @@ fn main() -> ExitCode {
     };
     let name = sub.subcommand_name().unwrap_or_default().to_owned();
     let implemented = match group {
-        "dc" | "cluster" | "settings" | "index" | "job" | "gateway" | "check" | "advisor"
-        | "shard" | "space" | "txn" | "sink" | "graph" | "search" | "recommendations"
-        | "inherit" | "login" | "logout" | "whoami" | "operator" | "token" | "ai" | "catalog" => {
-            true
-        }
+        "dc" | "cluster" | "settings" | "index" | "job" | "gateway" | "unit" | "check"
+        | "advisor" | "shard" | "space" | "txn" | "sink" | "graph" | "search"
+        | "recommendations" | "inherit" | "login" | "logout" | "whoami" | "operator" | "token"
+        | "ai" | "catalog" => true,
         "explain" => matches!(name.as_str(), "query" | "decision" | "placement"),
         "tenant" => !TENANT_LATER.contains(&name.as_str()),
         "logic" => logic::implemented(&name),
@@ -627,6 +628,9 @@ fn main() -> ExitCode {
                     }
                 }),
             "gateway" => gateway::run(&client, sub, output(&matches))
+                .await
+                .map(|()| ExitCode::SUCCESS),
+            "unit" => unit::run(&client, sub, output(&matches))
                 .await
                 .map(|()| ExitCode::SUCCESS),
             "logic" => logic::run(&client, sub, output(&matches))

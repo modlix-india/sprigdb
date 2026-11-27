@@ -363,12 +363,13 @@ pub(crate) fn read(text: &str) -> Option<Alter> {
     Some(a)
 }
 
-/// Whether `text` only adds plain (non-unique) secondary indexes, as
-/// `ALTER TABLE t ADD INDEX ...[, ADD KEY ...]` or `CREATE INDEX ... ON t`,
-/// with no `ALGORITHM = COPY` and no `LOCK = SHARED | EXCLUSIVE`, and none
-/// of them `IGNORED` / `INVISIBLE`: such a change is built online (the
-/// table stays writable while the entries are written).
-pub(crate) fn adds_plain_indexes_only(text: &str) -> bool {
+/// Whether `text` only adds secondary indexes, plain or unique, as
+/// `ALTER TABLE t ADD [UNIQUE] INDEX ...[, ADD KEY ...]`, `ADD CONSTRAINT
+/// c UNIQUE (...)` or `CREATE [UNIQUE] INDEX ... ON t`, with no
+/// `ALGORITHM = COPY` and no `LOCK = SHARED | EXCLUSIVE`, and none of
+/// them `IGNORED` / `INVISIBLE`: such a change is built online (the table
+/// stays writable while the entries are written).
+pub(crate) fn adds_indexes_only(text: &str) -> bool {
     let Some(a) = read(text) else {
         return false;
     };
@@ -387,13 +388,11 @@ pub(crate) fn adds_plain_indexes_only(text: &str) -> bool {
         matches!(
             word(Some(x)),
             Some(
-                "UNIQUE"
-                    | "FULLTEXT"
+                "FULLTEXT"
                     | "SPATIAL"
                     | "VECTOR"
                     | "PRIMARY"
                     | "FOREIGN"
-                    | "CONSTRAINT"
                     | "CHECK"
                     | "IGNORED"
                     | "INVISIBLE"
@@ -405,6 +404,41 @@ pub(crate) fn adds_plain_indexes_only(text: &str) -> bool {
             )
         )
     })
+}
+
+/// The indexes `text` makes public when that is all it does: `ALTER TABLE
+/// t ALTER INDEX k NOT IGNORED | VISIBLE [, ALTER KEY ...]` (lower case).
+pub(crate) fn made_public(text: &str) -> Option<Vec<String>> {
+    let t = table::tokens(text)?;
+    let w = |i: usize| word(t.get(i));
+    if w(0)? != "ALTER" {
+        return None;
+    }
+    let mut i = 1;
+    while matches!(w(i), Some("ONLINE" | "IGNORE")) {
+        i += 1;
+    }
+    if w(i) != Some("TABLE") {
+        return None;
+    }
+    i += 2;
+    while t.get(i) == Some(&Tok::Punct('.')) {
+        i += 2;
+    }
+    let mut out = Vec::new();
+    for s in split(t.get(i..)?) {
+        let (Some("ALTER"), Some("INDEX" | "KEY")) = (word(s.first()), word(s.get(1))) else {
+            return None;
+        };
+        if !matches!(
+            (word(s.get(3)), word(s.get(4)), s.len()),
+            (Some("NOT"), Some("IGNORED"), 5) | (Some("VISIBLE"), None, 4)
+        ) {
+            return None;
+        }
+        out.push(name(s.get(2))?);
+    }
+    (!out.is_empty()).then_some(out)
 }
 
 /// The `ALGORITHM` and `LOCK` options at the end of `CREATE INDEX` and
@@ -976,38 +1010,48 @@ mod tests {
 
     #[test]
     fn key_changes_and_clauses_are_read() {
-        assert!(adds_plain_indexes_only(
+        assert!(adds_indexes_only(
             "ALTER TABLE t ADD INDEX k (a, b), ADD KEY (c(4) DESC)"
         ));
-        assert!(adds_plain_indexes_only(
-            "CREATE INDEX k ON db.t (a) LOCK = NONE"
-        ));
-        assert!(adds_plain_indexes_only(
+        assert!(adds_indexes_only("CREATE INDEX k ON db.t (a) LOCK = NONE"));
+        assert!(adds_indexes_only(
             "alter table `t` add index `unique` (a) algorithm=inplace"
         ));
-        assert!(!adds_plain_indexes_only(
-            "ALTER TABLE t ADD UNIQUE KEY k (a)"
+        assert!(adds_indexes_only("ALTER TABLE t ADD UNIQUE KEY k (a)"));
+        assert!(adds_indexes_only("CREATE UNIQUE INDEX k ON t (a)"));
+        assert!(adds_indexes_only(
+            "ALTER TABLE t ADD CONSTRAINT c UNIQUE (a), ADD INDEX (b)"
         ));
-        assert!(!adds_plain_indexes_only("CREATE UNIQUE INDEX k ON t (a)"));
-        assert!(!adds_plain_indexes_only(
+        assert!(!adds_indexes_only(
+            "ALTER TABLE t ADD CONSTRAINT c PRIMARY KEY (a)"
+        ));
+        assert!(!adds_indexes_only(
+            "ALTER TABLE t ADD CONSTRAINT c CHECK (a > 0)"
+        ));
+        assert!(!adds_indexes_only(
             "ALTER TABLE t ADD INDEX k (a), ADD COLUMN c INT"
         ));
-        assert!(!adds_plain_indexes_only(
+        assert!(!adds_indexes_only(
             "ALTER TABLE t ADD INDEX k (a) ALGORITHM = COPY"
         ));
-        assert!(!adds_plain_indexes_only(
+        assert!(!adds_indexes_only(
             "ALTER TABLE t ADD INDEX k (a), LOCK = SHARED"
         ));
-        assert!(!adds_plain_indexes_only(
-            "ALTER TABLE t ADD INDEX k (a) IGNORED"
-        ));
-        assert!(!adds_plain_indexes_only(
-            "ALTER TABLE t ADD FULLTEXT INDEX k (a)"
-        ));
-        assert!(!adds_plain_indexes_only("ALTER TABLE t DROP INDEX k"));
-        assert!(!adds_plain_indexes_only(
+        assert!(!adds_indexes_only("ALTER TABLE t ADD INDEX k (a) IGNORED"));
+        assert!(!adds_indexes_only("ALTER TABLE t ADD FULLTEXT INDEX k (a)"));
+        assert!(!adds_indexes_only("ALTER TABLE t DROP INDEX k"));
+        assert!(!adds_indexes_only(
             "ALTER TABLE t ADD INDEX IF NOT EXISTS k (a)"
         ));
+        assert_eq!(
+            made_public("ALTER TABLE db.t ALTER INDEX `K` NOT IGNORED, ALTER KEY k2 VISIBLE"),
+            Some(vec!["k".to_owned(), "k2".to_owned()])
+        );
+        assert_eq!(made_public("ALTER TABLE t ALTER INDEX k IGNORED"), None);
+        assert_eq!(
+            made_public("ALTER TABLE t ALTER INDEX k NOT IGNORED, ADD INDEX (b)"),
+            None
+        );
         let a = read("ALTER TABLE t ADD INDEX k (a, b), ADD UNIQUE KEY u (c), ADD CONSTRAINT x UNIQUE (d), ADD PRIMARY KEY (id), DROP INDEX k2, DROP KEY k3, DROP PRIMARY KEY, RENAME INDEX a TO b, RENAME KEY c TO d, ALGORITHM=inplace, LOCK = NONE").unwrap();
         assert_eq!(
             a.specs,

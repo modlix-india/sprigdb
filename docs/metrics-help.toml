@@ -124,6 +124,7 @@ sprig_bolt_bookmark_waits_total = "Bolt reads with a bookmark that waited for a 
 sprig_bolt_connections = "Bolt connections open on this gateway; `version` is the negotiated Bolt version. Unit: count."
 sprig_bolt_keepalives_total = "Keep-alive (NOOP) chunks the gateway sent on Bolt connections while a request ran, one every half `bolt.recv_timeout_seconds`, so drivers wait for long statements. Unit: count."
 sprig_bolt_messages_total = "Bolt protocol messages; `message` is the message name, `result` how it was handled (such as `sent` or `ignored` after a failure). Unit: count."
+sprig_catalog_barrier_seconds = "On a replicated node, how long a catalog change waited before allocating its next version until every gateway held the committed one (the DDL barrier, two-version rule; past 5 s the laggards are fenced and their lease waited out). Unit: seconds."
 sprig_catalog_cache_bytes = "Memory used by this process's cache of tenant catalogs (`catalog.cache_max_mb`). Unit: bytes."
 sprig_catalog_cache_tenants = "Tenants whose catalogs are cached in this process (`catalog.cache_max_tenants`). Unit: count."
 sprig_catalog_changes_total = "Catalog changes committed (DDL, settings, accounts); `kind` is the kind of change. Unit: count."

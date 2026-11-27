@@ -1144,7 +1144,11 @@ mod tests {
 
     fn spec(sql: &str) -> Spec {
         let t = super::super::lex::lex(sql).unwrap();
-        let mut p = P { t: &t, i: 0 };
+        let mut p = P {
+            t: &t,
+            i: 0,
+            mysql: false,
+        };
         read(&mut p, "utf8mb4").unwrap()
     }
 

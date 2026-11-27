@@ -175,6 +175,56 @@ pub enum SqlOp {
         #[serde(default)]
         consumer: String,
     },
+    /// A stream sink's read of an engine stream's partitions, as the
+    /// request's user (who needs `SELECT` on the stream): one result of
+    /// rows `(partition_no, offset_no, ts, key, value, headers)`, each
+    /// partition's in offset order, `ts` as UTC text with milliseconds and
+    /// `headers` a JSON object (or NULL).
+    StreamRead {
+        /// The stream's database.
+        db: String,
+        /// The stream.
+        stream: String,
+        /// Where each partition is read from.
+        from: Vec<StreamFrom>,
+        /// Records per partition at most.
+        max_records: u32,
+        /// How long to wait for a record when none is there.
+        #[serde(default)]
+        wait_ms: u64,
+    },
+    /// A sink's dead letter published to an engine stream, as the
+    /// request's user (who needs `INSERT` on the stream).
+    StreamPublish {
+        /// The stream's database.
+        db: String,
+        /// The stream.
+        stream: String,
+        /// The record's key (base64; absent for none).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<String>,
+        /// Its value (base64; absent for none).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        value: Option<String>,
+        /// Its headers, as text.
+        #[serde(default)]
+        headers: Vec<(String, String)>,
+    },
+}
+
+/// Where [`SqlOp::StreamRead`] reads one partition from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamFrom {
+    /// The partition.
+    pub partition: u32,
+    /// The first offset to read; absent: the first record at or after
+    /// `from_ms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<u64>,
+    /// Without an offset: the first record time to read (ms since the
+    /// epoch; 0 for the partition's start).
+    #[serde(default)]
+    pub from_ms: i64,
 }
 
 /// One message of [`SqlOp::PublishBatch`].

@@ -375,7 +375,23 @@ pub(crate) fn key_value(column: &ColumnType, v: &Value, ty: &ExprType) -> KeyVal
             }
             _ => KeyVal::Unusable,
         },
+        // A UUID or address: the constant's stored bytes, if it is one.
+        ColumnType::Fbt(f) if fbt_usable(f, ty) => sprig_exec::fbt_stored(f, v, ty)
+            .map_or(KeyVal::Unusable, |b| {
+                KeyVal::Exact(Value::Bytes(Bytes::from(b)))
+            }),
         _ => KeyVal::Unusable,
+    }
+}
+
+/// Whether a value of static type `ty` compares with a `UUID`, `INET4` or
+/// `INET6` column in the column's type: a value of the type, an `INET4`
+/// one for an `INET6` column, or a string.
+fn fbt_usable(f: sprig_engine::row::Fbt, ty: &ExprType) -> bool {
+    use sprig_engine::row::Fbt;
+    match ty.fbt {
+        Some(g) => g == f || (g == Fbt::Inet4 && f == Fbt::Inet6),
+        None => ty.kind == Kind::Str,
     }
 }
 
@@ -394,6 +410,7 @@ pub(crate) fn key_usable(column: &ColumnType, ty: &ExprType) -> bool {
         }
         ColumnType::Date => ty.kind == Kind::Date,
         ColumnType::DateTime { .. } => matches!(ty.kind, Kind::Date | Kind::DateTime),
+        ColumnType::Fbt(f) => fbt_usable(f, ty),
         _ => false,
     }
 }
@@ -411,6 +428,7 @@ pub(crate) fn lookup_exact(column: &ColumnType, ty: &ExprType) -> bool {
         | ColumnType::Text { collation, .. } => {
             collation.charset() == Charset::Utf8mb4 && collation_holds(collation, ty)
         }
+        ColumnType::Fbt(f) => fbt_usable(f, ty),
         _ => false,
     }
 }

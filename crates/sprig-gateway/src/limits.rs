@@ -1135,8 +1135,28 @@ impl SessionExec for LimitedSession {
         self.inner.holds_tenant_privilege(action)
     }
 
+    fn holds_privilege_on(
+        &self,
+        action: sprig_auth::authz::Action,
+        db: &str,
+        name: Option<&str>,
+    ) -> Option<bool> {
+        self.inner.holds_privilege_on(action, db, name)
+    }
+
+    fn row_guard(&self) -> Option<std::sync::Arc<sprig_doc::docstore::guard::RowGuard>> {
+        self.inner.row_guard()
+    }
+
     fn set_claims(&mut self, claims: Option<std::sync::Arc<serde_json::Value>>) {
         self.inner.set_claims(claims);
+    }
+
+    fn lend_engine_txn(
+        &mut self,
+        txn: Option<sprig_engine::txn::Txn>,
+    ) -> Option<sprig_engine::txn::Txn> {
+        self.inner.lend_engine_txn(txn)
     }
 }
 

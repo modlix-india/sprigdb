@@ -350,6 +350,8 @@ async fn run_inner(c: &mut Conn, name: &str, body: &Document) -> Result<Document
             // open transactions roll back.
             let who = owner(c);
             c.shared.txns.kill_owner(&who).await;
+            // And their transactions on the storage engine.
+            super::engine::kill_all(c).await;
             return Ok(doc! {"ok": 1.0});
         }
         "refreshSessions" | "startSession" => {

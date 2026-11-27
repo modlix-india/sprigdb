@@ -162,6 +162,25 @@ impl<'a> Args<'a> {
     }
 }
 
+/// An operand compared with a UUID, INET4 or INET6 column of type `f`:
+/// the column itself, `NULL`, or a constant given as the type's stored
+/// bytes. Anything else is the planner's.
+fn fbt_operand(e: CExpr, f: sprig_engine::row::Fbt) -> Result<CExpr> {
+    let refuse = || not_on_engine("a UUID, INET4 or INET6 column compared with this");
+    match e {
+        CExpr::Col(_) | CExpr::Lit(Datum::Null) => Ok(e),
+        CExpr::Lit(Datum::Str(t)) => f
+            .parse(&t)
+            .map(|b| CExpr::Lit(Datum::Bytes(Bytes::from(b))))
+            .ok_or_else(refuse),
+        CExpr::Lit(Datum::Bytes(t)) => f
+            .from_binary(&t)
+            .map(|b| CExpr::Lit(Datum::Bytes(Bytes::from(b))))
+            .ok_or_else(refuse),
+        _ => Err(refuse()),
+    }
+}
+
 /// A compiled expression.
 #[derive(Debug, Clone)]
 pub(crate) enum CExpr {
@@ -349,6 +368,14 @@ impl Compiler<'_> {
         Ok(())
     }
 
+    /// The type of a UUID, INET4 or INET6 column `e` reads.
+    fn fbt_of(&self, e: &CExpr) -> Option<sprig_engine::row::Fbt> {
+        match self.col_type(e) {
+            Some(ColType::Fbt(f)) => Some(f),
+            _ => None,
+        }
+    }
+
     fn col_type(&self, e: &CExpr) -> Option<ColType> {
         match e {
             CExpr::Col(i) => Some(self.def.columns[*i].ty),
@@ -513,6 +540,30 @@ impl Compiler<'_> {
                 } else {
                     (no_now(a)?, no_now(b)?)
                 };
+                // A UUID or address column compares in its own order: a
+                // constant is taken as the type's stored bytes.
+                let (a, b) = match (self.fbt_of(&a), self.fbt_of(&b)) {
+                    (None, None) => (a, b),
+                    (fa, fb) => {
+                        let comparison = matches!(
+                            op,
+                            BinaryOperator::Eq
+                                | BinaryOperator::Spaceship
+                                | BinaryOperator::NotEq
+                                | BinaryOperator::Lt
+                                | BinaryOperator::LtEq
+                                | BinaryOperator::Gt
+                                | BinaryOperator::GtEq
+                        );
+                        if !comparison || (fa.is_some() && fb.is_some() && fa != fb) {
+                            return Err(not_on_engine(
+                                "a UUID, INET4 or INET6 column in this expression",
+                            ));
+                        }
+                        let f = fa.or(fb).unwrap_or(sprig_engine::row::Fbt::Uuid);
+                        (fbt_operand(a, f)?, fbt_operand(b, f)?)
+                    }
+                };
                 let cmp = |c: Cmp, s: &Self| -> Result<CExpr> {
                     let cx = s.cmp_cx(&a, &[&b], false)?;
                     Ok(CExpr::Cmp(c, Box::new(a.clone()), Box::new(b.clone()), cx))
@@ -546,6 +597,9 @@ impl Compiler<'_> {
                     .iter()
                     .map(|x| self.compile(x))
                     .collect::<Result<Vec<_>>>()?;
+                if self.fbt_of(&a).is_some() || l.iter().any(|x| self.fbt_of(x).is_some()) {
+                    return Err(not_on_engine("a UUID, INET4 or INET6 column in IN"));
+                }
                 let cx = self.cmp_cx(&a, &l.iter().collect::<Vec<_>>(), true)?;
                 if let Some(t) = self.col_type(&a) {
                     for x in &l {
@@ -563,6 +617,9 @@ impl Compiler<'_> {
                 let a = self.compile(expr)?;
                 let lo = self.compile(low)?;
                 let hi = self.compile(high)?;
+                if [&a, &lo, &hi].iter().any(|x| self.fbt_of(x).is_some()) {
+                    return Err(not_on_engine("a UUID, INET4 or INET6 column in BETWEEN"));
+                }
                 let cx = self.cmp_cx(&a, &[&lo, &hi], true)?;
                 if let Some(t) = self.col_type(&a) {
                     self.hint(&lo, t);

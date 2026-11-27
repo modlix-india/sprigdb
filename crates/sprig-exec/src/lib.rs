@@ -67,7 +67,9 @@ pub mod types;
 mod tz;
 
 pub use error::{Level, Result, SqlError, Warning};
-pub use expr::{BinOp, CastTarget, ColumnRef, Compiled, Expr, Truth, compile, value_text};
+pub use expr::{
+    BinOp, CastTarget, ColumnRef, Compiled, Expr, Truth, compile, fbt_stored, value_text,
+};
 pub use func::json::json_order;
 pub use func::jsontable::{JsonTable, JtColumn, JtOnMiss};
 pub use func::misc::{SessionInfo, take_set_insert_id};

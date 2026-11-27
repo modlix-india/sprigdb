@@ -21,6 +21,7 @@
 
 mod late;
 mod matcher;
+mod plan;
 mod stream;
 mod write;
 
@@ -504,6 +505,7 @@ fn prune_of(p: &Projection, first: Option<&Row>) -> Option<Prune> {
         bound: None,
         limit: 0,
         sql: false,
+        scan_top: None,
     })
 }
 
@@ -765,6 +767,10 @@ pub(crate) struct Prune {
     /// after the hop drops rows (one pattern, a `WHERE` of pushed numeric
     /// comparisons of `var` alone; the hop checks the rest).
     pub(crate) sql: bool,
+    /// [`crate::store::Scan::top`] for the start scan of `var`: the
+    /// `MATCH` is one node pattern whose `WHERE` holds only range
+    /// conditions on the first sort key's property.
+    pub(crate) scan_top: Option<(String, bool, usize)>,
 }
 
 impl Prune {
@@ -1758,6 +1764,7 @@ impl Exec<'_> {
                                 prune_of(p, rows.first())
                             };
                             self.prune_sql(patterns, where_.as_ref(), n);
+                            self.prune_scan_top(patterns, where_.as_ref(), n);
                             let r = self
                                 .match_clause(rows, patterns, where_.as_ref(), *optional, mult_ok)
                                 .await;
@@ -1997,6 +2004,14 @@ impl Exec<'_> {
                     self.b.tx_metadata.clone().unwrap_or_default(),
                 )]],
             ),
+            // A statistics pass for the planner, now.
+            "sprig.graph.analyze" => {
+                let (n, r) = self.store.analyze()?;
+                (
+                    vec!["nodes", "relationships"],
+                    vec![vec![Value::Float(n), Value::Float(r)]],
+                )
+            }
             // Drivers and cypher-shell call it to check a connection.
             "db.ping" => (vec!["success"], vec![vec![Value::Bool(true)]]),
             "dbms.components" => (
@@ -2104,6 +2119,35 @@ impl Exec<'_> {
         }
     }
 
+    /// Sets [`Prune::scan_top`]: one node pattern with one label and no
+    /// map, its `WHERE` (if any) only `<`, `<=`, `>`, `>=` and `STARTS
+    /// WITH` conditions on the property the first sort key reads.
+    fn prune_scan_top(&mut self, patterns: &[PathPattern], where_: Option<&Expr>, n: usize) {
+        let params = self.params;
+        let Some(pr) = &mut self.prune else { return };
+        let [p] = patterns else { return };
+        let ok_node = p.steps.is_empty()
+            && p.kind == crate::ast::PathKind::Normal
+            && p.var.is_none()
+            && p.start.props.is_none()
+            && p.start.var.as_ref() == Some(&pr.var)
+            && matches!(p.start.labels, Some(crate::ast::LabelExpr::Name(_)));
+        let Some((Expr::Prop(t, key), asc)) = pr.keys.first() else {
+            return;
+        };
+        if !ok_node || !matches!(&**t, Expr::Var(x) if *x == pr.var) || n == 0 {
+            return;
+        }
+        let ranged_only = where_.is_none_or(|w| {
+            matcher::conjuncts(w)
+                .into_iter()
+                .all(|c| plan::range_of(c, &pr.var, params).is_some_and(|(k, _)| k == *key))
+        });
+        if ranged_only {
+            pr.scan_top = Some((key.clone(), *asc, n));
+        }
+    }
+
     /// A `MATCH` followed by a projection that keeps its first `n` rows
     /// ([`Exec::topk_of`]): the incoming rows go through in chunks, and
     /// after each only the best `n` rows so far are kept (ties in input
@@ -2134,6 +2178,7 @@ impl Exec<'_> {
             prune_of(p, rows.first())
         };
         self.prune_sql(patterns, where_, n);
+        self.prune_scan_top(patterns, where_, n);
         while !rows.is_empty() {
             let rest = rows.split_off(MATCH_CHUNK.min(rows.len()));
             let chunk = std::mem::replace(&mut rows, rest);
@@ -2595,6 +2640,8 @@ fn is_row_error(e: &SprigError) -> bool {
 }
 
 /// The variables a pattern binds.
+pub use plan::{planner_on, set_planner};
+
 pub(crate) fn pattern_vars(p: &PathPattern) -> Vec<String> {
     let mut v = Vec::new();
     if let Some(x) = &p.var {

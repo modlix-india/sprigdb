@@ -209,6 +209,10 @@ where
     /// API call and the `tenant_bootstrap` loop both start one for a new
     /// tenant ([`bootstrap`](Self::bootstrap)).
     bootstrapping: Mutex<HashMap<TenantId, Arc<tokio::sync::Mutex<()>>>>,
+    /// The DC's unit descriptors, followed by a watch from the first
+    /// placement on: how many units each node holds and is home to, without
+    /// listing every descriptor for each new tenant.
+    units: std::sync::OnceLock<Arc<sprig_catalog::units::UnitDirectory>>,
 }
 
 impl<B: SettingsBackend> std::fmt::Debug for TenantService<B>
@@ -331,6 +335,7 @@ where
             dropper: std::sync::OnceLock::new(),
             waiting_dbs: Mutex::new(HashMap::new()),
             bootstrapping: Mutex::new(HashMap::new()),
+            units: std::sync::OnceLock::new(),
         })
     }
 
@@ -534,7 +539,25 @@ where
             }
             (e, true)
         };
-        let done = self.bootstrap(entry.body().tenant_id, guard).await?;
+        // A new tenant's unit may still be electing its leader, or moving
+        // it to the home node: such answers are retried for a while here
+        // (the `tenant_bootstrap` loop finishes the tenant anyway).
+        let id = entry.body().tenant_id;
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let done = loop {
+            match self.bootstrap(id, guard).await {
+                Err(e)
+                    if matches!(
+                        e.code(),
+                        Some(SprigCode::CatalogUnavailable | SprigCode::ShardMoved)
+                    ) && Instant::now() < deadline =>
+                {
+                    tracing::debug!(tenant = %id, error = %e, "tenant bootstrap retried");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                r => break r?,
+            }
+        };
         let tenant = self.show_id(done.entry.tenant_id).await?;
         Ok(CreateTenantResponse {
             created,
@@ -693,6 +716,10 @@ where
             ));
         }
         let (cluster, placement, considered) = self.place(&b, guard).await?;
+        if b.state == TenantState::Creating {
+            // Where its engine unit lives, before anything is written to it.
+            self.place_unit(&b, guard).await?;
+        }
         if b.state == TenantState::Active {
             return Ok(Bootstrapped {
                 entry: b,
@@ -904,7 +931,14 @@ where
             )));
         }
         let placeable = self.locator.pools().placeable().await?;
-        let counts = self.catalogs_per_cluster().await?;
+        // Counting every tenant's catalog map is a listing of all of them:
+        // only worth it when there is a cluster to choose among (an
+        // engine-only DC has none).
+        let counts = if placeable.is_empty() {
+            HashMap::new()
+        } else {
+            self.catalogs_per_cluster().await?
+        };
         let considered: Vec<(ClusterId, u64)> = placeable
             .iter()
             .map(|c| (c.clone(), counts.get(c).copied().unwrap_or(0)))
@@ -958,6 +992,150 @@ where
             tenant = %b.tenant_id, name = %b.name, %cluster, reason, considered = ?considered,
             "catalog placed");
         Ok((cluster, reason.to_owned(), considered))
+    }
+
+    /// Step 0 on an engine cluster whose nodes place units per tenant: the
+    /// tenant's unit descriptor, written once (guarded by `Missing` and the
+    /// DC leadership), so a rerun after a crash finds the same nodes. The
+    /// voters are three active nodes in distinct failure domains with the
+    /// fewest units, among those whose gateway is ready; the home node
+    /// leads it. Returns `None` when no node places units (every node holds
+    /// every unit).
+    ///
+    /// # Errors
+    /// 39120 when no ready node places units yet some do (or fewer than
+    /// three failure domains are ready); 39504 off the leader; the store's.
+    async fn place_unit(
+        &self,
+        b: &DirectoryEntry,
+        guard: &[Cmp],
+    ) -> Result<Option<sprig_catalog::units::UnitDescriptor>> {
+        use sprig_catalog::units;
+        let tenant = b.tenant_id.0;
+        if let Some(d) = units::read(&*self.dc_store, tenant).await? {
+            return Ok(Some(d));
+        }
+        let nodes: Vec<units::NodeRecord> = units::nodes(&*self.dc_store)
+            .await?
+            .into_iter()
+            .filter(|n| n.placement && n.state == "active")
+            .collect();
+        if nodes.is_empty() {
+            return Ok(None);
+        }
+        let ready = self.ready_raft_nodes().await?;
+        let dir = self.unit_directory().await;
+        let counts = match &dir {
+            Some(dir) => dir.counts(),
+            None => units::list(&*self.dc_store).await?.into_iter().fold(
+                BTreeMap::<u64, (usize, usize)>::new(),
+                |mut m, d| {
+                    for v in &d.voters {
+                        m.entry(*v).or_default().0 += 1;
+                    }
+                    m.entry(d.home).or_default().1 += 1;
+                    m
+                },
+            ),
+        };
+        let loads: Vec<sprig_balancer::units::NodeLoad> = nodes
+            .iter()
+            .filter(|n| ready.contains(&n.id))
+            .map(|n| {
+                let (units, homes) = counts.get(&n.id).copied().unwrap_or_default();
+                sprig_balancer::units::NodeLoad {
+                    id: n.id,
+                    failure_domain: n.failure_domain.clone(),
+                    units,
+                    homes,
+                }
+            })
+            .collect();
+        // Three copies; a cluster of fewer nodes gets one on each. Nodes
+        // not ready now are waited for (the bootstrap retries), so a unit
+        // never gets fewer copies than the cluster can give it.
+        let copies = nodes.len().min(3);
+        if copies < 3 {
+            tracing::warn!(tenant = %b.tenant_id, nodes = nodes.len(),
+                "the cluster has fewer than three nodes: the tenant's unit gets fewer copies");
+        }
+        let p = sprig_balancer::units::place(&loads, copies)?;
+        let desc = units::UnitDescriptor {
+            tenant,
+            unit: tenant,
+            voters: p.voters.clone(),
+            learners: Vec::new(),
+            home: p.home,
+            generation: 0,
+        };
+        let stored = units::place_once(&*self.dc_store, &desc, guard).await?;
+        if let Some(dir) = &dir {
+            // The next placement counts it, whether or not the watch has
+            // delivered it yet.
+            dir.put(stored.clone());
+        }
+        if stored == desc {
+            tracing::info!(event = "decision", component = "controller", kind = "unit.place",
+                tenant = %b.tenant_id, name = %b.name, voters = ?stored.voters, home = stored.home,
+                considered = ?loads.iter().map(|l| (l.id, l.units)).collect::<Vec<_>>(),
+                "tenant unit placed");
+        }
+        Ok(Some(stored))
+    }
+
+    /// The DC's unit descriptors as a watch keeps them (started on first
+    /// use); `None` while its first listing hasn't arrived within 2 s (the
+    /// caller lists the descriptors itself).
+    async fn unit_directory(&self) -> Option<Arc<sprig_catalog::units::UnitDirectory>> {
+        let dir = Arc::clone(self.units.get_or_init(|| {
+            let dir = sprig_catalog::units::UnitDirectory::new();
+            // Runs as long as the process: the controller serves placement
+            // whenever it leads the DC.
+            tokio::spawn(Arc::clone(&dir).follow(
+                Arc::clone(&self.dc_store),
+                sprig_common::CancellationToken::new(),
+            ));
+            dir
+        }));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !dir.is_ready() {
+            if Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        Some(dir)
+    }
+
+    /// Raft ids of the DC's ready gateways.
+    async fn ready_raft_nodes(&self) -> Result<Vec<u64>> {
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct Gw {
+            state: String,
+            #[serde(default)]
+            raft_node: Option<u64>,
+        }
+        impl sprig_meta::Versioned for Gw {
+            const V: u32 = 1;
+        }
+        let prefix = self.dc_store.tier().key("gateways/")?;
+        let page = self
+            .dc_store
+            .list(
+                &prefix,
+                ListOpts {
+                    limit: 10_000,
+                    ..ListOpts::default()
+                },
+            )
+            .await?;
+        Ok(page
+            .kvs
+            .iter()
+            .filter_map(|kv| Record::<Gw>::decode(&kv.value).ok())
+            .filter(|g| g.body.state == "ready")
+            .filter_map(|g| g.body.raft_node)
+            .collect())
     }
 
     async fn recorded_placement(&self, id: TenantId, c: &ClusterId) -> Option<BootstrapProgress> {

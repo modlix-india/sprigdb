@@ -70,23 +70,23 @@ pub(crate) struct Target {
 
 /// The statement's parts, as text.
 #[derive(Debug, Default, PartialEq, Eq)]
-struct Parts<'a> {
-    update: bool,
-    ignore: bool,
+pub(crate) struct Parts<'a> {
+    pub(crate) update: bool,
+    pub(crate) ignore: bool,
     /// The table references.
-    refs: &'a str,
+    pub(crate) refs: &'a str,
     /// `UPDATE`: each assignment's target name parts and value text.
-    sets: Vec<(Vec<String>, &'a str)>,
+    pub(crate) sets: Vec<(Vec<String>, &'a str)>,
     /// `DELETE`: the listed targets' name parts.
-    targets: Vec<Vec<String>>,
+    pub(crate) targets: Vec<Vec<String>>,
     /// `DELETE t FROM ...` or `DELETE FROM t USING ...`.
-    listed: bool,
-    filter: Option<&'a str>,
+    pub(crate) listed: bool,
+    pub(crate) filter: Option<&'a str>,
     /// After `ORDER BY`.
-    order: Option<&'a str>,
-    limit: Option<&'a str>,
+    pub(crate) order: Option<&'a str>,
+    pub(crate) limit: Option<&'a str>,
     /// Where `ORDER BY` or `LIMIT` starts (the MySQL port's syntax error).
-    tail_at: Option<usize>,
+    pub(crate) tail_at: Option<usize>,
 }
 
 struct Toks<'a> {
@@ -244,7 +244,7 @@ impl<'a> Toks<'a> {
 
 /// The statement's parts, `None` for text that isn't an `UPDATE` or
 /// `DELETE` of these shapes.
-fn split(text: &str, opts: LexOptions) -> Option<Parts<'_>> {
+pub(crate) fn split(text: &str, opts: LexOptions) -> Option<Parts<'_>> {
     let k = Toks::new(text, opts)?;
     let n = k.t.len();
     let mut p = Parts::default();
@@ -494,7 +494,7 @@ pub(crate) fn bind(
     let Some(r) = resolve_parts(cx, text, opts, mysql)? else {
         return Ok(None);
     };
-    plans(cx, r, opts)
+    plans(cx, r, opts, mysql)
 }
 
 /// A write's parts with its tables, targets and assignments resolved.
@@ -667,7 +667,14 @@ fn resolve_parts<'a>(
 
 /// [`bind`]'s second part: the `SELECT` and each target's one-row write.
 #[allow(clippy::too_many_lines)] // the SELECT's items, then each target's write
-fn plans(cx: &BindCtx<'_>, r: Resolved<'_>, opts: LexOptions) -> Result<Option<MultiWrite>> {
+fn plans(
+    cx: &BindCtx<'_>,
+    r: Resolved<'_>,
+    opts: LexOptions,
+    mysql: bool,
+) -> Result<Option<MultiWrite>> {
+    // MySQL: a later assignment reads an earlier one's new value.
+    let chained = (mysql && r.p.update && r.fs.len() > 1).then(|| chained_values(&r, opts));
     let Resolved {
         p,
         fs,
@@ -675,6 +682,14 @@ fn plans(cx: &BindCtx<'_>, r: Resolved<'_>, opts: LexOptions) -> Result<Option<M
         sets,
         ..
     } = r;
+    let sets: Vec<(usize, usize, &str)> = match &chained {
+        Some(c) => sets
+            .iter()
+            .zip(c)
+            .map(|((f, col, _), v)| (*f, *col, v.as_str()))
+            .collect(),
+        None => sets,
+    };
     let ci = |a: &str, b: &str| a.eq_ignore_ascii_case(b);
     // Which values the SELECT works out: every one with several tables;
     // with one, those holding a subquery (the rest run on the row).
@@ -864,6 +879,83 @@ pub(crate) struct RowsTarget {
     pub sets: Vec<(usize, usize)>,
 }
 
+/// MySQL 8.4's multi-table `UPDATE` values: the tables are written one
+/// after another in their order in the statement, so an assignment reads
+/// the new values of the earlier tables' columns and of its own table's
+/// columns assigned before it: a reference to one (`t.c`, or a bare `c`
+/// only one table has) is replaced by that assignment's value. MariaDB
+/// reads every value from the rows as they were.
+fn chained_values(r: &Resolved<'_>, opts: LexOptions) -> Vec<String> {
+    let ci = |a: &str, b: &str| a.eq_ignore_ascii_case(b);
+    let column_of = |fi: usize, name: &str| {
+        r.fs[fi]
+            .def
+            .as_ref()
+            .and_then(|(d, _)| d.columns.iter().position(|c| ci(&c.name, name)))
+    };
+    let mut done: Vec<(usize, usize, String)> = Vec::new();
+    let mut out = vec![String::new(); r.sets.len()];
+    // The tables are written in their order in the statement: one reads
+    // the new values of the tables before it and of its own columns
+    // assigned before, the old values of the tables after it.
+    let mut order: Vec<usize> = (0..r.sets.len()).collect();
+    order.sort_by_key(|&k| r.sets[k].0);
+    for k in order {
+        let (fi, col, v) = &r.sets[k];
+        let value = match Toks::new(v, opts) {
+            Some(k) if !done.is_empty() => {
+                let mut s = String::with_capacity(v.len());
+                let mut last = 0usize;
+                let n = k.t.len();
+                let mut i = 0;
+                while i < n {
+                    let ident = |j: usize| j < n && k.t[j].kind.is_ident_like();
+                    let after_dot = i > 0 && k.punct(i - 1, b".");
+                    if !ident(i) || after_dot || k.punct(i + 1, b"(") {
+                        i += 1;
+                        continue;
+                    }
+                    let name =
+                        |j: usize| String::from_utf8_lossy(&ident_value(k.bytes(j))).into_owned();
+                    let (target, end) =
+                        if k.punct(i + 1, b".") && ident(i + 2) && !k.punct(i + 3, b".") {
+                            let f = r.fs.iter().position(|f| ci(&f.visible, &name(i)));
+                            (
+                                f.and_then(|f| column_of(f, &name(i + 2)).map(|c| (f, c))),
+                                i + 3,
+                            )
+                        } else if k.punct(i + 1, b".") {
+                            (None, i + 1)
+                        } else {
+                            let mut hits = (0..r.fs.len())
+                                .filter_map(|f| column_of(f, &name(i)).map(|c| (f, c)));
+                            let one = hits.next();
+                            (if hits.next().is_none() { one } else { None }, i + 1)
+                        };
+                    if let Some((f, c)) = target
+                        && let Some((_, _, sub)) =
+                            done.iter().find(|(df, dc, _)| *df == f && *dc == c)
+                    {
+                        s.push_str(&v[last..k.t[i].start as usize]);
+                        s.push('(');
+                        s.push_str(sub);
+                        s.push(')');
+                        last = k.t[end - 1].end as usize;
+                    }
+                    i = end;
+                }
+                s.push_str(&v[last..]);
+                s
+            }
+            _ => (*v).to_owned(),
+        };
+        done.retain(|(df, dc, _)| !(df == fi && dc == col));
+        done.push((*fi, *col, value.clone()));
+        out[k] = value;
+    }
+    out
+}
+
 /// `text` as a [`RowsSelect`]; `None` when it isn't a multi-table write
 /// of engine tables.
 ///
@@ -899,7 +991,13 @@ pub(crate) fn rows_select(
             sets: Vec::new(),
         });
     }
-    for (sfi, col, v) in &r.sets {
+    // MySQL: a later assignment reads an earlier one's new value.
+    let values: Vec<String> = if mysql && r.p.update {
+        chained_values(&r, opts)
+    } else {
+        r.sets.iter().map(|(_, _, v)| (*v).to_owned()).collect()
+    };
+    for ((sfi, col, _), v) in r.sets.iter().zip(&values) {
         let Some(n) = r.chosen.iter().position(|c| c == sfi) else {
             continue;
         };

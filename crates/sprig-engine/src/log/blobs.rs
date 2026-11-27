@@ -375,7 +375,7 @@ impl NoteBlobs {
         let mut o = OpenOptions::new();
         o.read(true).write(true).create(true).truncate(true);
         #[cfg(target_os = "macos")]
-        if self.sync == SyncMode::Full {
+        if self.sync == SyncMode::Full && !super::syncs_simulated() {
             use std::os::unix::fs::OpenOptionsExt;
             o.custom_flags(O_DSYNC);
         }
@@ -410,12 +410,13 @@ impl NoteBlobs {
     fn write_pending(&self, a: &mut Active, sync: bool) -> io::Result<()> {
         if !a.pending.is_empty() {
             a.file.file.write_all_at(&a.pending, a.len)?;
+            super::fs::note_write();
             a.len += a.pending.len() as u64;
             a.pending.clear();
             a.dirty = true;
         }
         if sync && a.dirty {
-            if self.sync == SyncMode::Full {
+            if self.sync == SyncMode::Full && !super::simulated_sync() {
                 a.file.file.sync_data()?;
             }
             a.dirty = false;
@@ -543,8 +544,12 @@ impl NoteBlobs {
         }
     }
 
-    /// Syncs what was written (alongside the log's own sync; one caller at
-    /// a time, the log's writer). The file is synced outside the lock.
+    /// Syncs what was written (alongside the log's own sync). The file is
+    /// synced outside the lock, so writes go on meanwhile; several syncs
+    /// may run at once (a log that overlaps its syncs). One that finds
+    /// nothing written since the last sync began returns at once: whoever
+    /// counts on it must also wait for the syncs that began before it.
+    /// A file that rolled was synced when it rolled.
     ///
     /// # Errors
     /// The sync failed.
@@ -559,6 +564,7 @@ impl NoteBlobs {
         // macOS: written with O_DSYNC; the log's full sync flushes the
         // drive (module docs).
         if self.sync == SyncMode::Full
+            && !super::simulated_sync()
             && !cfg!(target_os = "macos")
             && let Err(e) = file.file.sync_data()
         {

@@ -396,6 +396,85 @@ impl DeadLetters for CatalogDead {
     }
 }
 
+/// Dead letters published to an engine stream (`DEAD LETTER TO STREAM`)
+/// through a gateway as the sink's owner: the record's key, value and
+/// headers, plus `sprig.dl.reason`, `sprig.dl.class`, `sprig.dl.attempts`,
+/// `sprig.dl.sink` and `sprig.dl.position`.
+struct StreamDead {
+    peer: Arc<dyn crate::peer::SinkPeer>,
+    run_as: crate::peer::RunAs,
+    db: String,
+    stream: String,
+    sink: SinkId,
+}
+
+#[async_trait]
+impl DeadLetters for StreamDead {
+    async fn write(&self, rec: &crate::model::SinkRecord, info: &DeadInfo) -> Result<()> {
+        use base64::Engine as _;
+        let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+        let mut headers: Vec<(String, String)> = rec
+            .headers
+            .iter()
+            .map(|(k, v)| (k.clone(), String::from_utf8_lossy(v).into_owned()))
+            .collect();
+        headers.push(("sprig.dl.reason".into(), info.reason.clone()));
+        headers.push(("sprig.dl.class".into(), info.class.to_owned()));
+        headers.push(("sprig.dl.attempts".into(), info.attempts.to_string()));
+        headers.push(("sprig.dl.sink".into(), self.sink.0.to_string()));
+        headers.push(("sprig.dl.position".into(), rec.pos.text()));
+        // A change record's value is its envelope; its key the row's key.
+        let value = rec
+            .value
+            .clone()
+            .or_else(|| rec.after.as_ref().map(|a| a.to_string().into_bytes()));
+        let op = crate::peer::SqlOp::StreamPublish {
+            db: self.db.clone(),
+            stream: self.stream.clone(),
+            key: rec.key.as_deref().map(b64),
+            value: value.as_deref().map(b64),
+            headers,
+        };
+        self.peer
+            .sql(self.sink.0, &self.run_as.request(op))
+            .await?
+            .ok()?;
+        Ok(())
+    }
+}
+
+/// Where a task's dead letters go: the stream `DEAD LETTER TO STREAM`
+/// names, else the sink's dead-letter records.
+async fn dead_letters(
+    env: &Arc<dyn SinkEnv>,
+    tenant: TenantId,
+    def: &SinkDef,
+    opts: &Opts,
+    store: &SinksStore,
+    sink: SinkId,
+) -> Result<Arc<dyn DeadLetters>> {
+    if let Some(crate::model::DeadLetter::Stream { name, .. }) = &def.dead_letter {
+        let peer = env.peer().ok_or_else(|| {
+            err(
+                SprigCode::SinkOptionInvalid,
+                "DEAD LETTER TO STREAM needs the DC's gateways, and this worker reaches none",
+            )
+        })?;
+        let who = run_as(env.as_ref(), tenant, def, opts).await?;
+        return Ok(Arc::new(StreamDead {
+            peer,
+            db: who.database.clone(),
+            run_as: who,
+            stream: name.clone(),
+            sink,
+        }));
+    }
+    Ok(Arc::new(CatalogDead {
+        store: store.clone(),
+        sink,
+    }))
+}
+
 /// The catalog side of a task: directives, state reports, the epoch.
 struct CatalogControl {
     store: SinksStore,
@@ -977,7 +1056,10 @@ pub async fn run_sink_task_of(
         SourceSpec::Changes { .. } => {
             run_changes_task(env, tenant, sink, task_no, cancel, c, store, def, opts).await
         }
-        other => Err(err(
+        SourceSpec::Stream { .. } => {
+            run_stream_task(env, tenant, sink, task_no, of, cancel, c, store, def, opts).await
+        }
+        other @ SourceSpec::FanIn { .. } => Err(err(
             SprigCode::SinkOptionInvalid,
             format!("{} sources don't run in workers yet", other.kind()),
         )),
@@ -1473,10 +1555,7 @@ async fn run_queue_task(
         regroup: None,
         owner: OwnerCheck::new(&env, tenant, &def),
     });
-    let dead = Arc::new(CatalogDead {
-        store: store.clone(),
-        sink,
-    });
+    let dead = dead_letters(&env, tenant, &def, &opts, &store, sink).await?;
     tracing::info!(tenant = %tenant, sink = sink.0, task = task_no.0, queue = %name, "queue sink task started");
     metrics::gauge!("sprig_sink_tasks", "state" => "running").increment(1.0);
     let end = run_task(
@@ -1620,10 +1699,7 @@ async fn run_changes_task(
         regroup: None,
         owner: OwnerCheck::new(&env, tenant, &def),
     });
-    let dead = Arc::new(CatalogDead {
-        store: store.clone(),
-        sink,
-    });
+    let dead = dead_letters(&env, tenant, &def, &opts, &store, sink).await?;
     tracing::info!(tenant = %tenant, sink = sink.0, task = task_no.0, tables = objects.len(), "change sink task started");
     metrics::gauge!("sprig_sink_tasks", "state" => "running").increment(1.0);
     let end = run_task(
@@ -1643,6 +1719,157 @@ async fn run_changes_task(
     .await;
     metrics::gauge!("sprig_sink_tasks", "state" => "running").decrement(1.0);
     tracing::info!(tenant = %tenant, sink = sink.0, task = task_no.0, end = ?end, "change sink task ended");
+    end
+}
+
+/// A `FROM STREAM` sink's task: its share of the engine stream's
+/// partitions (of `of` tasks) read through a gateway as the sink's owner
+/// ([`crate::stream_source`]), each resuming at the offset its row saved.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn run_stream_task(
+    env: Arc<dyn SinkEnv>,
+    tenant: TenantId,
+    sink: SinkId,
+    task_no: TaskNo,
+    of: u32,
+    cancel: Cancel,
+    c: Option<mysql_async::Conn>,
+    store: SinksStore,
+    def: Arc<SinkDef>,
+    opts: Opts,
+) -> Result<TaskEnd> {
+    let SourceSpec::Stream {
+        id,
+        name,
+        partitions,
+    } = &def.source
+    else {
+        return Ok(TaskEnd::Stopped);
+    };
+    let peer = env.peer().ok_or_else(|| {
+        err(
+            SprigCode::SinkOptionInvalid,
+            "stream sources need the DC's gateways, and this worker reaches none",
+        )
+    })?;
+    let who = run_as(env.as_ref(), tenant, &def, &opts).await?;
+    // The tasks share the partitions evenly, in order.
+    let share = partitions.div_ceil(of.max(1)).max(1);
+    let parts = task_partitions(*partitions, share, task_no.0);
+    let me = env.worker_id();
+    let saved = store
+        .task_claim(sink, task_no)
+        .await?
+        .map(|(_, _, part)| crate::stream_source::saved_offsets(&part))
+        .unwrap_or_default();
+    let epoch = store
+        .claim_task(sink, task_no, &crate::stream_source::part_of(&saved), &me)
+        .await?;
+    let mut conns = Vec::new();
+    for r in &def.connections {
+        conns.push(open_conn(env.as_ref(), tenant, &store, r, &opts).await?);
+    }
+    drop(c);
+    let info = TaskInfo {
+        tenant: tenant.0,
+        sink: sink.0,
+        task_no: task_no.0,
+        epoch,
+    };
+    let (conn, extra) = if def.target.kind() == TargetKind::Script {
+        (None, conns)
+    } else {
+        let mut it = conns.into_iter();
+        (it.next(), it.collect())
+    };
+    let ctx = TargetCtx {
+        task: info.clone(),
+        sink: Arc::clone(&def),
+        conn,
+        extra,
+        opts: opts.clone(),
+        db_name: opts.get("__db_name").unwrap_or("").to_owned(),
+    };
+    let mut settings = run_settings(&opts, &def)?;
+    if def.target.kind() == TargetKind::S3 {
+        crate::target::s3::run_settings_override(&opts, &mut settings)?;
+    }
+    let db = script_db(env.as_ref(), tenant, &def, &opts).await?;
+    let target = build_target_with(&ctx, db).await?;
+    // Without a saved offset: START AT EARLIEST reads from the partition's
+    // start, a time from that time, and LATEST (the default) from the
+    // sink's creation, so a task that restarts before saving loses
+    // nothing.
+    let from_ms = match def.start_at {
+        crate::model::StartAt::Earliest => 0,
+        crate::model::StartAt::Timestamp { ms } => ms.max(1),
+        crate::model::StartAt::Latest | crate::model::StartAt::Snapshot => store
+            .created_ms(sink)
+            .await?
+            .unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+            })
+            .max(1),
+    };
+    let source = crate::stream_source::StreamSource::new(
+        peer,
+        who.clone(),
+        who.database.clone(),
+        name.clone(),
+        *id,
+        &parts,
+        &saved,
+        from_ms,
+        sink.0,
+        Some(crate::change_source::Saver {
+            store: store.clone(),
+            sink,
+            task_no,
+            epoch,
+        }),
+    );
+    let prepare = SinkPrepare {
+        condition: def
+            .filter_sql
+            .as_deref()
+            .map(crate::filter::parse)
+            .transpose()?,
+        projection: def.projection.clone(),
+        transform: load_transform(env.records().as_ref(), tenant, &def, &opts).await?,
+    };
+    let control = Arc::new(CatalogControl {
+        store: store.clone(),
+        sink,
+        task: task_no,
+        epoch,
+        definition_ver: def.definition_ver,
+        delivered: AtomicU64::new(0),
+        rls: None,
+        regroup: None,
+        owner: OwnerCheck::new(&env, tenant, &def),
+    });
+    let dead = dead_letters(&env, tenant, &def, &opts, &store, sink).await?;
+    tracing::info!(tenant = %tenant, sink = sink.0, task = task_no.0, stream = %name, partitions = ?parts, "stream sink task started");
+    metrics::gauge!("sprig_sink_tasks", "state" => "running").increment(1.0);
+    let end = run_task(
+        TaskParts {
+            info,
+            source: Box::new(source),
+            target,
+            dead,
+            control,
+            prepare: Arc::new(prepare),
+            settings,
+            seed: None,
+            reject_via_source: false,
+        },
+        cancel,
+    )
+    .await;
+    metrics::gauge!("sprig_sink_tasks", "state" => "running").decrement(1.0);
+    tracing::info!(tenant = %tenant, sink = sink.0, task = task_no.0, end = ?end, "stream sink task ended");
     end
 }
 

@@ -140,6 +140,38 @@ pub async fn command(
         ));
     };
     let table = format!("{}.{}", ident(db), ident(&meta.table));
+    for stmt in statements(name, body, &table)? {
+        sql.exec(&stmt).await.map_err(|e| sql_error(&e))?;
+    }
+    Ok(doc! {"ok": 1.0})
+}
+
+/// Runs one of this module's commands on a collection of the document
+/// store (`db.coll` names its catalog object, which SQL's policy
+/// statements take as a table): the SQL statements as on the old path,
+/// run on the command's own executor session.
+///
+/// # Errors
+/// As [`command`].
+pub async fn engine_command(
+    sql: &mut SqlSession,
+    name: &str,
+    body: &Document,
+    db: &str,
+) -> Result<Document, MongoError> {
+    let coll = body
+        .get_str(name)
+        .map_err(|_| bad(format!("{name} needs a collection name")))?;
+    let table = format!("{}.{}", ident(db), ident(coll));
+    for stmt in statements(name, body, &table)? {
+        sql.exec(&stmt).await.map_err(|e| sql_error(&e))?;
+    }
+    Ok(doc! {"ok": 1.0})
+}
+
+/// The SQL statements command `name` is on table `table` (quoted, with
+/// its database).
+fn statements(name: &str, body: &Document, table: &str) -> Result<Vec<String>, MongoError> {
     let stmt = match name {
         "sprigCreatePolicy" => {
             let pname = body
@@ -203,14 +235,10 @@ pub async fn command(
             if out.is_empty() {
                 return Err(bad("sprigRowSecurity needs enable or force"));
             }
-            for s in &out {
-                sql.exec(s).await.map_err(|e| sql_error(&e))?;
-            }
-            return Ok(doc! {"ok": 1.0});
+            return Ok(out);
         }
     };
-    sql.exec(&stmt).await.map_err(|e| sql_error(&e))?;
-    Ok(doc! {"ok": 1.0})
+    Ok(vec![stmt])
 }
 
 #[cfg(test)]

@@ -327,6 +327,13 @@ fn note_or_warn(ctx: &mut Ctx<'_>, maria_level: Level, code: u16, msg: String) {
 
 /// `CAST(a AS target)`.
 pub(crate) fn cast(a: Node, target: CastTarget, env: Env<'_>) -> Result<Node> {
+    if let CastTarget::Fbt(f) = target {
+        return Ok(cast_fbt(a, f, env));
+    }
+    let a = match a.ty.fbt {
+        Some(f) => fbt_cast_source(a, f, target)?,
+        None => a,
+    };
     let maria = env.maria();
     let from = a.ty;
     let nullable = from.nullable;
@@ -589,7 +596,102 @@ pub(crate) fn cast(a: Node, target: CastTarget, env: Env<'_>) -> Result<Node> {
         // MariaDB has no JSON cast (its parser refuses it).
         CastTarget::Json if maria => return Err(SqlError::unsupported("CAST AS JSON")),
         CastTarget::Json => crate::func::json::cast_json(a, env),
+        // (Taken first, above.)
+        CastTarget::Fbt(f) => cast_fbt(a, f, env),
     })
+}
+
+/// `CAST(v AS UUID | INET4 | INET6)` (MariaDB): a value of the type, an
+/// `INET4` one as `INET6` (its IPv4-mapped address), a binary string of
+/// the type's length (stored bytes) or text of the type; `NULL` with a
+/// warning for anything else.
+fn cast_fbt(a: Node, f: sprig_engine::row::Fbt, env: Env<'_>) -> Node {
+    let from = a.ty;
+    // A constant that is a value of the type: never `NULL` (MariaDB's
+    // result metadata says so).
+    let valid_constant = a.konst && !from.nullable && {
+        let mut scratch = Ctx::new(env.s);
+        a.eval(&mut scratch, &[])
+            .ok()
+            .is_some_and(|v| super::fbt_stored(f, &v, &from).is_some())
+    };
+    let ty = ExprType::fbt_of(f).with_null(!valid_constant);
+    let text = format!("cast({} as {})", a.text, f.name());
+    Node::new(ty, text, move |ctx, row| {
+        let v = a.eval(ctx, row)?;
+        if v.is_null() {
+            return Ok(Value::Null);
+        }
+        // A binary string of 16 bytes is a UUID's bytes as written (a
+        // column stores such bytes as they are, see `fbt_stored`).
+        if f == sprig_engine::row::Fbt::Uuid
+            && from.fbt.is_none()
+            && let Value::Bytes(b) | Value::Str(b) = &v
+            && (matches!(v, Value::Bytes(_)) || from.coll == Collation::Binary)
+            && let Ok(t) = <&[u8; 16]>::try_from(b.as_ref())
+        {
+            let text = sprig_engine::row::fbt::uuid_text(t);
+            return Ok(Value::Str(Bytes::from(text.into_bytes())));
+        }
+        if let Some(b) = super::fbt_stored(f, &v, &from)
+            && let Some(t) = f.text(&b)
+        {
+            return Ok(Value::Str(Bytes::from(t.into_bytes())));
+        }
+        let shown = match &v {
+            Value::Str(b) | Value::Bytes(b) => err_text(b),
+            other => crate::conv::to_text(other, &from, ctx.maria())
+                .map(|b| String::from_utf8_lossy(&b).into_owned())
+                .unwrap_or_default(),
+        };
+        ctx.warn(1292, format!("Incorrect {} value: '{shown}'", f.name()));
+        Ok(Value::Null)
+    })
+}
+
+/// A `UUID`, `INET4` or `INET6` value given to a cast: the numeric and
+/// temporal casts refuse it (4079); `BINARY` takes its bytes as written;
+/// `CHAR` its text.
+fn fbt_cast_source(a: Node, f: sprig_engine::row::Fbt, target: CastTarget) -> Result<Node> {
+    let op = match target {
+        CastTarget::Signed => "cast_as_signed",
+        CastTarget::Unsigned => "cast_as_unsigned",
+        CastTarget::Decimal(..) => "decimal_typecast",
+        CastTarget::Double => "double_typecast",
+        CastTarget::Date => "cast_as_date",
+        CastTarget::Time(_) => "cast_as_time",
+        CastTarget::DateTime(_) => "cast_as_datetime",
+        CastTarget::Binary(_) => {
+            let ty = ExprType::string(
+                u32::try_from(f.bytes()).unwrap_or(16),
+                Collation::Binary,
+                Derivation::Implicit,
+            )
+            .with_null(a.ty.nullable);
+            let text = a.text.clone();
+            return Ok(Node::new(ty, text, move |ctx, row| {
+                let v = a.eval(ctx, row)?;
+                Ok(match super::fbt_stored(f, &v, &a.ty) {
+                    Some(b) => Value::Bytes(Bytes::from(f.written(&b))),
+                    None => v,
+                })
+            }));
+        }
+        _ => return Ok(a),
+    };
+    Err(fbt_illegal(f, op))
+}
+
+/// 4079: a `UUID`, `INET4` or `INET6` value where the operation takes none.
+pub(crate) fn fbt_illegal(f: sprig_engine::row::Fbt, op: &str) -> SqlError {
+    SqlError::new(
+        4079,
+        "HY000",
+        format!(
+            "Illegal parameter data type {} for operation '{op}'",
+            f.name()
+        ),
+    )
 }
 
 /// `CAST(v AS SIGNED)` and `CAST(v AS UNSIGNED)`.

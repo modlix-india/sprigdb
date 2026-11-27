@@ -9,7 +9,7 @@ use sprig_engine::row::Value;
 
 use super::{BinOp, Env, Node};
 use crate::conv::{self, Info, IntVal};
-use crate::error::Result;
+use crate::error::{Result, SqlError};
 use crate::num::Dec;
 use crate::session::Ctx;
 use crate::temporal;
@@ -80,6 +80,10 @@ pub(crate) enum CmpKind {
     Time,
     /// MySQL's comparison of JSON values (an operand of a JSON type).
     Json,
+    /// MariaDB's `UUID`, `INET4` or `INET6`: the operands' stored bytes
+    /// (a string converts to the type; one that isn't a value of it
+    /// compares as `NULL`).
+    Fbt(sprig_engine::row::Fbt),
 }
 
 /// A value converted into its comparison type.
@@ -198,6 +202,24 @@ impl Comparator {
                 temporal::cmp_key_strict(ctx, self.kind, v, self.strict_dates)?.map(Key::Dec)
             }
             CmpKind::Json => crate::func::json::compared(v, ty).map(Key::Json),
+            CmpKind::Fbt(f) => match super::fbt_stored(f, v, ty) {
+                Some(b) => Some(Key::Str(Bytes::from(b))),
+                // A string that isn't a value of the type: `NULL`, with
+                // MariaDB's warning.
+                None => {
+                    if let Value::Str(b) | Value::Bytes(b) = v {
+                        ctx.warn(
+                            1292,
+                            format!(
+                                "Incorrect {} value: '{}'",
+                                f.name(),
+                                crate::conv::err_text(b)
+                            ),
+                        );
+                    }
+                    None
+                }
+            },
         })
     }
 
@@ -480,9 +502,75 @@ fn loose_int_literal(col: &Node, k: &Node, v: &Value, env: Env<'_>) -> Option<No
     Some(lit)
 }
 
+/// The name MariaDB gives a value's type in error 4078.
+pub(crate) fn type_word(t: &ExprType) -> &'static str {
+    if let Some(f) = t.fbt {
+        return f.name();
+    }
+    match t.kind {
+        Kind::Int if t.width == 8 => "bigint",
+        Kind::Int => "int",
+        Kind::Decimal => "decimal",
+        Kind::Double => "double",
+        Kind::Float => "float",
+        Kind::Date => "date",
+        Kind::DateTime | Kind::Timestamp => "datetime",
+        Kind::Time => "time",
+        Kind::Year => "year",
+        Kind::Bit => "bit",
+        Kind::Str => "varchar",
+        _ => "null",
+    }
+}
+
+/// The comparison of operands one of which is MariaDB's `UUID`, `INET4` or
+/// `INET6`: `None` when none is. Strings convert to the type; an `INET4`
+/// meets an `INET6` as its IPv4-mapped address; anything else is an
+/// illegal pair of types (4078).
+fn fbt_compare(types: &[&ExprType], op: &str) -> Result<Option<CmpKind>> {
+    use sprig_engine::row::Fbt;
+    let Some(mut target) = types.iter().find_map(|t| t.fbt) else {
+        return Ok(None);
+    };
+    let illegal = |a: &ExprType, b: &ExprType| {
+        SqlError::new(
+            4078,
+            "HY000",
+            format!(
+                "Illegal parameter data types {} and {} for operation '{}'",
+                type_word(a),
+                type_word(b),
+                op.trim()
+            ),
+        )
+    };
+    let first = types.iter().find(|t| t.kind != Kind::Null).copied();
+    for t in types {
+        match (t.fbt, t.kind) {
+            (_, Kind::Null) | (None, Kind::Str) => {}
+            (Some(g), _) if g == target => {}
+            (Some(Fbt::Inet4), _) if target == Fbt::Inet6 => {}
+            (Some(Fbt::Inet6), _) if target == Fbt::Inet4 => target = Fbt::Inet6,
+            _ => {
+                let a = first.unwrap_or(t);
+                let b = if std::ptr::eq(a, *t) {
+                    types.iter().find(|x| x.fbt.is_some()).copied().unwrap_or(t)
+                } else {
+                    t
+                };
+                return Err(illegal(a, b));
+            }
+        }
+    }
+    Ok(Some(CmpKind::Fbt(target)))
+}
+
 /// The comparator of a two-operand comparison (`=` and its kin,
 /// `NULLIF`).
 pub(crate) fn comparator2(a: &Node, b: &Node, op: &str, env: Env<'_>) -> Result<Comparator> {
+    if let Some(k) = fbt_compare(&[&a.ty, &b.ty], op)? {
+        return Ok(Comparator::of(k));
+    }
     if json_compare(&[&a.ty, &b.ty], env) {
         return Ok(Comparator::of(CmpKind::Json));
     }
@@ -530,6 +618,9 @@ pub(crate) fn comparator_n(
     null_is_string: bool,
     env: Env<'_>,
 ) -> Result<Comparator> {
+    if let Some(k) = fbt_compare(types, op)? {
+        return Ok(Comparator::of(k));
+    }
     if json_compare(types, env) {
         return Ok(Comparator::of(CmpKind::Json));
     }
@@ -576,9 +667,85 @@ pub(crate) fn fold_for_column(a: Node, b: Node, env: Env<'_>) -> (Node, Node) {
     (a, b)
 }
 
+/// Whether MariaDB holds `n` as a JSON value in a comparison: a JSON
+/// function that returns a document. (A `JSON` column compares as the text
+/// it holds.)
+fn maria_json(n: &Node) -> bool {
+    const FUNCS: &[&str] = &[
+        "json_extract",
+        "json_query",
+        "json_object",
+        "json_array",
+        "json_set",
+        "json_insert",
+        "json_replace",
+        "json_remove",
+        "json_merge",
+        "json_merge_patch",
+        "json_merge_preserve",
+        "json_array_append",
+        "json_array_insert",
+        "json_compact",
+        "json_detailed",
+        "json_loose",
+    ];
+    if n.ty.column {
+        return false;
+    }
+    if n.ty.json {
+        return true;
+    }
+    // A function node's text is its name, or the call as written.
+    let t = n.text.trim_start_matches('(');
+    let name = t.split('(').next().unwrap_or(t).trim();
+    FUNCS.iter().any(|f| name.eq_ignore_ascii_case(f))
+}
+
+/// MariaDB compares a JSON function's result with a string by the JSON
+/// value's own text: a JSON string as its unquoted content, anything else
+/// as written. So `JSON_EXTRACT(doc, '$.name') = 'Ben'` holds for a row
+/// whose `doc` is `{"name": "Ben"}`.
+fn maria_json_text(n: Node) -> Node {
+    let ty = n.ty;
+    let text = n.text.clone();
+    let konst = n.konst;
+    let inner = n;
+    let mut out = Node::new(ty, text, move |ctx, row| {
+        Ok(match inner.eval(ctx, row)? {
+            Value::Str(b) => match crate::func::json::parse(&b) {
+                Some(crate::func::json::J::Str(s)) => Value::Str(Bytes::from(s.into_bytes())),
+                _ => Value::Str(b),
+            },
+            other => other,
+        })
+    });
+    out.konst = konst;
+    out
+}
+
+/// MariaDB's comparison operators, `NULLIF` and a one-item `IN` compare a
+/// JSON function's result with a string by its unquoted text
+/// ([`maria_json_text`]), constant or not. Only one side is unquoted: the
+/// first when it is JSON, so `JSON_EXTRACT('"b"', '$') = JSON_EXTRACT('"b"',
+/// '$')` is false there. `BETWEEN`, a longer `IN` list, `CASE`, `LIKE` and
+/// `STRCMP` compare the text as written.
+pub(crate) fn maria_json_pair(a: Node, b: Node, env: Env<'_>) -> (Node, Node) {
+    if !env.maria() {
+        return (a, b);
+    }
+    if maria_json(&a) && b.ty.kind == Kind::Str {
+        (maria_json_text(a), b)
+    } else if maria_json(&b) && a.ty.kind == Kind::Str {
+        (a, maria_json_text(b))
+    } else {
+        (a, b)
+    }
+}
+
 /// `= <> < <= > >= <=>`.
 pub(crate) fn compare(op: BinOp, a: Node, b: Node, env: Env<'_>) -> Result<Node> {
     let (a, b) = fold_for_column(a, b, env);
+    let (a, b) = maria_json_pair(a, b, env);
     let mut cmp = comparator2(&a, &b, op.sql(), env)?;
     if !env.maria() && cmp.kind == CmpKind::DateTime {
         // MySQL compares a DATE column with a constant number as dates
@@ -859,6 +1026,12 @@ pub(crate) fn in_list(a: Node, mut items: Vec<Node>, not: bool, env: Env<'_>) ->
             }
         }
     }
+    let (a, items) = if let [only] = &items[..] {
+        let (a, only) = maria_json_pair(a, only.clone(), env);
+        (a, vec![only])
+    } else {
+        (a, items)
+    };
     let mut cmps = if let [only] = &items[..] {
         vec![comparator2(&a, only, " IN ", env)?]
     } else {

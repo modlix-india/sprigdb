@@ -68,6 +68,29 @@ pub fn read_at(store: &dyn SortedStore, logical: &[u8], at: Ts) -> Result<Option
     }))
 }
 
+/// [`read_at`] for several logical keys (ascending keys share the store's
+/// cursor), in the order given.
+///
+/// # Errors
+/// Store failures.
+pub fn read_many_at(
+    store: &dyn SortedStore,
+    logicals: &[&[u8]],
+    at: Ts,
+) -> Result<Vec<Option<Version>>> {
+    Ok(store
+        .get_versions(Cf::Data, logicals, at, ReadTier::All)?
+        .expect_ready()?
+        .into_iter()
+        .map(|v| {
+            v.map(|(ts, raw)| Version {
+                ts,
+                value: decode_value(&raw),
+            })
+        })
+        .collect())
+}
+
 /// The newest committed version of `logical` in the store.
 ///
 /// # Errors

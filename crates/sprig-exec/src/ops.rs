@@ -295,6 +295,15 @@ impl OrdKey {
     }
 
     fn of(v: &Value, ty: &ExprType) -> Self {
+        // A UUID or address sorts by its stored bytes.
+        if let Some(f) = ty.fbt
+            && !v.is_null()
+        {
+            return match crate::expr::fbt_stored(f, v, ty) {
+                Some(b) => OrdKey::Bytes(b),
+                None => OrdKey::Null,
+            };
+        }
         match v {
             Value::Null => OrdKey::Null,
             Value::Str(s) | Value::Bytes(s) | Value::Json(s) => {

@@ -108,9 +108,11 @@ impl Names for CatalogNames<'_> {
         self.eng.table(db, name, self.lower_case).cloned()
     }
     fn other_relation(&self, db: DbId, name: &str) -> bool {
+        // A MongoDB collection's catalog object isn't one: the collection
+        // reads and writes through its own path.
         self.cat
             .object(db, Namespace::Relation, &self.key(name))
-            .is_some()
+            .is_some_and(|o| o.kind != sprig_catalog::store::ObjectKind::Collection)
     }
     fn db_name(&self, db: DbId) -> String {
         self.cat
@@ -147,6 +149,18 @@ impl Names for CatalogNames<'_> {
     }
     fn stream(&self, db: DbId, name: &str) -> Option<Arc<super::streamtable::StreamSource>> {
         super::streamtable::find(self.cat.tenant.0, db, &self.db_name(db), name)
+            // A queue reads through the same kind of source.
+            .or_else(|| super::queuetable::find(self.cat, db, name, self.lower_case))
+            // So does a Redis database's table.
+            .or_else(|| {
+                super::redistable::find(
+                    self.cat.tenant.0,
+                    db,
+                    &self.db_name(db),
+                    name,
+                    self.lower_case,
+                )
+            })
     }
     fn referencing(&self, db: DbId, name: &str) -> Vec<(Arc<TableDef>, usize)> {
         if self.eng.refs.is_empty() {
@@ -386,18 +400,16 @@ pub(crate) fn resolve(cx: &BindCtx<'_>, name: &ObjectName) -> Result<Resolved> {
         if cx.names.other_relation(db, table) {
             return Err(not_on_engine("a view or another relation kind"));
         }
-        // A collection is read by the planner's path (a `SELECT`); every
-        // other statement on one is refused.
+        // A collection is read by the planner's path (a `SELECT`) and
+        // written by `collwrite`; every other statement on one is refused.
         if cx.names.collection(db, table).is_some() {
-            return Err(not_on_engine(
-                "this statement on a MongoDB collection (collections are read-only from SQL)",
-            ));
+            return Err(not_on_engine("this statement on a MongoDB collection"));
         }
         // A stream likewise (`engine::streamtable`); writes to it are the
         // stream layer's.
         if cx.names.stream(db, table).is_some() {
             return Err(not_on_engine(
-                "this statement on a stream (a stream is read as a table by queries)",
+                "this statement on a stream or a queue (queries read them as tables)",
             ));
         }
         return Err(SprigError::standard(
@@ -904,6 +916,15 @@ fn bind_query(cx: &BindCtx<'_>, q: &Query) -> Result<Option<Plan>> {
     let Some((def, db, name, alias)) = single_table(cx, &s.from)? else {
         return Ok(None);
     };
+    // A UUID or address column is read as its text and sorts in its own
+    // order: the planner's.
+    if def
+        .columns
+        .iter()
+        .any(|c| matches!(c.ty, table::ColType::Fbt(_)))
+    {
+        return Err(not_on_engine("a query of a UUID, INET4 or INET6 column"));
+    }
     check_plain_select(s)?;
     if q.fetch.is_some() || !q.locks.is_empty() || q.for_clause.is_some() {
         return Err(not_on_engine("FETCH or a locking read"));

@@ -100,6 +100,27 @@ pub struct Scan {
     /// [`GraphStore::nodes_part`] reads them; stores without late reads
     /// give all.
     pub keys: Option<Vec<String>>,
+    /// Range conditions on properties (`<`, `>`, `STARTS WITH`): a
+    /// superset filter a store with a range index may apply, rechecked in
+    /// the executor.
+    pub props_range: Vec<(String, crate::ordkey::RangePred)>,
+    /// `(key, ascending, n)`: the statement keeps only the first `n` nodes
+    /// in the order of property `key` (ties broken by id) and drops none
+    /// of them afterwards; a store that can read them in that order may
+    /// return just those (with every node tied with the last), each
+    /// passing the scan's conditions exactly, in id order. Others ignore it.
+    pub top: Option<(String, bool, usize)>,
+}
+
+/// A condition on one property, for the planner's estimates.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PropPred {
+    /// Equal to one of these values.
+    Eq(Vec<crate::value::Value>),
+    /// In a range.
+    Range(crate::ordkey::RangePred),
+    /// Present (not null).
+    Present,
 }
 
 /// One row of a reach (CTE) call.
@@ -595,6 +616,49 @@ pub trait GraphStore: Send {
 
     /// Every relationship type, by name.
     fn all_types(&self) -> Vec<String>;
+
+    /// The planner's estimate of the nodes with `label` (`None`: every
+    /// node); `None` when the store keeps no statistics.
+    fn est_nodes(&self, _label: Option<u32>) -> Option<f64> {
+        None
+    }
+
+    /// The planner's estimate of the relationships of `types` (empty:
+    /// any) from nodes with label `near` to nodes with label `far` (`None`:
+    /// any), in `dir` from the near side.
+    fn est_rels(
+        &self,
+        _near: Option<u32>,
+        _types: &[u32],
+        _dir: Dir,
+        _far: Option<u32>,
+    ) -> Option<f64> {
+        None
+    }
+
+    /// The planner's estimate of the share of `label`'s nodes whose
+    /// property `key` passes `pred`.
+    fn est_prop(&self, _label: Option<u32>, _key: &str, _pred: &PropPred) -> Option<f64> {
+        None
+    }
+
+    /// Runs a statistics pass now (`CALL sprig.graph.analyze()`): the
+    /// nodes and relationships it counted.
+    ///
+    /// # Errors
+    /// 39901 where the store keeps no statistics.
+    fn analyze(&mut self) -> Result<(f64, f64)> {
+        Err(sprig_common::SprigError::new(
+            sprig_common::SprigCode::GraphUnsupported,
+            "this graph keeps no planner statistics",
+        ))
+    }
+
+    /// Whether an online index with ordered keys on `label`'s property
+    /// `key` (alone) exists: scans can then read ranges and orders of it.
+    fn ordered_index(&self, _label: u32, _key: &str) -> bool {
+        false
+    }
 
     /// `EXPLAIN`'s lines for how the router plans this graph's steps: its
     /// group and shards and each step's rule; none for

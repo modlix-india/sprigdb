@@ -42,7 +42,10 @@ fn dup_error(ns: &str, idx: Option<&IndexMeta>, doc: &Document) -> MongoError {
 }
 
 /// Writes the entries of one document in `idx`: unique entries checked
-/// against other documents' under their lock.
+/// against other documents' under their lock. While a unique index is
+/// being built, a duplicate isn't refused: the document is noted among the
+/// index's duplicates (a later change may remove either one), and the
+/// build checks them before it publishes the index, as MongoDB does.
 ///
 /// # Errors
 /// 11000 on a duplicate; a write conflict.
@@ -64,6 +67,13 @@ pub async fn put_entries(
             if let Some(v) = t.get_current(&k)?
                 && v.as_ref() != id
             {
+                if idx.building {
+                    let mut d = space.dups(idx.id);
+                    d.extend_from_slice(e);
+                    d.extend_from_slice(id);
+                    t.put(d, id.to_vec())?;
+                    continue;
+                }
                 return Err(dup_error(ns, Some(idx), doc));
             }
         } else {
@@ -72,6 +82,13 @@ pub async fn put_entries(
         t.put(k, id.to_vec())?;
     }
     Ok(())
+}
+
+/// The duplicate error of unique index `idx` for `doc` (a build that found
+/// two documents with the same values).
+#[must_use]
+pub fn duplicate(ns: &str, idx: &IndexMeta, doc: &Document) -> MongoError {
+    dup_error(ns, Some(idx), doc)
 }
 
 /// Deletes the entries of one document in `idx`.
@@ -91,6 +108,13 @@ pub async fn del_entries(
         k.extend_from_slice(e);
         if idx.unique {
             t.lock_entry(&k).await?;
+            if idx.building {
+                // Noted as a duplicate, perhaps.
+                let mut d = space.dups(idx.id);
+                d.extend_from_slice(e);
+                d.extend_from_slice(id);
+                t.delete(d)?;
+            }
             // Another document's entry (never ours to delete).
             match t.get_current(&k)? {
                 Some(v) if v.as_ref() == id => {}
@@ -221,7 +245,7 @@ impl DocStore {
     /// of its own committed at once: the fact must outlive a write that is
     /// rolled back or retried (a spurious fact only costs speed; a missing
     /// one would give duplicates and wrong orders).
-    async fn note_multikey(&self, c: &Coll, pos: usize) -> Result<(), MongoError> {
+    pub(super) async fn note_multikey(&self, c: &Coll, pos: usize) -> Result<(), MongoError> {
         if c.is_multikey(pos) {
             return Ok(());
         }
@@ -252,6 +276,7 @@ impl DocStore {
         if let Some(r) = crate::validate::Rules::of(&c.meta.options)? {
             r.check_insert(&ns, &d)?;
         }
+        super::guard::check(c, &d, true)?;
         let (idk, bytes) = checked(&d)?;
         let key = c.space.doc(&idk);
         t.lock_doc(&key).await?;
@@ -274,7 +299,7 @@ impl DocStore {
     ///
     /// # Errors
     /// As for [`Self::insert_doc`].
-    pub(crate) async fn replace_doc(
+    pub async fn replace_doc(
         &self,
         t: &mut DocTxn,
         c: &Coll,
@@ -287,6 +312,7 @@ impl DocStore {
         if let Some(r) = crate::validate::Rules::of(&c.meta.options)? {
             r.check_update(&ns, old, new)?;
         }
+        super::guard::check(c, new, false)?;
         let (_, bytes) = checked(new)?;
         let key = c.space.doc(idk);
         t.hint(&key, op)?;
@@ -399,13 +425,19 @@ impl DocStore {
                     // Nothing written yet: a fresh view to look again.
                     t.begin_statement();
                 }
-                let targets = self.targets(t, c, &pred, &sort, st.hint.as_ref(), limit)?;
+                let targets = super::guard::with_op(super::guard::Op::Update, || {
+                    self.targets(t, c, &pred, &sort, st.hint.as_ref(), limit)
+                })?;
                 let mut lost = false;
                 for (idk, _) in targets {
                     let Some(old) = self.lock_current(t, c, &idk, &pred).await? else {
                         lost = true;
                         continue;
                     };
+                    // Row-level security hid it meanwhile.
+                    if !super::guard::sees_for(c, &old, super::guard::Op::Update) {
+                        continue;
+                    }
                     let mut new = old.clone();
                     let changed = update::apply(&mut new, &spec, &cx)?;
                     out.n += 1;
@@ -485,13 +517,18 @@ impl DocStore {
             if round > 0 {
                 t.begin_statement();
             }
-            let targets = self.targets(t, c, &pred, &sort, hint, usize::from(limit_one))?;
+            let targets = super::guard::with_op(super::guard::Op::Delete, || {
+                self.targets(t, c, &pred, &sort, hint, usize::from(limit_one))
+            })?;
             let mut lost = false;
             for (idk, _) in targets {
                 let Some(old) = self.lock_current(t, c, &idk, &pred).await? else {
                     lost = true;
                     continue;
                 };
+                if !super::guard::sees_for(c, &old, super::guard::Op::Delete) {
+                    continue;
+                }
                 self.delete_doc(t, c, &idk, &old).await?;
                 gone.push(old);
             }

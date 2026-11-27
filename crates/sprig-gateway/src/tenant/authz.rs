@@ -826,6 +826,38 @@ pub enum AccountAnswer {
     Rows(LocalAnswer),
 }
 
+/// When `stmt` grants or revokes on `[db.]name`, which names no relation
+/// in `cat` but a MongoDB collection of the document store: the catalog
+/// brought to the store's collections (`mongo::collcat`), so the grant
+/// lands on the collection's object. `None`: nothing to do.
+///
+/// # Errors
+/// The catalog's.
+async fn collection_named(
+    ts: &TenantSession,
+    cat: &Arc<TenantCatalog>,
+    stmt: &AccountStmt,
+    current: Option<&str>,
+) -> Result<Option<Arc<TenantCatalog>>> {
+    use sprig_auth::authz::privilege::ObjectType;
+    use sprig_auth::authz::stmt::GrantOn;
+    let (AccountStmt::Grant { on, .. } | AccountStmt::Revoke { on, .. }) = stmt else {
+        return Ok(None);
+    };
+    let GrantOn::Object {
+        db,
+        name,
+        kind: ObjectType::Table,
+    } = on
+    else {
+        return Ok(None);
+    };
+    let Some(db) = db.as_deref().or(current) else {
+        return Ok(None);
+    };
+    crate::mongo::collcat::ensure_named(ts, cat, db, name).await
+}
+
 /// Runs an account statement for the session; waits until this gateway's
 /// snapshot has the change and its backend grants are applied, so the
 /// next statement (and MariaDB) sees it.
@@ -844,6 +876,9 @@ pub async fn account_statement(
     let Some(user) = ts.principal.user_id else {
         return Err(account_sql::need_privilege("CREATE USER"));
     };
+    // A MongoDB collection named before the catalog has its object.
+    let collection_cat = collection_named(ts, cat, stmt, current).await?;
+    let cat = collection_cat.as_ref().unwrap_or(cat);
     let compiled = privileges(ts, cat);
     let engine =
         session_engine(ts, cat).ok_or_else(|| account_sql::need_privilege("CREATE USER"))?;
@@ -1583,6 +1618,53 @@ pub fn dropped_objects(
             .collect(),
         _ => Vec::new(),
     }
+}
+
+/// MongoDB collections whose catalog objects a catalog sync
+/// (`mongo::collcat`) renames or drops, handed to the tenant's
+/// authorization engine as `RENAME TABLE` and `DROP TABLE` hand theirs:
+/// `renamed` before the change (their grants stay with their names),
+/// `dropped` after it (grants per `auth.grants_on_drop` at each database,
+/// policies deleted). `cat` is the snapshot before the change. Returns the
+/// auth version written, if any.
+///
+/// # Errors
+/// The catalog's.
+pub(crate) async fn collections_moved(
+    svc: &Arc<TenantServices>,
+    cat: &TenantCatalog,
+    renamed: &[Renamed],
+    dropped: &[(DbId, String, sprig_common::ids::ObjectId, String)],
+) -> Result<Option<u64>> {
+    let Some(engine) = engine_for(svc, cat) else {
+        return Ok(None);
+    };
+    let mut v = None;
+    if !renamed.is_empty() {
+        v = engine.objects_renamed(&svc.auth, cat, renamed).await?;
+    }
+    if !dropped.is_empty() {
+        let keep = |db: DbId| {
+            svc.settings.get(
+                &GRANTS_ON_DROP,
+                &cat.setting_ctx(&svc.dc).with_db(db),
+                Some(&cat.settings),
+            ) != "drop"
+        };
+        let list: Vec<Dropped> = dropped
+            .iter()
+            .map(|(db, db_key, object, name_key)| Dropped::Object {
+                db: *db,
+                db_key: db_key.clone(),
+                object: *object,
+                name_key: name_key.clone(),
+                namespace: Namespace::Relation,
+                keep: keep(*db),
+            })
+            .collect();
+        v = v.max(engine.objects_dropped(&svc.auth, cat, &list).await?);
+    }
+    Ok(v)
 }
 
 /// Hands what a successful `DROP` removed to the tenant's engine (see

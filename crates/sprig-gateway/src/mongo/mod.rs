@@ -24,6 +24,7 @@
 
 pub mod catalog;
 pub mod changes;
+pub(crate) mod collcat;
 pub mod commands;
 pub mod conn;
 pub mod cursors;
@@ -49,6 +50,8 @@ pub mod spill;
 pub mod sql;
 /// `serverStatus`, `connectionStatus` and change-stream reporting.
 pub mod status;
+pub mod tables;
+pub(crate) mod tablewrite;
 pub mod txn;
 pub mod users;
 /// Background upkeep of vector side tables.

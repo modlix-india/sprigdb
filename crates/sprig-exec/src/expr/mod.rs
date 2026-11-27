@@ -124,6 +124,8 @@ pub enum CastTarget {
     DateTime(u8),
     /// `JSON` (MySQL)
     Json,
+    /// MariaDB's `UUID`, `INET4` or `INET6`.
+    Fbt(sprig_engine::row::Fbt),
 }
 
 /// The truth value an `IS` test asks for.
@@ -400,6 +402,7 @@ impl Expr {
                         let _ = write!(out, "DATETIME({f})");
                     }
                     CastTarget::Json => out.push_str("JSON"),
+                    CastTarget::Fbt(f) => out.push_str(&f.name().to_ascii_uppercase()),
                 }
                 out.push(')');
             }
@@ -1151,7 +1154,13 @@ fn build_inner(expr: &Expr, env: Env<'_>) -> Result<Node> {
                 Expr::Double(t) => lit_double(t, false, env),
                 _ => arith::neg(build(e, env)?, env),
             },
-            other => arith::neg(build(other, env)?, env),
+            other => {
+                let a = build(other, env)?;
+                if let Some(f) = a.ty.fbt {
+                    return Err(cast::fbt_illegal(f, "-"));
+                }
+                arith::neg(a, env)
+            }
         },
         // Both servers turn NOT (x IS NULL) into x IS NOT NULL, and the
         // other way round (so `NOT (x IS NOT NULL)` of an expression that
@@ -1186,6 +1195,22 @@ fn build_inner(expr: &Expr, env: Env<'_>) -> Result<Node> {
         Expr::Binary(op, a, b) => {
             let (a, b) = (build(a, env)?, build(b, env)?);
             match op {
+                // MariaDB's UUID and addresses take no arithmetic (`DIV`
+                // reads them as numbers).
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod
+                    if a.ty.fbt.is_some() || b.ty.fbt.is_some() =>
+                {
+                    Err(SqlError::new(
+                        4078,
+                        "HY000",
+                        format!(
+                            "Illegal parameter data types {} and {} for operation '{}'",
+                            cmp::type_word(&a.ty),
+                            cmp::type_word(&b.ty),
+                            op.sql()
+                        ),
+                    ))
+                }
                 BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::IntDiv | BinOp::Mod => {
                     Ok(arith::binary(*op, a, b, env))
                 }
@@ -1367,10 +1392,54 @@ fn column(c: &ColumnRef, env: Env<'_>) -> Node {
                 None => Value::Null,
             })
         }),
+        // A UUID or address column's stored bytes are read as its text.
+        ColumnType::Fbt(f) => Node::new(ty, text, move |_, row| {
+            Ok(match row.get(slot) {
+                Some(v) => fbt_read(f, v),
+                None => Value::Null,
+            })
+        }),
         _ => Node::new(ty, text, move |_, row| {
             Ok(row.get(slot).cloned().unwrap_or(Value::Null))
         }),
     }
+}
+
+/// A `UUID`, `INET4` or `INET6` value as text: stored bytes become the
+/// type's text; text stays.
+#[must_use]
+pub fn fbt_read(f: sprig_engine::row::Fbt, v: &Value) -> Value {
+    match v {
+        Value::Bytes(b) => match f.text(b) {
+            Some(t) => Value::Str(bytes::Bytes::from(t.into_bytes())),
+            None => v.clone(),
+        },
+        _ => v.clone(),
+    }
+}
+
+/// The stored bytes of a value compared or sorted as type `f`: `None`
+/// when it isn't one. `ty` is the value's own type: a value of the type
+/// (or an `INET4` one met as `INET6`), a binary string of the type's
+/// length, or text of the type.
+#[must_use]
+pub fn fbt_stored(f: sprig_engine::row::Fbt, v: &Value, ty: &ExprType) -> Option<Vec<u8>> {
+    use sprig_engine::row::Fbt;
+    let own = ty.fbt.unwrap_or(f);
+    let stored = match v {
+        Value::Bytes(b) if ty.fbt.is_some() => own.from_binary(b)?,
+        Value::Bytes(b) => return f.from_binary(b),
+        Value::Str(b) if ty.fbt.is_none() && ty.coll == Collation::Binary => {
+            return f.from_binary(b);
+        }
+        Value::Str(b) => own.parse(b)?,
+        _ => return None,
+    };
+    if own == Fbt::Inet4 && f == Fbt::Inet6 {
+        let b: [u8; 4] = stored.as_slice().try_into().ok()?;
+        return Some(sprig_engine::row::fbt::inet4_as_inet6(&b).to_vec());
+    }
+    (own == f).then_some(stored)
 }
 
 fn lit_int(text: &str, neg: bool, env: Env<'_>) -> Result<Node> {

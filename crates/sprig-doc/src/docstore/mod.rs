@@ -16,17 +16,22 @@
 //! - [`write`]: inserts, updates, deletes, `findAndModify`;
 //! - [`pipeline`]: aggregation over the store;
 //! - [`cmd`]: the MongoDB commands, answered as reply documents;
-//! - [`ttl`]: the TTL sweeper.
+//! - [`ttl`]: the TTL sweeper;
+//! - [`guard`]: row-level security, applied by the store.
 
 // One shape per match arm reads better here than `if let ... else`.
 #![allow(clippy::single_match_else)]
 
+pub mod build;
+pub mod bulk;
 pub mod catalog;
 pub mod cmd;
+pub mod guard;
 pub mod keys;
 pub mod layout;
 pub mod pipeline;
 pub mod read;
+pub mod stats;
 pub mod ttl;
 pub mod write;
 
@@ -44,6 +49,19 @@ use sprig_proto_mongo::errors::{MongoError, code};
 
 use self::catalog::CollMeta;
 use self::layout::Space;
+
+/// A collection or view as its record names it ([`DocStore::namespaces`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Namespace {
+    /// The database.
+    pub db: String,
+    /// The name.
+    pub name: String,
+    /// The engine object of its documents (`layout::CATALOG + n`).
+    pub object: u32,
+    /// A view.
+    pub view: bool,
+}
 
 /// A collection as the store uses it: its record, its keyspace, and the
 /// multikey facts of its indexes.
@@ -122,6 +140,21 @@ pub struct DocTxn {
     /// A multi-document transaction: snapshot reads, and a lock another
     /// transaction holds is a write conflict at once.
     pub multi: bool,
+    /// An SQL statement's transaction lent to the store ([`DocTxn::adopt`]):
+    /// documents are locked exclusively, waiting as the session waits, and
+    /// the first engine error is kept as it was ([`sql_errors`]).
+    sql: bool,
+    /// SQL mode: a document's lock makes the snapshot check (a session's
+    /// transaction on MariaDB's port).
+    sql_snapshot_check: bool,
+}
+
+/// The first engine error of each transaction an SQL statement lent to the
+/// store, by transaction id: kept out of [`DocTxn`] itself, whose size every
+/// command's future carries, as such errors are rare.
+fn sql_errors() -> &'static Mutex<HashMap<u64, SprigError>> {
+    static ERRS: std::sync::OnceLock<Mutex<HashMap<u64, SprigError>>> = std::sync::OnceLock::new();
+    ERRS.get_or_init(Mutex::default)
 }
 
 impl DocTxn {
@@ -136,10 +169,67 @@ impl DocTxn {
         Self {
             txn: Txn::begin_on(Arc::clone(path), opts),
             multi,
+            sql: false,
+            sql_snapshot_check: false,
         }
     }
 
-    fn err(&self, e: &SprigError) -> MongoError {
+    /// Serves an SQL statement's engine transaction `txn`: the store's
+    /// writes join it (and its commit); documents and entries are locked
+    /// exclusively, waiting up to the transaction's lock wait, a document's
+    /// lock with the snapshot check when `snapshot_check` (a session's
+    /// transaction on MariaDB's port); the first engine error stays
+    /// available ([`DocTxn::take_engine_error`]). [`DocTxn::into_txn`] gives
+    /// the transaction back.
+    #[must_use]
+    pub fn adopt(txn: Txn, snapshot_check: bool) -> Self {
+        Self {
+            txn,
+            multi: false,
+            sql: true,
+            sql_snapshot_check: snapshot_check,
+        }
+    }
+
+    /// Puts `txn` in place of the engine transaction and returns that one:
+    /// a transaction lent for a command the store doesn't run itself (an
+    /// SQL statement on a table) and given back the same way.
+    pub fn swap_engine_txn(&mut self, txn: Txn) -> Txn {
+        std::mem::replace(&mut self.txn, txn)
+    }
+
+    /// The engine transaction, back to its owner.
+    #[must_use]
+    pub fn into_txn(mut self) -> Txn {
+        let _ = self.take_engine_error();
+        self.txn
+    }
+
+    /// The first engine error a call met (lock waits, deadlocks, snapshot
+    /// conflicts), as the engine raised it; only kept in SQL mode.
+    pub fn take_engine_error(&mut self) -> Option<SprigError> {
+        if !self.sql {
+            return None;
+        }
+        sql_errors()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.txn.id())
+    }
+
+    fn err(&mut self, e: &SprigError) -> MongoError {
+        if self.sql {
+            sql_errors()
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .entry(self.txn.id())
+                .or_insert_with(|| SprigError {
+                    kind: e.kind,
+                    message: e.message.clone(),
+                    retryable: e.retryable,
+                    source: None,
+                });
+        }
         engine_error(e, self.multi)
     }
 
@@ -149,7 +239,12 @@ impl DocTxn {
     /// # Errors
     /// A write conflict.
     pub async fn lock_doc(&mut self, key: &[u8]) -> Result<(), MongoError> {
-        let req = if self.multi {
+        let req = if self.sql {
+            LockRequest {
+                check_snapshot: self.sql_snapshot_check,
+                ..LockRequest::write()
+            }
+        } else if self.multi {
             LockRequest::for_update().with_wait(Wait::NoWait)
         } else {
             LockRequest::write()
@@ -167,7 +262,10 @@ impl DocTxn {
     /// # Errors
     /// A write conflict.
     pub async fn lock_entry(&mut self, key: &[u8]) -> Result<(), MongoError> {
-        let req = if self.multi {
+        let req = if self.sql {
+            // An entry is no row: no snapshot check.
+            LockRequest::write()
+        } else if self.multi {
             LockRequest::write().with_wait(Wait::NoWait)
         } else {
             LockRequest::write()
@@ -256,6 +354,17 @@ impl DocTxn {
     /// Undoes the current statement's writes.
     pub fn rollback_statement(&mut self) {
         self.txn.rollback_statement();
+    }
+
+    /// A point the writes since can be undone to ([`DocTxn::rollback_to`]).
+    #[must_use]
+    pub fn savepoint(&self) -> sprig_engine::txn::Savepoint {
+        self.txn.savepoint()
+    }
+
+    /// Undoes the writes made since `sp`; locks stay.
+    pub fn rollback_to(&mut self, sp: sprig_engine::txn::Savepoint) {
+        self.txn.rollback_to(sp);
     }
 
     /// Commits, and waits until the commit (and everything the
@@ -370,6 +479,11 @@ pub struct DocStore {
     pub(crate) txns: cmd::TxnTable,
     /// The tenants served since start (the TTL sweeper's list).
     tenants: Mutex<std::collections::BTreeSet<u64>>,
+    /// The online index builds running here.
+    builds: build::Builds,
+    /// Per tenant: how many times its collections were created, dropped
+    /// or renamed here since start (the catalog follows them).
+    generations: Mutex<HashMap<u64, u64>>,
 }
 
 impl std::fmt::Debug for DocStore {
@@ -396,7 +510,65 @@ impl DocStore {
             clock: AtomicI64::new(i64::MIN),
             txns: cmd::TxnTable::default(),
             tenants: Mutex::new(std::collections::BTreeSet::new()),
+            builds: build::Builds::default(),
+            generations: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// How many times `tenant`'s collections were created, dropped or
+    /// renamed on this node since start: the catalog's copy of them is
+    /// brought up to date when it moves.
+    #[must_use]
+    pub fn generation(&self, tenant: u64) -> u64 {
+        self.generations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&tenant)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn bump_generation(&self, tenant: u64) {
+        *self
+            .generations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(tenant)
+            .or_insert(0) += 1;
+    }
+
+    /// Every collection of `tenant` (views included), as its record holds
+    /// it: (database, name, engine object, whether it is a view).
+    ///
+    /// # Errors
+    /// The store failed.
+    pub fn namespaces(&self, tenant: u64) -> Result<Vec<Namespace>, MongoError> {
+        let p = layout::coll_records(tenant, None);
+        let end = layout::after_prefix(&p);
+        let mut t = self.begin(false);
+        let rows = t.scan(&p, &end, Dir::Forward, usize::MAX);
+        t.rollback();
+        let mut out = Vec::new();
+        for (_, v) in rows? {
+            let Ok(rec) = Document::from_reader(&mut &v[..]) else {
+                continue;
+            };
+            let (Ok(db), Ok(name), Ok(n)) =
+                (rec.get_str("db"), rec.get_str("name"), rec.get_i64("n"))
+            else {
+                continue;
+            };
+            let Ok(n) = u32::try_from(n) else { continue };
+            out.push(Namespace {
+                db: db.to_owned(),
+                name: name.to_owned(),
+                object: Space::new(tenant, n).object,
+                view: rec
+                    .get_document("options")
+                    .is_ok_and(|o| o.contains_key("viewOn")),
+            });
+        }
+        Ok(out)
     }
 
     /// The tenants with collections here: the registry, and those served
@@ -608,6 +780,7 @@ impl DocStore {
         let meta = CollMeta::new(&name.db, &name.coll, n, options);
         Self::put_record(&mut t, tenant, &meta)?;
         t.commit().await?;
+        self.bump_generation(tenant);
         let c = Arc::new(Coll::new(meta, tenant, &[]));
         self.cache().insert((tenant, name.clone()), Arc::clone(&c));
         Ok(Some(c))
@@ -678,6 +851,7 @@ impl DocStore {
         t.lock_entry(&rk).await?;
         t.delete(rk)?;
         t.commit().await?;
+        self.bump_generation(tenant);
         self.cache().remove(&(tenant, name.clone()));
         let all = c.space.all();
         self.delete_range(&all, &layout::after_prefix(&all)).await?;
@@ -740,6 +914,7 @@ impl DocStore {
         }
         Self::put_record(&mut t, tenant, &meta)?;
         t.commit().await?;
+        self.bump_generation(tenant);
         self.cache().remove(&(tenant, from.clone()));
         self.cache().remove(&(tenant, to.clone()));
         Ok(())
@@ -775,7 +950,7 @@ impl DocStore {
         let mut meta = c.meta.clone();
         let mut fresh = Vec::new();
         for s in specs {
-            let m = catalog::parse_index(s, meta.next_index)?;
+            let m = catalog::parse_index(&meta.index_spec(s), meta.next_index)?;
             if let catalog::Added::New = meta.add_index(m)? {
                 fresh.push(meta.next_index);
                 meta.next_index += 1;
@@ -818,8 +993,7 @@ impl DocStore {
                 };
                 lo = layout::after_prefix(last);
                 for (_, v) in &rows {
-                    let d = Document::from_reader(&mut layout::doc_bson(v))
-                        .map_err(|e| MongoError::new(code::INTERNAL_ERROR, e.to_string()))?;
+                    let d = read::decode(v)?;
                     for idx in &new_idx {
                         keys::entries(&d, idx)?;
                     }
@@ -838,8 +1012,7 @@ impl DocStore {
                 };
                 lo = layout::after_prefix(last);
                 for (k, v) in &rows {
-                    let d = Document::from_reader(&mut layout::doc_bson(v))
-                        .map_err(|e| MongoError::new(code::INTERNAL_ERROR, e.to_string()))?;
+                    let d = read::decode(v)?;
                     let id = &k[docs_p.len()..];
                     for idx in &new_idx {
                         let (entries, multi) = keys::entries(&d, idx)?;
@@ -971,8 +1144,9 @@ impl DocStore {
         for (id, unique) in gone {
             let p = c.space.index(id, unique);
             self.delete_range(&p, &layout::after_prefix(&p)).await?;
-            let mk = c.space.multikey(id);
-            self.delete_range(&mk, &layout::after_prefix(&mk)).await?;
+            for p in [c.space.multikey(id), c.space.dups(id)] {
+                self.delete_range(&p, &layout::after_prefix(&p)).await?;
+            }
         }
         Ok(before)
     }

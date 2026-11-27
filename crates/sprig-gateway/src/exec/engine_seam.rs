@@ -97,6 +97,8 @@ mod temp;
 // Multi-table and subquery UPDATE and DELETE.
 mod write;
 
+mod collwrite;
+
 /// What the session's variables say, as the engine path needs it. Worked
 /// out once and kept while only prepared engine statements run (they
 /// change no variable); any other statement makes it stale.
@@ -262,6 +264,8 @@ enum Bound {
     /// `INSERT ... SELECT` into an engine table: the query (the planner's)
     /// runs first, then its rows are inserted.
     InsertSelect(Box<(crate::engine::general::General, sqlparser::ast::Insert)>),
+    /// An SQL write of a MongoDB collection (`engine::collwrite`).
+    CollWrite(Box<crate::engine::collwrite::CollWrite>),
 }
 
 /// A prepared statement on an engine table.
@@ -791,6 +795,26 @@ impl PassSession {
             .or_else(|| ts.services().cache.cached(ts.tenant))
     }
 
+    /// The newer of the session's catalog and the node's cached one: a
+    /// MongoDB session's commands on the store refresh no catalog, but
+    /// grants and policies changed since its last statement apply to them.
+    pub(super) fn newest_catalog(
+        ts: &crate::tenant::session::TenantSession,
+    ) -> Option<Arc<TenantCatalog>> {
+        let own = ts.catalog().cloned();
+        let node = ts.services().cache.cached(ts.tenant);
+        match (own, node) {
+            (Some(a), Some(b)) => Some(
+                if (b.version, b.auth_version) > (a.version, a.auth_version) {
+                    b
+                } else {
+                    a
+                },
+            ),
+            (a, b) => a.or(b),
+        }
+    }
+
     /// Binds `text`: a plan when it is one engine table's statement.
     #[allow(clippy::too_many_lines)] // one pass over the binders, in order
     fn engine_bind(
@@ -856,6 +880,10 @@ impl PassSession {
             let Some(t) = whole else {
                 return Ok(None);
             };
+            // One that writes a MongoDB collection: the document store's.
+            if let Some(w) = crate::engine::collwrite::bind_text(cx, t, self.lex_opts().0)? {
+                return Ok(Some(Bound::CollWrite(Box::new(w))));
+            }
             let mysql = self.persona == sprig_proto_mysql::Persona::MySql84;
             Ok(
                 crate::engine::multiwrite::bind(cx, t, self.lex_opts().0, mysql)?
@@ -920,6 +948,15 @@ impl PassSession {
             } else {
                 Ok(Bound::Elsewhere { tables: true })
             };
+        }
+        // A write of a MongoDB collection: the document store's.
+        if matches!(
+            stmt,
+            Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
+        ) && let Some(t) = whole
+            && let Some(w) = crate::engine::collwrite::bind(&cx, &stmt, t, self.lex_opts().0)?
+        {
+            return Ok(Bound::CollWrite(Box::new(w)));
         }
         match plan::bind(&cx, &stmt) {
             Ok(Some(mut bound)) => {
@@ -2188,6 +2225,11 @@ impl PassSession {
         if let Ok(e) = engine::engine() {
             e.sweep_once(&cat);
         }
+        // Once per tenant and process: online index builds an earlier
+        // process of this node didn't finish are finished.
+        if let Some(ts) = self.tenant.as_deref() {
+            online_index::resume_once(ts.services(), &cat);
+        }
         // The session's wait for definition changes of engine tables
         // (MariaDB keeps its own copy of the variable).
         if let Some(w) = control::metadata_wait(sql) {
@@ -2342,6 +2384,11 @@ impl PassSession {
             }
             Ok(Bound::Write(w)) => {
                 return Box::pin(self.write_text(cx, cat, *w, logical, more, out))
+                    .await
+                    .map(Some);
+            }
+            Ok(Bound::CollWrite(w)) => {
+                return Box::pin(self.coll_write_text(cx, cat, *w, logical, more, out))
                     .await
                     .map(Some);
             }
@@ -2610,6 +2657,10 @@ impl PassSession {
                 let results = self.engine_vars(cx).results;
                 let types = write_param_types(self.persona, &w, rewritten);
                 return Ok(Some(self.write_prepare(client, results, &types)));
+            }
+            Bound::CollWrite(_) => {
+                let results = self.engine_vars(cx).results;
+                return Ok(Some(self.write_prepare(client, results, &[])));
             }
         };
         let mut plan = *plan;

@@ -10,8 +10,20 @@
 //!   any other range            every document, those in range, in _id order
 //! ```
 //!
-//! A locking read of a collection is refused: collections are read-only
-//! from SQL.
+//! A numeric condition on an indexed field (`collection::PathIndex`, keys
+//! `KeyId::Index(1)` on) reads the index's entries: the numbers in the
+//! range, widened by a relative 1e-9 (SQL compares them as doubles), and
+//! every entry that is no number (SQL turns a string, a date's text or a
+//! boolean into a number too); a multikey index (an array's text converts
+//! to 0) is read whole. Each document is read once and the planner checks
+//! the condition again.
+//!
+//! A locking read (`FOR UPDATE`, `LOCK IN SHARE MODE`, any read of a
+//! SERIALIZABLE transaction, the `SELECT` half of an SQL write) reads each
+//! document as it is now and locks its key, as the store's own writers lock
+//! it: a candidate key of `_id` equality is locked even when no document has
+//! it (its place, at REPEATABLE READ), a scanned range locks every document
+//! read and the stretch between them. `SKIP LOCKED` skips a locked document.
 
 use std::collections::VecDeque;
 use std::ops::Bound as RangeBound;
@@ -27,7 +39,6 @@ use sprig_plan::catalog::KeyId;
 
 use super::{Bound, COUNT_CAP, Inner, LARGE_TABLE, SCAN_BATCH, STATS_TTL, internal, stats};
 use crate::engine::collection::{self, CollTable, ID, row_id};
-use crate::engine::not_on_engine;
 use crate::engine::row::Datum;
 
 /// One collection a statement reads.
@@ -59,13 +70,22 @@ fn space(inner: &Inner, c: &CollBound) -> Result<Option<DocSpace>, SqlError> {
     Ok(s)
 }
 
-fn refuse_lock(inner: &Inner, b: &Bound) -> Result<(), SqlError> {
-    if b.lock.is_some() {
-        return Err(inner.fail(not_on_engine(
-            "a locking read of a MongoDB collection (collections are read-only from SQL)",
-        )));
-    }
-    Ok(())
+/// Up to `want` documents of `[lo, hi)` from `lo` (or back from `hi`):
+/// plain reads at the read view, or, for a locking read, locked and read as
+/// they are now.
+fn read_batch(
+    inner: &Inner,
+    b: &Bound,
+    lo: &[u8],
+    hi: &[u8],
+    reverse: bool,
+    want: usize,
+) -> Result<Option<Vec<(Bytes, Bytes)>>, SqlError> {
+    let lock = b.lock;
+    inner.with(|tx| match lock {
+        Some((mode, how)) => tx.scan_lock_blocking(lo, hi, reverse, want, mode, how, true),
+        None => tx.scan(lo, hi, reverse, want),
+    })
 }
 
 /// The documents the collection holds, counted up to a cap and kept a
@@ -101,7 +121,8 @@ pub(super) fn table_rows(inner: &Inner, b: &Bound, c: &CollBound) -> u64 {
     n
 }
 
-/// Entries of `key` in `range`: one per value of `_id`.
+/// Entries of `key` in `range`: one per value of `_id`; for a field's
+/// index, its entries the range reads (counted up to a cap).
 pub(super) fn rows_in_range(
     inner: &Inner,
     b: &Bound,
@@ -109,6 +130,16 @@ pub(super) fn rows_in_range(
     key: KeyId,
     range: &KeyRange,
 ) -> u64 {
+    if let Some(p) = path_of(c, key) {
+        let Ok(Some(sp)) = space(inner, c) else {
+            return 0;
+        };
+        let multikey = is_multikey(inner, &sp, p);
+        return path_ranges(&sp, p, std::slice::from_ref(range), multikey)
+            .iter()
+            .map(|(lo, hi)| inner.count(lo, hi, COUNT_CAP / 10) as u64)
+            .sum();
+    }
     match key {
         KeyId::Index(_) if range.is_point(1) => 1,
         KeyId::Index(_) => (table_rows(inner, b, c) / 3).max(1),
@@ -116,12 +147,154 @@ pub(super) fn rows_in_range(
     }
 }
 
-/// Rows per value of the `_id` key: one.
+/// Rows per value of the `_id` key: one (a field's index: unknown).
 pub(super) fn rows_per_key(key: KeyId) -> Option<f64> {
     match key {
-        KeyId::Index(_) => Some(1.0),
-        KeyId::Primary => None,
+        KeyId::Index(0) => Some(1.0),
+        KeyId::Index(_) | KeyId::Primary => None,
     }
+}
+
+/// The field index planner key `key` stands for, if it is one.
+fn path_of(c: &CollBound, key: KeyId) -> Option<&collection::PathIndex> {
+    match key {
+        KeyId::Index(i) if i > 0 => c.table.paths.get(i - 1),
+        _ => None,
+    }
+}
+
+/// Whether the index has seen an array (its multikey fact, at the read
+/// view).
+fn is_multikey(inner: &Inner, sp: &DocSpace, p: &collection::PathIndex) -> bool {
+    !matches!(inner.with(|tx| tx.get(&sp.multikey(p.id))), Ok(Some(None)))
+}
+
+/// A bound's number (`NULL`: below every number).
+fn bound_number(v: &[Datum]) -> Option<f64> {
+    #[allow(clippy::cast_precision_loss)] // a bound, widened anyway
+    match v.first()? {
+        Datum::Double(f) => Some(*f),
+        Datum::Float(f) => Some(f64::from(*f)),
+        Datum::Int(i) => Some(*i as f64),
+        Datum::UInt(u) => Some(*u as f64),
+        Datum::Null => Some(f64::NEG_INFINITY),
+        _ => None,
+    }
+}
+
+/// The index's byte ranges a key range of the planner reads (see the
+/// module notes): `[start, end)` each.
+fn path_ranges(
+    sp: &DocSpace,
+    p: &collection::PathIndex,
+    ranges: &[KeyRange],
+    multikey: bool,
+) -> Vec<(Vec<u8>, Vec<u8>)> {
+    use bson::Bson;
+    let base = sp.index(p.id, p.unique);
+    let end = doclayout::after_prefix(&base);
+    let at = |class: u8| {
+        let mut k = base.clone();
+        k.push(class);
+        k
+    };
+    let num = sprig_doc::keyenc::class::NUMBER;
+    let whole = vec![(base.clone(), end.clone())];
+    if multikey {
+        return whole;
+    }
+    // Everything that is no number, then each range's numbers.
+    let mut out = vec![(base.clone(), at(num)), (at(num + 1), end)];
+    for r in ranges {
+        let lo = match &r.start {
+            RangeBound::Unbounded => Some(f64::NEG_INFINITY),
+            RangeBound::Included(v) | RangeBound::Excluded(v) => bound_number(v),
+        };
+        let hi = match &r.end {
+            RangeBound::Unbounded => Some(f64::INFINITY),
+            RangeBound::Included(v) | RangeBound::Excluded(v) => bound_number(v),
+        };
+        let (Some(lo), Some(hi)) = (lo, hi) else {
+            return whole;
+        };
+        if lo.is_nan() || hi.is_nan() {
+            return whole;
+        }
+        let widen = |x: f64| x.abs() * 1e-9 + f64::MIN_POSITIVE;
+        let start = if lo.is_finite() {
+            let mut k = base.clone();
+            k.extend(sprig_doc::keyenc::key(&Bson::Double(lo - widen(lo))));
+            k
+        } else {
+            at(num)
+        };
+        let stop = if hi.is_finite() {
+            let mut k = base.clone();
+            k.extend(sprig_doc::keyenc::key(&Bson::Double(hi + widen(hi))));
+            doclayout::after_prefix(&k)
+        } else if hi == f64::NEG_INFINITY {
+            // Only `NULL`: no number.
+            continue;
+        } else {
+            at(num + 1)
+        };
+        if start < stop {
+            out.push((start, stop));
+        }
+    }
+    out
+}
+
+/// The documents a field index's ranges name, each once.
+fn path_scan(
+    inner: &Inner,
+    b: &Bound,
+    sp: &DocSpace,
+    p: &collection::PathIndex,
+    ranges: &[KeyRange],
+    counters: &Counters,
+) -> Result<VecDeque<Row>, SqlError> {
+    let multikey = is_multikey(inner, sp, p);
+    let mut ids: Vec<Vec<u8>> = Vec::new();
+    for (lo, hi) in path_ranges(sp, p, ranges, multikey) {
+        counters.add_seek();
+        let mut from = lo;
+        loop {
+            inner.check_time()?;
+            let batch = inner
+                .with(|tx| tx.scan(&from, &hi, false, SCAN_BATCH))?
+                .unwrap_or_default();
+            let full = batch.len() == SCAN_BATCH;
+            for (_, id) in &batch {
+                counters.add_entry();
+                ids.push(id.to_vec());
+            }
+            match batch.last() {
+                Some((k, _)) if full => from = crate::engine::keys::prefix_end(k),
+                _ => break,
+            }
+        }
+    }
+    ids.sort();
+    ids.dedup();
+    let mut out = VecDeque::new();
+    for id in ids {
+        let key = sp.doc(&id);
+        let lock = b.lock;
+        let got = inner.with(|tx| match lock {
+            Some((mode, wait)) => Ok(tx
+                .lock_read_blocking(&Bytes::from(key.clone()), mode, wait)?
+                .flatten()),
+            None => tx.get(&key),
+        })?;
+        if let Some(Some(v)) = got {
+            let mut r = id_and_rest(inner, b, &v)?;
+            b.mask(&mut r);
+            counters.add_row();
+            out.push_back(r);
+        }
+    }
+    Ok(out)
 }
 
 /// The row of a stored document, as the statement may read it.
@@ -148,10 +321,13 @@ pub(super) fn scan(
     let Some(c) = b.coll.as_ref() else {
         return Err(internal("not a collection"));
     };
-    refuse_lock(inner, b)?;
     let Some(sp) = space(inner, c)? else {
         return Ok(Box::new(Rows(VecDeque::new())));
     };
+    if let Some(p) = path_of(c, key) {
+        let rows = path_scan(inner, b, &sp, p, ranges, &counters)?;
+        return Ok(Box::new(Rows(rows)));
+    }
     if key == KeyId::Primary {
         let lo = sp.docs();
         let hi = doclayout::after_prefix(&lo);
@@ -270,7 +446,7 @@ fn read_range(
     let mut out = Vec::new();
     loop {
         inner.check_time()?;
-        let Some(batch) = inner.with(|tx| tx.scan(&lo, hi, false, SCAN_BATCH))? else {
+        let Some(batch) = read_batch(inner, b, &lo, hi, false, SCAN_BATCH)? else {
             return Ok(out);
         };
         let full = batch.len() == SCAN_BATCH;
@@ -317,7 +493,16 @@ fn by_id(
     for k in keys {
         counters.add_seek();
         let key = sp.doc(&k);
-        let Some(Some(v)) = inner.with(|tx| tx.get(&key))? else {
+        let lock = b.lock;
+        let got = inner.with(|tx| match lock {
+            // Locked even when missing: its place, so an insert of that
+            // `_id` waits (REPEATABLE READ and SERIALIZABLE).
+            Some((mode, wait)) => Ok(tx
+                .lock_read_blocking(&Bytes::from(key.clone()), mode, wait)?
+                .flatten()),
+            None => tx.get(&key),
+        })?;
+        let Some(Some(v)) = got else {
             continue;
         };
         let r = id_and_rest(inner, b, &v)?;
@@ -380,8 +565,9 @@ impl RowCursor for Docs {
                 return Ok(None);
             }
             let want = self.batch;
-            let (lo, hi, rev) = (&self.lo, &self.hi, self.reverse);
-            let Some(batch) = self.inner.with(|tx| tx.scan(lo, hi, rev, want))? else {
+            let b = &self.inner.tables[self.table];
+            let Some(batch) = read_batch(&self.inner, b, &self.lo, &self.hi, self.reverse, want)?
+            else {
                 return Ok(None);
             };
             self.more = batch.len() == want;

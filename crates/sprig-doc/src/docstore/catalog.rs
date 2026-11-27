@@ -5,6 +5,7 @@ use bson::spec::BinarySubtype;
 use bson::{Binary, Bson, Document, doc};
 use sprig_proto_mongo::errors::{MongoError, code};
 
+use crate::collation::Collation;
 use crate::filter::{self, Pred};
 
 /// How one field of an index orders its values.
@@ -21,6 +22,7 @@ pub enum FieldKind {
 }
 
 /// One index of a collection.
+#[allow(clippy::struct_excessive_bools)] // unique, sparse, hidden, building: options, not states
 #[derive(Debug, Clone)]
 pub struct IndexMeta {
     /// The key index number (never reused in the collection).
@@ -43,6 +45,12 @@ pub struct IndexMeta {
     pub wildcard_projection: Option<Document>,
     /// The specification `listIndexes` shows.
     pub spec: Document,
+    /// Being built online: writes keep its entries, but no read uses it
+    /// and `listIndexes` doesn't show it yet.
+    pub building: bool,
+    /// The index's collation (`None`: simple): its string keys are sort
+    /// keys under it.
+    pub collation: Option<Collation>,
 }
 
 impl IndexMeta {
@@ -72,6 +80,7 @@ impl IndexMeta {
             && self.unique == other.unique
             && self.sparse == other.sparse
             && self.spec.get(PARTIAL) == other.spec.get(PARTIAL)
+            && self.spec.get("collation") == other.spec.get("collation")
     }
 
     /// Every option the same too.
@@ -113,7 +122,8 @@ pub fn default_name(key: &Document) -> String {
 ///
 /// # Errors
 /// MongoDB's: 9 for a missing key, 67 for a bad pattern or options; 115 for
-/// index kinds the engine doesn't store (text, geo, collated).
+/// index kinds the engine doesn't store (text, geo); 2 for a bad
+/// collation.
 #[allow(clippy::too_many_lines)]
 pub fn parse_index(s: &Document, id: u16) -> Result<IndexMeta, MongoError> {
     let key = match s.get("key") {
@@ -219,14 +229,16 @@ pub fn parse_index(s: &Document, id: u16) -> Result<IndexMeta, MongoError> {
     let unique = flag("unique")?;
     let sparse = flag("sparse")?;
     let hidden = flag("hidden")?;
-    if let Some(c) = s.get_document("collation").ok()
-        && c.get_str("locale").ok() != Some("simple")
-    {
-        return Err(MongoError::new(
-            code::SPRIG_DOC_FEATURE_UNSUPPORTED,
-            "indexes with a collation are not supported on collections stored on the SprigDB engine yet",
-        ));
-    }
+    let (collation, collation_spec) = match s.get("collation") {
+        None => (None, None),
+        Some(Bson::Document(c)) => (Collation::parse(c)?, Collation::normalize(c)?),
+        Some(_) => {
+            return Err(MongoError::new(
+                code::TYPE_MISMATCH,
+                "The field 'collation' must be an object",
+            ));
+        }
+    };
     let partial = match s.get(PARTIAL) {
         None => None,
         Some(Bson::Document(f)) => Some(filter::parse(f)?),
@@ -292,14 +304,25 @@ pub fn parse_index(s: &Document, id: u16) -> Result<IndexMeta, MongoError> {
     // options as sent.
     let mut spec = doc! {"v": 2, "key": key, "name": name.clone()};
     for (k, v) in s {
-        if matches!(
-            k.as_str(),
-            "v" | "key" | "name" | "ns" | "background" | "commitQuorum"
-        ) {
+        if matches!(k.as_str(), "v" | "key" | "name" | "ns" | "commitQuorum") {
+            continue;
+        }
+        // MongoDB 8.0 leaves out `unique: false` and `hidden: false`, and
+        // keeps `sparse: false` and `background` (as booleans).
+        if matches!(k.as_str(), "unique" | "hidden") && !crate::filter::truthy(v) {
+            continue;
+        }
+        // A collation is shown with every field; the simple one not at all.
+        if k == "collation" {
+            if let Some(c) = &collation_spec {
+                spec.insert("collation", c.clone());
+            }
             continue;
         }
         let v = match k.as_str() {
-            "unique" | "sparse" | "hidden" => Bson::Boolean(crate::filter::truthy(v)),
+            "unique" | "sparse" | "hidden" | "background" => {
+                Bson::Boolean(crate::filter::truthy(v))
+            }
             "expireAfterSeconds" => match v {
                 Bson::Double(f) => Bson::Int32(f64_to_i32(*f)),
                 Bson::Int64(n) => Bson::Int32(i32::try_from(*n).unwrap_or(i32::MAX)),
@@ -320,7 +343,17 @@ pub fn parse_index(s: &Document, id: u16) -> Result<IndexMeta, MongoError> {
         hidden,
         wildcard_projection,
         spec,
+        building: false,
+        collation,
     })
+}
+
+/// The default collation of a collection's `create` options.
+fn default_collation(options: &Document) -> Option<Collation> {
+    options
+        .get_document("collation")
+        .ok()
+        .and_then(|c| Collation::parse(c).ok().flatten())
 }
 
 #[allow(clippy::cast_possible_truncation)]
@@ -356,6 +389,9 @@ pub struct CollMeta {
     pub next_index: u16,
     /// The validator, parsed.
     pub validator: Option<Pred>,
+    /// The default collation (`create`'s `collation`): reads and writes
+    /// that name none use it, and new indexes that name none get it.
+    pub collation: Option<Collation>,
 }
 
 impl CollMeta {
@@ -376,6 +412,7 @@ impl CollMeta {
             .get_document("validator")
             .ok()
             .and_then(|v| filter::parse(v).ok());
+        let collation = default_collation(&options);
         Self {
             db: db.to_owned(),
             name: name.to_owned(),
@@ -385,6 +422,33 @@ impl CollMeta {
             indexes: Vec::new(),
             next_index: 1,
             validator,
+            collation,
+        }
+    }
+
+    /// Index specification `s` with the collection's default collation
+    /// added when it names none (`{locale: "simple"}` keeps the simple
+    /// one), as MongoDB builds it.
+    #[must_use]
+    pub fn index_spec(&self, s: &Document) -> Document {
+        match self.options.get_document("collation") {
+            Ok(c) if !s.contains_key("collation") => {
+                let mut s = s.clone();
+                s.insert("collation", c.clone());
+                s
+            }
+            _ => s.clone(),
+        }
+    }
+
+    /// The collation a read or write of this collection uses when it names
+    /// none in `body` (its `collation` field).
+    #[must_use]
+    pub fn collation_for(&self, body: &Document) -> Option<Collation> {
+        if body.contains_key("collation") {
+            None
+        } else {
+            self.collation
         }
     }
 
@@ -417,7 +481,13 @@ impl CollMeta {
             "uuid": self.uuid_bson(),
             "options": self.options.clone(),
             "next_index": i32::from(self.next_index),
-            "indexes": self.indexes.iter().map(|i| Bson::Document(doc! {"id": i32::from(i.id), "spec": i.spec.clone()})).collect::<Vec<_>>(),
+            "indexes": self.indexes.iter().map(|i| {
+                let mut d = doc! {"id": i32::from(i.id), "spec": i.spec.clone()};
+                if i.building {
+                    d.insert("building", true);
+                }
+                Bson::Document(d)
+            }).collect::<Vec<_>>(),
         }
     }
 
@@ -443,12 +513,14 @@ impl CollMeta {
             let spec = d.get_document("spec").map_err(|_| damaged())?;
             let mut m = parse_index(spec, id)?;
             m.spec = spec.clone();
+            m.building = d.get_bool("building").unwrap_or(false);
             indexes.push(m);
         }
         let validator = options
             .get_document("validator")
             .ok()
             .and_then(|v| filter::parse(v).ok());
+        let collation = default_collation(&options);
         Ok(Self {
             db: db.to_owned(),
             name: name.to_owned(),
@@ -458,6 +530,7 @@ impl CollMeta {
             indexes,
             next_index,
             validator,
+            collation,
         })
     }
 
@@ -515,11 +588,27 @@ impl CollMeta {
         Ok(Added::New)
     }
 
+    /// The `_id_` index as `listIndexes` shows it: with the collection's
+    /// default collation, if it has one.
+    #[must_use]
+    pub fn id_index_spec(&self) -> Document {
+        let mut d = doc! {"v": 2, "key": {"_id": 1}, "name": "_id_"};
+        if let Ok(c) = self.options.get_document("collation") {
+            d.insert("collation", c.clone());
+        }
+        d
+    }
+
     /// The `listIndexes` entries: `_id_` first.
     #[must_use]
     pub fn index_specs(&self) -> Vec<Document> {
-        let mut v = vec![doc! {"v": 2, "key": {"_id": 1}, "name": "_id_"}];
-        v.extend(self.indexes.iter().map(|i| i.spec.clone()));
+        let mut v = vec![self.id_index_spec()];
+        v.extend(
+            self.indexes
+                .iter()
+                .filter(|i| !i.building)
+                .map(|i| i.spec.clone()),
+        );
         v
     }
 }
@@ -563,5 +652,47 @@ mod tests {
         let r = CollMeta::from_record("d", "c", &c.to_record()).unwrap();
         assert_eq!(r.indexes.len(), 1);
         assert_eq!(r.uuid, c.uuid);
+    }
+
+    #[test]
+    fn collated_indexes() {
+        let ci = parse_index(
+            &doc! {"key": {"a": 1}, "name": "a_ci", "collation": {"locale": "en", "strength": 2}},
+            1,
+        )
+        .unwrap();
+        assert_eq!(ci.collation.unwrap().strength, 2);
+        let shown = ci.spec.get_document("collation").unwrap();
+        assert_eq!(shown.get_str("caseFirst"), Ok("off"));
+        assert_eq!(shown.get_str("alternate"), Ok("non-ignorable"));
+        let plain = parse_index(
+            &doc! {"key": {"a": 1}, "name": "a_1", "collation": {"locale": "simple"}},
+            2,
+        )
+        .unwrap();
+        assert!(plain.collation.is_none() && !plain.spec.contains_key("collation"));
+        let fr = Collation::normalize(&doc! {"locale": "fr"})
+            .unwrap()
+            .unwrap();
+        let mut c = CollMeta::new("d", "c", 1, doc! {"collation": fr});
+        assert!(c.collation.is_some());
+        assert!(matches!(c.add_index(ci), Ok(Added::New)));
+        assert!(matches!(c.add_index(plain), Ok(Added::New)));
+        let inherited = parse_index(&c.index_spec(&doc! {"key": {"b": 1}}), 3).unwrap();
+        let shown = inherited.spec.get_document("collation").unwrap();
+        assert_eq!(shown.get_str("locale"), Ok("fr"));
+        let r = CollMeta::from_record("d", "c", &c.to_record()).unwrap();
+        assert_eq!(r.indexes[0].collation, c.indexes[0].collation);
+        assert!(
+            c.collation_for(&doc! {"collation": {"locale": "simple"}})
+                .is_none()
+        );
+        assert!(c.collation_for(&doc! {}).is_some());
+        assert_eq!(
+            parse_index(&doc! {"key": {"a": 1}, "collation": 1}, 1)
+                .unwrap_err()
+                .code,
+            14
+        );
     }
 }

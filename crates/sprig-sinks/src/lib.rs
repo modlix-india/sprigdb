@@ -43,5 +43,6 @@ pub mod settings;
 pub mod source;
 pub mod sql;
 pub mod store;
+pub mod stream_source;
 pub mod target;
 pub mod transform;

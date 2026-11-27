@@ -440,6 +440,22 @@ pub enum Step {
 /// the way a crash would: the transaction is dropped, not rolled back.
 pub type Failpoint = Arc<dyn Fn(TenantId, VersionKind, Step) -> Result<()> + Send + Sync>;
 
+/// The DDL barrier across nodes (the two-version rule): before a catalog
+/// change allocates version `v + 1`, every node serving the tenant must
+/// hold its catalog at `v` (the committed version) or newer, so at most two
+/// adjacent versions are ever in use. A node that can't confirm in time is
+/// fenced by the implementation (it reloads before its next statement).
+#[async_trait::async_trait]
+pub trait VersionBarrier: Send + Sync + 'static {
+    /// Waits until every node serving `tenant` holds its catalog at
+    /// `version` or newer.
+    ///
+    /// # Errors
+    /// The implementation's; the change is then refused (nothing is
+    /// allocated) and may be retried.
+    async fn hold(&self, tenant: TenantId, version: u64) -> Result<()>;
+}
+
 /// Options of one change.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ChangeOpts {
@@ -453,6 +469,7 @@ pub struct Versioner<B: VersionBackend> {
     backend: Arc<B>,
     allocator: Arc<dyn VersionAllocator>,
     failpoint: Option<Failpoint>,
+    barrier: Option<Arc<dyn VersionBarrier>>,
 }
 
 impl<B: VersionBackend> Clone for Versioner<B> {
@@ -461,6 +478,7 @@ impl<B: VersionBackend> Clone for Versioner<B> {
             backend: Arc::clone(&self.backend),
             allocator: Arc::clone(&self.allocator),
             failpoint: self.failpoint.clone(),
+            barrier: self.barrier.clone(),
         }
     }
 }
@@ -480,7 +498,16 @@ impl<B: VersionBackend> Versioner<B> {
             backend: Arc::new(backend),
             allocator,
             failpoint: None,
+            barrier: None,
         }
+    }
+
+    /// The same versioner holding every catalog change behind `barrier`
+    /// (the two-version rule across nodes; [`VersionBarrier`]).
+    #[must_use]
+    pub fn with_barrier(mut self, barrier: Arc<dyn VersionBarrier>) -> Self {
+        self.barrier = Some(barrier);
+        self
     }
 
     /// The same versioner with a failpoint, for crash tests.
@@ -552,6 +579,7 @@ impl<B: VersionBackend> Versioner<B> {
             backend: Arc::clone(&self.backend),
             allocator: Arc::clone(&self.allocator),
             failpoint: self.failpoint.clone(),
+            barrier: self.barrier.clone(),
             tenant,
             kind,
             previous,
@@ -615,6 +643,7 @@ pub struct Locked<B: VersionBackend> {
     backend: Arc<B>,
     allocator: Arc<dyn VersionAllocator>,
     failpoint: Option<Failpoint>,
+    barrier: Option<Arc<dyn VersionBarrier>>,
     tenant: TenantId,
     kind: VersionKind,
     previous: u64,
@@ -661,10 +690,21 @@ impl<B: VersionBackend> Locked<B> {
             backend,
             allocator,
             failpoint,
+            barrier,
             tenant,
             kind,
             previous,
         } = self;
+        // The two-version rule: nothing allocates the next catalog version
+        // until every node holds the committed one. Waited for under the
+        // version row's lock, so no other change can move past it.
+        if kind == VersionKind::Catalog
+            && let Some(b) = &barrier
+            && let Err(e) = b.hold(tenant, previous).await
+        {
+            let _ = backend.rollback(tx).await;
+            return Err(e);
+        }
         let version = match allocator
             .allocate(tenant, kind, previous, opts.tenant_settings)
             .await

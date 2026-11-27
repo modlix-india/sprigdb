@@ -105,8 +105,9 @@ impl PassSession {
     }
 
     /// `ANALYZE`, `CHECK`, `OPTIMIZE` and `REPAIR TABLE` of engine tables,
-    /// with the servers' answers for InnoDB tables: the engine keeps no
-    /// statistics to refresh and has nothing to rebuild or repair; `CHECK`
+    /// with the servers' answers for InnoDB tables: `ANALYZE` collects the
+    /// planner's statistics (`crate::engine::stats::admin` reads its forms
+    /// on each port); the engine has nothing to rebuild or repair; `CHECK`
     /// reads every row. `None`: another statement, a form this doesn't
     /// read, or a table of a database that isn't the engine's.
     #[allow(clippy::too_many_lines)] // read the statement, find the tables, one answer per table
@@ -157,6 +158,24 @@ impl PassSession {
             }
             i += 1;
         }
+        // `ANALYZE`'s own forms: MariaDB's `PERSISTENT FOR`, MySQL's
+        // histograms.
+        let mysql = self.persona == sprig_proto_mysql::packets::Persona::MySql84;
+        let form = if op == "analyze" {
+            match crate::engine::stats::admin::Form::parse(toks, sql, i, mysql)? {
+                Ok(f) => {
+                    i = toks.len();
+                    Some(f)
+                }
+                Err(e) => return Some(Err(e)),
+            }
+        } else {
+            None
+        };
+        let op = form.as_ref().map_or(op, |f| f.op());
+        let histogram = form
+            .as_ref()
+            .is_some_and(crate::engine::stats::admin::Form::histogram);
         // The options that change nothing here.
         while let Some(w) = word(i) {
             match (op, w.as_slice()) {
@@ -173,7 +192,6 @@ impl PassSession {
         let cat = self.eng.temps.overlay(ts.catalog()?);
         let eng = catalog::of(&cat)?;
         let lctn = ts.lower_case_table_names();
-        let mysql = self.persona == sprig_proto_mysql::packets::Persona::MySql84;
         let current = match self.bs.as_ref().and_then(|b| b.vars().schema.clone()) {
             Some(s) => Some(s),
             None => ts.schema_of(self.current_logical().as_deref()),
@@ -208,6 +226,10 @@ impl PassSession {
                 Some(text.as_bytes()),
             ]));
         };
+        if histogram && found.len() > 1 {
+            row("", "Error", crate::engine::stats::admin::ONE_TABLE);
+            found.clear();
+        }
         for (schema_name, db, t) in found {
             let shown = format!("{schema_name}.{t}");
             if let Some(td) = eng.table(db, &t, lctn) {
@@ -236,8 +258,23 @@ impl PassSession {
                         "note",
                         "The storage engine for the table doesn't support repair",
                     ),
+                    "analyze" | "histogram" => match &form {
+                        Some(f) => {
+                            for (ty, text) in f.run(ts.tenant.0, td).await {
+                                row(&shown, ty, &text);
+                            }
+                        }
+                        None => row(&shown, "status", "OK"),
+                    },
                     _ => row(&shown, "status", "OK"),
                 }
+            } else if histogram {
+                let text = if eng.view(db, &t, lctn).is_some() {
+                    crate::engine::stats::admin::NOT_A_VIEW.to_owned()
+                } else {
+                    format!("Table '{shown}' doesn't exist")
+                };
+                row(&shown, "Error", &text);
             } else if eng.view(db, &t, lctn).is_some() {
                 if op == "check" {
                     row(&shown, "status", "OK");

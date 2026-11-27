@@ -31,8 +31,8 @@ use std::sync::Arc;
 use bytes::{BufMut, Bytes, BytesMut};
 use sprig_common::{Result, SprigError};
 use sprig_engine::keys::collation::Collation;
-use sprig_engine::row::LobSize;
 use sprig_engine::row::record::{self, Column as RecordColumn, RowSchema};
+use sprig_engine::row::{Fbt, LobSize};
 
 use super::indexes;
 use super::row::Datum;
@@ -605,6 +605,11 @@ fn put_type(b: &mut BytesMut, ty: ColType) {
             b.put_u8(members);
         }
         ColType::Json => b.put_u8(19),
+        ColType::Fbt(f) => b.put_u8(match f {
+            Fbt::Uuid => 20,
+            Fbt::Inet4 => 21,
+            Fbt::Inet6 => 22,
+        }),
     }
 }
 
@@ -646,6 +651,9 @@ fn get_type(r: &mut Reader<'_>) -> Option<ColType> {
         17 => ColType::Enum { members: r.u16()? },
         18 => ColType::Set { members: r.u8()? },
         19 => ColType::Json,
+        20 => ColType::Fbt(Fbt::Uuid),
+        21 => ColType::Fbt(Fbt::Inet4),
+        22 => ColType::Fbt(Fbt::Inet6),
         _ => return None,
     })
 }

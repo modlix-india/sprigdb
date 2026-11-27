@@ -33,6 +33,8 @@ fn identical(a: &Value, b: &Value) -> bool {
 fn row_types() -> Vec<ColumnType> {
     let mut t = all_types();
     t.push(ColumnType::Json);
+    t.push(ColumnType::Fbt(sprig_engine::row::Fbt::Uuid));
+    t.push(ColumnType::Fbt(sprig_engine::row::Fbt::Inet4));
     t
 }
 

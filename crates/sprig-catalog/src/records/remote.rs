@@ -8,11 +8,16 @@
 //! transaction) rolls it back.
 //!
 //! **Which gateway.** `SPRIGDB_CATALOG_NODE` (`host:port` of the engine
-//! node's peer listener) when set; otherwise the one ready gateway with a
-//! peer port registered in this DC. None, or several without the
-//! variable, is 39070 (retryable).
+//! node's peer listener) when set. Otherwise, among the ready gateways with
+//! a peer port registered in this DC, the one leading the tenant's unit:
+//! a gateway that doesn't lead it refuses the transaction with 39110 and,
+//! when it knows, the leader's Raft id, so this side tries the node that
+//! last accepted the tenant, the unit's home node and its other voters (or
+//! every replicated gateway when the unit has no descriptor), following
+//! hints, for up to 15 s. A DC whose engines don't replicate must have
+//! exactly one ready gateway: none, or several, is 39070 (retryable).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -27,6 +32,7 @@ use tokio::sync::mpsc;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 
 use super::{RecordStore, RecordTx, unavailable};
+use crate::units::UnitDescriptor;
 
 /// The variable naming the engine node's peer listener.
 pub const NODE_VAR: &str = "SPRIGDB_CATALOG_NODE";
@@ -81,10 +87,43 @@ struct GwRecord {
     #[serde(default)]
     listeners: BTreeMap<String, u16>,
     state: String,
+    /// Its engine's Raft id, when its engine is one replica of several.
+    #[serde(default)]
+    raft_node: Option<u64>,
 }
 
 impl Versioned for GwRecord {
     const V: u32 = 1;
+}
+
+/// One peer listener to try.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Target {
+    /// `host:port`.
+    addr: String,
+    /// The host, for TLS.
+    host: String,
+    /// The gateway's Raft id (`None`: a one-node engine).
+    raft: Option<u64>,
+}
+
+/// How long a listing of the DC's gateways is reused.
+const GATEWAYS_TTL: Duration = Duration::from_secs(2);
+/// How long a tenant's unit descriptor is reused (absent: shorter).
+const UNIT_TTL: Duration = Duration::from_secs(10);
+const NO_UNIT_TTL: Duration = Duration::from_secs(1);
+/// How long `begin` keeps looking for the tenant's leader.
+const FIND_LEADER: Duration = Duration::from_secs(15);
+
+/// The node a "not the leader" answer names (`... leader node <id> ...`).
+#[must_use]
+pub fn leader_hint(message: &str) -> Option<u64> {
+    let at = message.find("leader node ")? + "leader node ".len();
+    let digits: String = message[at..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    digits.parse().ok()
 }
 
 /// Catalog records on the engine node.
@@ -92,8 +131,15 @@ pub struct RemoteRecords {
     dc: Option<Arc<dyn MetaStore>>,
     fixed: Option<String>,
     tls: Option<PeerPems>,
-    /// The channel and the address it goes to, found at most every 2 s.
-    channel: Mutex<Option<(Instant, String, Channel)>>,
+    /// A channel per peer listener.
+    channels: Mutex<HashMap<String, Channel>>,
+    /// The DC's ready gateways with a peer port, and when they were read.
+    gateways: Mutex<Option<(Instant, Vec<GwRecord>)>>,
+    /// Per tenant: its unit's descriptor, and when it was read.
+    units: Mutex<HashMap<u64, (Instant, Option<UnitDescriptor>)>>,
+    /// Per tenant: the Raft id of the node that last accepted its catalog
+    /// transactions (its unit's leader then).
+    leaders: Mutex<HashMap<u64, u64>>,
 }
 
 impl std::fmt::Debug for RemoteRecords {
@@ -105,10 +151,14 @@ impl std::fmt::Debug for RemoteRecords {
     }
 }
 
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 impl RemoteRecords {
-    /// Records on the gateway named by `SPRIGDB_CATALOG_NODE`, or found in
-    /// `dc`'s gateway registrations; reached with `tls` (`None`:
-    /// plaintext, development).
+    /// Records on the gateway named by `SPRIGDB_CATALOG_NODE`, or on the
+    /// node leading each tenant's unit among `dc`'s gateway registrations;
+    /// reached with `tls` (`None`: plaintext, development).
     #[must_use]
     pub fn new(dc: Option<Arc<dyn MetaStore>>, tls: Option<PeerPems>) -> Self {
         let fixed = std::env::var(NODE_VAR)
@@ -119,7 +169,10 @@ impl RemoteRecords {
             dc,
             fixed,
             tls,
-            channel: Mutex::new(None),
+            channels: Mutex::new(HashMap::new()),
+            gateways: Mutex::new(None),
+            units: Mutex::new(HashMap::new()),
+            leaders: Mutex::new(HashMap::new()),
         }
     }
 
@@ -130,20 +183,22 @@ impl RemoteRecords {
             dc: None,
             fixed: Some(addr.into()),
             tls,
-            channel: Mutex::new(None),
+            channels: Mutex::new(HashMap::new()),
+            gateways: Mutex::new(None),
+            units: Mutex::new(HashMap::new()),
+            leaders: Mutex::new(HashMap::new()),
         }
     }
 
-    async fn node(&self) -> Result<(String, String)> {
-        if let Some(a) = &self.fixed {
-            let host = a.rsplit_once(':').map_or(a.as_str(), |(h, _)| h).to_owned();
-            return Ok((a.clone(), host));
+    /// The DC's ready gateways with a peer port (listed at most every
+    /// [`GATEWAYS_TTL`]).
+    async fn gateways(&self, dc: &Arc<dyn MetaStore>, fresh: bool) -> Result<Vec<GwRecord>> {
+        if !fresh
+            && let Some((at, g)) = &*lock(&self.gateways)
+            && at.elapsed() < GATEWAYS_TTL
+        {
+            return Ok(g.clone());
         }
-        let Some(dc) = &self.dc else {
-            return Err(unavailable(format!(
-                "no engine node: set {NODE_VAR} to its peer address"
-            )));
-        };
         let prefix = dc.tier().key("gateways/")?;
         let page = dc
             .list(
@@ -162,63 +217,141 @@ impl RemoteRecords {
             .map(|r| r.body)
             .filter(|g| g.state == "ready" && g.listeners.contains_key("peer"))
             .collect();
-        match ready.as_slice() {
-            [g] => {
-                let port = g.listeners.get("peer").copied().unwrap_or(7403);
-                Ok((format!("{}:{port}", g.addr), g.addr.clone()))
+        *lock(&self.gateways) = Some((Instant::now(), ready.clone()));
+        Ok(ready)
+    }
+
+    /// `tenant`'s unit descriptor (read at most every [`UNIT_TTL`]; with
+    /// `fresh`, an absent one is read again at once: a new tenant's
+    /// descriptor appears between its first catalog calls).
+    async fn unit(
+        &self,
+        dc: &Arc<dyn MetaStore>,
+        tenant: u64,
+        fresh: bool,
+    ) -> Option<UnitDescriptor> {
+        if let Some((at, d)) = lock(&self.units).get(&tenant)
+            && at.elapsed() < if d.is_some() { UNIT_TTL } else { NO_UNIT_TTL }
+            && !(fresh && d.is_none())
+        {
+            return d.clone();
+        }
+        match crate::units::read(dc.as_ref(), tenant).await {
+            Ok(d) => {
+                lock(&self.units).insert(tenant, (Instant::now(), d.clone()));
+                d
             }
-            [] => Err(unavailable(
-                "no ready gateway with a peer port in this DC holds the catalog",
-            )),
-            _ => Err(unavailable(format!(
-                "{} ready gateways in this DC: set {NODE_VAR} to the engine node's peer address",
-                ready.len()
-            ))),
+            Err(e) => {
+                tracing::debug!(tenant, error = %e, "catalog: unit descriptor unreadable");
+                None
+            }
         }
     }
 
-    async fn client(&self) -> Result<CatalogPeerClient<Channel>> {
-        if let Some((at, _, ch)) = &*self.channel.lock().unwrap_or_else(PoisonError::into_inner)
-            && (self.fixed.is_some() || at.elapsed() < Duration::from_secs(2))
-        {
-            return Ok(CatalogPeerClient::new(ch.clone()));
+    /// The peer listeners to try for `tenant`, the likeliest leader first:
+    /// the node that last accepted it, the unit's home, its other voters;
+    /// without a descriptor, every replicated gateway. A DC of one-node
+    /// engines must have exactly one.
+    async fn targets(&self, tenant: u64, fresh: bool) -> Result<Vec<Target>> {
+        if let Some(a) = &self.fixed {
+            let host = a.rsplit_once(':').map_or(a.as_str(), |(h, _)| h).to_owned();
+            return Ok(vec![Target {
+                addr: a.clone(),
+                host,
+                raft: None,
+            }]);
         }
-        let (addr, host) = self.node().await?;
-        let mut slot = self.channel.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some((at, a, ch)) = slot.as_mut()
-            && *a == addr
-        {
-            *at = Instant::now();
+        let Some(dc) = &self.dc else {
+            return Err(unavailable(format!(
+                "no engine node: set {NODE_VAR} to its peer address"
+            )));
+        };
+        let ready = self.gateways(dc, fresh).await?;
+        let target = |g: &GwRecord| Target {
+            addr: format!(
+                "{}:{}",
+                g.addr,
+                g.listeners.get("peer").copied().unwrap_or(7403)
+            ),
+            host: g.addr.clone(),
+            raft: g.raft_node,
+        };
+        let replicated: Vec<&GwRecord> = ready.iter().filter(|g| g.raft_node.is_some()).collect();
+        if replicated.is_empty() {
+            return match ready.as_slice() {
+                [g] => Ok(vec![target(g)]),
+                [] => Err(unavailable(
+                    "no ready gateway with a peer port in this DC holds the catalog",
+                )),
+                _ => Err(unavailable(format!(
+                    "{} ready gateways in this DC, none replicated: set {NODE_VAR} to the engine node's peer address",
+                    ready.len()
+                ))),
+            };
+        }
+        // Raft ids in the order to try.
+        let mut order: Vec<u64> = Vec::new();
+        if let Some(l) = lock(&self.leaders).get(&tenant) {
+            order.push(*l);
+        }
+        if let Some(d) = self.unit(dc, tenant, fresh).await {
+            order.push(d.home);
+            order.extend(d.voters.iter().copied());
+            order.retain(|id| d.voters.contains(id));
+        } else {
+            let mut ids: Vec<u64> = replicated.iter().filter_map(|g| g.raft_node).collect();
+            ids.sort_unstable();
+            order.extend(ids);
+        }
+        let mut seen = Vec::new();
+        order.retain(|id| {
+            let new = !seen.contains(id);
+            seen.push(*id);
+            new
+        });
+        let out: Vec<Target> = order
+            .iter()
+            .filter_map(|id| replicated.iter().find(|g| g.raft_node == Some(*id)))
+            .map(|g| target(g))
+            .collect();
+        if out.is_empty() {
+            return Err(unavailable(format!(
+                "none of the nodes holding tenant {tenant}'s catalog is ready"
+            )));
+        }
+        Ok(out)
+    }
+
+    fn client(&self, t: &Target) -> Result<CatalogPeerClient<Channel>> {
+        if let Some(ch) = lock(&self.channels).get(&t.addr) {
             return Ok(CatalogPeerClient::new(ch.clone()));
         }
         let scheme = if self.tls.is_some() { "https" } else { "http" };
-        let uri = format!("{scheme}://{addr}");
+        let uri = format!("{scheme}://{}", t.addr);
         let mut ep = Endpoint::from_shared(uri.clone())
             .map_err(|e| unavailable(format!("peer address {uri}: {e}")))?
             .connect_timeout(Duration::from_secs(5));
-        if let Some(t) = &self.tls {
+        if let Some(p) = &self.tls {
             let cfg = ClientTlsConfig::new()
-                .ca_certificate(Certificate::from_pem(&t.ca))
-                .identity(Identity::from_pem(&t.cert, &t.key))
-                .domain_name(host);
+                .ca_certificate(Certificate::from_pem(&p.ca))
+                .identity(Identity::from_pem(&p.cert, &p.key))
+                .domain_name(t.host.clone());
             ep = ep
                 .tls_config(cfg)
                 .map_err(|e| unavailable(format!("peer TLS: {e}")))?;
         }
         let ch = ep.connect_lazy();
-        *slot = Some((Instant::now(), addr, ch.clone()));
+        lock(&self.channels).insert(t.addr.clone(), ch.clone());
         Ok(CatalogPeerClient::new(ch))
     }
 
-    fn forget(&self) {
-        *self.channel.lock().unwrap_or_else(PoisonError::into_inner) = None;
+    fn forget(&self, t: &Target) {
+        lock(&self.channels).remove(&t.addr);
     }
-}
 
-#[async_trait::async_trait]
-impl RecordStore for RemoteRecords {
-    async fn begin(&self, tenant: TenantId) -> Result<Box<dyn RecordTx>> {
-        let mut client = self.client().await?;
+    /// Opens a transaction on `tenant` at `t`.
+    async fn begin_at(&self, t: &Target, tenant: TenantId) -> Result<RemoteTx> {
+        let mut client = self.client(t)?;
         let (send, recv) = mpsc::channel::<CatalogOp>(4);
         let ops = futures::stream::unfold(recv, next_op);
         let mut tx = RemoteTx {
@@ -231,17 +364,66 @@ impl RecordStore for RemoteRecords {
         let replies = match tokio::time::timeout(OP_TIMEOUT, client.txn(ops)).await {
             Ok(Ok(r)) => r.into_inner(),
             Ok(Err(s)) => {
-                self.forget();
-                return Err(unavailable(format!("engine node: {}", s.message())));
+                self.forget(t);
+                return Err(unavailable(format!(
+                    "engine node {}: {}",
+                    t.addr,
+                    s.message()
+                )));
             }
             Err(_) => {
-                self.forget();
-                return Err(unavailable("engine node didn't answer"));
+                self.forget(t);
+                return Err(unavailable(format!("engine node {} didn't answer", t.addr)));
             }
         };
         tx.replies = Some(replies);
         tx.reply().await?;
-        Ok(Box::new(tx))
+        Ok(tx)
+    }
+}
+
+#[async_trait::async_trait]
+impl RecordStore for RemoteRecords {
+    async fn begin(&self, tenant: TenantId) -> Result<Box<dyn RecordTx>> {
+        let deadline = Instant::now() + FIND_LEADER;
+        let mut fresh = false;
+        loop {
+            let targets = self.targets(tenant.0, fresh).await?;
+            let mut last: Option<SprigError> = None;
+            for t in &targets {
+                match self.begin_at(t, tenant).await {
+                    Ok(tx) => {
+                        if let Some(r) = t.raft {
+                            lock(&self.leaders).insert(tenant.0, r);
+                        }
+                        return Ok(Box::new(tx));
+                    }
+                    // Not the unit's leader: the answer names it when known.
+                    Err(e) if e.code() == Some(SprigCode::ShardMoved) => {
+                        match leader_hint(&e.message) {
+                            Some(l) => lock(&self.leaders).insert(tenant.0, l),
+                            None => lock(&self.leaders).remove(&tenant.0),
+                        };
+                        last = Some(e);
+                    }
+                    Err(e) if e.code() == Some(SprigCode::CatalogUnavailable) => {
+                        last = Some(e);
+                    }
+                    Err(e) => return Err(e),
+                }
+                // One node only: its answer is final.
+                if targets.len() == 1 && t.raft.is_none() {
+                    break;
+                }
+            }
+            let only_one = targets.len() == 1 && targets[0].raft.is_none();
+            if only_one || Instant::now() >= deadline {
+                return Err(last.unwrap_or_else(|| unavailable("no engine node answered")));
+            }
+            // An election may be running: look again shortly.
+            fresh = true;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 }
 

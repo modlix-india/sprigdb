@@ -106,9 +106,13 @@ fn table_of(
         .filter(|d| d.state == DbState::Active)
         .ok_or_else(|| SprigError::standard(1049, *b"42000", format!("Unknown database '{db}'")))?;
     let okey = object_key(ObjectKind::Table, &t.name, lctn);
+    // A MongoDB collection's catalog object takes policies as a table does.
     let obj = cat
         .object(row.db_id, Namespace::Relation, &okey)
-        .filter(|o| o.state == ObjectState::Active && o.kind == ObjectKind::Table)
+        .filter(|o| {
+            o.state == ObjectState::Active
+                && matches!(o.kind, ObjectKind::Table | ObjectKind::Collection)
+        })
         .ok_or_else(|| no_table(db, &t.name))?;
     Ok((row.db_id, key, obj.object_id, obj.name.clone()))
 }
@@ -288,6 +292,28 @@ pub async fn statement(
     lex: &LexOptions,
     charset: u16,
 ) -> Result<PolicyAnswer> {
+    // A MongoDB collection named before the catalog has its object.
+    let named = match stmt {
+        PolicyStmt::Show { table: None, .. } => None,
+        PolicyStmt::Create { table, .. }
+        | PolicyStmt::Rename { table, .. }
+        | PolicyStmt::Alter { table, .. }
+        | PolicyStmt::Drop { table, .. }
+        | PolicyStmt::Security { table, .. }
+        | PolicyStmt::ShowCreate { table, .. }
+        | PolicyStmt::Show {
+            table: Some(table), ..
+        } => table
+            .db
+            .as_deref()
+            .or(current)
+            .map(|d| (d, table.name.as_str())),
+    };
+    let fresh = match named {
+        Some((d, n)) => crate::mongo::collcat::ensure_named(ts, cat, d, n).await?,
+        None => None,
+    };
+    let cat = fresh.as_ref().unwrap_or(cat);
     let lctn = ts.lower_case_table_names();
     let p = super::authz::privileges(ts, cat);
     let state = RlsState::of(cat).cloned().unwrap_or_default();
@@ -1710,6 +1736,79 @@ pub fn doc_views(ts: &TenantSession, cat: &TenantCatalog, rls: Option<&SessionRl
             .or_insert_with(|| doc_policies(ts, cat, rls, *o));
     }
     out
+}
+
+/// The document store's row guard for a session whose compiled policies
+/// are `rls`: for every collection whose policies bind the session, each
+/// command's `USING` and `WITH CHECK` as the policies' MongoDB forms,
+/// bound to the session's values. A policy without a MongoDB form (written
+/// in SQL) can't be evaluated on documents, so the combination it is part
+/// of lets nothing through. `None` when no collection binds the session.
+#[must_use]
+pub fn doc_guard(
+    ts: &TenantSession,
+    cat: &TenantCatalog,
+    rls: &SessionRls,
+) -> Option<Arc<sprig_doc::docstore::guard::RowGuard>> {
+    use sprig_doc::docstore::guard::{CollPolicies, Filter, RowGuard};
+    let bound: Vec<(u32, &Arc<TableRls>)> = rls
+        .tables
+        .iter()
+        .filter(|(o, _)| {
+            cat.objects
+                .get(**o)
+                .is_some_and(|x| x.kind == ObjectKind::Collection)
+        })
+        .filter_map(|(o, t)| Some((u32::try_from(o.0).ok()?, t)))
+        .collect();
+    if bound.is_empty() {
+        return None;
+    }
+    let values = SessionValues::of(ts, cat);
+    let lookup = |k: &str| values.mongo_value(k);
+    let filter = |t: &TableRls, c: u8, k: Clause| -> Filter {
+        let comb = t.combination(c, k);
+        let compile =
+            |terms: &[sprig_auth::authz::rls::Term<'_>]| -> Option<Vec<sprig_doc::filter::Pred>> {
+                terms
+                    .iter()
+                    .map(|term| {
+                        let p = term.policy;
+                        let text = match k {
+                            Clause::Using => p.using_mongo.as_deref(),
+                            Clause::Check if p.check_expr.is_some() => p.check_mongo.as_deref(),
+                            Clause::Check => p.using_mongo.as_deref(),
+                        }?;
+                        let f = mongo_filter(text)?;
+                        let bound = sprig_doc::policy::bind(&f, &lookup)?;
+                        sprig_doc::filter::parse(&bound).ok()
+                    })
+                    .collect()
+            };
+        match (compile(&comb.permissive), compile(&comb.restrictive)) {
+            (Some(permissive), Some(restrictive)) => Filter {
+                permissive,
+                restrictive,
+            },
+            _ => Filter::hidden(),
+        }
+    };
+    let colls = bound
+        .into_iter()
+        .map(|(object, t)| {
+            (
+                object,
+                Arc::new(CollPolicies {
+                    select: filter(t, cmd::SELECT, Clause::Using),
+                    update_using: filter(t, cmd::UPDATE, Clause::Using),
+                    update_check: filter(t, cmd::UPDATE, Clause::Check),
+                    delete_using: filter(t, cmd::DELETE, Clause::Using),
+                    insert_check: filter(t, cmd::INSERT, Clause::Check),
+                }),
+            )
+        })
+        .collect();
+    Some(Arc::new(RowGuard::new(colls)))
 }
 
 /// A policy's MongoDB form (relaxed extended JSON) as a filter document.

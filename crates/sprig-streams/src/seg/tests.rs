@@ -177,6 +177,69 @@ async fn idempotent_producers_dedupe_and_fence() {
     ));
 }
 
+/// A producer's later batch that arrives before its first (the first
+/// went to a former leader) waits for it; a retry of a batch older than
+/// the ones remembered is a duplicate, never out of order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_producers_batches_stay_in_order_across_a_leader_move() {
+    let d = TempDir::new("idem-move");
+    let l = open(d.path());
+    let rec = |n: usize| -> Vec<(Option<Vec<u8>>, Option<Vec<u8>>)> {
+        (0..n)
+            .map(|_| (Some(b"k".to_vec()), Some(b"v".to_vec())))
+            .collect()
+    };
+    let at = |seq: i32, n: usize| batch_with(&rec(n), 1, Some((88, 0, seq)));
+    // The second batch comes first: refused, and nothing appended.
+    assert!(matches!(
+        put(&l, key(0), &at(5, 5)).await,
+        Outcome::Refused { code: 45, .. }
+    ));
+    assert_eq!(l.bounds(key(0)).high_watermark, 0);
+    // The first batch's retry, then the second's.
+    assert_eq!(base(&put(&l, key(0), &at(0, 5)).await), 0);
+    assert_eq!(base(&put(&l, key(0), &at(5, 5)).await), 5);
+    // Five more batches: the first ones are no longer remembered.
+    for i in 0..5 {
+        assert_eq!(
+            base(&put(&l, key(0), &at(10 + i, 1)).await),
+            10 + i64::from(i)
+        );
+    }
+    // A late retry of the first batch, and of the second: duplicates,
+    // offsets no longer known.
+    for seq in [0, 5] {
+        assert!(matches!(
+            put(&l, key(0), &at(seq, 5)).await,
+            Outcome::Duplicate { base: -1, .. }
+        ));
+    }
+    assert!(matches!(
+        put(&l, key(0), &at(14, 1)).await,
+        Outcome::Duplicate { base: 14, .. }
+    ));
+    // A batch reaching past the last one taken, or a gap: out of order.
+    assert!(matches!(
+        put(&l, key(0), &at(13, 3)).await,
+        Outcome::Refused { code: 45, .. }
+    ));
+    assert!(matches!(
+        put(&l, key(0), &at(20, 1)).await,
+        Outcome::Refused { code: 45, .. }
+    ));
+    assert_eq!(l.bounds(key(0)).high_watermark, 15);
+    // A producer that comes back after its state expired starts a new
+    // epoch at 0.
+    assert!(matches!(
+        put(&l, key(0), &batch_with(&rec(1), 1, Some((89, 0, 7)))).await,
+        Outcome::Refused { code: 45, .. }
+    ));
+    assert_eq!(
+        base(&put(&l, key(0), &batch_with(&rec(1), 1, Some((89, 1, 0)))).await),
+        15
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_crash_replays_unsynced_appends_from_the_log() {
     let d = TempDir::new("crash");

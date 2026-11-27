@@ -18,6 +18,7 @@ use super::catalog::{FieldKind, IndexMeta};
 use super::layout::{self, after_prefix};
 use super::{Coll, DocStore, DocTxn};
 use crate::agg::{self, Projection, SortSpec};
+use crate::collation::Collation;
 use crate::filter::{FieldOp, InItem, Pred};
 use crate::keyenc::{self, class};
 
@@ -101,22 +102,43 @@ fn encode(fb: &FieldBound, kind: FieldKind) -> (Option<Vec<u8>>, Option<Vec<u8>>
     (lo, hi)
 }
 
+/// What a read's collation means for one index: the index's collation
+/// (its string keys are sort keys under it), and whether the read's
+/// collation is the same, so string bounds may use the index.
+#[derive(Debug, Clone, Copy)]
+struct IxColl {
+    index: Option<Collation>,
+    same: bool,
+}
+
+impl IxColl {
+    fn of(idx: &IndexMeta) -> Self {
+        Self {
+            index: idx.collation,
+            same: idx.collation == crate::collation::active(),
+        }
+    }
+}
+
 /// The bound of one comparison, with MongoDB's type bracketing; `None`
-/// when the operator can't bound the index.
-fn op_bound(op: &FieldOp, hashed: bool) -> Option<Vec<FieldBound>> {
+/// when the operator can't bound the index. A value holding strings bounds
+/// an index only when the read's collation is the index's.
+fn op_bound(op: &FieldOp, hashed: bool, cl: IxColl) -> Option<Vec<FieldBound>> {
     let class_of = |v: &Bson| keyenc::class_of(v);
     let usable = |v: &Bson| {
         !matches!(
             v,
             Bson::Array(_) | Bson::MinKey | Bson::MaxKey | Bson::RegularExpression(_)
-        )
+        ) && (cl.same || !keyenc::has_text(v))
     };
     let point = |v: &Bson| -> Option<FieldBound> {
         if !usable(v) {
             return None;
         }
         if hashed {
-            return Some(FieldBound::point(keyenc::key(&super::keys::hashed(v))));
+            return Some(FieldBound::point(keyenc::key(&super::keys::hashed_in(
+                v, cl.index,
+            ))));
         }
         if matches!(v, Bson::Null | Bson::Undefined) {
             return Some(FieldBound {
@@ -124,7 +146,7 @@ fn op_bound(op: &FieldOp, hashed: bool) -> Option<Vec<FieldBound>> {
                 hi: B::Class(class::NULL),
             });
         }
-        Some(FieldBound::point(keyenc::key(v)))
+        Some(FieldBound::point(keyenc::key_in(v, cl.index)))
     };
     match op {
         FieldOp::Eq(v) => point(v).map(|b| vec![b]),
@@ -139,8 +161,8 @@ fn op_bound(op: &FieldOp, hashed: bool) -> Option<Vec<FieldBound>> {
             Some(out)
         }
         // A regex anchored on a literal prefix reads the strings that start
-        // with it.
-        FieldOp::Regex(re) if !hashed => {
+        // with it (bytes: never in a collated index's sort keys).
+        FieldOp::Regex(re) if !hashed && cl.index.is_none() => {
             let p = re.literal_prefix()?;
             let mut lo = vec![class::STRING];
             for b in p.as_bytes() {
@@ -158,7 +180,7 @@ fn op_bound(op: &FieldOp, hashed: bool) -> Option<Vec<FieldBound>> {
         FieldOp::Gt(v) | FieldOp::Gte(v) | FieldOp::Lt(v) | FieldOp::Lte(v)
             if !hashed && usable(v) && !matches!(v, Bson::Null | Bson::Undefined) =>
         {
-            let k = keyenc::key(v);
+            let k = keyenc::key_in(v, cl.index);
             let c = class_of(v);
             Some(vec![match op {
                 FieldOp::Gt(_) => FieldBound {
@@ -216,6 +238,7 @@ fn path_bounds(
     path: &str,
     hashed: bool,
     multikey: bool,
+    cl: IxColl,
 ) -> Option<Vec<FieldBound>> {
     let mut found: Option<Vec<FieldBound>> = None;
     for c in conj {
@@ -225,7 +248,7 @@ fn path_bounds(
         if p != path {
             continue;
         }
-        let Some(bs) = op_bound(op, hashed) else {
+        let Some(bs) = op_bound(op, hashed, cl) else {
             continue;
         };
         found = Some(match found {
@@ -334,6 +357,7 @@ fn index_intervals(
     conj: &[&Pred],
 ) -> Option<(Vec<(Vec<u8>, Vec<u8>)>, usize, bool, bool, bool)> {
     let multikey = c.is_multikey(pos);
+    let cl = IxColl::of(idx);
     let base = c.space.index(idx.id, idx.unique);
     let mut prefixes = vec![base.clone()];
     let mut points = 0usize;
@@ -368,7 +392,7 @@ fn index_intervals(
             if doc_arg {
                 continue;
             }
-            let Some(bs) = op_bound(op, false) else {
+            let Some(bs) = op_bound(op, false, cl) else {
                 continue;
             };
             let keeps = {
@@ -407,7 +431,7 @@ fn index_intervals(
     let mut out = Vec::new();
     for (i, (path, kind)) in idx.fields.iter().enumerate() {
         let hashed = *kind == FieldKind::Hashed;
-        let bs = path_bounds(conj, path, hashed, multikey);
+        let bs = path_bounds(conj, path, hashed, multikey, cl);
         let Some(bs) = bs else {
             out = prefixes
                 .iter()
@@ -486,9 +510,10 @@ fn merge(mut iv: Vec<(Vec<u8>, Vec<u8>)>) -> Vec<(Vec<u8>, Vec<u8>)> {
 }
 
 /// Whether an index scan from field `from` on gives `sort`'s order, and in
-/// which direction.
+/// which direction. An index whose collation isn't the read's gives no
+/// order (its strings sort otherwise).
 fn sort_dir(idx: &IndexMeta, from: usize, sort: &SortSpec) -> Option<Dir> {
-    if sort.is_empty() || idx.is_hashed() || idx.is_wildcard() {
+    if sort.is_empty() || idx.is_hashed() || idx.is_wildcard() || !IxColl::of(idx).same {
         return None;
     }
     let rest = idx.fields.get(from..)?;
@@ -522,6 +547,14 @@ pub struct Want<'a> {
     pub natural: Option<i32>,
 }
 
+/// Counts a read's use of its index for `$indexStats` (since the node
+/// started, as MongoDB counts since `mongod` started).
+pub fn note_use(c: &Coll, p: &Plan) {
+    if let Some(n) = &p.index {
+        crate::usage::record_index(c.space.tenant, &c.meta.db, &c.meta.name, n);
+    }
+}
+
 /// Plans a read of `c` for `pred`.
 ///
 /// # Errors
@@ -536,7 +569,10 @@ pub fn plan(c: &Coll, pred: &Pred, want: &Want<'_>) -> Result<Plan, MongoError> 
     }
     let id_sort = match want.sort.as_slice() {
         [] => Some(Dir::Forward),
-        [(p, d)] if p == "_id" => Some(if *d < 0 { Dir::Reverse } else { Dir::Forward }),
+        // Under a collation, string `_id`s sort otherwise than their keys.
+        [(p, d)] if p == "_id" && !collated => {
+            Some(if *d < 0 { Dir::Reverse } else { Dir::Forward })
+        }
         _ => None,
     };
     let mut conj = Vec::new();
@@ -562,14 +598,14 @@ pub fn plan(c: &Coll, pred: &Pred, want: &Want<'_>) -> Result<Plan, MongoError> 
                 c.meta
                     .indexes
                     .iter()
-                    .position(|i| &i.name == n)
+                    .position(|i| &i.name == n && !i.building)
                     .ok_or_else(bad_hint)?,
             ),
             Bson::Document(k) => Some(
                 c.meta
                     .indexes
                     .iter()
-                    .position(|i| &i.key() == k)
+                    .position(|i| &i.key() == k && !i.building)
                     .ok_or_else(bad_hint)?,
             ),
             _ => return Err(bad_hint()),
@@ -580,15 +616,11 @@ pub fn plan(c: &Coll, pred: &Pred, want: &Want<'_>) -> Result<Plan, MongoError> 
             return Ok(p);
         };
         let idx = &c.meta.indexes[pos];
-        let (iv, points, single, bounded, _) = if collated {
-            None
-        } else {
-            index_intervals(c, pos, idx, &conj)
-        }
-        .unwrap_or_else(|| {
-            let p = c.space.index(idx.id, idx.unique);
-            (vec![(p.clone(), after_prefix(&p))], 0, true, false, false)
-        });
+        let (iv, points, single, bounded, _) =
+            index_intervals(c, pos, idx, &conj).unwrap_or_else(|| {
+                let p = c.space.index(idx.id, idx.unique);
+                (vec![(p.clone(), after_prefix(&p))], 0, true, false, false)
+            });
         let sd = (single && !c.is_multikey(pos))
             .then(|| sort_dir(idx, points, &want.sort))
             .flatten();
@@ -606,7 +638,7 @@ pub fn plan(c: &Coll, pred: &Pred, want: &Want<'_>) -> Result<Plan, MongoError> 
     }
     // `_id` lookups.
     if let Some(ids) = pred.id_values()
-        && !(collated && ids.iter().any(|v| matches!(v, Bson::String(_))))
+        && !(collated && ids.iter().any(keyenc::has_text))
     {
         let mut keys: Vec<Vec<u8>> = ids
             .iter()
@@ -628,56 +660,53 @@ pub fn plan(c: &Coll, pred: &Pred, want: &Want<'_>) -> Result<Plan, MongoError> 
     // The best bounded index: most leading points, then a range; a
     // unique index pinned on every field first.
     let mut best: Option<(i64, Plan)> = None;
-    if !collated {
-        for (pos, idx) in c.meta.indexes.iter().enumerate() {
-            if idx.hidden || idx.partial.is_some() {
-                continue;
-            }
-            let Some((iv, points, single, bounded, nulls)) = index_intervals(c, pos, idx, &conj)
-            else {
-                continue;
-            };
-            if !bounded || (idx.sparse && nulls) {
-                continue;
-            }
-            let multikey = c.is_multikey(pos);
-            let sd = (single && !multikey)
-                .then(|| sort_dir(idx, points, &want.sort))
-                .flatten();
-            let full = points == idx.fields.len();
-            let mut score = i64::try_from(points).unwrap_or(0) * 10 + 5;
-            if full && idx.unique && !nulls && !multikey {
-                score += 100;
-            }
-            if sd.is_some() {
-                score += 3;
-            }
-            if multikey {
-                score -= 1;
-            }
-            if best.as_ref().is_none_or(|(s, _)| score > *s) {
-                best = Some((
-                    score,
-                    Plan {
-                        access: Access::Ranges {
-                            index: Some((idx.id, idx.unique)),
-                            intervals: iv,
-                            dir: sd.unwrap_or(Dir::Forward),
-                            dedup: true,
-                        },
-                        sorted: sd.is_some() || want.sort.is_empty(),
-                        index: Some(idx.name.clone()),
-                        bounded: true,
+    for (pos, idx) in c.meta.indexes.iter().enumerate() {
+        if idx.hidden || idx.building || idx.partial.is_some() {
+            continue;
+        }
+        let Some((iv, points, single, bounded, nulls)) = index_intervals(c, pos, idx, &conj) else {
+            continue;
+        };
+        if !bounded || (idx.sparse && nulls) {
+            continue;
+        }
+        let multikey = c.is_multikey(pos);
+        let sd = (single && !multikey)
+            .then(|| sort_dir(idx, points, &want.sort))
+            .flatten();
+        let full = points == idx.fields.len();
+        let mut score = i64::try_from(points).unwrap_or(0) * 10 + 5;
+        if full && idx.unique && !nulls && !multikey {
+            score += 100;
+        }
+        if sd.is_some() {
+            score += 3;
+        }
+        if multikey {
+            score -= 1;
+        }
+        if best.as_ref().is_none_or(|(s, _)| score > *s) {
+            best = Some((
+                score,
+                Plan {
+                    access: Access::Ranges {
+                        index: Some((idx.id, idx.unique)),
+                        intervals: iv,
+                        dir: sd.unwrap_or(Dir::Forward),
+                        dedup: true,
                     },
-                ));
-            }
+                    sorted: sd.is_some() || want.sort.is_empty(),
+                    index: Some(idx.name.clone()),
+                    bounded: true,
+                },
+            ));
         }
     }
     if let Some((_, p)) = best {
         return Ok(p);
     }
     // An `$or` whose every branch has a bounded plan: their union.
-    if want.sort.is_empty() && !collated {
+    if want.sort.is_empty() {
         for cj in &conj {
             let Pred::Or(branches) = cj else { continue };
             let mut parts = Vec::with_capacity(branches.len());
@@ -705,25 +734,23 @@ pub fn plan(c: &Coll, pred: &Pred, want: &Want<'_>) -> Result<Plan, MongoError> 
         return Ok(p);
     }
     // An index whose order is the sort's, read whole.
-    if !collated {
-        for (pos, idx) in c.meta.indexes.iter().enumerate() {
-            if idx.hidden || idx.partial.is_some() || idx.sparse || c.is_multikey(pos) {
-                continue;
-            }
-            if let Some(d) = sort_dir(idx, 0, &want.sort) {
-                let p = c.space.index(idx.id, idx.unique);
-                return Ok(Plan {
-                    access: Access::Ranges {
-                        index: Some((idx.id, idx.unique)),
-                        intervals: vec![(p.clone(), after_prefix(&p))],
-                        dir: d,
-                        dedup: true,
-                    },
-                    sorted: true,
-                    index: Some(idx.name.clone()),
-                    bounded: false,
-                });
-            }
+    for (pos, idx) in c.meta.indexes.iter().enumerate() {
+        if idx.hidden || idx.building || idx.partial.is_some() || idx.sparse || c.is_multikey(pos) {
+            continue;
+        }
+        if let Some(d) = sort_dir(idx, 0, &want.sort) {
+            let p = c.space.index(idx.id, idx.unique);
+            return Ok(Plan {
+                access: Access::Ranges {
+                    index: Some((idx.id, idx.unique)),
+                    intervals: vec![(p.clone(), after_prefix(&p))],
+                    dir: d,
+                    dedup: true,
+                },
+                sorted: true,
+                index: Some(idx.name.clone()),
+                bounded: false,
+            });
         }
     }
     Ok(Plan::scan_all(c, Dir::Forward))
@@ -741,8 +768,14 @@ fn bad_hint() -> MongoError {
 /// # Errors
 /// The value is damaged.
 pub fn decode(v: &[u8]) -> Result<Document, MongoError> {
-    Document::from_reader(&mut layout::doc_bson(v))
-        .map_err(|e| MongoError::new(code::INTERNAL_ERROR, format!("damaged document: {e}")))
+    // Through the raw form: a field shaped like legacy extended JSON
+    // (`{$binary: "...", $type: "00"}`) stays an ordinary document, as
+    // MongoDB stores it (`Document::from_reader` would read it as binary).
+    let damaged = |e: &dyn std::fmt::Display| {
+        MongoError::new(code::INTERNAL_ERROR, format!("damaged document: {e}"))
+    };
+    let raw = bson::RawDocument::from_bytes(layout::doc_bson(v)).map_err(|e| damaged(&e))?;
+    Document::try_from(raw).map_err(|e| damaged(&e))
 }
 
 /// Where a scan stands.
@@ -803,7 +836,9 @@ impl Scan {
 
     /// Reads candidates in order until `want` of them match `pred` (or the
     /// keyspace ends), calling `take` with each match's `_id` key and
-    /// document. `take` returns false to stop early.
+    /// document. `take` returns false to stop early. Under a row guard
+    /// whose policies bind `c`, documents they hide are passed over first
+    /// ([`super::guard`]).
     ///
     /// # Errors
     /// The store failed.
@@ -815,6 +850,11 @@ impl Scan {
         cx: &dyn crate::filter::ExprEval,
         mut take: impl FnMut(Vec<u8>, Document) -> bool,
     ) -> Result<(), MongoError> {
+        if super::guard::binds(c) {
+            return self.run_dyn(t, c, pred, cx, &mut |k, d| {
+                !super::guard::sees(c, &d) || take(k, d)
+            });
+        }
         self.run_dyn(t, c, pred, cx, &mut take)
     }
 
@@ -1153,6 +1193,7 @@ impl DocStore {
             natural,
         };
         let plan = plan(c, &pred, &want)?;
+        note_use(c, &plan);
         let remaining = (args.limit > 0).then_some(args.limit);
         let collation = crate::collation::active();
         if plan.sorted && txn.is_none() {
@@ -1268,6 +1309,7 @@ impl DocStore {
             natural: None,
         };
         let plan = plan(c, pred, &want)?;
+        note_use(c, &plan);
         let cx = crate::agg::AggExpr { now: self.now() };
         let mut out: Vec<(Vec<u8>, Document)> = Vec::new();
         let early = plan.sorted && limit > 0;

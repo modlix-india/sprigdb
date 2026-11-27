@@ -192,6 +192,10 @@ pub(crate) fn slot_type(ty: &ExprType) -> ColumnType {
         Kind::Float => ColumnType::Float,
         // A JSON value stays one through the slot.
         Kind::Str if ty.json => ColumnType::Json,
+        // So is a UUID or an address.
+        Kind::Str if ty.fbt.is_some() => {
+            ColumnType::Fbt(ty.fbt.unwrap_or(sprig_engine::row::Fbt::Uuid))
+        }
         Kind::Str => {
             if ty.coll == Collation::Binary {
                 ColumnType::VarBinary { bytes: ty.len }

@@ -789,7 +789,7 @@ impl Engine {
                         h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
                     })
                 {
-                    tokio::task::block_in_place(rest)?;
+                    crate::offload::block_in_place(rest)?;
                 } else {
                     rest()?;
                 }
@@ -830,7 +830,7 @@ impl Engine {
         let r = if off_worker {
             let watch =
                 interrupt.map(|h| interrupt_on_stop(h, a.stop.clone(), a.deadline.map(|d| d.0)));
-            let r = tokio::task::block_in_place(run);
+            let r = crate::offload::block_in_place(run);
             if let Some(w) = watch {
                 w.abort();
             }
@@ -939,6 +939,49 @@ impl Engine {
                 Err(e)
             }
         }
+    }
+
+    /// Runs `g` as a part of the statement already running in `txn` (an
+    /// `ON DUPLICATE KEY UPDATE`'s values for a collection's conflicting
+    /// document): no new statement starts, and an error undoes nothing
+    /// (the running statement's own error handling does).
+    ///
+    /// # Errors
+    /// The statement's, or the engine's.
+    pub(crate) async fn general_run_part(
+        &self,
+        g: &General,
+        a: &RunArgs<'_>,
+        txn: &mut SessionTxn,
+    ) -> Result<Rows> {
+        let Some(tx) = txn.open_tx() else {
+            return Err(SprigError::internal("engine: no open transaction"));
+        };
+        let all = if g.lock_each.is_some() {
+            tx.options().isolation != sprig_engine::txn::Isolation::ReadCommitted
+        } else {
+            tx.shared_reads()
+        };
+        let lock = g.lock.map(|l| lock_of(l, all)).or_else(|| {
+            tx.shared_reads().then_some(Lock {
+                mode: LockMode::Shared,
+                wait: Wait::Block,
+                all: true,
+            })
+        });
+        let spaces = self.general_spaces(a.tenant, g, Some(tx)).await?;
+        let Some(owned) = txn.lend() else {
+            return Err(SprigError::internal("engine: no open transaction"));
+        };
+        let (owned, r) = Self::general_exec(g, spaces, Some(owned), a, lock);
+        let Some(owned) = owned else {
+            return Err(SprigError::internal(
+                "engine: a statement lost its transaction",
+            ));
+        };
+        let tx = txn.restore(owned);
+        let ran = r?;
+        tx.gate().await.map(|()| ran)
     }
 
     /// The result columns of `g` without running it (a `PREPARE`): planned

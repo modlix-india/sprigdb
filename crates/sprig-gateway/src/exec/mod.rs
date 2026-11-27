@@ -1328,12 +1328,86 @@ impl SessionExec for PassSession {
         }
     }
 
+    fn lend_engine_txn(
+        &mut self,
+        txn: Option<sprig_engine::txn::Txn>,
+    ) -> Option<sprig_engine::txn::Txn> {
+        // A MongoDB transaction's, for its SQL statements on tables.
+        self.engine_txn_loan(txn)
+    }
+
     fn holds_tenant_privilege(&self, action: sprig_auth::authz::Action) -> Option<bool> {
         // `$currentOp` with `allUsers` needs `PROCESS`.
         let ts = self.tenant.as_deref()?;
         let cat = Self::session_catalog(ts)?;
         let p = crate::tenant::authz::privileges(ts, &cat);
         Some(p.unrestricted() || p.allows(action, sprig_auth::authz::Target::Tenant))
+    }
+
+    fn holds_privilege_on(
+        &self,
+        action: sprig_auth::authz::Action,
+        db: &str,
+        name: Option<&str>,
+    ) -> Option<bool> {
+        // A MongoDB command on an engine collection: the database's grant,
+        // or one on the collection: its catalog object's, or one held by
+        // its name.
+        use sprig_auth::authz::Target;
+        use sprig_catalog::store::{DbState, Namespace, ObjectKind, ObjectState};
+        let ts = self.tenant.as_deref()?;
+        let cat = Self::newest_catalog(ts)?;
+        let p = crate::tenant::authz::privileges(ts, &cat);
+        if p.unrestricted() {
+            return Some(true);
+        }
+        let lctn = ts.lower_case_table_names();
+        let db_key = sprig_catalog::ddl::database_key(db, lctn);
+        if p.allows(action, Target::Database { db_key: &db_key }) {
+            return Some(true);
+        }
+        Some(name.is_some_and(|n| {
+            let name_key = sprig_catalog::ddl::object_key(ObjectKind::Collection, n, lctn);
+            let object = cat
+                .database(&db_key)
+                .filter(|d| d.state == DbState::Active)
+                .and_then(|d| {
+                    cat.object(d.db_id, Namespace::Relation, &name_key)
+                        .filter(|o| o.state == ObjectState::Active)
+                        .map(|o| (d.db_id, o.object_id))
+                });
+            match object {
+                Some((db, object)) => p.allows(
+                    action,
+                    Target::Object {
+                        db_key: &db_key,
+                        db,
+                        object,
+                    },
+                ),
+                None => p.allows(
+                    action,
+                    Target::Named {
+                        db_key: &db_key,
+                        name_key: &name_key,
+                    },
+                ),
+            }
+        }))
+    }
+
+    fn row_guard(&self) -> Option<std::sync::Arc<sprig_doc::docstore::guard::RowGuard>> {
+        // The session's policies on collections, at the newest catalog
+        // this node has (a MongoDB session runs no statement that would
+        // refresh its own).
+        let ts = self.tenant.as_deref()?;
+        let cat = Self::newest_catalog(ts)?;
+        let p = crate::tenant::authz::privileges(ts, &cat);
+        let rls = p.row_policies()?;
+        if rls.tables.is_empty() {
+            return None;
+        }
+        crate::tenant::rls::doc_guard(ts, &cat, &rls)
     }
 
     fn attach_capture(&mut self, capture: crate::workload::SessionCapture) {

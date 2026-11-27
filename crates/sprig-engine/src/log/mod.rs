@@ -47,7 +47,7 @@ use raft_engine::{LogBatch, ReadableSize, RecoveryMode};
 use sprig_common::{Result, SprigCode, SprigError};
 
 pub use entry::{EntryExt, LogEntry};
-pub use fs::{LogFs, SimDisk, SyncMode};
+pub use fs::{LogFs, SimDisk, SimSyncs, SyncMode, simulate_syncs, simulated_sync, syncs_simulated};
 pub use payload::Payload;
 
 /// A unit: an unsharded tenant or one shard, with its own log (one Raft

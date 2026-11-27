@@ -21,7 +21,7 @@ use sprig_engine::row::{ColumnType, Value};
 use sprig_exec::{BinOp, Expr, ExprType};
 
 use crate::access::KeyRange;
-use crate::catalog::{IndexPart, TableDef};
+use crate::catalog::{IndexPart, PathPart, TableDef};
 use crate::keyval::{KeyVal, key_value, truncate};
 
 /// The most ranges one scan is given; past it the deepest key parts are
@@ -112,26 +112,68 @@ pub(crate) struct KeyCtx<'a> {
     /// Evaluates a constant expression: its value and static type, or
     /// `None` when it can't be evaluated now.
     pub(crate) eval: &'a dyn Fn(&Expr) -> Option<(Value, ExprType)>,
+    /// Per part of the key, its JSON path ([`PathPart`]); empty for a key
+    /// of columns only.
+    pub(crate) paths: &'a [Option<PathPart>],
+}
+
+/// The column slot and path of `JSON_VALUE(col, path ...)`,
+/// `JSON_EXTRACT(col, path)` or `JSON_UNQUOTE(JSON_EXTRACT(col, path))`
+/// with a constant path.
+fn json_path(e: &Expr) -> Option<(usize, &str)> {
+    fn col_path<'e>(c: &Expr, p: &'e Expr) -> Option<(usize, &'e str)> {
+        match (c, p) {
+            (Expr::Column(c), Expr::Str(p)) => Some((c.slot, p.as_str())),
+            _ => None,
+        }
+    }
+    match e {
+        Expr::Func(n, a) if n == "JSON_UNQUOTE" && a.len() == 1 => match &a[0] {
+            Expr::Func(m, b) if m == "JSON_EXTRACT" && b.len() == 2 => col_path(&b[0], &b[1]),
+            _ => None,
+        },
+        Expr::Func(n, a)
+            if (n == "JSON_EXTRACT" && a.len() == 2) || (n == "JSON_VALUE" && a.len() >= 2) =>
+        {
+            col_path(&a[0], &a[1])
+        }
+        _ => None,
+    }
 }
 
 impl KeyCtx<'_> {
+    fn path(&self, part: usize) -> Option<&PathPart> {
+        self.paths.get(part).and_then(Option::as_ref)
+    }
+
     fn ty(&self, part: usize) -> &ColumnType {
-        &self.table.columns[self.parts[part].column].ty
+        match self.path(part) {
+            Some(p) => &p.ty,
+            None => &self.table.columns[self.parts[part].column].ty,
+        }
     }
 
     fn nullable(&self, part: usize) -> bool {
-        self.table.columns[self.parts[part].column].nullable
+        // A document may lack the path, or hold null there.
+        self.path(part).is_some() || self.table.columns[self.parts[part].column].nullable
     }
 
     /// The first key part over the column `e` reads, if `e` is a bare
     /// column of the table.
     fn part_of(&self, e: &Expr) -> Option<usize> {
+        // A path part: the same column and path.
+        if let Some((slot, path)) = json_path(e) {
+            let col = slot.checked_sub(self.base)?;
+            return (0..self.parts.len()).find(|&i| {
+                self.parts[i].column == col && self.path(i).is_some_and(|p| p.path == path)
+            });
+        }
         let Expr::Column(c) = e else { return None };
         let col = c.slot.checked_sub(self.base)?;
         if col >= self.table.columns.len() {
             return None;
         }
-        self.parts.iter().position(|p| p.column == col)
+        (0..self.parts.len()).find(|&i| self.parts[i].column == col && self.path(i).is_none())
     }
 
     fn is_real(&self, konst: &Expr) -> bool {
@@ -149,8 +191,9 @@ impl KeyCtx<'_> {
 
     fn level(&self, part: usize, lo: Edge, hi: Edge) -> PartTree {
         let mut t = PartTree::never(part);
-        // An index prefix holds the start of a value only.
-        t.exact = self.parts[part].prefix.is_none();
+        // An index prefix holds the start of a value only; a path part's
+        // rows are always checked again.
+        t.exact = self.parts[part].prefix.is_none() && self.path(part).is_none();
         if cmp_edge(self.ty(part), &lo, &hi) == Ordering::Less {
             t.list.push(Interval { lo, hi, next: None });
         }
@@ -690,6 +733,7 @@ mod tests {
             parts: &t.indexes[0].parts,
             base: 0,
             eval: &eval,
+            paths: &[],
         };
         let tree = ctx.tree(e)?;
         ctx.ranges(&tree)

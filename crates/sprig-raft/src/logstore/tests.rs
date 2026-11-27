@@ -228,6 +228,65 @@ fn raft_engine_after_a_power_cut_keeps_a_prefix() {
     }
 }
 
+/// Writes go on while syncs run ([`LogStore::write_unsynced`] beside
+/// [`LogStore::sync_written`]): after a power cut, everything written before
+/// a sync that returned is there, then a gap-free prefix of the rest.
+#[test]
+fn raft_engine_syncs_beside_writes_keep_what_came_before_them() {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    for seed in [3u64, 11, 77] {
+        let dir = std::env::temp_dir().join(format!(
+            "sprig-raft-logstore-pipe-{}-{seed}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let sim = SimDisk::new();
+        let durable = AtomicU64::new(0);
+        {
+            let s = EngineLogStore::open(&dir, SyncMode::Full, Some(Arc::clone(&sim))).unwrap();
+            let written = AtomicU64::new(0);
+            let done = AtomicBool::new(false);
+            std::thread::scope(|sc| {
+                for _ in 0..3 {
+                    sc.spawn(|| {
+                        while !done.load(Ordering::Acquire) {
+                            let upto = written.load(Ordering::Acquire);
+                            s.sync_written().unwrap();
+                            durable.fetch_max(upto, Ordering::AcqRel);
+                        }
+                    });
+                }
+                for i in 1..=300 {
+                    let b = batch(vec![GroupWrite {
+                        group: 1,
+                        entries: vec![ent(i, 1)],
+                        hard_state: Some(hs(1, i)),
+                        ..GroupWrite::default()
+                    }]);
+                    s.write_unsynced(&[&b], true).unwrap();
+                    written.store(i, Ordering::Release);
+                }
+                done.store(true, Ordering::Release);
+            });
+            sim.power_cut();
+        }
+        sim.crash(&dir, seed).unwrap();
+        let s = EngineLogStore::open(&dir, SyncMode::Full, None).unwrap();
+        let r = s.recover().unwrap();
+        let idx: Vec<u64> = r[0].entries.iter().map(|e| e.index).collect();
+        let last = idx.last().copied().unwrap_or(0);
+        let durable = durable.load(Ordering::Acquire);
+        assert!(durable > 0, "seed {seed}: no sync covered anything");
+        assert!(
+            last >= durable,
+            "seed {seed}: lost synced entries: last {last} < {durable}"
+        );
+        assert_eq!(idx, (1..=last).collect::<Vec<_>>(), "seed {seed}");
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// With note blobs, synced writes keep large notes in blob files and the
 /// log reads them back whole; unsynced writes keep them inline. A crash
 /// that cut the newest blob file's tail cuts the log at the first entry

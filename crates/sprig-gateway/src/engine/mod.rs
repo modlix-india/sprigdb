@@ -42,6 +42,7 @@ pub(crate) mod alter;
 pub(crate) mod assign;
 pub(crate) mod catalog;
 pub(crate) mod collection;
+pub(crate) mod collwrite;
 pub(crate) mod control;
 pub(crate) mod ddl;
 pub(crate) mod ddlexec;
@@ -63,11 +64,14 @@ pub(crate) mod paramtype;
 pub(crate) mod partition;
 pub(crate) mod plan;
 pub(crate) mod plancache;
+pub(crate) mod queuetable;
+pub(crate) mod redistable;
 pub(crate) mod routine;
 pub(crate) mod row;
 pub(crate) mod sequence;
 pub(crate) mod session;
 pub(crate) mod show;
+pub(crate) mod stats;
 pub(crate) mod streamtable;
 pub(crate) mod store;
 pub(crate) mod table;
@@ -264,7 +268,7 @@ pub(crate) fn engine() -> Result<&'static Engine> {
 }
 
 /// The object number of `def` in keys (engine object numbers are 32-bit).
-fn object_of(def: &TableDef) -> Result<u32> {
+pub(crate) fn object_of(def: &TableDef) -> Result<u32> {
     u32::try_from(def.object.0)
         .map_err(|_| not_on_engine("a table whose object id needs more than 32 bits"))
 }

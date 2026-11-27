@@ -9,7 +9,7 @@ source: the metric macros in the source tree, and docs/metrics-help.toml
 
 Every metric SprigDB records, as exported on each process's telemetry port (`/metrics`, Prometheus text) and through OTLP. Counters end in `_total`; durations are histograms in seconds.
 
-472 metrics in 54 groups.
+473 metrics in 54 groups.
 
 ## `sprig_advisor_*`
 
@@ -194,6 +194,7 @@ Every metric SprigDB records, as exported on each process's telemetry port (`/me
 
 | Metric | Type | Labels | Recorded by | Description |
 |---|---|---|---|---|
+| `sprig_catalog_barrier_seconds` | histogram | - | sprig-gateway | On a replicated node, how long a catalog change waited before allocating its next version until every gateway held the committed one (the DDL barrier, two-version rule; past 5 s the laggards are fenced and their lease waited out). Unit: seconds. |
 | `sprig_catalog_cache_bytes` | gauge | - | sprig-catalog | Memory used by this process's cache of tenant catalogs (`catalog.cache_max_mb`). Unit: bytes. |
 | `sprig_catalog_cache_tenants` | gauge | - | sprig-catalog | Tenants whose catalogs are cached in this process (`catalog.cache_max_tenants`). Unit: count. |
 | `sprig_catalog_changes_total` | counter | `kind` | sprig-catalog | Catalog changes committed (DDL, settings, accounts); `kind` is the kind of change. Unit: count. |

@@ -150,6 +150,7 @@ pub(crate) fn key_len(table: &TableDef, parts: &[IndexPart]) -> usize {
                 ColumnType::Enum { .. } => 2,
                 ColumnType::Set { .. } => 8,
                 ColumnType::Json => 0,
+                ColumnType::Fbt(f) => f.bytes() as u32,
             };
             len as usize + usize::from(col.nullable)
         })

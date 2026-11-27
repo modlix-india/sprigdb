@@ -45,7 +45,11 @@ enum Clause {
 
 /// Applies the statement in `t` to `def`.
 pub(super) fn apply(def: &Def, t: &[Tok], cx: &Ctx) -> Result<Def, Fail> {
-    let mut p = P { t, i: 0 };
+    let mut p = P {
+        t,
+        i: 0,
+        mysql: cx.mysql,
+    };
     let clauses = if p.is("CREATE") {
         create_index(&mut p, &def.cs.0)?
     } else if p.is("DROP") {
@@ -752,10 +756,13 @@ fn run(d: &mut Def, clauses: Vec<Clause>, cx: &Ctx) -> Result<(), Fail> {
             }
             Clause::Add(raw) => {
                 for mut k in raw.keys {
-                    // A plain index a user's statement builds online
-                    // (`engine::ddl::USER_ONLINE`): published ignored, made
-                    // public once its entries are written.
-                    let online = k.kind == KeyKind::Plain
+                    // A plain or unique index a user's statement builds
+                    // online (`engine::ddl::USER_ONLINE`): published
+                    // ignored, made public once its entries are written. A
+                    // unique key of a table without a primary key may become
+                    // the table's key, so it takes the usual path.
+                    let keyed = d.keys.iter().any(|x| x.kind == KeyKind::Primary);
+                    let online = (k.kind == KeyKind::Plain || (k.kind == KeyKind::Unique && keyed))
                         && !k.ignored
                         && crate::engine::ddl::USER_ONLINE.try_with(|_| ()).is_ok();
                     if online {

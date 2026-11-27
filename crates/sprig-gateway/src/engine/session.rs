@@ -501,6 +501,34 @@ impl SessionTxn {
         self.tx.insert(tx)
     }
 
+    /// Opens the session's transaction over `tx`, an engine transaction
+    /// another front end lent (a MongoDB transaction's, for an SQL statement
+    /// on a table): the session's statements run in it until
+    /// [`SessionTxn::take_lent`]. `Some(tx)` back when the session has a
+    /// transaction (or an XA branch) of its own.
+    pub(crate) fn adopt_lent(&mut self, tx: Tx) -> Option<Tx> {
+        if self.tx.is_some() || self.xa.is_some() {
+            return Some(tx);
+        }
+        self.opts = Some(*tx.options());
+        self.read_only = false;
+        self.touched = true;
+        self.savepoints.clear();
+        self.in_flight = false;
+        self.quiet = false;
+        self.tx = Some(tx);
+        None
+    }
+
+    /// Takes back the transaction [`SessionTxn::adopt_lent`] opened;
+    /// `None` when the engine rolled it back meanwhile (a deadlock, a
+    /// snapshot conflict).
+    pub(crate) fn take_lent(&mut self) -> Option<Tx> {
+        let tx = self.tx.take();
+        self.forget();
+        tx.filter(Tx::is_open)
+    }
+
     /// The statement ended (with an answer or an error). When the engine
     /// rolled the transaction back by itself, the session is outside a
     /// transaction now: `true`.

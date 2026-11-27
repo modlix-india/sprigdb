@@ -30,8 +30,9 @@ use zeroize::Zeroizing;
 use crate::grammar::{self, AlterConnection, AlterSink, ConnName, OptVal, Stmt, TargetAst};
 use crate::meta::{PlatformConnection, SinkIndex};
 use crate::model::{
-    ConnKind, ConnRef, ConnectionDef, ConnectionId, Guarantee, ScriptLanguage, SinkDef, SinkId,
-    SinkState, SourceKind, SourceSpec, StartAt, TargetKind, TargetSpec, TaskRow, bad_option, err,
+    ConnKind, ConnRef, ConnectionDef, ConnectionId, DeadLetter, Guarantee, ScriptLanguage, SinkDef,
+    SinkId, SinkState, SourceKind, SourceSpec, StartAt, TargetKind, TargetSpec, TaskRow,
+    bad_option, err,
 };
 use crate::policy::{Destinations, Residency, url_host_port};
 use crate::secrets::SinkKeyring;
@@ -155,6 +156,18 @@ pub trait Host: Send {
     /// when there is none, or this host can't tell.
     fn table(&self, _db: u32, _name: &str) -> Option<u64> {
         None
+    }
+
+    /// The engine stream `name` of database `db`: its id and partitions.
+    /// `None` when there is none, or this host can't tell.
+    fn stream(&self, _db: u32, _name: &str) -> Option<(u64, u32)> {
+        None
+    }
+
+    /// Whether the user may `INSERT` into (publish to) `db.name` (a
+    /// stream).
+    fn can_insert(&self, db: &str, name: &str) -> bool {
+        self.can_select(db, name)
     }
 
     /// What `TEST CONNECTION` and `TEST SINK` open connections and read
@@ -1197,11 +1210,44 @@ async fn sink_def(h: &mut dyn Host, c: grammar::CreateSink) -> Result<SinkDef> {
     let (db, dbname) = db_of(h, c.name.db.as_deref())?;
     // The source, readable by the owner.
     let source = match &c.source {
-        grammar::SourceAst::Stream(_) | grammar::SourceAst::FanIn { .. } => {
+        grammar::SourceAst::Stream(st) => {
+            // An engine stream of the sink's database, read as the owner,
+            // who needs SELECT on it.
+            let (sdb, sdbname) = db_of(h, st.db.as_deref().or(Some(&dbname)))?;
+            if sdb != db {
+                return Err(bad_option(
+                    "a stream sink's stream must be in the sink's database",
+                ));
+            }
+            let (id, partitions) = h.stream(sdb, &st.name).ok_or_else(|| {
+                err(
+                    SprigCode::SinkOptionInvalid,
+                    format!("no stream {} in database {sdbname}", st.name),
+                )
+            })?;
+            if !h.can_select(&sdbname, &st.name) {
+                return Err(err(
+                    SprigCode::SinkPrivilege,
+                    format!("you need SELECT on stream {}", st.name),
+                ));
+            }
+            if c.start_at == StartAt::Snapshot {
+                return Err(bad_option(
+                    "START AT SNAPSHOT is for tables' changes: a stream sink starts at LATEST, \
+                     EARLIEST or a TIMESTAMP",
+                ));
+            }
+            SourceSpec::Stream {
+                id,
+                name: st.name.clone(),
+                partitions: partitions.max(1),
+            }
+        }
+        grammar::SourceAst::FanIn { .. } => {
             return Err(err(
                 SprigCode::SinkOptionInvalid,
-                "sinks read queues and tables' changes only: streams are stored on the \
-                 SprigDB engine, which has no stream sink source yet",
+                "FAN IN sinks read FOR EACH TENANT streams, which aren't stored on the SprigDB \
+                 engine yet",
             ));
         }
         grammar::SourceAst::Changes(ts) => {
@@ -1345,13 +1391,40 @@ async fn sink_def(h: &mut dyn Host, c: grammar::CreateSink) -> Result<SinkDef> {
         }
     }
     // Dead letters go to the sink's dead-letter records, which sprigctl
-    // replays from; `DEAD LETTER TO STREAM | QUEUE | EXCHANGE` aren't built.
+    // replays from, or with `DEAD LETTER TO STREAM d` to an engine stream
+    // of the sink's database, published as the owner (who needs INSERT on
+    // it); `DEAD LETTER TO QUEUE | EXCHANGE` aren't built.
     let dead_letter = match &c.dead_letter {
         None => None,
+        Some(grammar::DeadAst::Stream(name)) => {
+            let (id, _) = h.stream(db, name).ok_or_else(|| {
+                err(
+                    SprigCode::SinkOptionInvalid,
+                    format!("no stream {name} in database {dbname} for DEAD LETTER TO STREAM"),
+                )
+            })?;
+            if !h.can_insert(&dbname, name) {
+                return Err(err(
+                    SprigCode::SinkPrivilege,
+                    format!("you need INSERT on stream {name} (DEAD LETTER TO STREAM)"),
+                ));
+            }
+            if let SourceSpec::Stream { id: from, .. } = &source
+                && *from == id
+            {
+                return Err(bad_option(
+                    "a sink's dead letters can't go to the stream it reads",
+                ));
+            }
+            Some(DeadLetter::Stream {
+                id,
+                name: name.clone(),
+            })
+        }
         Some(_) => {
             return Err(bad_option(
-                "DEAD LETTER TO STREAM, QUEUE and EXCHANGE aren't built yet; dead letters are \
-                 kept in the sink's dead-letter records",
+                "DEAD LETTER TO QUEUE and EXCHANGE aren't built yet; use DEAD LETTER TO STREAM, \
+                 or leave it out to keep dead letters in the sink's dead-letter records",
             ));
         }
     };
@@ -1624,6 +1697,9 @@ pub fn render_sink(d: &SinkDef) -> String {
         Guarantee::AtLeastOnce => " GUARANTEE AT LEAST ONCE",
         Guarantee::ExactlyOnce => " GUARANTEE EXACTLY ONCE",
     });
+    if let Some(DeadLetter::Stream { name, .. }) = &d.dead_letter {
+        s.push_str(&format!(" DEAD LETTER TO STREAM `{name}`"));
+    }
     s.push_str(&match d.start_at {
         StartAt::Latest => " START AT LATEST".to_owned(),
         StartAt::Earliest => " START AT EARLIEST".to_owned(),

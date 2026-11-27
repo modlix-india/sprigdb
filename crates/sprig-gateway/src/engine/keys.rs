@@ -171,6 +171,34 @@ pub(crate) fn object_prefix(tenant: u64, object: u32) -> Vec<u8> {
 /// records).
 const DROPS_INDEX: u16 = 1;
 
+/// The index number of the tenant's list of tables with an online index
+/// build a user's statement started and hasn't finished, in the same
+/// records object.
+const ONLINE_INDEX: u16 = 2;
+
+/// The prefix of `tenant`'s online build marks: one key per table,
+/// `prefix | object u32`, its value the owner (node and process, 16 bytes)
+/// and the indexes' names, one per line.
+pub(crate) fn online_prefix(tenant: u64) -> Vec<u8> {
+    let mut k = Vec::with_capacity(24);
+    KeyPrefix {
+        tenant,
+        shard: 0,
+        object: 0,
+        kind: kind::META,
+        index: ONLINE_INDEX,
+    }
+    .encode_into(&mut k);
+    k
+}
+
+/// The online build mark of table `object`.
+pub(crate) fn online_mark(tenant: u64, object: u32) -> Vec<u8> {
+    let mut k = online_prefix(tenant);
+    k.extend_from_slice(&object.to_be_bytes());
+    k
+}
+
 /// The prefix of `tenant`'s list of dropped tables whose keys are still
 /// being deleted: one key per table, `prefix | object u32`, empty value.
 pub(crate) fn drops_prefix(tenant: u64) -> Vec<u8> {
@@ -191,6 +219,13 @@ pub(crate) fn drop_mark(tenant: u64, object: u32) -> Vec<u8> {
     let mut k = drops_prefix(tenant);
     k.extend_from_slice(&object.to_be_bytes());
     k
+}
+
+/// The key of a table's online copy record: while a definition change
+/// copies the rows without holding the table, the key ranges it writes
+/// (with its owner), so what a stopped process wrote is deleted later.
+pub(crate) fn copying_key(tenant: u64, object: u32) -> Vec<u8> {
+    meta_key(tenant, object, b"copying")
 }
 
 /// The key of a table's index record.

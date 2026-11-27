@@ -56,13 +56,20 @@ fn until<T>(what: &str, mut f: impl FnMut() -> Option<T>) -> T {
 
 impl Cluster {
     fn new(ids: &[NodeId], cfg: RaftConfig) -> Self {
+        Self::with_stores(ids, cfg, |_| {})
+    }
+
+    /// [`Cluster::new`] with each member's store set up by `setup`.
+    fn with_stores(ids: &[NodeId], cfg: RaftConfig, setup: impl Fn(&MemLogStore)) -> Self {
         let mut c = Cluster {
             net: MemNetwork::new(),
             cfg,
             members: BTreeMap::new(),
         };
         for id in ids {
-            c.start(*id, MemLogStore::new());
+            let store = MemLogStore::new();
+            setup(&store);
+            c.start(*id, store);
         }
         c
     }
@@ -237,6 +244,47 @@ fn a_log_writer_thread_replicates_and_keeps_writes_through_crashes() {
         assert_eq!(c.get(g, 2), Some(g * 1000 + 17));
         let s = c.converged(g);
         assert_eq!(s.data()[&1].len(), 7);
+    }
+}
+
+/// The log writer thread with its syncs overlapped (each takes 2 ms, up to
+/// four at once): writes from several clients replicate, syncs run side by
+/// side, and every acknowledged write survives crashes that lose whatever
+/// wasn't synced.
+#[test]
+fn a_pipelined_log_writer_overlaps_syncs_and_keeps_acknowledged_writes() {
+    let mut c = Cluster::with_stores(&[1, 2, 3], threaded(), |s| {
+        s.set_sync_pipeline(4);
+        s.set_sync_delay(|| Duration::from_millis(2));
+    });
+    for g in 20..24 {
+        c.create(g, &[1, 2, 3]);
+    }
+    std::thread::scope(|s| {
+        for t in 0..8u64 {
+            let c = &c;
+            s.spawn(move || {
+                for i in 0..25 {
+                    c.put(20 + t % 4, t, t * 1000 + i);
+                }
+            });
+        }
+    });
+    let most = c
+        .members
+        .values()
+        .map(|m| m.store.most_syncs_at_once())
+        .max()
+        .unwrap_or(0);
+    assert!(most > 1, "syncs never overlapped (most at once: {most})");
+    for (n, id) in [1, 2, 3].into_iter().enumerate() {
+        c.crash_restart(id, 3000 + n as u64);
+    }
+    for t in 0..8u64 {
+        assert_eq!(c.get(20 + t % 4, t), Some(t * 1000 + 24), "client {t}");
+    }
+    for g in 20..24 {
+        c.converged(g);
     }
 }
 

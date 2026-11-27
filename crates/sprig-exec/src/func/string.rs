@@ -2,6 +2,8 @@
 
 use std::cmp::Ordering;
 
+use std::fmt::Write as _;
+
 use bytes::Bytes;
 use sprig_engine::keys::collation::{Charset, Collation};
 use sprig_engine::row::Value;
@@ -882,6 +884,29 @@ pub(crate) fn describe(name: &str, a: Node, env: Env<'_>) -> Node {
 /// `HEX(x)`: a string's bytes, or a number's integer value, in upper-case
 /// hexadecimal.
 pub(crate) fn hex(a: Node, env: Env<'_>) -> Node {
+    // A UUID or address: its bytes as written (MariaDB's 32 or 8 digits).
+    if let Some(f) = a.ty.fbt {
+        // (Typed by the text's length, as MariaDB does.)
+        let ty = ExprType {
+            dec: 0,
+            ..ExprType::string(f.text_len() * 2, env.conn(), Derivation::Coercible)
+        }
+        .nullable();
+        let from = a.ty;
+        return Node::new(ty, "hex", move |ctx, row| {
+            let v = a.eval(ctx, row)?;
+            Ok(match crate::expr::fbt_stored(f, &v, &from) {
+                Some(b) => {
+                    let mut h = String::with_capacity(b.len() * 2);
+                    for x in f.written(&b) {
+                        let _ = write!(h, "{x:02X}");
+                    }
+                    Value::Str(Bytes::from(h.into_bytes()))
+                }
+                None => Value::Null,
+            })
+        });
+    }
     let numeric = a.ty.kind != Kind::Str && a.ty.kind != Kind::Null;
     let chars = if numeric {
         16

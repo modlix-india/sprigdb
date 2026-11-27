@@ -382,11 +382,46 @@ pub trait SessionExec: Send {
         None
     }
 
+    /// Whether the session holds `action` on database `db`, or on its
+    /// object `name` by name (a MongoDB collection on the engine, which
+    /// grants name rather than number). Defaults to the tenant-wide
+    /// answer. `None` when the executor can't tell.
+    fn holds_privilege_on(
+        &self,
+        action: sprig_auth::authz::Action,
+        db: &str,
+        name: Option<&str>,
+    ) -> Option<bool> {
+        let _ = (db, name);
+        self.holds_tenant_privilege(action)
+    }
+
+    /// The document store's row guard for this session: the collections
+    /// whose row-level security policies bind it (`None`: none does, or
+    /// the executor has no policies).
+    fn row_guard(&self) -> Option<std::sync::Arc<sprig_doc::docstore::guard::RowGuard>> {
+        None
+    }
+
     /// The verified claims of the token the session's caller presented,
     /// for `SPRIG_CLAIM()`; executors without row-level
     /// security ignore them.
     fn set_claims(&mut self, claims: Option<std::sync::Arc<serde_json::Value>>) {
         let _ = claims;
+    }
+
+    /// Lends the session an engine transaction another front end holds, or
+    /// takes it back. `Some(txn)` opens the session's transaction over
+    /// `txn` (a MongoDB transaction's, for SQL statements on tables) and
+    /// returns `None`, or returns `txn` untouched when the session can't
+    /// take it (a transaction of its own is open, no engine). `None` takes
+    /// the lent transaction back: `None` when the engine rolled it back
+    /// meanwhile. Executors without the engine never take one.
+    fn lend_engine_txn(
+        &mut self,
+        txn: Option<sprig_engine::txn::Txn>,
+    ) -> Option<sprig_engine::txn::Txn> {
+        txn
     }
 
     /// A prepared single-row read for a protocol engine (MongoDB's `_id`
@@ -746,8 +781,28 @@ impl SessionExec for HookedSession {
         self.inner.holds_tenant_privilege(action)
     }
 
+    fn holds_privilege_on(
+        &self,
+        action: sprig_auth::authz::Action,
+        db: &str,
+        name: Option<&str>,
+    ) -> Option<bool> {
+        self.inner.holds_privilege_on(action, db, name)
+    }
+
+    fn row_guard(&self) -> Option<std::sync::Arc<sprig_doc::docstore::guard::RowGuard>> {
+        self.inner.row_guard()
+    }
+
     fn set_claims(&mut self, claims: Option<std::sync::Arc<serde_json::Value>>) {
         self.inner.set_claims(claims);
+    }
+
+    fn lend_engine_txn(
+        &mut self,
+        txn: Option<sprig_engine::txn::Txn>,
+    ) -> Option<sprig_engine::txn::Txn> {
+        self.inner.lend_engine_txn(txn)
     }
 }
 

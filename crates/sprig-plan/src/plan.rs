@@ -661,6 +661,8 @@ impl Path {
 struct RelInfo {
     /// Conditions over this item alone that its own scan may apply.
     local: Vec<Expr>,
+    /// The share of the item's rows each of `local` keeps.
+    shares: Vec<f64>,
     /// The item's access paths, cheapest first at `best`.
     paths: Vec<Path>,
     best: usize,
@@ -852,13 +854,7 @@ fn pick_path(
         } else {
             Cx::order_served(table, path.key, path.const_parts(), const_cols, want)
         };
-        let out = (path
-            .kept
-            .iter()
-            .map(|c| selectivity(&info.local[*c]))
-            .product::<f64>()
-            * path.rows)
-            .max(1.0);
+        let out = (path.kept.iter().map(|c| info.shares[*c]).product::<f64>() * path.rows).max(1.0);
         let cost = match (served, early) {
             (Some(_), Some(l)) if single => path.cost * (l / out).min(1.0) + SEEK,
             (Some(_), _) => path.cost,
@@ -1275,14 +1271,17 @@ impl<'a> Cx<'a> {
             kept: all.clone(),
         }];
         let eval = |e: &Expr| self.eval_const(e);
-        for (id, def) in table.keys() {
+        // Keys of columns, then keys over values inside JSON columns (read
+        // only for ranges of conditions on their paths).
+        for (id, def) in table.keys().chain(table.path_keys()) {
             let parts = table.ordering_parts(id);
             let held: BTreeSet<usize> = parts
                 .iter()
                 .filter(|p| key_holds(table, p))
                 .map(|p| p.column)
                 .collect();
-            let covering = id != KeyId::Primary && needed.iter().all(|c| held.contains(c));
+            let covering =
+                id != KeyId::Primary && !def.has_paths() && needed.iter().all(|c| held.contains(c));
             let per_row = match (id, covering) {
                 (KeyId::Primary, _) => ROW,
                 (_, true) => ENTRY,
@@ -1293,6 +1292,7 @@ impl<'a> Cx<'a> {
                 parts: &parts,
                 base,
                 eval: &eval,
+                paths: &def.paths,
             };
             let trees: Vec<_> = local.iter().map(|c| ctx.tree(c)).collect();
             let tree = trees.iter().cloned().fold(None, |acc, t| ctx.and(acc, t));
@@ -1353,6 +1353,48 @@ impl<'a> Cx<'a> {
         paths
     }
 
+    /// The share of `table`'s rows each condition of `local` keeps: from
+    /// storage's statistics when the condition reads one column of the
+    /// table and range analysis turns it into ranges of that column (as if
+    /// the column alone were a key), else the fixed guesses.
+    fn local_shares(&self, base: usize, table: &Arc<TableDef>, local: &[Expr]) -> Vec<f64> {
+        local
+            .iter()
+            .map(|e| {
+                self.column_share(base, table, e)
+                    .unwrap_or_else(|| selectivity(e))
+            })
+            .collect()
+    }
+
+    fn column_share(&self, base: usize, table: &Arc<TableDef>, e: &Expr) -> Option<f64> {
+        let mut col = None;
+        for s in exprs::slots(e) {
+            let c = s.checked_sub(base)?;
+            if c >= table.columns.len() || col.is_some_and(|x| x != c) {
+                return None;
+            }
+            col = Some(c);
+        }
+        let col = col?;
+        // Nothing to ask for when storage has no figures of the column.
+        self.storage.column_distinct(table, col)?;
+        let parts = [crate::catalog::IndexPart::asc(col)];
+        let eval = |e: &Expr| self.eval_const(e);
+        let ctx = KeyCtx {
+            table,
+            parts: &parts,
+            base,
+            eval: &eval,
+            paths: &[],
+        };
+        let set = ctx.ranges(&ctx.tree(e)?)?;
+        if set.is_empty() {
+            return Some(0.0);
+        }
+        self.storage.column_share(table, col, &set.ranges)
+    }
+
     /// Whether reading `key` after `const_parts` constant leading parts
     /// gives rows in the wanted order; the answer is whether to read
     /// backwards.
@@ -1363,6 +1405,13 @@ impl<'a> Cx<'a> {
         const_cols: &BTreeSet<usize>,
         want: &[(usize, bool)],
     ) -> Option<bool> {
+        // A key over values inside a JSON column gives no order.
+        if table
+            .key(key)
+            .is_some_and(crate::catalog::IndexDef::has_paths)
+        {
+            return None;
+        }
         let parts = table.ordering_parts(key);
         let unique_tail = table.primary.is_some();
         let mut i = const_parts;
@@ -1481,15 +1530,10 @@ impl<'a> Cx<'a> {
                         &BTreeSet::new(),
                         &mut unused,
                     );
+                    let shares = self.local_shares(0, &simple.table, &simple.filters);
                     paths
                         .iter()
-                        .map(|p| {
-                            p.rows
-                                * p.kept
-                                    .iter()
-                                    .map(|c| selectivity(&simple.filters[*c]))
-                                    .product::<f64>()
-                        })
+                        .map(|p| p.rows * p.kept.iter().map(|c| shares[*c]).product::<f64>())
                         .fold(f64::INFINITY, f64::min)
                 }
                 _ => f64::INFINITY,
@@ -1712,6 +1756,10 @@ impl<'a> Cx<'a> {
                 .map(|s| s - rel.base)
                 .collect();
             let mut possible = Vec::new();
+            let shares = match &rel.kind {
+                RelKind::Table(t) => self.local_shares(rel.base, t, &local),
+                _ => local.iter().map(selectivity).collect(),
+            };
             let (paths, table_rows) = match &rel.kind {
                 RelKind::Table(t) => (
                     self.table_paths(rel.base, t, &local, &needed, &mut possible),
@@ -1754,14 +1802,11 @@ impl<'a> Cx<'a> {
                     best = p;
                 }
             }
-            let out_rows = paths[best]
-                .kept
-                .iter()
-                .map(|c| selectivity(&local[*c]))
-                .product::<f64>()
-                * paths[best].rows;
+            let out_rows =
+                paths[best].kept.iter().map(|c| shares[*c]).product::<f64>() * paths[best].rows;
             infos.push(RelInfo {
                 local,
+                shares,
                 paths,
                 best,
                 table_rows,

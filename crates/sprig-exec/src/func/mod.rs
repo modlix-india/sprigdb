@@ -389,6 +389,10 @@ pub(crate) fn build(name: &str, args: &[Expr], env: Env<'_>) -> Result<Node> {
                 Ok(json::value(d, p, env))
             }
         },
+        "JSON_QUERY" if env.maria() => {
+            let [d, p] = take(name, nodes)?;
+            Ok(json::query(d, p, env))
+        }
         "JSON_TYPE" => {
             let [a] = take(name, nodes)?;
             Ok(json::type_of(a, env))

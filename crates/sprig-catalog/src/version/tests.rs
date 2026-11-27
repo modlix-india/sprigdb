@@ -632,3 +632,50 @@ proptest! {
         run_ops(ops);
     }
 }
+
+/// A barrier that records what it was asked and refuses while `refuse`.
+#[derive(Default)]
+struct Barrier {
+    asked: Mutex<Vec<(TenantId, u64)>>,
+    refuse: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl VersionBarrier for Barrier {
+    async fn hold(&self, tenant: TenantId, version: u64) -> Result<()> {
+        self.asked.lock().unwrap().push((tenant, version));
+        if self.refuse.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(SprigError::new(
+                SprigCode::CatalogConflict,
+                "a node didn't confirm in time",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn catalog_changes_wait_for_every_node_to_hold_the_committed_version() {
+    let (g, v) = setup().await;
+    let b = Arc::new(Barrier::default());
+    let v = v.with_barrier(Arc::clone(&b) as Arc<dyn VersionBarrier>);
+    assert_eq!(commit_one(&v, VersionKind::Catalog).await.unwrap(), 1);
+    assert_eq!(commit_one(&v, VersionKind::Catalog).await.unwrap(), 2);
+    // Auth changes don't wait: the rule is about schemas.
+    assert_eq!(commit_one(&v, VersionKind::Auth).await.unwrap(), 1);
+    assert_eq!(*b.asked.lock().unwrap(), vec![(T, 0), (T, 1)]);
+    // A barrier that can't be met refuses the change: nothing allocated,
+    // no gap, the version row free again.
+    b.refuse.store(true, std::sync::atomic::Ordering::SeqCst);
+    let e = commit_one(&v, VersionKind::Catalog).await.unwrap_err();
+    assert_eq!(e.code(), Some(SprigCode::CatalogConflict));
+    assert_eq!(directory(&*g, T).await["catalog_version"], 2);
+    assert_eq!(v.backend().read(T).unwrap().catalog, 2);
+    b.refuse.store(false, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(commit_one(&v, VersionKind::Catalog).await.unwrap(), 3);
+    assert_eq!(b.asked.lock().unwrap().last(), Some(&(T, 2)));
+    // Unversioned commits and releases don't wait either.
+    let l = v.lock(T, VersionKind::Catalog).await.unwrap();
+    l.release().await.unwrap();
+    assert_eq!(b.asked.lock().unwrap().len(), 4);
+}

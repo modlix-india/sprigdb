@@ -47,6 +47,8 @@ struct Collect {
     /// The columns, for binary rows (prepared statements).
     defs: Vec<ColumnDef>,
     binary: bool,
+    /// Keep the column definitions of text rows too (`query_typed`).
+    keep_defs: bool,
     rows: Rows,
     ok: Option<Done>,
     error: Option<SprigError>,
@@ -65,7 +67,7 @@ impl ResultSink for Collect {
     async fn begin_rows(&mut self, columns: &[ColumnDef], format: RowFormat) -> Result<()> {
         self.columns = columns.len();
         self.binary = format == RowFormat::Binary;
-        if self.binary {
+        if self.binary || self.keep_defs {
             self.defs = columns.to_vec();
         }
         Ok(())
@@ -281,12 +283,40 @@ impl SqlSession {
         self.exec.engine_database(name)
     }
 
+    /// Lends the session a MongoDB transaction's engine transaction for its
+    /// SQL statements, or takes it back (`SessionExec::lend_engine_txn`).
+    pub fn lend_engine_txn(
+        &mut self,
+        txn: Option<sprig_engine::txn::Txn>,
+    ) -> Option<sprig_engine::txn::Txn> {
+        self.exec.lend_engine_txn(txn)
+    }
+
     /// Whether the session holds `action` on the whole tenant
     /// (`$currentOp`'s `allUsers` needs `PROCESS`); `None` when it can't
     /// tell.
     #[must_use]
     pub fn holds_tenant_privilege(&self, action: sprig_auth::authz::Action) -> Option<bool> {
         self.exec.holds_tenant_privilege(action)
+    }
+
+    /// Whether the session holds `action` on database `db` or its
+    /// collection `coll` (by name); `None` when it can't tell.
+    #[must_use]
+    pub fn holds_privilege_on(
+        &self,
+        action: sprig_auth::authz::Action,
+        db: &str,
+        coll: Option<&str>,
+    ) -> Option<bool> {
+        self.exec.holds_privilege_on(action, db, coll)
+    }
+
+    /// The store's row guard for the session (see
+    /// [`crate::pipeline::SessionExec::row_guard`]).
+    #[must_use]
+    pub fn row_guard(&self) -> Option<std::sync::Arc<sprig_doc::docstore::guard::RowGuard>> {
+        self.exec.row_guard()
     }
 
     /// The client's known data center (`appName`'s `~dc`):
@@ -517,6 +547,77 @@ impl SqlSession {
             return Err(sql_error(&e));
         }
         Ok(sink)
+    }
+
+    /// Runs `sql` as the client's own statement (not internal: the user's
+    /// privileges, row-level security and reserved names apply), with the
+    /// result's column definitions: a MongoDB command reading an SQL table.
+    ///
+    /// # Errors
+    /// The statement's, as the engine persona words them.
+    pub async fn query_typed(
+        &mut self,
+        sql: &str,
+    ) -> std::result::Result<(Vec<ColumnDef>, Rows), SqlError> {
+        let mut sink = Collect {
+            keep_defs: true,
+            ..Collect::default()
+        };
+        self.session
+            .begin_command("Query", Some(sql.chars().take(1024).collect()));
+        self.exec.set_internal(false);
+        let r = {
+            let mut cx = ExecCtx {
+                session: &mut self.session,
+                proto: &self.proto,
+                db: None,
+            };
+            let req = Request::Query {
+                sql: Bytes::copy_from_slice(sql.as_bytes()),
+                attrs: QueryAttrs::default(),
+            };
+            self.exec.execute(&mut cx, req, &mut sink).await
+        };
+        self.session.end_command();
+        if let Err(e) = r {
+            return Err(sql_error(&e));
+        }
+        if let Some(e) = sink.error.take() {
+            return Err(sql_error(&e));
+        }
+        Ok((sink.defs, sink.rows))
+    }
+
+    /// Runs write `sql` as the client's own statement (as
+    /// [`Self::query_typed`]): a MongoDB command writing an SQL table.
+    ///
+    /// # Errors
+    /// The statement's, as the engine persona words them.
+    pub async fn exec_client(&mut self, sql: &str) -> std::result::Result<Done, SqlError> {
+        let mut sink = Collect::default();
+        self.session
+            .begin_command("Query", Some(sql.chars().take(1024).collect()));
+        self.exec.set_internal(false);
+        let r = {
+            let mut cx = ExecCtx {
+                session: &mut self.session,
+                proto: &self.proto,
+                db: None,
+            };
+            let req = Request::Query {
+                sql: Bytes::copy_from_slice(sql.as_bytes()),
+                attrs: QueryAttrs::default(),
+            };
+            self.exec.execute(&mut cx, req, &mut sink).await
+        };
+        self.session.end_command();
+        if let Err(e) = r {
+            return Err(sql_error(&e));
+        }
+        if let Some(e) = sink.error.take() {
+            return Err(sql_error(&e));
+        }
+        Ok(sink.ok.unwrap_or_default())
     }
 
     /// Whether the session keeps a backend connection between statements

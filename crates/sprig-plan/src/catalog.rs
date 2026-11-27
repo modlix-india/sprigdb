@@ -86,6 +86,26 @@ impl IndexPart {
     }
 }
 
+/// A key part over a value inside a JSON column: the part's column holds
+/// documents, and the key orders the value at `path` in each of them (a
+/// MongoDB collection's index on a field, read from SQL).
+///
+/// The planner uses such a part for conditions on `JSON_VALUE(col, path)`,
+/// `JSON_EXTRACT(col, path)` or `col->>path` (`JSON_UNQUOTE(JSON_EXTRACT(...))`)
+/// compared with constants of the part's type `ty` (a number type for
+/// numbers, a string type for strings): it hands storage ranges of such
+/// constants, and storage returns every row whose value could compare so
+/// (more rows are fine). The condition is always checked again on the rows
+/// read. Such a key never serves an order, a lookup by an earlier table's
+/// rows, or a covering read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathPart {
+    /// The JSON path, as written in the condition (`$.a.b`).
+    pub path: String,
+    /// The type the part's bounds are given in.
+    pub ty: ColumnType,
+}
+
 /// A key of a table: the primary key or a secondary index.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexDef {
@@ -99,6 +119,10 @@ pub struct IndexDef {
     /// key's entries, and no plan reads them. [`TableDef::keys`] leaves
     /// such a key out.
     pub ignored: bool,
+    /// Per part, the JSON path it orders (see [`PathPart`]); empty when no
+    /// part has one. A key with a path part is left out of
+    /// [`TableDef::keys`] and listed by [`TableDef::path_keys`].
+    pub paths: Vec<Option<PathPart>>,
 }
 
 impl IndexDef {
@@ -110,7 +134,21 @@ impl IndexDef {
             unique,
             parts,
             ignored: false,
+            paths: Vec::new(),
         }
+    }
+
+    /// The same key with these path parts (one entry per part).
+    #[must_use]
+    pub fn with_paths(mut self, paths: Vec<Option<PathPart>>) -> Self {
+        self.paths = paths;
+        self
+    }
+
+    /// Whether a part orders a value inside a JSON column.
+    #[must_use]
+    pub fn has_paths(&self) -> bool {
+        self.paths.iter().any(Option::is_some)
     }
 
     /// The same key, ignored by plans when `ignored`.
@@ -165,16 +203,26 @@ impl TableDef {
         }
     }
 
-    /// Every key a plan may read, the primary key first: ignored
-    /// secondary indexes are left out.
+    /// Every key of columns a plan may read, the primary key first:
+    /// ignored secondary indexes and keys with path parts are left out.
     pub fn keys(&self) -> impl Iterator<Item = (KeyId, &IndexDef)> {
         self.primary.iter().map(|k| (KeyId::Primary, k)).chain(
             self.indexes
                 .iter()
                 .enumerate()
-                .filter(|(_, k)| !k.ignored)
+                .filter(|(_, k)| !k.ignored && !k.has_paths())
                 .map(|(i, k)| (KeyId::Index(i), k)),
         )
+    }
+
+    /// The keys with path parts ([`PathPart`]) a plan may read: only for
+    /// ranges of the conditions on their paths.
+    pub fn path_keys(&self) -> impl Iterator<Item = (KeyId, &IndexDef)> {
+        self.indexes
+            .iter()
+            .enumerate()
+            .filter(|(_, k)| !k.ignored && k.has_paths())
+            .map(|(i, k)| (KeyId::Index(i), k))
     }
 
     /// The parts an entry of key `id` is ordered by: the key's own parts

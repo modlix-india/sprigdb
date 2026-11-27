@@ -763,8 +763,13 @@ fn as_json(ctx: &mut Ctx<'_>, a: &Node, row: &[Value]) -> Result<J> {
     let v = a.eval(ctx, row)?;
     let json_node =
         a.text.starts_with("json_") || a.text.starts_with("JSON_") || (a.ty.json && !ctx.maria());
+    // MariaDB keeps a boolean's kind: `TRUE`, `FALSE` and a predicate
+    // (comparison, `AND`, `NOT`, `IN`, ...) are JSON `true` / `false`.
+    let boolean = ctx.maria()
+        && (a.pred || a.text.eq_ignore_ascii_case("true") || a.text.eq_ignore_ascii_case("false"));
     Ok(match v {
         Value::Null => J::Null,
+        Value::Int(n) if boolean => J::Bool(n != 0),
         Value::Json(b) => parse(&b).unwrap_or(J::Null),
         Value::Str(b) | Value::Bytes(b) if json_node => {
             parse(&b).unwrap_or_else(|| J::Str(String::from_utf8_lossy(&b).into_owned()))
@@ -773,9 +778,20 @@ fn as_json(ctx: &mut Ctx<'_>, a: &Node, row: &[Value]) -> Result<J> {
         Value::Int(n) => J::Num(n.to_string()),
         Value::UInt(n) => J::Num(n.to_string()),
         other => {
-            let s = crate::value_text(&other, &a.ty, crate::Persona::MySql)
+            let mut s = crate::value_text(&other, &a.ty, crate::Persona::MySql)
                 .map(|b| String::from_utf8_lossy(&b).into_owned())
                 .unwrap_or_default();
+            // MySQL's JSON double is written with a fraction when whole
+            // (`5.0`; `JSON_EXTRACT(..) + JSON_EXTRACT(..)` is a double).
+            if !ctx.maria()
+                && matches!(other, Value::Double(_) | Value::Float(_))
+                && s.trim_start_matches('-')
+                    .bytes()
+                    .all(|c| c.is_ascii_digit())
+                && !s.is_empty()
+            {
+                s.push_str(".0");
+            }
             if matches!(
                 other,
                 Value::Decimal(_) | Value::Double(_) | Value::Float(_)
@@ -994,11 +1010,17 @@ pub(crate) fn unquote(a: Node, env: Env<'_>) -> Node {
 }
 
 /// `JSON_VALUE(doc, path)`: a scalar's text; `NULL` for an object or array.
+/// On MariaDB the result has the document's collation.
 pub(crate) fn value(d: Node, p: Node, env: Env<'_>) -> Node {
     let maria = env.maria();
+    let coll = if maria && d.ty.kind == crate::types::Kind::Str {
+        d.ty.coll
+    } else {
+        env.conn()
+    };
     let ty = ExprType::string(
         if maria { u32::MAX / 4 } else { 512 },
-        env.conn(),
+        coll,
         Derivation::Implicit,
     )
     .nullable();
@@ -1016,6 +1038,26 @@ pub(crate) fn value(d: Node, p: Node, env: Env<'_>) -> Node {
             Some(J::Num(n)) => Value::Str(Bytes::from(n.clone().into_bytes())),
             Some(J::Bool(b)) => Value::Str(Bytes::from_static(if *b { b"true" } else { b"false" })),
             Some(v @ (J::Arr(_) | J::Obj(_))) if !maria => out_value(v, false),
+            _ => Value::Null,
+        })
+    })
+}
+
+/// `JSON_QUERY(doc, path)` (MariaDB): the object or array at the path, as
+/// it is written in the document; `NULL` for a scalar.
+pub(crate) fn query(d: Node, p: Node, env: Env<'_>) -> Node {
+    let ty = doc_type(&d, env);
+    Node::new(ty, "json_query", move |ctx, row| {
+        let Some(j) = doc(ctx, &d, row, true, "json_query", 1)? else {
+            return Ok(Value::Null);
+        };
+        let Some(path) = path(ctx, &p, row, true, "json_query", 2)? else {
+            return Ok(Value::Null);
+        };
+        let mut found = Vec::new();
+        select(&j, &path, &mut found);
+        Ok(match found.first() {
+            Some(v @ (J::Arr(_) | J::Obj(_))) => out_value(v, true),
             _ => Value::Null,
         })
     })
@@ -1567,14 +1609,21 @@ pub(crate) fn search(nodes: Vec<Node>, env: Env<'_>) -> Result<Node> {
     }))
 }
 
-/// `JSON_TYPE(doc)`.
+/// `JSON_TYPE(doc)`. MariaDB's result is `utf8mb3_general_ci`.
 pub(crate) fn type_of(a: Node, env: Env<'_>) -> Node {
     let maria = env.maria();
-    let ty = ExprType::string(
-        if maria { 12 } else { 51 },
-        env.conn(),
-        Derivation::Implicit,
-    )
+    let ty = if maria {
+        ExprType {
+            mb3: true,
+            ..ExprType::string(
+                12,
+                sprig_engine::keys::collation::Collation::Utf8mb4GeneralCi,
+                Derivation::Implicit,
+            )
+        }
+    } else {
+        ExprType::string(51, env.conn(), Derivation::Implicit)
+    }
     .nullable();
     Node::new(ty, "json_type", move |ctx, row| {
         let Some(j) = doc(ctx, &a, row, maria, "json_type", 1)? else {

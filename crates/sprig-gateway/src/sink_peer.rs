@@ -28,6 +28,13 @@
 //! Changes {objects, token, ...}
 //!                       a CHANGES OF sink's engine tables' changes from the
 //!                       change log (crate::table_changes)
+//! StreamRead {db, stream, from, ...}
+//!                       a FROM STREAM sink's records: per partition one
+//!                       SELECT of the stream as the user (its SELECT
+//!                       privilege applies), waiting a little when none
+//!                       is there
+//! StreamPublish {db, stream, key, value, headers}
+//!                       a dead letter: INSERT INTO the stream as the user
 //! ```
 
 use std::net::SocketAddr;
@@ -303,6 +310,143 @@ async fn serve_inner(
                 ..SqlReply::default()
             })
         }
+        SqlOp::StreamRead {
+            db,
+            stream,
+            from,
+            max_records,
+            wait_ms,
+        } => {
+            Box::pin(stream_read(
+                engine,
+                &caller,
+                caps,
+                &db,
+                &stream,
+                &from,
+                max_records,
+                wait_ms,
+            ))
+            .await
+        }
+        SqlOp::StreamPublish {
+            db,
+            stream,
+            key,
+            value,
+            headers,
+        } => {
+            let sql = publish_text(&db, &stream, key.as_deref(), value.as_deref(), &headers)?;
+            let results = run(engine, &caller, "", sql, None, caps).await?;
+            Ok(SqlReply {
+                results,
+                ..SqlReply::default()
+            })
+        }
+    }
+}
+
+fn ident(name: &str) -> String {
+    format!("`{}`", name.replace('`', "``"))
+}
+
+/// `X'..'` of base64 `b64` (`NULL` for none).
+fn hex_of(b64: Option<&str>) -> Result<String> {
+    use base64::Engine as _;
+    use std::fmt::Write as _;
+    let Some(b) = b64 else {
+        return Ok("NULL".into());
+    };
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b)
+        .map_err(|_| SprigError::internal("a dead letter's bytes aren't base64"))?;
+    let mut h = String::with_capacity(bytes.len() * 2 + 3);
+    h.push_str("X'");
+    for x in bytes {
+        let _ = write!(h, "{x:02X}");
+    }
+    h.push('\'');
+    Ok(h)
+}
+
+/// The `INSERT INTO` of a dead letter ([`SqlOp::StreamPublish`]).
+fn publish_text(
+    db: &str,
+    stream: &str,
+    key: Option<&str>,
+    value: Option<&str>,
+    headers: &[(String, String)],
+) -> Result<String> {
+    use base64::Engine as _;
+    let h: serde_json::Map<String, serde_json::Value> = headers
+        .iter()
+        .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+        .collect();
+    let h = serde_json::Value::Object(h).to_string();
+    Ok(format!(
+        "INSERT INTO {}.{} (`key`, `value`, `headers`) VALUES ({}, {}, {})",
+        ident(db),
+        ident(stream),
+        hex_of(key)?,
+        hex_of(value)?,
+        hex_of(Some(
+            &base64::engine::general_purpose::STANDARD.encode(h.as_bytes())
+        ))?
+    ))
+}
+
+/// A stream sink's read ([`SqlOp::StreamRead`]): each partition's records
+/// from its offset (or its first record at or after the start time), up
+/// to `max` each, as one result; with none there, read again every 100 ms
+/// until `wait_ms` has passed.
+#[allow(clippy::too_many_arguments)]
+async fn stream_read(
+    engine: &Arc<SqlEngine>,
+    caller: &Caller,
+    caps: Caps,
+    db: &str,
+    stream: &str,
+    from: &[sprig_sinks::peer::StreamFrom],
+    max: u32,
+    wait_ms: u64,
+) -> Result<SqlReply> {
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_millis(wait_ms.min(30_000));
+    let table = format!("{}.{}", ident(db), ident(stream));
+    loop {
+        let mut out = SqlResult::default();
+        for f in from {
+            let start = match f.offset {
+                Some(o) => format!("offset_no >= {o}"),
+                None if f.from_ms > 0 => format!(
+                    "ts >= '{}'",
+                    sprig_sinks::stream_source::utc_text(f.from_ms)
+                ),
+                None => "TRUE".into(),
+            };
+            let sql = format!(
+                "SELECT partition_no, offset_no, ts, `key`, `value`, headers FROM {table} \
+                 WHERE partition_no = {} AND {start} ORDER BY offset_no LIMIT {}",
+                f.partition,
+                max.max(1)
+            );
+            let mut r = run(engine, caller, "", sql, None, caps).await?;
+            let Some(r) = r.pop() else {
+                continue;
+            };
+            if out.columns.is_empty() {
+                out.columns = r.columns;
+                out.types = r.types;
+            }
+            out.rows.extend(r.rows);
+        }
+        if !out.rows.is_empty() || std::time::Instant::now() >= deadline {
+            return Ok(SqlReply {
+                results: vec![out],
+                ..SqlReply::default()
+            });
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 }
 

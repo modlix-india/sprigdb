@@ -277,7 +277,7 @@ fn frac_len(fsp: u8) -> u32 {
 
 /// The column definition of column `ci` of `def`, selected from table
 /// `alias` of logical database `db`, named `name` in the result.
-#[allow(clippy::too_many_arguments)] // the names a column definition carries
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // the names a column definition carries; one arm per type
 pub(crate) fn column_def(
     db: &Bytes,
     alias: &Bytes,
@@ -374,6 +374,12 @@ pub(crate) fn column_def(
                 ext_type = Some(Bytes::from_static(b"json"));
                 (string().id, u32::MAX, column_type::BLOB, 0)
             }
+        }
+        // MariaDB's UUID, INET4 and INET6: their text, as a fixed string.
+        ColType::Fbt(f) => {
+            ext_type = Some(Bytes::from_static(f.name().as_bytes()));
+            let (cs, len) = chars(u64::from(f.text_len()));
+            (cs, len, column_type::STRING, 0)
         }
     };
     ColumnDef {
@@ -562,6 +568,11 @@ pub(crate) fn text_in(c: &Column, d: &Datum, env: &Env, results: Results) -> Opt
         Datum::Str(s) => in_results(c, s, results),
         Datum::Int(v) => Bytes::from(v.to_string()),
         Datum::UInt(v) => Bytes::from(v.to_string()),
+        // A UUID or address column's stored bytes: its text.
+        Datum::Bytes(s) if matches!(c.ty, ColType::Fbt(_)) => match c.ty {
+            ColType::Fbt(f) => f.text(s).map_or_else(|| s.clone(), Bytes::from),
+            _ => s.clone(),
+        },
         Datum::Bytes(s) | Datum::Json(s) => s.clone(),
         Datum::Decimal(v) => Bytes::from(v.to_string()),
         Datum::Float(v) => float_text(c, f64::from(*v), results, expr::float_text(*v)),

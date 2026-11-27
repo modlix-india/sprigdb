@@ -241,8 +241,21 @@ impl TenantServices {
                 .with_records(Arc::clone(&records)),
             Arc::new(DirectoryAllocator::new(Arc::clone(&global))),
         );
+        // One replica of several: the two-version rule across nodes.
+        let catalog = if crate::node_engine::replicated_from_env() {
+            catalog.with_barrier(Arc::new(crate::ddl_barrier::NodeBarrier::new(Arc::clone(
+                &stores.dc,
+            ))))
+        } else {
+            catalog
+        };
+        // Auth changes run on the tenant unit's leader, wherever it is.
+        let writers: Arc<dyn RecordStore> = Arc::new(catalog_records::LeaderRecords::new(
+            Arc::clone(&records),
+            Arc::clone(&stores.dc),
+        ));
         let auth = Versioner::new(
-            RecBackend::new(Arc::clone(&records)).with_clock(Arc::clone(&clock)),
+            RecBackend::new(writers).with_clock(Arc::clone(&clock)),
             Arc::new(DirectoryAllocator::new(Arc::clone(&global))),
         );
         // No destructive change of a shared object, checked

@@ -955,6 +955,17 @@ impl Conn {
                 tokio::time::sleep(b).await;
             }
             if i.close {
+                // A statement of a transaction on the storage engine cut
+                // off by the closed connection aborts the transaction, as
+                // a `mongos` that loses its client mid-transaction does.
+                if body.get_bool("autocommit") == Ok(false)
+                    && !matches!(name.as_str(), "commitTransaction" | "abortTransaction")
+                    && let Some(Bson::Binary(b)) =
+                        body.get_document("lsid").ok().and_then(|l| l.get("id"))
+                {
+                    let lsid = b.bytes.clone();
+                    super::engine::abort_session(self, &lsid).await;
+                }
                 self.close_now = true;
                 return (name, Reply::Doc(Document::new()));
             }
@@ -984,13 +995,26 @@ impl Conn {
                     if retryable && super::retry::retryable_code(c) {
                         e = e.label("RetryableWriteError");
                     }
-                    if (in_txn && (matches!(c, 112 | 251) || super::retry::retryable_code(c)))
-                        || (ending && c == 251)
+                    // LockTimeout (24) is transient for a transaction's
+                    // statements and its commit, as MongoDB labels it.
+                    if (in_txn && (matches!(c, 24 | 112 | 251) || super::retry::retryable_code(c)))
+                        || (ending && matches!(c, 24 | 251))
                     {
                         e = e.label("TransientTransactionError");
                     }
                 }
-                return (name, Reply::Doc(e.to_doc()));
+                let mut d = e.to_doc();
+                // A state-change error carries the node's topology version,
+                // as `mongod` and `mongos` attach it: a driver then knows
+                // the node didn't change and keeps using it, instead of
+                // waiting for its next `hello` (up to `maxAwaitTimeMS`).
+                if matches!(c, 91 | 189 | 10058 | 10107 | 11600 | 11602 | 13435 | 13436) {
+                    d.insert(
+                        "topologyVersion",
+                        doc! {"processId": self.shared.process_id, "counter": 0i64},
+                    );
+                }
+                return (name, Reply::Doc(d));
             }
         }
         // The other two fail points of the drivers' tests.

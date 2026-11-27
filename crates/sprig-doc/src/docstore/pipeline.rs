@@ -40,6 +40,19 @@ impl Reader<'_> {
     }
 }
 
+tokio::task_local! {
+    /// An `aggregate` command's `hint`, for its first collection read.
+    static HINT: std::cell::RefCell<Option<Bson>>;
+}
+
+/// Runs `f` (an `aggregate`) with the command's `hint`.
+pub async fn with_hint<F: std::future::Future>(hint: Option<Bson>, f: F) -> F::Output {
+    match hint {
+        Some(h) => HINT.scope(std::cell::RefCell::new(Some(h)), f).await,
+        None => f.await,
+    }
+}
+
 impl DocStore {
     /// Documents of `c` matching `pred` through `plan`, stopping after
     /// `limit` (0: all), in `t`.
@@ -214,6 +227,14 @@ impl DocStore {
                     format!("{name} is not allowed on a database-level aggregation"),
                 ));
             }
+        } else if let Some(d) = match stages.first() {
+            Some(s0) => self.stats_stage(tenant, db, coll, s0)?,
+            None => None,
+        } {
+            // A statistics stage opens the pipeline: the rest runs on its
+            // documents.
+            docs = d;
+            stages = &stages[1..];
         } else {
             if let Some(s0) = stages.first() {
                 let name = s0.keys().next().map_or("", String::as_str);
@@ -263,11 +284,16 @@ impl DocStore {
             docs = match c {
                 None => Vec::new(),
                 Some(c) => {
+                    // The command's `hint`, for its own collection's read
+                    // only (taken once).
+                    let hint = HINT.try_with(|h| h.borrow_mut().take()).ok().flatten();
                     let want = Want {
                         sort: sort.clone().unwrap_or_default(),
+                        hint: hint.as_ref(),
                         ..Want::default()
                     };
                     let plan = read::plan(&c, &pred, &want)?;
+                    read::note_use(&c, &plan);
                     let mut limit = 0usize;
                     if sort.is_some() && plan.sorted {
                         stages = &stages[1..];
@@ -386,9 +412,14 @@ impl DocStore {
         let lets = spec.get_document("let").ok();
         let mut out = Vec::with_capacity(docs.len());
         let mut bytes = 0usize;
-        if lets.is_some_and(|l| !l.is_empty()) {
-            // A correlated pipeline: run once per input document with its
-            // variables bound.
+        if lets.is_some_and(|l| !l.is_empty())
+            || (!pipe.is_empty() && local.is_some() && foreign.is_some())
+        {
+            // A correlated pipeline (variables, or the concise form's
+            // equality and a pipeline): run once per input document, the
+            // equality first, then the pipeline on the documents it
+            // matched; everything it returns is joined (the pipeline may
+            // drop or change the foreign field).
             let lets = lets.cloned().unwrap_or_default();
             for d in docs {
                 let vars = agg::Vars::new(&d, lim.now);
@@ -415,7 +446,7 @@ impl DocStore {
                 let joined = crate::engine::join_chunk(
                     std::slice::from_ref(&d),
                     &fd,
-                    local.zip(foreign),
+                    None,
                     as_f,
                     lim,
                     &mut bytes,
@@ -751,6 +782,11 @@ pub fn distinct_values(docs: &[Document], key: &str) -> Vec<Bson> {
             }
         }
         out.sort_by(crate::keyenc::compare);
+        // Under a collation, strings it holds equal are one value: the
+        // first met (the sort is stable).
+        if crate::collation::active().is_some() {
+            out.dedup_by(|a, b| crate::keyenc::compare(a, b) == std::cmp::Ordering::Equal);
+        }
         out
     }
 }

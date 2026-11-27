@@ -293,6 +293,18 @@ impl GraphStore for FilteredStore<'_> {
     }
 
     async fn scan(&mut self, s: &Scan) -> Result<Vec<NodeRow>> {
+        // Hidden nodes drop out here, so the store may not stop at the
+        // first nodes in an order.
+        let untopped;
+        let s = if s.top.is_some() && self.vis.is_some() {
+            untopped = Scan {
+                top: None,
+                ..s.clone()
+            };
+            &untopped
+        } else {
+            s
+        };
         let Some(limit) = s.limit else {
             let rows = self.inner.scan(s).await?;
             return Ok(rows.into_iter().filter(|n| self.node_ok(n)).collect());
@@ -552,6 +564,54 @@ impl GraphStore for FilteredStore<'_> {
             .into_iter()
             .filter(|t| self.vis.as_ref().is_none_or(|v| v.types.contains(t)))
             .collect()
+    }
+
+    // Estimates count every element, so a session that can't see them all
+    // plans without them.
+    fn est_nodes(&self, label: Option<u32>) -> Option<f64> {
+        self.vis
+            .is_none()
+            .then(|| self.inner.est_nodes(label))
+            .flatten()
+    }
+
+    fn est_rels(
+        &self,
+        near: Option<u32>,
+        types: &[u32],
+        dir: Dir,
+        far: Option<u32>,
+    ) -> Option<f64> {
+        self.vis
+            .is_none()
+            .then(|| self.inner.est_rels(near, types, dir, far))
+            .flatten()
+    }
+
+    fn est_prop(
+        &self,
+        label: Option<u32>,
+        key: &str,
+        pred: &crate::store::PropPred,
+    ) -> Option<f64> {
+        self.vis
+            .is_none()
+            .then(|| self.inner.est_prop(label, key, pred))
+            .flatten()
+    }
+
+    fn ordered_index(&self, label: u32, key: &str) -> bool {
+        self.inner.ordered_index(label, key)
+    }
+
+    fn analyze(&mut self) -> Result<(f64, f64)> {
+        if self.vis.is_some() {
+            return Err(sprig_common::SprigError::new(
+                sprig_common::SprigCode::GraphUnsupported,
+                "a statistics pass needs read access to every label and type",
+            ));
+        }
+        self.inner.analyze()
     }
 
     fn indexes(&self) -> Vec<IndexDef> {

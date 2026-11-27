@@ -708,6 +708,18 @@ impl Run {
                                     .iter()
                                     .filter_map(|s| s.get_str("name").ok().map(str::to_owned))
                                     .collect();
+                                // An online index build's own steps (an index
+                                // entering or leaving the `building` state, or
+                                // a failed build's index removed) are not
+                                // events: `createIndexes` is reported when the
+                                // index becomes visible.
+                                if after == before
+                                    && p.options == m.options
+                                    && (p.indexes.iter().any(|i| i.building)
+                                        || m.indexes.iter().any(|i| i.building))
+                                {
+                                    return Out::Skip;
+                                }
                                 let (kind, specs) = if after.len() > before.len() {
                                     (
                                         "createIndexes",

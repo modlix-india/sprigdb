@@ -664,19 +664,25 @@ fn a_gap_in_one_index_blocks_no_other_index_and_a_wide_gap_blocks_all_it_spans()
 
 #[test]
 fn a_million_row_locks_fit_the_default_lock_memory() {
-    // One transaction locking a million rows of a table keyed by a BIGINT
-    // (the key's head and eight bytes) stays under the default cap.
+    // One transaction writing a million rows of a table keyed by a BIGINT
+    // (the key's head and eight bytes), each with its entries in four
+    // secondary indexes (an INT and the key), stays under the default cap.
     let t = Arc::new(LockTable::new(LockConfig::default()));
     let w = w();
     for i in 0..1_000_000u64 {
-        let mut k = in_index(0, "").to_vec();
-        k.extend_from_slice(&i.to_be_bytes());
-        let k = Bytes::from(k);
-        assert!(
-            granted(&t.acquire(1, &w, &k, LockMode::Exclusive, false, false)),
-            "row {i} refused at {} bytes",
-            t.bytes_held_by(1)
-        );
+        for ix in 0..5u16 {
+            let mut k = in_index(ix, "").to_vec();
+            if ix > 0 {
+                k.extend_from_slice(&u32::try_from(i).unwrap().to_be_bytes());
+            }
+            k.extend_from_slice(&i.to_be_bytes());
+            let k = Bytes::from(k);
+            assert!(
+                granted(&t.acquire(1, &w, &k, LockMode::Exclusive, false, false)),
+                "row {i} index {ix} refused at {} bytes",
+                t.bytes_held_by(1)
+            );
+        }
     }
     t.release_all(1);
 }

@@ -71,6 +71,8 @@ pub mod backup;
 pub mod bolt;
 pub mod changelog;
 pub mod dc;
+// The two-version rule for catalog changes across nodes.
+pub mod ddl_barrier;
 // The in-process SQL backend (the storage engine's first prototype).
 pub(crate) mod engine;
 // Docs search and the sprig_docs database.
@@ -240,6 +242,22 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
         degraded: std::collections::BTreeMap::new(),
         raft_node: node_engine::raft_id_from_env(),
     });
+    // One replica of several: the node registry, and the unit
+    // descriptors when units are placed per tenant.
+    node_engine::set_peer_pems(
+        ctx.config
+            .tls
+            .as_ref()
+            .map(sprig_catalog::records::remote::PeerPems::from_config)
+            .transpose()?,
+    );
+    node_engine::start_placement(
+        Arc::clone(&stores.dc),
+        Arc::clone(&stores.global),
+        stop.clone(),
+        gateway_id.clone(),
+        registrar.record().addr,
+    );
     let lease_live = live.clone();
     let lease_dc = dc.clone();
     let registration = registrar

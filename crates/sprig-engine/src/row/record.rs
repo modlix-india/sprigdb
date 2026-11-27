@@ -308,7 +308,9 @@ fn put_fixed(out: &mut Vec<u8>, ty: ColumnType, v: &Value) -> Result<()> {
             #[allow(clippy::cast_possible_truncation)]
             out.push(y.saturating_sub(1900) as u8);
         }
-        (ColumnType::Binary { .. }, Value::Bytes(b)) => out.extend_from_slice(b),
+        (ColumnType::Binary { .. } | ColumnType::Fbt(_), Value::Bytes(b)) => {
+            out.extend_from_slice(b);
+        }
         (_, Value::Enum(i)) => out.extend_from_slice(&i.to_le_bytes()),
         (_, Value::Set(m)) => out.extend_from_slice(&m.to_le_bytes()),
         _ => return Err(bad("a fixed-width column was given another type's value")),
@@ -361,7 +363,7 @@ fn get_fixed(ty: ColumnType, b: &[u8], row: &Bytes) -> Result<Value> {
             0 => 0,
             n => 1900 + u16::from(n),
         }),
-        ColumnType::Binary { .. } => Value::Bytes(row.slice_ref(b)),
+        ColumnType::Binary { .. } | ColumnType::Fbt(_) => Value::Bytes(row.slice_ref(b)),
         ColumnType::Enum { .. } => Value::Enum(u16::from_le_bytes([b[0], b[1]])),
         ColumnType::Set { .. } => Value::Set(le(false)),
         _ => return Err(corrupt()),

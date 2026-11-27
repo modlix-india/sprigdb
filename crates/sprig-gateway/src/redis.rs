@@ -192,6 +192,11 @@ pub fn mesh_opts(live: &LiveSettings, dc: &DcId) -> sprig_redis::fabric::MeshOpt
 fn read_config(live: &LiveSettings, dc: &DcId) -> sprig_redis::Config {
     let cx = SettingCtx::process(dc);
     let us = |x: u64| usize::try_from(x).unwrap_or(usize::MAX);
+    // SQL reads the Redis databases as tables of this database.
+    crate::engine::redistable::note_config(
+        &live.get(&LOGICAL_DATABASE, &cx),
+        u32::try_from(live.get(&DATABASES, &cx)).unwrap_or(16),
+    );
     sprig_redis::Config {
         server_version: live.get(&SERVER_VERSION, &cx).into_owned(),
         databases: u32::try_from(live.get(&DATABASES, &cx)).unwrap_or(16),

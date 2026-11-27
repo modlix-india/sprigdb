@@ -273,7 +273,58 @@ pub(crate) fn store(cx: &mut Store<'_>, c: &Column, d: Datum) -> Result<Datum> {
         ColType::Bit { bits } => bit(cx, c, &d, bits),
         ColType::Json => json(cx, c, d),
         ColType::Char { .. } | ColType::VarChar { .. } | ColType::Text { .. } => string(cx, c, d),
+        ColType::Fbt(f) => fixed(cx, c, f, &d),
     }
+}
+
+/// A `UUID`, `INET4` or `INET6` column: text of the type, or a binary
+/// string of its stored length. A number or date is refused (4078); other
+/// text is 1292 (a warning and `NULL` outside strict mode).
+fn fixed(cx: &mut Store<'_>, c: &Column, f: sprig_engine::row::Fbt, d: &Datum) -> Result<Datum> {
+    let stored = match d {
+        Datum::Str(s) | Datum::Json(s) => f.parse(s),
+        Datum::Bytes(b) => f.from_binary(b),
+        other => {
+            let from = match other {
+                Datum::Int(_) | Datum::UInt(_) | Datum::Bit(_) | Datum::Year(_) => "int",
+                Datum::Decimal(_) => "decimal",
+                Datum::Float(_) | Datum::Double(_) => "double",
+                Datum::Date(_) => "date",
+                Datum::Time(_) => "time",
+                _ => "datetime",
+            };
+            return Err(SprigError::standard(
+                4078,
+                *b"HY000",
+                format!(
+                    "Cannot cast '{from}' as '{}' in assignment of `{}`.`{}`.`{}`",
+                    f.name(),
+                    String::from_utf8_lossy(cx.db),
+                    cx.table,
+                    c.name
+                ),
+            ));
+        }
+    };
+    if let Some(b) = stored {
+        return Ok(Datum::Bytes(Bytes::from(b)));
+    }
+    let text = text_of(d);
+    let m = format!(
+        "Incorrect {} value: '{}' for column `{}`.`{}`.`{}` at row {}",
+        f.name(),
+        String::from_utf8_lossy(&text),
+        String::from_utf8_lossy(cx.db),
+        cx.table,
+        c.name,
+        cx.row
+    );
+    cx.warn(1292, *b"22007", m)?;
+    Ok(if c.nullable {
+        Datum::Null
+    } else {
+        Datum::Bytes(Bytes::from(vec![0u8; f.bytes()]))
+    })
 }
 
 /// The range of an integer type.

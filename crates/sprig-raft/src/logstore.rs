@@ -9,6 +9,7 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
@@ -148,6 +149,41 @@ pub trait LogStore: Send + Sync {
         Ok(())
     }
 
+    /// How many syncs the log writer thread may have running at once while
+    /// it goes on writing ([`LogStore::write_unsynced`] then
+    /// [`LogStore::sync_written`]); 0: each write is synced in the same
+    /// call ([`LogStore::write_all`]), one after another.
+    fn sync_pipeline(&self) -> usize {
+        0
+    }
+
+    /// Writes `batches` in order without syncing them. `sync` says a sync
+    /// ([`LogStore::sync_written`]) will make them durable before anyone
+    /// counts them as persisted (a store may keep synced writes
+    /// differently). On a failure, says how many were written before it.
+    /// The default writes and syncs ([`LogStore::write_all`]).
+    ///
+    /// # Errors
+    /// As [`LogStore::write_all`].
+    fn write_unsynced(
+        &self,
+        batches: &[&WriteBatch],
+        sync: bool,
+    ) -> Result<(), (usize, RaftError)> {
+        self.write_all(batches, sync)
+    }
+
+    /// Makes everything written before the call durable. It may run
+    /// alongside writes and other syncs; one that finds nothing new to sync
+    /// returns at once, so a caller counts a write as durable only once
+    /// every sync that began before its own has returned too.
+    ///
+    /// # Errors
+    /// The sync failed. The driver stops.
+    fn sync_written(&self) -> Result<(), RaftError> {
+        Ok(())
+    }
+
     /// Every group the log holds.
     ///
     /// # Errors
@@ -199,6 +235,8 @@ struct MemDisk {
     base: BTreeMap<GroupId, RecoveredGroup>,
     /// Batches since `base`, each with whether it was synced.
     records: Vec<(WriteBatch, bool)>,
+    /// Batches folded into `base`: `records[i]` is batch `folded + i`.
+    folded: u64,
 }
 
 impl MemDisk {
@@ -208,9 +246,24 @@ impl MemDisk {
             return;
         }
         let folded: Vec<(WriteBatch, bool)> = self.records.drain(..n).collect();
+        self.folded += n as u64;
         for (b, _) in &folded {
             apply_batch(&mut self.base, b);
         }
+    }
+
+    /// Batches written so far.
+    fn written(&self) -> u64 {
+        self.folded + self.records.len() as u64
+    }
+
+    /// Marks the first `upto` batches synced.
+    fn sync_to(&mut self, upto: u64) {
+        let n = usize::try_from(upto.saturating_sub(self.folded)).unwrap_or(usize::MAX);
+        for r in self.records.iter_mut().take(n) {
+            r.1 = true;
+        }
+        self.fold_synced();
     }
 }
 
@@ -235,6 +288,10 @@ type DelayFn = Box<dyn FnMut() -> Duration + Send>;
 pub struct MemLogStore {
     disk: Mutex<MemDisk>,
     delay: Mutex<Option<DelayFn>>,
+    /// [`LogStore::sync_pipeline`].
+    pipeline: AtomicUsize,
+    /// Syncs running now, and the most ever at once.
+    syncing: Mutex<(usize, usize)>,
 }
 
 impl std::fmt::Debug for MemLogStore {
@@ -288,6 +345,21 @@ impl MemLogStore {
         let d = self.disk.lock().unwrap_or_else(PoisonError::into_inner);
         d.records.iter().filter(|(_, s)| !*s).count()
     }
+
+    /// Lets the log writer thread run up to `n` syncs at once while it
+    /// writes on ([`LogStore::sync_pipeline`]); each takes the sync delay.
+    pub fn set_sync_pipeline(&self, n: usize) {
+        self.pipeline.store(n, Ordering::Release);
+    }
+
+    /// The most syncs that ever ran at once.
+    #[must_use]
+    pub fn most_syncs_at_once(&self) -> usize {
+        self.syncing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .1
+    }
 }
 
 impl LogStore for MemLogStore {
@@ -295,11 +367,53 @@ impl LogStore for MemLogStore {
         let mut d = self.disk.lock().unwrap_or_else(PoisonError::into_inner);
         d.records.push((batch.clone(), false));
         if sync {
-            for r in &mut d.records {
-                r.1 = true;
-            }
-            d.fold_synced();
+            let n = d.written();
+            d.sync_to(n);
         }
+        Ok(())
+    }
+
+    fn sync_pipeline(&self) -> usize {
+        self.pipeline.load(Ordering::Acquire)
+    }
+
+    fn write_unsynced(
+        &self,
+        batches: &[&WriteBatch],
+        _sync: bool,
+    ) -> Result<(), (usize, RaftError)> {
+        let mut d = self.disk.lock().unwrap_or_else(PoisonError::into_inner);
+        for b in batches {
+            d.records.push(((*b).clone(), false));
+        }
+        Ok(())
+    }
+
+    fn sync_written(&self) -> Result<(), RaftError> {
+        // Covers what was written before it began, not what is written
+        // while it runs.
+        let upto = self
+            .disk
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .written();
+        {
+            let mut s = self.syncing.lock().unwrap_or_else(PoisonError::into_inner);
+            s.0 += 1;
+            s.1 = s.1.max(s.0);
+        }
+        let d = self.sync_delay();
+        if !d.is_zero() {
+            std::thread::sleep(d);
+        }
+        self.syncing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .0 -= 1;
+        self.disk
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .sync_to(upto);
         Ok(())
     }
 
@@ -348,9 +462,16 @@ fn engine_err(what: &str, e: &raft_engine::Error) -> RaftError {
 /// references; every read puts them back.
 pub struct EngineLogStore {
     engine: raft_engine::Engine<LogFs>,
+    fs: Arc<LogFs>,
     dir: PathBuf,
     blobs: OnceLock<Arc<NoteBlobs>>,
+    /// [`LogStore::sync_pipeline`].
+    pipeline: AtomicUsize,
 }
+
+/// Syncs an [`EngineLogStore`] lets run at once unless told otherwise
+/// ([`EngineLogStore::set_sync_pipeline`]).
+pub const SYNC_PIPELINE: usize = 8;
 
 impl std::fmt::Debug for EngineLogStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -384,16 +505,27 @@ impl EngineLogStore {
             ..raft_engine::Config::default()
         };
         let fs = Arc::new(LogFs::new(sync, sim));
+        let opened = Arc::clone(&fs);
         // Opening reads the files; raft-engine's per-thread read cache must
         // start empty (several logs can live in one process).
         let engine = on_fresh_thread(move || {
-            raft_engine::Engine::open_with_file_system(cfg, fs).map_err(|e| engine_err("open", &e))
+            raft_engine::Engine::open_with_file_system(cfg, opened)
+                .map_err(|e| engine_err("open", &e))
         })?;
         Ok(Arc::new(Self {
             engine,
+            fs,
             dir,
             blobs: OnceLock::new(),
+            pipeline: AtomicUsize::new(SYNC_PIPELINE),
         }))
+    }
+
+    /// How many syncs the log writer thread may run at once while it goes
+    /// on writing ([`LogStore::sync_pipeline`]); 0 writes and syncs in one
+    /// call, one after another. Set it before the node starts.
+    pub fn set_sync_pipeline(&self, n: usize) {
+        self.pipeline.store(n, Ordering::Release);
     }
 
     /// Keeps large notes in `blobs` (see the type's docs). Set it before the
@@ -597,6 +729,61 @@ impl LogStore for EngineLogStore {
             };
             wrote?;
             synced.map_err(|e| (0, blob_err("sync", &e)))
+        })
+    }
+
+    fn sync_pipeline(&self) -> usize {
+        self.pipeline.load(Ordering::Acquire)
+    }
+
+    fn write_unsynced(
+        &self,
+        batches: &[&WriteBatch],
+        sync: bool,
+    ) -> Result<(), (usize, RaftError)> {
+        // As `write_all`, without the syncs: the blobs go out before the
+        // log's write that refers to them, and one later sync covers both.
+        let take = self
+            .blobs
+            .get()
+            .filter(|b| sync && b.takes())
+            .map(Arc::as_ref);
+        let mut lbs = Vec::with_capacity(batches.len());
+        for b in batches {
+            lbs.push(Self::log_batch(b, take).map_err(|e| (0, e))?);
+        }
+        if let Some(b) = take {
+            b.write_out()
+                .map_err(|e| (0, RaftError::Storage(format!("note blobs: write: {e}"))))?;
+        }
+        self.write_lbs(lbs, false)
+    }
+
+    fn sync_written(&self) -> Result<(), RaftError> {
+        let log = || {
+            self.fs
+                .sync_written()
+                .map_err(|e| RaftError::Storage(format!("sync: {e}")))
+        };
+        let Some(b) = self.blobs.get() else {
+            return log();
+        };
+        let blob = || {
+            b.sync()
+                .map_err(|e| RaftError::Storage(format!("note blobs: sync: {e}")))
+        };
+        // Both files' syncs at once: on a journaling file system both
+        // files' size changes then ride one journal commit.
+        std::thread::scope(|s| {
+            let synced = std::thread::Builder::new()
+                .name("sprig-raft-blob-sync".into())
+                .spawn_scoped(s, blob);
+            let logged = log();
+            let synced = match synced {
+                Ok(t) => t.join().unwrap_or_else(|p| std::panic::resume_unwind(p)),
+                Err(_) => blob(),
+            };
+            logged.and(synced)
         })
     }
 

@@ -171,12 +171,8 @@ pub fn parse(u: &Bson) -> Result<UpdateSpec, MongoError> {
                     out.push((op.clone(), path.clone(), v.clone()));
                 }
             }
-            if out.is_empty() {
-                return Err(MongoError::new(
-                    code::FAILED_TO_PARSE,
-                    "'$set' is empty. You must specify a field like so: {$set: {<field>: ...}}",
-                ));
-            }
+            // Operators with no fields (`{$set: {}}`) change nothing:
+            // MongoDB 5.0 and later accept them.
             // MongoDB 5.0+ applies an update's fields in field-name order,
             // whatever the operator (numeric names numerically), so new
             // fields are appended in that order (found by the `$merge`

@@ -31,7 +31,7 @@ use sprig_common::ids::{DbId, ObjectId};
 use sprig_engine::keys::collation::{Charset, Collation, Flavor};
 use sprig_engine::keys::typed::KeyColumn;
 use sprig_engine::row::record::{Column as RecordColumn, RowSchema};
-use sprig_engine::row::{Date, DateTime, Decimal, LobSize, Time, Timestamp};
+use sprig_engine::row::{Date, DateTime, Decimal, Fbt, LobSize, Time, Timestamp};
 use sprig_proto_mysql::resultset::ColumnFlags;
 
 use super::expr::{self, CExpr, Compiler};
@@ -61,6 +61,8 @@ pub(crate) enum Family {
     Bit,
     /// `JSON`.
     Json,
+    /// MariaDB's `UUID`, `INET4`, `INET6`.
+    Fixed,
 }
 
 impl Family {
@@ -82,6 +84,7 @@ impl Family {
             }
             ColType::Enum { .. } | ColType::Set { .. } => Family::Members,
             ColType::Json => Family::Json,
+            ColType::Fbt(_) => Family::Fixed,
         }
     }
 
@@ -103,6 +106,7 @@ impl Family {
             Family::Members => "ENUM and SET columns",
             Family::Bit => "BIT columns",
             Family::Json => "JSON columns",
+            Family::Fixed => "UUID, INET4 and INET6 columns",
         }
     }
 }
@@ -118,6 +122,7 @@ const SERVED: &[Family] = &[
     Family::Members,
     Family::Bit,
     Family::Json,
+    Family::Fixed,
 ];
 
 /// A column's `DEFAULT`.
@@ -260,6 +265,7 @@ fn implicit_default(ty: ColType) -> Datum {
         ColType::Enum { .. } => Datum::Enum(1),
         ColType::Set { .. } => Datum::Set(0),
         ColType::Json => Datum::Json(Bytes::from_static(b"null")),
+        ColType::Fbt(f) => Datum::Bytes(Bytes::from(vec![0u8; f.bytes()])),
     }
 }
 
@@ -1040,6 +1046,7 @@ enum Base {
     Blob(LobSize),
     Enum(Vec<String>),
     Set(Vec<String>),
+    Fbt(Fbt),
 }
 
 /// A `DEFAULT` as the text states it.
@@ -1153,6 +1160,9 @@ fn base_type(word: &str, args: Option<&[Tok]>) -> std::result::Result<(Base, u32
         "LONGBLOB" => (Base::Blob(LobSize::Long), 0),
         "ENUM" => (Base::Enum(members()?), 0),
         "SET" => (Base::Set(members()?), 0),
+        "UUID" => (Base::Fbt(Fbt::Uuid), 0),
+        "INET4" => (Base::Fbt(Fbt::Inet4), 0),
+        "INET6" => (Base::Fbt(Fbt::Inet6), 0),
         other => return Err(format!("column type {other}")),
     })
 }
@@ -1656,6 +1666,7 @@ pub(crate) fn parse(object: ObjectId, version: u64, db: DbId, create_sql: &str) 
             Base::Set(m) => ColType::Set {
                 members: u8::try_from(m.len()).unwrap_or(0),
             },
+            Base::Fbt(f) => ColType::Fbt(*f),
         };
         if ty.validate().is_err() {
             return bad(&format!("the type of column {}", rc.name));
@@ -1820,6 +1831,7 @@ pub(crate) fn parse(object: ObjectId, version: u64, db: DbId, create_sql: &str) 
                     | ColType::Bit { .. }
                     | ColType::Year
                     | ColType::Timestamp { .. }
+                    | ColType::Fbt(_)
             )
         {
             f |= ColumnFlags::UNSIGNED;
@@ -1850,6 +1862,7 @@ pub(crate) fn parse(object: ObjectId, version: u64, db: DbId, create_sql: &str) 
                     | ColType::VarBinary { .. }
                     | ColType::Blob { .. }
                     | ColType::Json
+                    | ColType::Fbt(_)
             )
         {
             f |= ColumnFlags::BINARY;
@@ -2044,7 +2057,11 @@ pub(crate) fn parse(object: ObjectId, version: u64, db: DbId, create_sql: &str) 
         let Ok(t) = super::define::lex::lex(text) else {
             return bad("the partitioning");
         };
-        let mut p = super::define::P { t: &t, i: 0 };
+        let mut p = super::define::P {
+            t: &t,
+            i: 0,
+            mysql: false,
+        };
         let Ok(spec) = super::define::partition::read(&mut p, "utf8mb4") else {
             return bad("the partitioning");
         };
@@ -2151,31 +2168,31 @@ pub(crate) fn check_create(text: &str) -> std::result::Result<(), String> {
         let Some(ty) = word(1) else {
             continue;
         };
-        let family = match ty {
-            "TINYINT" | "SMALLINT" | "MEDIUMINT" | "INT" | "INTEGER" | "BIGINT" | "INT1"
-            | "INT2" | "INT3" | "INT4" | "INT8" | "MIDDLEINT" | "BOOL" | "BOOLEAN" | "SERIAL" => {
-                Some(Family::Integer)
-            }
-            "BIT" => Some(Family::Bit),
-            "DECIMAL" | "DEC" | "NUMERIC" | "FIXED" => Some(Family::Decimal),
-            "FLOAT" | "FLOAT4" | "FLOAT8" | "DOUBLE" | "REAL" => Some(Family::Float),
-            "DATE" | "TIME" | "DATETIME" | "TIMESTAMP" | "YEAR" => Some(Family::Temporal),
-            "VARCHAR" | "TINYTEXT" | "TEXT" | "MEDIUMTEXT" | "LONGTEXT" | "NCHAR" | "NVARCHAR" => {
-                Some(Family::Text)
-            }
-            "VARBINARY" | "TINYBLOB" | "BLOB" | "MEDIUMBLOB" | "LONGBLOB" | "BINARY" => {
-                Some(Family::Binary)
-            }
-            "ENUM" | "SET" => Some(Family::Members),
-            "JSON" => Some(Family::Json),
-            "GEOMETRY" | "POINT" | "LINESTRING" | "POLYGON" | "MULTIPOINT" | "MULTILINESTRING"
-            | "MULTIPOLYGON" | "GEOMETRYCOLLECTION" | "UUID" | "INET4" | "INET6" | "VECTOR" => {
-                return Err(format!("column type {ty}"));
-            }
-            // `CHAR`, `CHARACTER [VARYING]`, `CHAR BYTE`, `LONG [VARBINARY]`,
-            // `NATIONAL ...` and what isn't known: read once it exists.
-            _ => None,
-        };
+        let family =
+            match ty {
+                "TINYINT" | "SMALLINT" | "MEDIUMINT" | "INT" | "INTEGER" | "BIGINT" | "INT1"
+                | "INT2" | "INT3" | "INT4" | "INT8" | "MIDDLEINT" | "BOOL" | "BOOLEAN"
+                | "SERIAL" => Some(Family::Integer),
+                "BIT" => Some(Family::Bit),
+                "DECIMAL" | "DEC" | "NUMERIC" | "FIXED" => Some(Family::Decimal),
+                "FLOAT" | "FLOAT4" | "FLOAT8" | "DOUBLE" | "REAL" => Some(Family::Float),
+                "DATE" | "TIME" | "DATETIME" | "TIMESTAMP" | "YEAR" => Some(Family::Temporal),
+                "VARCHAR" | "TINYTEXT" | "TEXT" | "MEDIUMTEXT" | "LONGTEXT" | "NCHAR"
+                | "NVARCHAR" => Some(Family::Text),
+                "VARBINARY" | "TINYBLOB" | "BLOB" | "MEDIUMBLOB" | "LONGBLOB" | "BINARY" => {
+                    Some(Family::Binary)
+                }
+                "ENUM" | "SET" => Some(Family::Members),
+                "JSON" => Some(Family::Json),
+                "UUID" | "INET4" | "INET6" => Some(Family::Fixed),
+                "GEOMETRY" | "POINT" | "LINESTRING" | "POLYGON" | "MULTIPOINT"
+                | "MULTILINESTRING" | "MULTIPOLYGON" | "GEOMETRYCOLLECTION" | "VECTOR" => {
+                    return Err(format!("column type {ty}"));
+                }
+                // `CHAR`, `CHARACTER [VARYING]`, `CHAR BYTE`, `LONG [VARBINARY]`,
+                // `NATIONAL ...` and what isn't known: read once it exists.
+                _ => None,
+            };
         if let Some(f) = family
             && !f.served()
         {
@@ -2440,7 +2457,8 @@ mod tests {
         assert!(check_create("create table `t` (id bigint unsigned not null auto_increment, primary key (id)) engine=innodb").is_ok());
         let e = check_create("CREATE TABLE t (id INT PRIMARY KEY, g GEOMETRY)").unwrap_err();
         assert!(e.contains("GEOMETRY"), "{e}");
-        assert!(check_create("CREATE TABLE t (id INT PRIMARY KEY, u UUID)").is_err());
+        assert!(check_create("CREATE TABLE t (id INT PRIMARY KEY, u UUID)").is_ok());
+        assert!(check_create("CREATE TABLE t (id INT PRIMARY KEY, v VECTOR(3))").is_err());
         assert!(
             check_create("CREATE TABLE t (id INT PRIMARY KEY, p INT REFERENCES o (id))").is_err()
         );

@@ -7,6 +7,8 @@
 //!   counting the rows it hands over.
 //! - [`mem`]: tables in memory behind both traits, for tests and for
 //!   callers that have rows but no engine.
+//! - [`stats`]: planner statistics (row counts, distinct counts,
+//!   histograms) as storage keeps them, and the estimates made from them.
 //! - [`Planner`]: name resolution, the range analyzer, access-path choice,
 //!   the join-order search, grouping, ordering and `LIMIT` placement, and
 //!   `EXPLAIN`.
@@ -72,6 +74,7 @@ mod range;
 mod recursive;
 mod resolve;
 mod sources;
+pub mod stats;
 pub mod whatif;
 
 pub use explain::{Actual, ExplainRow, analyze_answer, analyzed};

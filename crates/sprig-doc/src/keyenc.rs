@@ -393,6 +393,59 @@ pub fn key(v: &Bson) -> Vec<u8> {
     k
 }
 
+/// Appends the key of `v` under collation `c`: strings (in documents and
+/// arrays too) as their sort keys, so the bytes order as the collation
+/// compares. Field names are never collated. `None`: [`encode_key`].
+pub fn encode_key_in(v: &Bson, c: Option<crate::collation::Collation>, out: &mut Vec<u8>) {
+    let Some(c) = c else {
+        encode_key(v, out);
+        return;
+    };
+    match v {
+        Bson::String(s) | Bson::Symbol(s) => {
+            out.push(class_of(v));
+            encode_str(&c.sort_key(s), out);
+        }
+        Bson::Document(d) => {
+            out.push(class::OBJECT);
+            for (k, x) in d {
+                out.push(class_of(x));
+                encode_str(k.as_bytes(), out);
+                encode_key_in(x, Some(c), out);
+            }
+            out.push(0);
+        }
+        Bson::Array(a) => {
+            out.push(class::ARRAY);
+            for x in a {
+                encode_key_in(x, Some(c), out);
+            }
+            out.push(0);
+        }
+        other => encode_key(other, out),
+    }
+}
+
+/// The key of `v` under collation `c` as a new vector.
+#[must_use]
+pub fn key_in(v: &Bson, c: Option<crate::collation::Collation>) -> Vec<u8> {
+    let mut k = Vec::with_capacity(16);
+    encode_key_in(v, c, &mut k);
+    k
+}
+
+/// Whether `v` holds a string (itself, or in a document or array): the
+/// values a collation changes.
+#[must_use]
+pub fn has_text(v: &Bson) -> bool {
+    match v {
+        Bson::String(_) | Bson::Symbol(_) => true,
+        Bson::Document(d) => d.values().any(has_text),
+        Bson::Array(a) => a.iter().any(has_text),
+        _ => false,
+    }
+}
+
 /// MongoDB's comparison of two values (undefined as null).
 #[must_use]
 pub fn compare(a: &Bson, b: &Bson) -> Ordering {
@@ -409,7 +462,11 @@ pub fn compare(a: &Bson, b: &Bson) -> Ordering {
             Some(c) => c.compare(x, y),
             None => x.as_bytes().cmp(y.as_bytes()),
         },
-        _ => key(a).cmp(&key(b)),
+        _ => match crate::collation::active() {
+            // Strings inside documents and arrays follow the collation too.
+            Some(c) if has_text(a) || has_text(b) => key_in(a, Some(c)).cmp(&key_in(b, Some(c))),
+            _ => key(a).cmp(&key(b)),
+        },
     }
 }
 

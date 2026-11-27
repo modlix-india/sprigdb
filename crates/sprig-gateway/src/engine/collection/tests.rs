@@ -454,8 +454,10 @@ async fn a_collection_answers_as_the_same_json_in_a_table() {
 }
 
 #[tokio::test]
-async fn collections_are_read_only_from_sql() {
+async fn locking_reads_lock_documents() {
     let (e, f, _d) = setup().await;
+    // The single-table binder leaves every collection statement to the
+    // planner's path and `collwrite`.
     for sql in [
         "UPDATE events SET doc = '{}' WHERE _id = 'e3'",
         "DELETE FROM events",
@@ -469,8 +471,9 @@ async fn collections_are_read_only_from_sql() {
         wait: sprig_engine::txn::Wait::Block,
     };
     let g = general(&f, "SELECT _id FROM events", Some(lock)).unwrap();
-    let err = run(&e, &g).await.unwrap_err();
-    assert_eq!(err.protocol().mysql_errno, NOT_ON_ENGINE, "{err}");
+    assert_eq!(run(&e, &g).await.unwrap().len(), 6);
+    let g = general(&f, "SELECT _id FROM events WHERE _id = 'e3'", Some(lock)).unwrap();
+    assert_eq!(run(&e, &g).await.unwrap(), ["e3"]);
     // An unknown name is still unknown.
     let err = bind(
         &cx(&f),
@@ -489,4 +492,479 @@ async fn collections_are_read_only_from_sql() {
     .unwrap()
     .unwrap();
     assert_eq!(run(&e, &g).await.unwrap().len(), 2);
+}
+
+/// Runs SQL write `sql` of a collection in a transaction of its own, on
+/// document store `store`: (affected, info, warnings) or the error.
+async fn write(
+    e: &Engine,
+    f: &Fake,
+    store: &DocStore,
+    sql: &str,
+) -> sprig_common::Result<(u64, Option<String>, usize)> {
+    use crate::engine::session::{SessionTxn, Start};
+    let w = crate::engine::collwrite::bind(
+        &cx(f),
+        &parse(sql),
+        sql,
+        sprig_sql::lex::LexOptions::mariadb(),
+    )?
+    .unwrap_or_else(|| panic!("{sql}: not a collection write"));
+    let s = Seed::of(false);
+    let a = RunArgs {
+        tenant: TENANT.0,
+        params: &[],
+        seed: &s,
+        deadline: None,
+        stop: None,
+    };
+    let mut own = SessionTxn::default();
+    own.begin(e, TxnOptions::default(), false, Start::default())?;
+    let r = e.coll_write_with(store, &w, &a, &mut own, false).await;
+    own.statement_done();
+    match r {
+        Ok(o) => {
+            own.commit().await?;
+            Ok((o.affected, o.info, o.conds.len()))
+        }
+        Err(err) => {
+            own.rollback();
+            Err(err)
+        }
+    }
+}
+
+/// Document `id` (a string `_id`) as the store holds it.
+async fn stored(store: &DocStore, id: Bson) -> Option<bson::Document> {
+    let r = store
+        .command(
+            TENANT.0,
+            "app",
+            "shop",
+            "find",
+            &doc! {"find": "events", "filter": {"_id": id}},
+        )
+        .await
+        .unwrap();
+    let d = r.into_doc(0);
+    d.get_document("cursor")
+        .ok()?
+        .get_array("firstBatch")
+        .ok()?
+        .first()?
+        .as_document()
+        .cloned()
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one statement after the other, each checked
+async fn sql_writes_run_through_the_document_store() {
+    let (e, f, _d) = setup().await;
+    let store = DocStore::new(Arc::new(f.eng.clone()));
+    // INSERT: `_id` from the document, from the column, or made.
+    let (n, info, _) = write(
+        &e,
+        &f,
+        &store,
+        r#"INSERT INTO events (doc) VALUES ('{"_id":"n1","k":1}'), (JSON_OBJECT('k', 2, 'big', 5000000000))"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(n, 2);
+    assert_eq!(
+        info.as_deref(),
+        Some("Records: 2  Duplicates: 0  Warnings: 0")
+    );
+    let n1 = stored(&store, Bson::String("n1".into())).await.unwrap();
+    assert_eq!(n1.get("k"), Some(&Bson::Int32(1)));
+    let made = select(
+        &e,
+        &f,
+        "SELECT _id, doc->>'$.big' FROM events WHERE doc->>'$.k' = 2",
+    )
+    .await;
+    assert_eq!(made.len(), 1);
+    assert_eq!(made[0].len(), 24 + 1 + 10, "{made:?}");
+    write(
+        &e,
+        &f,
+        &store,
+        r#"INSERT INTO events (_id, doc) VALUES ('n2', '{"v":true}')"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        stored(&store, Bson::String("n2".into())).await,
+        Some(doc! {"_id": "n2", "v": true})
+    );
+    // A duplicate `_id`: 1062, or a warning with IGNORE.
+    let err = write(
+        &e,
+        &f,
+        &store,
+        r#"INSERT INTO events (doc) VALUES ('{"_id":"n1"}')"#,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.protocol().mysql_errno, 1062, "{err}");
+    let (n, _, warns) = write(
+        &e,
+        &f,
+        &store,
+        r#"INSERT IGNORE INTO events (doc) VALUES ('{"_id":"n1"}'), ('{"_id":"n3"}')"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!((n, warns), (1, 1));
+    // Disagreeing `_id`s, and a document that isn't one.
+    for sql in [
+        r#"INSERT INTO events (_id, doc) VALUES ('a', '{"_id":"b"}')"#,
+        "INSERT INTO events (doc) VALUES ('[1,2]')",
+    ] {
+        let err = write(&e, &f, &store, sql).await.unwrap_err();
+        assert_eq!(err.protocol().mysql_errno, 39667, "{sql}: {err}");
+    }
+    // UPDATE keeps the types of what it leaves alone (`n` is a long, `at`
+    // a date), and `_id`.
+    let (n, info, _) = write(
+        &e,
+        &f,
+        &store,
+        "UPDATE events SET doc = JSON_SET(doc, '$.n', 6, '$.kind', 'sell') WHERE _id IN ('1', 'e3')",
+    )
+    .await
+    .unwrap();
+    assert_eq!(n, 2);
+    assert_eq!(
+        info.as_deref(),
+        Some("Rows matched: 2  Changed: 2  Warnings: 0")
+    );
+    let one = stored(&store, Bson::Int32(1)).await.unwrap();
+    assert_eq!(one.get("n"), Some(&Bson::Int64(6)));
+    assert_eq!(one.get_str("kind").unwrap(), "sell");
+    let e3 = stored(&store, Bson::String("e3".into())).await.unwrap();
+    assert!(matches!(e3.get("at"), Some(Bson::DateTime(_))), "{e3:?}");
+    assert_eq!(e3.get_str("kind").unwrap(), "sell");
+    // An unchanged row is matched, not changed.
+    let (_, info, _) = write(
+        &e,
+        &f,
+        &store,
+        "UPDATE events SET doc = doc WHERE _id = 'e3'",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        info.as_deref(),
+        Some("Rows matched: 1  Changed: 0  Warnings: 0")
+    );
+    // `_id` can't change.
+    for sql in [
+        "UPDATE events SET doc = JSON_SET(doc, '$._id', 'zz') WHERE _id = 'e3'",
+        "UPDATE events SET _id = 'zz' WHERE _id = 'e3'",
+    ] {
+        let err = write(&e, &f, &store, sql).await.unwrap_err();
+        assert_eq!(err.protocol().mysql_errno, 39668, "{sql}: {err}");
+    }
+    // A new document without `_id` keeps the old one.
+    write(
+        &e,
+        &f,
+        &store,
+        r#"UPDATE events SET doc = '{"fresh":1}' WHERE _id = 'n3'"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        stored(&store, Bson::String("n3".into())).await,
+        Some(doc! {"_id": "n3", "fresh": 1})
+    );
+    // A join with a table finds the rows to change.
+    let (n, _, _) = write(
+        &e,
+        &f,
+        &store,
+        "UPDATE events t JOIN customers c ON c.id = t.doc->>'$.customer_id' SET t.doc = JSON_SET(t.doc, '$.who', c.name) WHERE c.name = 'Ben'",
+    )
+    .await
+    .unwrap();
+    assert_eq!(n, 2);
+    let who = select(
+        &e,
+        &f,
+        "SELECT doc->>'$.who' FROM events WHERE doc->>'$.who' IS NOT NULL",
+    )
+    .await;
+    assert_eq!(who, ["Ben", "Ben"]);
+    // REPLACE: the document of the same `_id` is replaced.
+    let (n, _, _) = write(
+        &e,
+        &f,
+        &store,
+        r#"REPLACE INTO events (doc) VALUES ('{"_id":"n2","v":2}')"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(n, 2);
+    assert_eq!(
+        stored(&store, Bson::String("n2".into())).await,
+        Some(doc! {"_id": "n2", "v": 2})
+    );
+    // INSERT ... SELECT from a table.
+    let (n, info, _) = write(
+        &e,
+        &f,
+        &store,
+        "INSERT INTO events (_id, doc) SELECT CONCAT('c', id), JSON_OBJECT('name', name) FROM customers",
+    )
+    .await
+    .unwrap();
+    assert_eq!(n, 3);
+    assert_eq!(
+        info.as_deref(),
+        Some("Records: 3  Duplicates: 0  Warnings: 0")
+    );
+    // DELETE.
+    let (n, _, _) = write(
+        &e,
+        &f,
+        &store,
+        "DELETE FROM events WHERE _id LIKE 'c%' OR _id = 'n1'",
+    )
+    .await
+    .unwrap();
+    assert_eq!(n, 4);
+    assert!(stored(&store, Bson::String("n1".into())).await.is_none());
+    // A form not built: two collections written by one statement.
+    let sql = "UPDATE events a JOIN events b ON a._id = b._id SET a.doc = '{}', b.doc = '{}'";
+    let err = crate::engine::collwrite::bind(
+        &cx(&f),
+        &parse(sql),
+        sql,
+        sprig_sql::lex::LexOptions::mariadb(),
+    )
+    .unwrap_err();
+    assert_eq!(err.protocol().mysql_errno, NOT_ON_ENGINE);
+}
+
+#[tokio::test]
+async fn a_unique_index_and_a_validator_hold_for_sql_writes() {
+    let (e, f, _d) = setup().await;
+    let store = DocStore::new(Arc::new(f.eng.clone()));
+    store
+        .command(
+            TENANT.0,
+            "app",
+            "shop",
+            "createIndexes",
+            &doc! {"createIndexes": "events", "indexes": [{"key": {"n": 1}, "name": "kn", "unique": true, "sparse": true}]},
+        )
+        .await
+        .unwrap();
+    let err = write(
+        &e,
+        &f,
+        &store,
+        r#"INSERT INTO events (doc) VALUES ('{"n":5}')"#,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.protocol().mysql_errno, 1062, "{err}");
+    assert!(err.message.contains("for key 'kn'"), "{err}");
+    // The index follows an UPDATE: the old entry goes, the new one is found.
+    write(
+        &e,
+        &f,
+        &store,
+        "UPDATE events SET doc = JSON_SET(doc, '$.n', 8) WHERE _id = '1'",
+    )
+    .await
+    .unwrap();
+    write(
+        &e,
+        &f,
+        &store,
+        r#"INSERT INTO events (doc) VALUES ('{"n":5}')"#,
+    )
+    .await
+    .unwrap();
+    let r = store
+        .command(
+            TENANT.0,
+            "app",
+            "shop",
+            "find",
+            &doc! {"find": "events", "filter": {"n": 8}, "hint": "kn"},
+        )
+        .await
+        .unwrap()
+        .into_doc(0);
+    let batch = r
+        .get_document("cursor")
+        .unwrap()
+        .get_array("firstBatch")
+        .unwrap();
+    assert_eq!(batch.len(), 1, "{r:?}");
+    store
+        .command(
+            TENANT.0,
+            "app",
+            "shop",
+            "collMod",
+            &doc! {"collMod": "events", "validator": {"customer_id": {"$type": "number"}}},
+        )
+        .await
+        .unwrap();
+    let err = write(
+        &e,
+        &f,
+        &store,
+        r#"INSERT INTO events (doc) VALUES ('{"customer_id":"three"}')"#,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.protocol().mysql_errno, 39667, "{err}");
+}
+
+#[tokio::test]
+async fn on_duplicate_key_update_changes_the_conflicting_document() {
+    let (e, f, _d) = setup().await;
+    let store = DocStore::new(Arc::new(f.eng.clone()));
+    // A new `_id`: inserted (1); an existing one: its document updated (2),
+    // the assignment reading both the old document and the new row.
+    let (n, info, _) = write(
+        &e,
+        &f,
+        &store,
+        r#"INSERT INTO events (doc) VALUES ('{"_id":"u1","hits":1}'), ('{"_id":"e3","hits":1}') ON DUPLICATE KEY UPDATE doc = JSON_SET(doc, '$.hits', JSON_EXTRACT(VALUES(doc), '$.hits') + 10)"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(n, 3);
+    assert_eq!(
+        info.as_deref(),
+        Some("Records: 2  Duplicates: 1  Warnings: 0")
+    );
+    let e3 = stored(&store, Bson::String("e3".into())).await.unwrap();
+    assert_eq!(e3.get("hits"), Some(&Bson::Int32(11)), "{e3:?}");
+    // The rest of the document kept its types.
+    assert_eq!(
+        e3.get("at"),
+        Some(&Bson::DateTime(bson::DateTime::from_millis(
+            1_700_000_000_000
+        )))
+    );
+    // Nothing changes: 0 rows.
+    let (n, _, _) = write(
+        &e,
+        &f,
+        &store,
+        r#"INSERT INTO events (doc) VALUES ('{"_id":"e3"}') ON DUPLICATE KEY UPDATE doc = doc"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(n, 0);
+    // `_id` stays.
+    let err = write(
+        &e,
+        &f,
+        &store,
+        r#"INSERT INTO events (doc) VALUES ('{"_id":"e3"}') ON DUPLICATE KEY UPDATE _id = 'zz'"#,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.protocol().mysql_errno, 39668, "{err}");
+}
+
+#[tokio::test]
+async fn one_statement_writes_a_table_and_a_collection() {
+    let (e, f, _d) = setup().await;
+    let store = DocStore::new(Arc::new(f.eng.clone()));
+    let (n, info, _) = write(
+        &e,
+        &f,
+        &store,
+        "UPDATE customers c JOIN events ev ON ev._id = 'e3' AND c.id = 3 SET c.name = 'Asha B', ev.doc = JSON_SET(ev.doc, '$.who', c.name)",
+    )
+    .await
+    .unwrap();
+    assert_eq!(n, 2);
+    assert_eq!(
+        info.as_deref(),
+        Some("Rows matched: 2  Changed: 2  Warnings: 0")
+    );
+    let e3 = stored(&store, Bson::String("e3".into())).await.unwrap();
+    // The value worked out from the rows as they were before the statement.
+    assert_eq!(e3.get("who"), Some(&Bson::String("Asha".into())));
+    assert_eq!(
+        select(&e, &f, "SELECT name FROM customers WHERE id = 3").await,
+        vec!["Asha B".to_owned()]
+    );
+    let (n, _, _) = write(
+        &e,
+        &f,
+        &store,
+        "DELETE c, ev FROM customers c JOIN events ev ON ev._id = 'e3' AND c.id = 3",
+    )
+    .await
+    .unwrap();
+    assert_eq!(n, 2);
+    assert!(stored(&store, Bson::String("e3".into())).await.is_none());
+    assert!(
+        select(&e, &f, "SELECT name FROM customers WHERE id = 3")
+            .await
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn a_field_index_answers_as_a_scan_does() {
+    let (e, f, _d) = setup().await;
+    let store = DocStore::new(Arc::new(f.eng.clone()));
+    let queries = [
+        "SELECT _id FROM events WHERE doc->>'$.customer_id' = 3 ORDER BY _id",
+        "SELECT _id FROM events WHERE JSON_EXTRACT(doc, '$.customer_id') = 4 ORDER BY _id",
+        "SELECT _id FROM events WHERE JSON_VALUE(doc, '$.customer_id') > 3.5 ORDER BY _id",
+        "SELECT _id FROM events WHERE doc->>'$.customer_id' BETWEEN 3 AND 4 ORDER BY _id",
+        "SELECT _id FROM events WHERE doc->>'$.customer_id' IN (99, 5) ORDER BY _id",
+        "SELECT _id FROM events WHERE doc->>'$.customer_id' IS NULL ORDER BY _id",
+    ];
+    let mut before = Vec::new();
+    for q in queries {
+        before.push(select(&e, &f, q).await);
+    }
+    store
+        .command(
+            TENANT.0,
+            "app",
+            "shop",
+            "createIndexes",
+            &doc! {"createIndexes": "events", "indexes": [{"key": {"customer_id": 1}, "name": "cust_1"}]},
+        )
+        .await
+        .unwrap();
+    // A document whose field is text: SQL compares it as a number too.
+    store
+        .command(
+            TENANT.0,
+            "app",
+            "shop",
+            "insert",
+            &doc! {"insert": "events", "documents": [{"_id": "t1", "customer_id": "3"}]},
+        )
+        .await
+        .unwrap();
+    for (i, q) in queries.iter().enumerate() {
+        let mut want = before[i].clone();
+        let got = select(&e, &f, q).await;
+        if i == 0 || i == 3 {
+            want.push("t1".to_owned());
+            want.sort();
+        }
+        assert_eq!(got, want, "{q}");
+    }
+    // The planner reads the index.
+    let c = f.collection(DB, "events").unwrap();
+    assert_eq!(c.paths.len(), 1);
+    assert_eq!(c.paths[0].path, "$.customer_id");
 }

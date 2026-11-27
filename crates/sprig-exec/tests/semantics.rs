@@ -628,10 +628,13 @@ fn json_values_are_a_type_on_mysql_and_text_on_mariadb() {
     each(&bin(BinOp::Lt, js("12.5"), js("100")), "0", "1");
     each(&bin(BinOp::Gt, js("[1,2]"), js(r#"{"a":1}"#)), "0", "1");
     each(&bin(BinOp::Gt, js("true"), js("[9]")), "1", "1");
-    each(&bin(BinOp::Lt, js(r#""b""#), js(r#"{"a":1}"#)), "1", "1");
+    // (MariaDB unquotes the first: `b` against `{"a": 1}`, punctuation
+    // first in its collation.)
+    each(&bin(BinOp::Lt, js(r#""b""#), js(r#"{"a":1}"#)), "0", "1");
     each(&bin(BinOp::Eq, js("1.0"), js("1")), "0", "1");
-    // A non-JSON operand is a JSON scalar: 'b' is the string "b".
-    each(&bin(BinOp::Eq, js(r#""b""#), s("b")), "0", "1");
+    // A non-JSON operand is a JSON scalar on MySQL: 'b' is the string "b".
+    // MariaDB compares the JSON string's unquoted text.
+    each(&bin(BinOp::Eq, js(r#""b""#), s("b")), "1", "1");
     each(&bin(BinOp::Lt, js(r#""b""#), i(50)), "1", "0");
 }
 

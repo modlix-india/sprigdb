@@ -578,6 +578,8 @@ sprig_codes! {
     KvInvalidKey = 39723, "ER_SPRIG_KV_INVALID_KEY", "SprigKvInvalidKey", SQLSTATE_GENERAL, false;
     /// A value over the namespace's limit or not in its codec.
     KvValueInvalid = 39724, "ER_SPRIG_KV_VALUE_INVALID", "SprigKvValueInvalid", SQLSTATE_GENERAL, false;
+    /// An SQL write naming a Redis database's table (read-only from SQL).
+    KvSqlReadOnly = 39729, "ER_SPRIG_KV_SQL_READ_ONLY", "SprigKvSqlReadOnly", SQLSTATE_GENERAL, false;
     /// The key holds another type (Redis `WRONGTYPE`).
     KvWrongType = 39730, "ER_SPRIG_KV_WRONG_TYPE", "SprigKvWrongType", SQLSTATE_GENERAL, false;
     /// A hash field or member over 2024 bytes.
@@ -837,6 +839,8 @@ sprig_codes! {
     CursorLimit = 39630, "ER_SPRIG_CURSOR_LIMIT", "SprigCursorLimit", SQLSTATE_GENERAL, false;
     /// A document's encoded `_id` is over 1024 bytes.
     DocIdTooLong = 39660, "ER_SPRIG_DOC_ID_TOO_LONG", "SprigDocIdTooLong", SQLSTATE_GENERAL, false;
+    /// An SQL write of a MongoDB collection while `doc.sql_writes` is `off`.
+    CollectionReadOnly = 39661, "ER_SPRIG_COLLECTION_READ_ONLY", "SprigCollectionReadOnly", SQLSTATE_GENERAL, false;
     /// A MongoDB feature not supported in this version.
     DocFeatureUnsupported = 39662, "ER_SPRIG_DOC_FEATURE_UNSUPPORTED", "SprigDocFeatureUnsupported", SQLSTATE_GENERAL, false;
     /// Reserved: an array value in a collection's shard key field (not raised in this version).
@@ -847,9 +851,10 @@ sprig_codes! {
     DocTooDeep = 39665, "ER_SPRIG_DOC_TOO_DEEP", "SprigDocTooDeep", SQLSTATE_GENERAL, false;
     /// Reserved: a MongoDB message too small to hold its header (not raised in this version).
     PacketTooSmall = 39666, "ER_SPRIG_PACKET_TOO_SMALL", "SprigPacketTooSmall", SQLSTATE_GENERAL, false;
-    /// Reserved: a document SprigDB can't store (not raised in this version).
+    /// A document SprigDB can't store (an SQL write's row that is no valid
+    /// document, or one its validator refuses).
     DocInvalid = 39667, "ER_SPRIG_DOC_INVALID", "SprigDocInvalid", SQLSTATE_GENERAL, false;
-    /// Reserved: an update that changes `_id` (not raised in this version).
+    /// An SQL write that would change a document's `_id`.
     DocIdImmutable = 39668, "ER_SPRIG_DOC_ID_IMMUTABLE", "SprigDocIdImmutable", SQLSTATE_GENERAL, false;
     /// A Redis 7.2 command not supported in this version.
     RedisUnsupported = 39840, "ER_SPRIG_REDIS_UNSUPPORTED", "SprigRedisUnsupported", SQLSTATE_GENERAL, false;
@@ -1139,14 +1144,6 @@ impl SprigCode {
             "Reserved: a MongoDB message too short for its header; not raised in this version.",
         ),
         (
-            SprigCode::DocInvalid,
-            "Reserved: a document SprigDB can't store; not raised in this version.",
-        ),
-        (
-            SprigCode::DocIdImmutable,
-            "Reserved: an update that changes _id; not raised in this version.",
-        ),
-        (
             SprigCode::VectorTooManyIndexes,
             "Reserved: more vector indexes on a table than vector.max_indexes_per_table; not raised in this version.",
         ),
@@ -1408,7 +1405,9 @@ fn sprig_protocol(code: SprigCode) -> ProtocolError {
         | SprigCode::NeedsGateway
         | SprigCode::PrivilegeDropped
         | SprigCode::AuthPropagationPending
-        | SprigCode::RlsDefinerDefault => (Code::FailedPrecondition, 400),
+        | SprigCode::RlsDefinerDefault
+        | SprigCode::CollectionReadOnly
+        | SprigCode::KvSqlReadOnly => (Code::FailedPrecondition, 400),
         SprigCode::GatewayDraining
         | SprigCode::ListenerRetired
         | SprigCode::MetaUnavailable

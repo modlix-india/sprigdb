@@ -10,6 +10,9 @@
 //!   prefix(S, i) | k_1 .. k_m | keyenc(_id)     -> keyenc(_id)
 //!   prefix(U, i) | k_1 .. k_m                   -> keyenc(_id)
 //!   prefix(M, 2) | i u16                        -> 1 (index i has seen an array)
+//!   prefix(M, 4) | i u16 | k_1 .. k_m | keyenc(_id) -> keyenc(_id)
+//!                         (unique index i, built online: a document whose
+//!                          values another document's entry already held)
 //! prefix(kind, index) = tenant u64 | shard u32 (0) | object u32 | kind u8 | index u16
 //! ```
 //!
@@ -36,6 +39,9 @@ const MULTIKEY: u16 = 2;
 /// Database drop markers: a delete written when `dropDatabase` dropped a
 /// database's collections, so the change log shows the database's drop.
 const CAT_DB_DROPS: u16 = 3;
+/// Duplicates met while a unique index is built, under a collection's
+/// metadata kind.
+const DUPS: u16 = 4;
 
 /// The header byte of a stored document: format 1, no field directory.
 pub const DOC_FORMAT_1: u8 = 1;
@@ -247,6 +253,17 @@ impl Space {
     #[must_use]
     pub fn multikey(&self, i: u16) -> Vec<u8> {
         let mut k = prefix(self.tenant, self.object, kind::META, MULTIKEY);
+        k.extend_from_slice(&i.to_be_bytes());
+        k
+    }
+
+    /// The prefix of the duplicates met while unique index `i` is built
+    /// online: `| entry | _id key -> _id key`, one per document whose
+    /// entry another document held; the build checks them before the
+    /// index is published.
+    #[must_use]
+    pub fn dups(&self, i: u16) -> Vec<u8> {
+        let mut k = prefix(self.tenant, self.object, kind::META, DUPS);
         k.extend_from_slice(&i.to_be_bytes());
         k
     }

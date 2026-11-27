@@ -8,10 +8,13 @@
 //!                                table's definition (a hypothetical index):
 //!   catalog  the table's definition gains the index, last, so every
 //!            existing key keeps its position
-//!   storage  the hypothetical key's figures come from a sample of the
-//!            table's rows (the first `sample_rows` in primary-key order),
-//!            loaded into an in-memory table that has the index, scaled to
-//!            the table's row count; every other key asks real storage
+//!   storage  the hypothetical key's figures come from storage's
+//!            statistics of its columns (histograms and distinct counts,
+//!            the columns taken as independent) when it keeps them; else
+//!            from a sample of the table's rows (the first `sample_rows` in
+//!            primary-key order), loaded into an in-memory table that has
+//!            the index, scaled to the table's row count; every other key
+//!            asks real storage
 //! ```
 //!
 //! Nothing is executed: the planner builds its operators, which read
@@ -25,6 +28,7 @@
 //! tables before it (a nested loop's reads); blocks add up.
 
 use std::collections::BTreeMap;
+use std::ops::Bound;
 use std::sync::Arc;
 
 use sprig_engine::row::Value;
@@ -320,6 +324,57 @@ impl WhatIfStorage {
     fn not_built() -> sprig_exec::SqlError {
         sprig_exec::SqlError::new(1235, "42000", "a hypothetical index has no entries to read")
     }
+
+    /// Rows of the hypothetical key in `range` from storage's statistics
+    /// of its columns: the leading parts both bounds fix are points, the
+    /// next part a range, the columns taken as independent. `None` when
+    /// storage has no statistics of a column the range needs.
+    fn hypo_rows(&self, table: &TableDef, range: &KeyRange) -> Option<u64> {
+        let key = table.key(self.hypo_key)?;
+        let vals = |b: &Bound<Vec<Value>>| match b {
+            Bound::Included(v) | Bound::Excluded(v) => v.clone(),
+            Bound::Unbounded => Vec::new(),
+        };
+        let (lo, hi) = (vals(&range.start), vals(&range.end));
+        let common = lo.iter().zip(&hi).take_while(|(a, b)| a == b).count();
+        let mut share = 1.0;
+        for (i, v) in lo.iter().take(common).enumerate() {
+            let col = key.parts.get(i)?.column;
+            share *= self
+                .real
+                .column_share(table, col, &[KeyRange::point(vec![v.clone()])])?;
+        }
+        if lo.len() > common || hi.len() > common {
+            let col = key.parts.get(common)?.column;
+            // A bound with parts past this one is inclusive here.
+            let at = |b: &Bound<Vec<Value>>, v: &[Value]| match (b, v.get(common)) {
+                (_, None) => Bound::Unbounded,
+                (Bound::Excluded(_), Some(x)) if v.len() == common + 1 => {
+                    Bound::Excluded(vec![x.clone()])
+                }
+                (_, Some(x)) => Bound::Included(vec![x.clone()]),
+            };
+            let r = KeyRange {
+                start: at(&range.start, &lo),
+                end: at(&range.end, &hi),
+            };
+            share *= self.real.column_share(table, col, &[r])?;
+        }
+        let rows = self.real.table_rows(table) as f64;
+        Some(((share * rows).round() as u64).max(1))
+    }
+
+    /// Rows per value of the hypothetical key's first `parts` parts from
+    /// storage's distinct counts of its columns, taken as independent.
+    fn hypo_per_key(&self, table: &TableDef, parts: usize) -> Option<f64> {
+        let key = table.key(self.hypo_key)?;
+        let rows = self.real.table_rows(table) as f64;
+        let mut distinct = 1.0f64;
+        for p in key.parts.get(..parts)? {
+            distinct *= self.real.column_distinct(table, p.column)?.max(1.0);
+        }
+        Some((rows / distinct.min(rows.max(1.0))).max(1.0))
+    }
 }
 
 impl Storage for WhatIfStorage {
@@ -330,6 +385,9 @@ impl Storage for WhatIfStorage {
     fn rows_in_range(&self, table: &TableDef, key: KeyId, range: &KeyRange) -> u64 {
         if !self.is_hypo(table, key) {
             return self.real.rows_in_range(table, key, range);
+        }
+        if let Some(n) = self.hypo_rows(table, range) {
+            return n;
         }
         let n = self.sample.mem.rows_in_range(table, key, range);
         if self.sample.complete() {
@@ -342,6 +400,9 @@ impl Storage for WhatIfStorage {
     fn rows_per_key(&self, table: &TableDef, key: KeyId, parts: usize) -> Option<f64> {
         if !self.is_hypo(table, key) {
             return self.real.rows_per_key(table, key, parts);
+        }
+        if let Some(per) = self.hypo_per_key(table, parts) {
+            return Some(per);
         }
         let per = self.sample.mem.rows_per_key(table, key, parts)?;
         if self.sample.complete() {
@@ -358,6 +419,14 @@ impl Storage for WhatIfStorage {
             distinct * self.sample.scale() * (distinct / n)
         };
         Some((self.sample.total as f64 / estimated_distinct.max(1.0)).max(1.0))
+    }
+
+    fn column_share(&self, table: &TableDef, column: usize, ranges: &[KeyRange]) -> Option<f64> {
+        self.real.column_share(table, column, ranges)
+    }
+
+    fn column_distinct(&self, table: &TableDef, column: usize) -> Option<f64> {
+        self.real.column_distinct(table, column)
     }
 
     fn get(&self, table: &TableDef, key: &[Value], counters: &Counters) -> Result<Option<Row>> {

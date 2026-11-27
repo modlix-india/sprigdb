@@ -2,7 +2,7 @@
 //! metadata and use to choose comparison and arithmetic rules.
 
 use sprig_engine::keys::collation::{Charset, Collation};
-use sprig_engine::row::{ColumnType, LobSize};
+use sprig_engine::row::{ColumnType, Fbt, LobSize};
 
 use crate::error::{Result, SqlError};
 use crate::session::Persona;
@@ -177,6 +177,11 @@ pub struct ExprType {
     /// names (`utf8mb3_general_ci`) and the merging rules (a `utf8mb4`
     /// side takes in a `utf8mb3` one held no more strongly).
     pub mb3: bool,
+    /// MariaDB's `UUID`, `INET4` or `INET6`: a value of the type, held as
+    /// its text (a column's stored bytes are read as text). It compares
+    /// and sorts as the type orders, and a string meeting it converts to
+    /// the type.
+    pub fbt: Option<Fbt>,
 }
 
 impl ExprType {
@@ -198,6 +203,7 @@ impl ExprType {
         ascii: false,
         json: false,
         mb3: false,
+        fbt: None,
     };
 
     /// The type of the `NULL` literal.
@@ -344,6 +350,23 @@ impl ExprType {
         self
     }
 
+    /// A value of MariaDB's `UUID`, `INET4` or `INET6` (see
+    /// [`ExprType::fbt`]): text that gives way to any other string's
+    /// character set.
+    #[must_use]
+    pub fn fbt_of(f: Fbt) -> Self {
+        Self {
+            fbt: Some(f),
+            ascii: true,
+            dec: 0,
+            ..Self::string(
+                f.text_len(),
+                Collation::Utf8mb4Uca1400AiCi,
+                Derivation::Numeric,
+            )
+        }
+    }
+
     /// The type an expression has when it reads a column of `ty`.
     #[must_use]
     pub fn of_column(ty: &ColumnType, nullable: bool) -> Self {
@@ -428,10 +451,11 @@ impl ExprType {
                 json: true,
                 ..Self::string(u32::MAX / 4, Collation::Utf8mb4Bin, Derivation::Implicit)
             },
+            ColumnType::Fbt(f) => Self::fbt_of(f),
         };
         Self {
             column: true,
-            ascii: t.kind == Kind::Str && t.coll.charset() == Charset::Ascii,
+            ascii: t.fbt.is_some() || (t.kind == Kind::Str && t.coll.charset() == Charset::Ascii),
             ..t.with_null(nullable)
         }
     }
@@ -512,7 +536,7 @@ impl ExprType {
                 } else {
                     bytes
                 };
-                let field = if self.fixed {
+                let field = if self.fixed || self.fbt.is_some() {
                     FieldType::String
                 } else if own >= 1 << 24 {
                     FieldType::LongBlob
@@ -539,9 +563,13 @@ impl ExprType {
             field,
             len,
             dec,
-            unsigned: self.unsigned,
+            // MariaDB marks a UUID or address unsigned, and its column
+            // binary.
+            unsigned: self.unsigned || self.fbt.is_some(),
             not_null: !self.nullable,
-            binary: self.kind != Kind::Str || self.coll == Collation::Binary,
+            binary: self.kind != Kind::Str
+                || self.coll == Collation::Binary
+                || (self.fbt.is_some() && self.column),
             coll: self.coll,
         }
     }

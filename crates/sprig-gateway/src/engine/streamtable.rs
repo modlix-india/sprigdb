@@ -24,6 +24,9 @@ pub(crate) struct StreamSource {
     pub def: Arc<TableDef>,
     /// Its rows.
     pub storage: Arc<dyn sprig_plan::access::Storage>,
+    /// A Redis database's table (`engine::redistable`): read in the
+    /// statement's transaction instead of through `storage`.
+    pub redis: Option<super::redistable::RedisTable>,
 }
 
 impl std::fmt::Debug for StreamSource {
@@ -61,5 +64,9 @@ pub(crate) fn find(tenant: u64, db: DbId, db_name: &str, name: &str) -> Option<A
         t.stream_id,
         partitions,
     );
-    Some(Arc::new(StreamSource { def, storage }))
+    Some(Arc::new(StreamSource {
+        def,
+        storage,
+        redis: None,
+    }))
 }

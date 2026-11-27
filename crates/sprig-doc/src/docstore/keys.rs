@@ -8,6 +8,7 @@ use bson::{Bson, Document};
 use sprig_proto_mongo::errors::MongoError;
 
 use super::catalog::{FieldKind, IndexMeta};
+use crate::collation::Collation;
 use crate::keyenc;
 
 /// The values at one indexed path.
@@ -99,15 +100,25 @@ fn values(doc: &Document, path: &str) -> Found {
 /// The hashed key of a value: a 64-bit hash of its equality key.
 #[must_use]
 pub fn hashed(v: &Bson) -> Bson {
+    hashed_in(v, None)
+}
+
+/// The hashed key of a value in an index with collation `c`: strings hash
+/// by their sort keys, so collation-equal strings share a hash.
+#[must_use]
+pub fn hashed_in(v: &Bson, c: Option<Collation>) -> Bson {
     let mut h = twox_hash::XxHash64::with_seed(0);
-    h.write(&keyenc::eq_key(v));
+    match c {
+        Some(c) if keyenc::has_text(v) => h.write(&keyenc::key_in(v, Some(c))),
+        _ => h.write(&keyenc::eq_key(v)),
+    }
     Bson::Int64(h.finish().cast_signed())
 }
 
-fn component(v: &Bson, kind: FieldKind) -> Vec<u8> {
+fn component(v: &Bson, kind: FieldKind, c: Option<Collation>) -> Vec<u8> {
     let mut k = match kind {
-        FieldKind::Hashed => keyenc::key(&hashed(v)),
-        _ => keyenc::key(v),
+        FieldKind::Hashed => keyenc::key(&hashed_in(v, c)),
+        _ => keyenc::key_in(v, c),
     };
     if kind == FieldKind::Desc {
         keyenc::complement(&mut k);
@@ -123,7 +134,7 @@ fn component(v: &Bson, kind: FieldKind) -> Vec<u8> {
 /// under a hashed field.
 pub fn entries(doc: &Document, idx: &IndexMeta) -> Result<(Vec<Vec<u8>>, bool), MongoError> {
     if let Some(p) = &idx.partial
-        && !p.matches(doc)
+        && !crate::collation::sync_scope(idx.collation, || p.matches(doc))
     {
         return Ok((Vec::new(), false));
     }
@@ -157,7 +168,11 @@ pub fn entries(doc: &Document, idx: &IndexMeta) -> Result<(Vec<Vec<u8>>, bool), 
             }
             arrays.push((at.clone(), path.clone()));
         }
-        let mut comps: Vec<Vec<u8>> = f.vals.iter().map(|v| component(v, *kind)).collect();
+        let mut comps: Vec<Vec<u8>> = f
+            .vals
+            .iter()
+            .map(|v| component(v, *kind, idx.collation))
+            .collect();
         comps.sort();
         comps.dedup();
         per_field.push(comps);
@@ -254,7 +269,7 @@ fn wildcard_entries(doc: &Document, idx: &IndexMeta) -> (Vec<Vec<u8>>, bool) {
         if !wildcard_keeps(&p, root, idx.wildcard_projection.as_ref()) {
             continue;
         }
-        out.insert(wildcard_key(&p, &v));
+        out.insert(wildcard_key_in(&p, &v, idx.collation));
     }
     (out.into_iter().collect(), multi)
 }
@@ -262,8 +277,15 @@ fn wildcard_entries(doc: &Document, idx: &IndexMeta) -> (Vec<Vec<u8>>, bool) {
 /// A wildcard entry's key: the path, then the value.
 #[must_use]
 pub fn wildcard_key(path: &str, v: &Bson) -> Vec<u8> {
+    wildcard_key_in(path, v, None)
+}
+
+/// A wildcard entry's key in an index with collation `c` (the path is
+/// never collated).
+#[must_use]
+pub fn wildcard_key_in(path: &str, v: &Bson, c: Option<Collation>) -> Vec<u8> {
     let mut k = keyenc::key(&Bson::String(path.to_owned()));
-    keyenc::encode_key(v, &mut k);
+    keyenc::encode_key_in(v, c, &mut k);
     k
 }
 

@@ -30,8 +30,9 @@
 //!   of `_id` read the collection and keep the rows in range, in `_id`
 //!   order. A full scan reads in the store's `_id` order, which the
 //!   planner doesn't rely on (the table has no primary key).
-//! - **Read-only.** A write naming a collection, and a locking read of
-//!   one, answer `ER_SPRIG_NOT_ON_ENGINE`.
+//! - **Writes** (`INSERT`, `REPLACE`, `UPDATE`, `DELETE`) run through the
+//!   document store's write path in the SQL transaction
+//!   ([`super::collwrite`]); a locking read locks the documents it reads.
 //! - **Privileges** are the database's: a collection has no SQL grants of
 //!   its own, so the session needs `SELECT` on the database (or wider).
 //! - A MongoDB database is visible from SQL once the tenant has an SQL
@@ -68,6 +69,76 @@ pub(crate) struct CollTable {
     pub db: String,
     /// The collection's name.
     pub name: String,
+    /// Its indexes a numeric condition on a field can read
+    /// (`general::storage::coll`), each the planner's key after `_id_`.
+    pub paths: Vec<PathIndex>,
+}
+
+/// A collection index the planner may read for a numeric condition on its
+/// first field (`doc->>'$.f' = 7`, `JSON_EXTRACT(doc, '$.f') > 2`, ...): an
+/// ascending index on a plain field path, neither sparse, partial, hidden,
+/// hashed, wildcard nor being built, so every document has an entry.
+#[derive(Debug, Clone)]
+pub(crate) struct PathIndex {
+    /// The index's number in the collection.
+    pub id: u16,
+    /// Unique (its entries are keyed without the `_id`).
+    pub unique: bool,
+    /// Its name.
+    pub name: String,
+    /// The JSON path of its first field (`$.a.b`).
+    pub path: String,
+}
+
+/// The indexes of collection record `rec` SQL may read (see [`PathIndex`]).
+fn path_indexes(rec: &Document, db: &str, name: &str) -> Vec<PathIndex> {
+    use sprig_doc::docstore::catalog::{CollMeta, FieldKind};
+    let Ok(meta) = CollMeta::from_record(db, name, rec) else {
+        return Vec::new();
+    };
+    let plain = |f: &str| {
+        !f.is_empty()
+            && f.split('.').all(|seg| {
+                seg.chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                    && seg.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            })
+    };
+    meta.indexes
+        .iter()
+        .filter(|i| {
+            !i.building && !i.hidden && !i.sparse && i.partial.is_none() && !i.is_wildcard()
+        })
+        .filter_map(|i| {
+            let (f, kind) = i.fields.first()?;
+            (*kind == FieldKind::Asc && f != "_id" && plain(f)).then(|| PathIndex {
+                id: i.id,
+                unique: i.unique,
+                name: i.name.clone(),
+                path: format!("$.{f}"),
+            })
+        })
+        .collect()
+}
+
+/// The table the planner sees for collection `c`: [`plan_table`]'s, with
+/// a key per [`PathIndex`] over `doc` at its path, its bounds as `DOUBLE`
+/// (`KeyId::Index(1)` is the first).
+pub(crate) fn plan_table_of(c: &CollTable, db_name: &str) -> PlanTable {
+    use sprig_plan::catalog::{IndexDef, IndexPart, PathPart};
+    let mut t = plan_table(&c.def, db_name);
+    for p in &c.paths {
+        t.indexes.push(
+            IndexDef::new(&p.name, false, vec![IndexPart::asc(DOC)]).with_paths(vec![Some(
+                PathPart {
+                    path: p.path.clone(),
+                    ty: sprig_engine::row::ColumnType::Double,
+                },
+            )]),
+        );
+    }
+    t
 }
 
 fn quote(name: &str) -> String {
@@ -152,11 +223,15 @@ pub(crate) fn find(
     t.rollback();
     let (coll, v) = found?;
     let n = record_n(&v)?;
+    let paths = Document::from_reader(&mut &v[..])
+        .map(|rec| path_indexes(&rec, db_name, &coll))
+        .unwrap_or_default();
     Some(Arc::new(CollTable {
         def: table_def(db, &coll, n)?,
         tenant,
         db: db_name.to_owned(),
         name: coll,
+        paths,
     }))
 }
 

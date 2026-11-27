@@ -236,6 +236,50 @@ pub(crate) fn push_op(out: &mut Vec<u8>, code: u8, bytes: &[u8]) {
     put_slice(out, bytes);
 }
 
+/// Whether one payload writes under `prefix`: a put or a delete of a key
+/// that starts with it, or a range delete that overlaps the keys that do.
+/// Notes (and blob references) write nothing to the store.
+///
+/// # Errors
+/// The payload is malformed.
+pub fn writes_under(data: &[u8], prefix: &[u8]) -> Result<bool> {
+    let mut r = Reader(data);
+    if r.byte()? != FORMAT {
+        return Err(Reader::bad());
+    }
+    while !r.0.is_empty() {
+        match r.byte()? {
+            PUT => {
+                r.cf()?;
+                let k = r.slice()?;
+                r.slice()?;
+                if k.starts_with(prefix) {
+                    return Ok(true);
+                }
+            }
+            DELETE => {
+                r.cf()?;
+                if r.slice()?.starts_with(prefix) {
+                    return Ok(true);
+                }
+            }
+            RANGE => {
+                r.cf()?;
+                let s = r.slice()?;
+                let e = r.slice()?;
+                if s.starts_with(prefix) || (s < prefix && e > prefix) {
+                    return Ok(true);
+                }
+            }
+            NOTE | BLOB => {
+                r.slice()?;
+            }
+            _ => return Err(Reader::bad()),
+        }
+    }
+    Ok(false)
+}
+
 /// The notes of one payload, in order (what [`Payload::note`] added).
 ///
 /// # Errors
@@ -306,5 +350,30 @@ mod tests {
         let bytes = p.into_bytes();
         assert_eq!(notes(&bytes).unwrap(), vec![&b"one"[..], &b"two"[..]]);
         assert!(decode_into(&[1, 1, 0, 5, b'x'], &mut StoreBatch::new()).is_err());
+    }
+
+    #[test]
+    fn writes_under_a_prefix() {
+        let one = |f: &dyn Fn(&mut Payload)| {
+            let mut p = Payload::new();
+            p.note(b"n");
+            f(&mut p);
+            p.into_bytes()
+        };
+        let put = one(&|p| p.put(Cf::Data, b"pq1", b"v"));
+        assert!(writes_under(&put, b"pq").unwrap());
+        assert!(!writes_under(&put, b"pr").unwrap());
+        let del = one(&|p| p.delete(Cf::Data, b"pq1"));
+        assert!(writes_under(&del, b"pq").unwrap());
+        // A range over the prefix, one inside it, and one beside it.
+        let over = one(&|p| p.delete_range(Cf::Data, b"a", b"z"));
+        assert!(writes_under(&over, b"pq").unwrap());
+        let inside = one(&|p| p.delete_range(Cf::Data, b"pq1", b"pq9"));
+        assert!(writes_under(&inside, b"pq").unwrap());
+        let beside = one(&|p| p.delete_range(Cf::Data, b"a", b"pp"));
+        assert!(!writes_under(&beside, b"pq").unwrap());
+        let notes_only = one(&|_| {});
+        assert!(!writes_under(&notes_only, b"").unwrap());
+        assert!(writes_under(&[1, 9], b"pq").is_err());
     }
 }

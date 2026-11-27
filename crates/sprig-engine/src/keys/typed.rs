@@ -169,6 +169,12 @@ fn encode_value(out: &mut Vec<u8>, col: &KeyColumn, v: &Value) -> Result<()> {
             memcmp::put_bytes(out, &prefix(Charset::Binary, b));
             Ok(())
         }
+        // Fixed width, and the stored bytes already order as the values do.
+        (ColumnType::Fbt(_), Value::Bytes(b)) => {
+            col.ty.check(v)?;
+            out.extend_from_slice(b);
+            Ok(())
+        }
         _ => Err(mismatch(col, v)),
     }
 }
@@ -248,6 +254,7 @@ pub fn decode_column<'a>(input: &'a [u8], col: &KeyColumn) -> Result<(Option<Val
     Ok((v, &input[input.len() - rest.len()..]))
 }
 
+#[allow(clippy::too_many_lines)] // one arm per column type
 fn decode_asc<'a>(input: &'a [u8], col: &KeyColumn) -> Result<(Option<Value>, &'a [u8])> {
     let mut input = input;
     if col.nullable {
@@ -338,6 +345,10 @@ fn decode_asc<'a>(input: &'a [u8], col: &KeyColumn) -> Result<(Option<Value>, &'
         ColumnType::Binary { .. } | ColumnType::VarBinary { .. } | ColumnType::Blob { .. } => {
             let (b, rest) = memcmp::get_bytes(input)?;
             (Value::Bytes(Bytes::from(b)), rest)
+        }
+        ColumnType::Fbt(f) => {
+            let (head, rest) = take(f.bytes())?;
+            (Value::Bytes(Bytes::copy_from_slice(head)), rest)
         }
         ColumnType::Json => return Err(malformed()),
     };
@@ -548,5 +559,26 @@ mod tests {
         for cut in 0..k.len() - 2 {
             assert!(decode_key(&k[..cut], &cols).is_err(), "cut at {cut}");
         }
+    }
+
+    #[test]
+    fn fixed_binary_types_are_their_stored_bytes() {
+        use crate::row::Fbt;
+        let col = KeyColumn::new(ColumnType::Fbt(Fbt::Uuid)).nullable();
+        let a = Fbt::Uuid
+            .parse(b"00000000-0000-1000-8000-000000000003")
+            .unwrap();
+        let b = Fbt::Uuid
+            .parse(b"10000000-0000-0000-0000-000000000002")
+            .unwrap();
+        let (ka, kb) = (key(&col, &Value::bytes(&a)), key(&col, &Value::bytes(&b)));
+        assert!(ka < kb);
+        assert!(key(&col, &Value::Null) < ka);
+        let (got, rest) = decode_column(&ka, &col).unwrap();
+        assert_eq!((got, rest), (Some(Value::bytes(&a)), &[][..]));
+        let i4 = KeyColumn::new(ColumnType::Fbt(Fbt::Inet4));
+        assert_eq!(key(&i4, &Value::bytes(&[1, 2, 3, 4])), [1, 2, 3, 4]);
+        let mut out = Vec::new();
+        assert!(encode_column(&mut out, &i4, &Value::bytes(&[1, 2, 3])).is_err());
     }
 }

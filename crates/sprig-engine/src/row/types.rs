@@ -5,6 +5,7 @@ use std::cmp::Ordering;
 use sprig_common::{Result, SprigError};
 
 use super::decimal::Decimal;
+use super::fbt::Fbt;
 use super::temporal::{frac_bytes, frac_fits};
 use super::value::Value;
 use crate::keys::collation::Collation;
@@ -133,6 +134,9 @@ pub enum ColumnType {
     },
     /// `JSON`: opaque bytes; never part of a key.
     Json,
+    /// MariaDB's `UUID`, `INET4` or `INET6`: the value's stored bytes
+    /// ([`Fbt`]), which order as the server orders the values.
+    Fbt(Fbt),
 }
 
 fn bad(msg: impl Into<String>) -> SprigError {
@@ -195,7 +199,8 @@ impl ColumnType {
             | Self::Year
             | Self::Text { .. }
             | Self::Blob { .. }
-            | Self::Json => true,
+            | Self::Json
+            | Self::Fbt(_) => true,
         };
         if ok {
             Ok(())
@@ -232,6 +237,7 @@ impl ColumnType {
             Self::Year => 1,
             Self::Binary { bytes } => usize::from(bytes),
             Self::Enum { .. } => 2,
+            Self::Fbt(f) => f.bytes(),
             Self::Char { .. }
             | Self::VarChar { .. }
             | Self::Text { .. }
@@ -314,6 +320,7 @@ impl ColumnType {
             (Self::Enum { members }, Value::Enum(i)) => *i <= members,
             (Self::Set { members }, Value::Set(m)) => members >= 64 || *m < 1u64 << members,
             (Self::Json, Value::Json(_)) => true,
+            (Self::Fbt(f), Value::Bytes(b)) => b.len() == f.bytes(),
             _ => false,
         }
     }

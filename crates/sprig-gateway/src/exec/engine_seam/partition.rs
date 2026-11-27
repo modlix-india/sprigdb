@@ -579,7 +579,11 @@ impl PassSession {
 /// it doesn't read: the usual path answers).
 fn partition_changes(sql: &str, def: &crate::engine::define::Def) -> Option<Vec<Change>> {
     let t = crate::engine::define::lex::lex(sql).ok()?;
-    let mut p = crate::engine::define::P { t: &t, i: 0 };
+    let mut p = crate::engine::define::P {
+        t: &t,
+        i: 0,
+        mysql: false,
+    };
     let mut out = Vec::new();
     while p.i < t.len() {
         let before = p.i;

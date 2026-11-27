@@ -1,5 +1,6 @@
 //! Driver settings.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 /// How a node runs its groups. The defaults are the production values:
@@ -51,6 +52,13 @@ pub struct RaftConfig {
     /// unit needs creating on one member only. A node not listed creates
     /// nothing this way.
     pub static_voters: Vec<crate::NodeId>,
+    /// Placement per unit: where it is set, it decides which nodes a unit's
+    /// group starts on, and `static_voters` serve only the units it answers
+    /// [`UnitPlacement::Static`] for. A member the lookup lists creates the
+    /// group with exactly those voters when it first hears of it (or on its
+    /// first write), as every listed member would; a node it doesn't list
+    /// creates nothing that way.
+    pub placement: Option<PlacementLookup>,
     /// Log writes and syncs run on a thread of their own, started by
     /// [`crate::Node::spawn`]: the loop keeps stepping groups (and sending
     /// what doesn't wait for durability) while a sync runs, and writes
@@ -76,8 +84,70 @@ impl Default for RaftConfig {
             snapshot_retry_ticks: 30,
             auto_create: true,
             static_voters: Vec::new(),
+            placement: None,
             log_writer_thread: false,
         }
+    }
+}
+
+/// Where a unit's group starts, as the placement lookup knows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnitPlacement {
+    /// The unit is placed on these voters (its descriptor's first
+    /// membership).
+    Voters(Vec<crate::NodeId>),
+    /// Not placed per unit: the cluster's fixed voters
+    /// ([`RaftConfig::static_voters`]) hold it.
+    Static,
+    /// Not known here (yet): nothing creates the group from a message or a
+    /// write until it is; a leader may still add this node as a replica.
+    Unknown,
+}
+
+/// The placement lookup of [`RaftConfig::placement`]: called on the
+/// driver's thread, so it must answer from memory.
+#[derive(Clone)]
+pub struct PlacementLookup(pub Arc<dyn Fn(crate::GroupId) -> UnitPlacement + Send + Sync>);
+
+impl PlacementLookup {
+    /// A lookup from `f`.
+    pub fn new(f: impl Fn(crate::GroupId) -> UnitPlacement + Send + Sync + 'static) -> Self {
+        Self(Arc::new(f))
+    }
+
+    /// Where `group` starts.
+    #[must_use]
+    pub fn of(&self, group: crate::GroupId) -> UnitPlacement {
+        (self.0)(group)
+    }
+}
+
+impl std::fmt::Debug for PlacementLookup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PlacementLookup")
+    }
+}
+
+impl RaftConfig {
+    /// The voters node `me` starts `group` with when it doesn't hold it
+    /// yet: `None` when `me` isn't one of them or the unit's placement isn't
+    /// known here.
+    #[must_use]
+    pub fn start_voters(
+        &self,
+        me: crate::NodeId,
+        group: crate::GroupId,
+    ) -> Option<Vec<crate::NodeId>> {
+        let placed = match &self.placement {
+            None => UnitPlacement::Static,
+            Some(p) => p.of(group),
+        };
+        let voters = match placed {
+            UnitPlacement::Voters(v) => v,
+            UnitPlacement::Static => self.static_voters.clone(),
+            UnitPlacement::Unknown => return None,
+        };
+        voters.contains(&me).then_some(voters)
     }
 }
 

@@ -102,9 +102,13 @@ impl Bed {
         let mut body = body;
         body.insert("$db", db);
         let coll = sprig_doc::collation::Collation::of(&body).unwrap();
-        let r =
-            sprig_doc::collation::scope(coll, self.store.command(TENANT, "u", db, &name, &body))
-                .await;
+        // Boxed: the store's command future is large (clippy's
+        // `large_futures` in every test that awaits it).
+        let r = sprig_doc::collation::scope(
+            coll,
+            Box::pin(self.store.command(TENANT, "u", db, &name, &body)),
+        )
+        .await;
         match r {
             Ok(Reply::Doc(d)) => d,
             Ok(c @ Reply::Cursor { .. }) => {

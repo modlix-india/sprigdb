@@ -3301,7 +3301,11 @@ impl Engine {
 /// documents whose `foreign` values equal one of its `local` values
 /// (a missing or null local value matches missing or null foreign ones),
 /// in foreign order; every foreign document without fields.
-pub(crate) fn join_chunk(
+///
+/// # Errors
+/// `QueryExceededMemoryLimit` when the joined documents pass the stage's
+/// memory.
+pub fn join_chunk(
     chunk: &[Document],
     foreign_docs: &[Document],
     fields: Option<(&str, &str)>,

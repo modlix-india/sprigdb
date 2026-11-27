@@ -411,6 +411,20 @@ impl<F: Future> Future for Guarded<F> {
     }
 }
 
+/// Runs `f` with `tokio::task::block_in_place`: the worker's queue goes
+/// to another thread while `f` runs on this one. For that time this
+/// thread's poll doesn't count as holding a worker, so the stall watchdog
+/// ([`on_stall`]) doesn't stop the statement; the poll's clock starts
+/// again when `f` returns. Call it only on a multi-threaded runtime.
+pub fn block_in_place<R>(f: impl FnOnce() -> R) -> R {
+    let saved = SLOT.with(|s| s.since_us.swap(0, Ordering::SeqCst));
+    let r = tokio::task::block_in_place(f);
+    if saved != 0 {
+        SLOT.with(|s| s.since_us.store(now_us(), Ordering::SeqCst));
+    }
+    r
+}
+
 /// The watchdog saw the runtime stuck for `stuck`: logs and counts it, and
 /// stops every statement whose current poll has run for `min_poll` or more
 /// Returns how many it stopped.
@@ -790,6 +804,29 @@ mod tests {
         assert!(
             !idle.0.load(Ordering::SeqCst),
             "a waiting statement was stopped"
+        );
+    }
+
+    /// Work moved off the worker with [`block_in_place`] holds no worker:
+    /// the stall handler leaves its statement alone.
+    #[test]
+    fn work_off_the_worker_is_not_stopped_on_a_stall() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let long = Arc::new(Victim(std::sync::atomic::AtomicBool::new(false)));
+        let who: Arc<dyn Stoppable> = Arc::clone(&long) as Arc<dyn Stoppable>;
+        let t = rt.spawn(Guarded::new(Some(who), async {
+            block_in_place(|| spin(Duration::from_millis(600)));
+        }));
+        std::thread::sleep(Duration::from_millis(300));
+        on_stall(Duration::from_secs(2), Duration::from_millis(200));
+        rt.block_on(t).unwrap();
+        assert!(
+            !long.0.load(Ordering::SeqCst),
+            "a statement off the worker was stopped"
         );
     }
 

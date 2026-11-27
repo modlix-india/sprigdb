@@ -42,10 +42,44 @@
 //!   uncompressed goes into the log LZ4-compressed when that makes it an
 //!   eighth smaller (default `true`; `false` stores it as it arrives).
 //!   Batches a client compressed are always stored as they arrive.
+//! - `SPRIGDB_ENGINE_PLACEMENT=on`: on a replicated node, each tenant's
+//!   unit lives on the three nodes its unit descriptor names (the
+//!   controller places it when it creates the tenant), not on every node:
+//!   this node starts a unit's group only where the descriptor lists it,
+//!   prefers the descriptor's home node as the unit's leader, and refuses
+//!   reads and writes of units placed elsewhere as retryable (39110).
+//!   `off` (the default): every node holds every tenant unit, as before.
+//!   Every replica must use the same value.
+//! - `SPRIGDB_ENGINE_FAILURE_DOMAIN`: this node's failure domain (rack or
+//!   zone) for placement: a unit's voters sit in distinct domains. Unset:
+//!   a domain of its own.
+//! - `SPRIGDB_ENGINE_RAFT_TLS_DIR`: on a replicated node, a directory with
+//!   the internal CA (`ca.pem`) and this node's certificate and key
+//!   (`node.pem`, `node-key.pem`); the certificate names the node
+//!   (subjectAltName `node-<raft id>`). Set, Raft traffic uses mutual TLS
+//!   with node identity: a node dials only the node it means and accepts
+//!   frames only from the node a peer's certificate names. Unset: plain
+//!   TCP (development).
+//! - `SPRIGDB_ENGINE_RAFT_SYNC_PIPELINE`: with the log writer thread, how
+//!   many syncs of the Raft log may run at once while the thread goes on
+//!   writing (default 8; 0 on macOS, where each sync flushes the whole
+//!   drive): a write counts as persisted once a sync that began after it
+//!   has returned, and every earlier write counts too. `0` writes and syncs
+//!   one after another, as before.
+//! - `SPRIGDB_ENGINE_SIM_SYNC_US` (benchmarks only): every log sync in the
+//!   process sleeps this many microseconds instead of reaching the disk, so
+//!   nothing is durable; `SPRIGDB_ENGINE_SIM_SYNC_SERIAL=true` runs them one
+//!   at a time, each covering every sync that waited for it (a journaling
+//!   file system's commits).
 //! - `SPRIGDB_ENGINE_RAFT_JOIN=true`: this node replaces a lost replica.
 //!   It starts with no units of its own and takes each unit only from the
 //!   unit's leader, once an operator runs `sprigctl engine replace-replica`
 //!   (the route [`REPLACE_PATH`] on a surviving gateway).
+//! - `SPRIGDB_ENGINE_RAFT_CUT_FILE`: fault tests only. A file this node
+//!   reads every 100 ms: the Raft ids it lists (comma- or space-separated)
+//!   are cut off, as a network partition would cut them: frames to them
+//!   aren't sent and frames from them are dropped. An empty or missing
+//!   file heals every link. Unset (always, outside fault tests): no cuts.
 //!
 //! If it can't open, every caller gets the same error, naming the
 //! directory; nothing falls back to MariaDB.
@@ -83,6 +117,398 @@ pub const STREAM_WRITE_ONCE_VAR: &str = "SPRIGDB_ENGINE_STREAM_WRITE_ONCE";
 /// The variable that turns LZ4 on uncompressed stream batches off
 /// (`false`).
 pub const STREAM_COMPRESS_VAR: &str = "SPRIGDB_ENGINE_STREAM_COMPRESS";
+/// The variable that places each tenant's unit on the nodes its
+/// descriptor names (`on`) instead of every node (`off`, the default).
+pub const PLACEMENT_VAR: &str = "SPRIGDB_ENGINE_PLACEMENT";
+/// The variable naming this node's failure domain.
+pub const FAILURE_DOMAIN_VAR: &str = "SPRIGDB_ENGINE_FAILURE_DOMAIN";
+/// The variable naming the directory of the Raft transport's certificates.
+pub const RAFT_TLS_DIR_VAR: &str = "SPRIGDB_ENGINE_RAFT_TLS_DIR";
+/// The variable naming a fault test's file of Raft ids to cut off.
+pub const RAFT_CUT_FILE_VAR: &str = "SPRIGDB_ENGINE_RAFT_CUT_FILE";
+
+/// The Raft ids listed in a cut file's text.
+fn cut_ids(text: &str) -> std::collections::BTreeSet<u64> {
+    text.split(|c: char| c == ',' || c.is_whitespace())
+        .filter_map(|t| t.trim().parse().ok())
+        .collect()
+}
+
+/// For fault tests ([`RAFT_CUT_FILE_VAR`]): keeps `transport`'s cut links
+/// equal to the file's list.
+fn follow_cut_file(transport: Arc<sprig_raft::tcp::TcpTransport>) {
+    let Ok(path) = std::env::var(RAFT_CUT_FILE_VAR) else {
+        return;
+    };
+    let spawned = std::thread::Builder::new()
+        .name("sprig-raft-cut".into())
+        .spawn(move || {
+            loop {
+                let want = std::fs::read_to_string(&path)
+                    .map(|t| cut_ids(&t))
+                    .unwrap_or_default();
+                if want != transport.cut() {
+                    tracing::warn!(cut = ?want, "engine: fault test: raft links cut off");
+                    transport.set_cut(want);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        });
+    if let Err(e) = spawned {
+        tracing::warn!(error = %e, "engine: the raft cut file isn't followed");
+    }
+}
+
+/// The Raft transport's mutual TLS for node `id` from
+/// [`RAFT_TLS_DIR_VAR`]; `None` when it isn't set.
+fn raft_tls(id: u64) -> Result<Option<sprig_raft::tcp::TlsConfig>> {
+    let Some(dir) = std::env::var(RAFT_TLS_DIR_VAR)
+        .ok()
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty())
+    else {
+        return Ok(None);
+    };
+    let dir = PathBuf::from(dir);
+    let read = |name: &str| {
+        std::fs::read(dir.join(name)).map_err(|e| {
+            SprigError::internal(format!(
+                "{RAFT_TLS_DIR_VAR}: {}: {e}",
+                dir.join(name).display()
+            ))
+        })
+    };
+    sprig_raft::tcp::TlsConfig::node_identity(
+        id,
+        &read("ca.pem")?,
+        &read("node.pem")?,
+        &read("node-key.pem")?,
+    )
+    .map(Some)
+    .map_err(|e| SprigError::internal(format!("{RAFT_TLS_DIR_VAR}: {e}")))
+}
+
+/// Whether units are placed per tenant on a replicated node
+/// ([`PLACEMENT_VAR`]).
+#[must_use]
+pub fn placement_from_env() -> bool {
+    placement_from(|k| std::env::var(k).ok())
+}
+
+fn placement_from(lookup: impl Fn(&str) -> Option<String>) -> bool {
+    matches!(raft_from(&lookup), Ok(Some(_)))
+        && lookup(PLACEMENT_VAR).is_some_and(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "on" | "true" | "1" | "yes"
+            )
+        })
+}
+
+/// This node's failure domain ([`FAILURE_DOMAIN_VAR`]), if set.
+#[must_use]
+pub fn failure_domain_from_env() -> Option<String> {
+    std::env::var(FAILURE_DOMAIN_VAR)
+        .ok()
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty())
+}
+
+/// The unit descriptors this node follows, when units are placed per
+/// tenant (made when the engine opens; filled by [`follow_units`]).
+static UNITS: OnceLock<Arc<sprig_catalog::units::UnitDirectory>> = OnceLock::new();
+
+/// The unit descriptors this node follows, when units are placed per
+/// tenant.
+#[must_use]
+pub fn unit_directory() -> Option<Arc<sprig_catalog::units::UnitDirectory>> {
+    UNITS.get().cloned()
+}
+
+/// On one replica of several: records this node in the DC tier's node
+/// registry (`nodes/<raft id>`, retried until it lands), and with units
+/// placed per tenant keeps this node's unit descriptors equal to the DC
+/// tier's until `stop`, dropping this node's replicas of a tenant's units
+/// once its descriptor is deleted (the tenant is gone; also, once at
+/// start, those of tenants deleted while this node was down). Does nothing
+/// on a one-node engine.
+pub fn start_placement(
+    dc: Arc<dyn sprig_meta::MetaStore>,
+    global: Arc<dyn sprig_meta::MetaStore>,
+    stop: sprig_common::CancellationToken,
+    gateway_id: String,
+    addr: String,
+) {
+    let Some(id) = raft_id_from_env() else {
+        return;
+    };
+    let rec = sprig_catalog::units::NodeRecord {
+        id,
+        gateway_id,
+        addr,
+        failure_domain: failure_domain_from_env().unwrap_or_default(),
+        placement: placement_from_env(),
+        state: "active".to_owned(),
+    };
+    let store = Arc::clone(&dc);
+    let until = stop.clone();
+    tokio::spawn(async move {
+        let mut backoff = std::time::Duration::from_millis(200);
+        while !until.is_cancelled() {
+            match sprig_catalog::units::register_node(store.as_ref(), &rec).await {
+                Ok(()) => return,
+                Err(e) => {
+                    tracing::warn!(error = %e, "node registry: this node's record wasn't written; retrying");
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(std::time::Duration::from_secs(5));
+                }
+            }
+        }
+    });
+    if let Some(dir) = unit_directory() {
+        let _ = DC_STORE.set(Arc::clone(&dc));
+        dir.on_removed(|unit| {
+            // Off the watch's task: dropping clears the units' keys.
+            tokio::task::spawn_blocking(move || drop_tenant_units(tenant_of_unit(unit)));
+        });
+        tokio::spawn(sweep_deleted(
+            Arc::clone(&dir),
+            Arc::clone(&dc),
+            global,
+            stop.clone(),
+        ));
+        tokio::spawn(dir.follow(dc, stop));
+    }
+}
+
+/// Drops this node's replicas of `tenant`'s units (its own and its
+/// partition groups), whose descriptor was deleted with the tenant: each
+/// group leaves this node with a tombstone, and the unit's keys here are
+/// cleared. Returns how many it dropped.
+fn drop_tenant_units(tenant: u64) -> usize {
+    let (Some(raft), Ok(engine)) = (RAFT.get(), engine()) else {
+        return 0;
+    };
+    if tenant == 0 {
+        return 0;
+    }
+    let node = raft.node.node();
+    let snaps = sprig_raft::EngineSnapshots::new(engine);
+    let mut n = 0;
+    for g in node.groups() {
+        if g >= sprig_engine::NODE_UNIT.0 || tenant_of_unit(g) != tenant {
+            continue;
+        }
+        match node.drop_group(g) {
+            Ok(true) => {
+                n += 1;
+                if let Err(e) =
+                    sprig_raft::UnitSnapshots::ingest(&snaps, sprig_engine::UnitId(g), 0, &[])
+                {
+                    tracing::warn!(unit = g, error = %e, "engine: a deleted tenant's unit keys weren't cleared");
+                }
+            }
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(unit = g, error = %e, "engine: a deleted tenant's unit replica wasn't dropped");
+            }
+        }
+    }
+    if n > 0 {
+        tracing::info!(
+            tenant,
+            units = n,
+            "engine: dropped this node's replicas of a deleted tenant's units"
+        );
+    }
+    n
+}
+
+/// Once the descriptors are listed: drops the units this node holds whose
+/// tenant has neither a descriptor nor a directory entry any more (deleted
+/// while this node was down, so no watch told it).
+async fn sweep_deleted(
+    dir: Arc<sprig_catalog::units::UnitDirectory>,
+    dc: Arc<dyn sprig_meta::MetaStore>,
+    global: Arc<dyn sprig_meta::MetaStore>,
+    stop: sprig_common::CancellationToken,
+) {
+    while !dir.is_ready() {
+        tokio::select! {
+            () = stop.cancelled() => return,
+            () = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
+        }
+    }
+    let Some(raft) = RAFT.get() else {
+        return;
+    };
+    let tenants: std::collections::BTreeSet<u64> = raft
+        .node
+        .node()
+        .groups()
+        .into_iter()
+        .filter(|g| *g < sprig_engine::NODE_UNIT.0)
+        .map(tenant_of_unit)
+        .filter(|t| *t != 0 && dir.get(*t).is_none())
+        .collect();
+    for t in tenants {
+        // Both read again, linearizably: a tenant being created has its
+        // directory entry before its descriptor, and its descriptor
+        // before any write to its unit.
+        if !matches!(sprig_catalog::units::read(dc.as_ref(), t).await, Ok(None)) {
+            continue;
+        }
+        let Ok(key) = global.tier().key(&format!("tenants/{t}")) else {
+            continue;
+        };
+        if matches!(
+            global
+                .get(&key, sprig_meta::Consistency::Linearizable)
+                .await,
+            Ok(None)
+        ) {
+            let _ = tokio::task::spawn_blocking(move || drop_tenant_units(t)).await;
+        }
+    }
+}
+
+/// The peer service's client identity (`[tls]`), for catalog
+/// transactions this node sends to another node's peer service.
+static PEER_PEMS: OnceLock<Option<sprig_catalog::records::remote::PeerPems>> = OnceLock::new();
+
+/// Records this process's peer identity (`None`: plaintext, development).
+/// Call once at start, before the first catalog write.
+pub fn set_peer_pems(p: Option<sprig_catalog::records::remote::PeerPems>) {
+    let _ = PEER_PEMS.set(p);
+}
+
+/// The peer identity [`set_peer_pems`] recorded.
+#[must_use]
+pub fn peer_pems() -> Option<sprig_catalog::records::remote::PeerPems> {
+    PEER_PEMS.get().cloned().flatten()
+}
+
+/// The DC tier, for reading a descriptor the watch hasn't delivered yet.
+static DC_STORE: OnceLock<Arc<dyn sprig_meta::MetaStore>> = OnceLock::new();
+
+/// Makes sure the directory knows `tenant`'s descriptor: when the watch
+/// hasn't delivered it yet (a tenant created a moment ago), reads it from
+/// the DC tier. Returns `Some(false)` only when that read found none.
+async fn know_unit(tenant: u64) -> Option<bool> {
+    let (Some(dir), Some(dc)) = (unit_directory(), DC_STORE.get()) else {
+        return None;
+    };
+    if dir.get(tenant).is_some() {
+        return Some(true);
+    }
+    match sprig_catalog::units::read(dc.as_ref(), tenant).await {
+        Ok(Some(d)) => {
+            dir.put(d);
+            Some(true)
+        }
+        Ok(None) => Some(false),
+        Err(e) => {
+            tracing::debug!(tenant, error = %e, "unit descriptor unreadable");
+            None
+        }
+    }
+}
+
+/// The tenant a unit belongs to: its own, or a partition group's tenant.
+fn tenant_of_unit(unit: u64) -> u64 {
+    sprig_streams::seg::group_of_unit(unit).map_or(unit, |(t, _)| t)
+}
+
+/// Where a unit starts, from the descriptors: its tenant's voters; tenant
+/// 0's (data no tenant owns) on every node; anything else not known yet.
+/// A unit not known yet has its descriptor read from the DC tier on
+/// `rt` (once per tenant every 2 s at most): a new tenant's home node
+/// campaigns as soon as the descriptor is written, which can be before
+/// this node's watch delivers it, and its next try then finds this node
+/// ready to vote.
+fn placement_of(
+    dir: &sprig_catalog::units::UnitDirectory,
+    unit: u64,
+    rt: &tokio::runtime::Handle,
+) -> sprig_raft::UnitPlacement {
+    let tenant = tenant_of_unit(unit);
+    match dir.get(tenant) {
+        Some(d) => sprig_raft::UnitPlacement::Voters(d.voters),
+        None if tenant == 0 => sprig_raft::UnitPlacement::Static,
+        None => {
+            if unit < sprig_engine::NODE_UNIT.0 && fetch_due(tenant) {
+                rt.spawn(async move {
+                    know_unit(tenant).await;
+                });
+            }
+            sprig_raft::UnitPlacement::Unknown
+        }
+    }
+}
+
+/// Whether to read `tenant`'s descriptor now: not within 2 s of the last
+/// read started for it.
+fn fetch_due(tenant: u64) -> bool {
+    static LAST: OnceLock<std::sync::Mutex<std::collections::HashMap<u64, std::time::Instant>>> =
+        OnceLock::new();
+    let mut last = LAST
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let now = std::time::Instant::now();
+    if last
+        .get(&tenant)
+        .is_some_and(|t| now.duration_since(*t) < std::time::Duration::from_secs(2))
+    {
+        return false;
+    }
+    if last.len() > 10_000 {
+        last.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(2));
+    }
+    last.insert(tenant, now);
+    true
+}
+
+/// Syncs of the Raft log that may run at once (`SPRIGDB_ENGINE_RAFT_SYNC_PIPELINE`).
+pub const RAFT_SYNC_PIPELINE_VAR: &str = "SPRIGDB_ENGINE_RAFT_SYNC_PIPELINE";
+/// Benchmarks only: simulated log syncs, in microseconds.
+pub const SIM_SYNC_US_VAR: &str = "SPRIGDB_ENGINE_SIM_SYNC_US";
+/// Benchmarks only: simulated syncs one at a time.
+pub const SIM_SYNC_SERIAL_VAR: &str = "SPRIGDB_ENGINE_SIM_SYNC_SERIAL";
+
+/// Syncs of the Raft log that may run at once by default. On macOS a sync
+/// is a full flush of the whole drive (`F_FULLFSYNC`), so overlapping them
+/// gains nothing there (measured 10% slower); everywhere else, and with
+/// simulated syncs, [`sprig_raft::logstore::SYNC_PIPELINE`].
+fn default_sync_pipeline() -> usize {
+    if cfg!(target_os = "macos") && !sprig_engine::log::syncs_simulated() {
+        0
+    } else {
+        sprig_raft::logstore::SYNC_PIPELINE
+    }
+}
+
+/// Turns on simulated syncs when [`SIM_SYNC_US_VAR`] is set (benchmarks).
+fn simulate_syncs_from_env() {
+    let Some(us) = std::env::var(SIM_SYNC_US_VAR)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    else {
+        return;
+    };
+    let serial =
+        std::env::var(SIM_SYNC_SERIAL_VAR).is_ok_and(|v| v.trim().eq_ignore_ascii_case("true"));
+    if sprig_engine::log::simulate_syncs(sprig_engine::log::SimSyncs {
+        delay: std::time::Duration::from_micros(us),
+        serial,
+    }) {
+        tracing::warn!(
+            us,
+            serial,
+            "engine log syncs are SIMULATED: nothing is durable (benchmarks only)"
+        );
+    }
+}
 
 /// Whether uncompressed stream batches go into the log LZ4-compressed
 /// ([`STREAM_COMPRESS_VAR`], default on).
@@ -156,9 +582,20 @@ pub fn unit_leader(unit: u64) -> UnitLeader {
             UnitLeader::Any
         };
     };
+    let me = raft.node.node().id();
     match raft.node.node().status(unit) {
+        // Placed per tenant: a unit this node holds no replica of yet is
+        // led where its descriptor says, or by no one known.
+        None if raft.placed => match preferred(&raft.voters, unit) {
+            Some(p) if p == me => UnitLeader::Here,
+            Some(p) => UnitLeader::Node(p),
+            None => match raft.node.node().start_voters(unit) {
+                Some(_) => UnitLeader::Any,
+                None => UnitLeader::Unknown,
+            },
+        },
         None => match preferred_leader(&raft.voters, unit) {
-            Some(p) if p == raft.node.node().id() => UnitLeader::Here,
+            Some(p) if p == me => UnitLeader::Here,
             Some(p) => UnitLeader::Node(p),
             None => UnitLeader::Any,
         },
@@ -177,6 +614,23 @@ fn preferred_leader(voters: &[u64], unit: u64) -> Option<u64> {
     let n = u64::try_from(voters.len()).ok().filter(|n| *n > 0)?;
     let at = (tenant % n + u64::from(g)) % n;
     voters.get(usize::try_from(at).ok()?).copied()
+}
+
+/// The replica that should lead `unit` on this node's cluster: with units
+/// placed per tenant, a tenant's unit is led by its descriptor's home and
+/// its partition groups spread over the tenant's own voters; otherwise as
+/// [`preferred_leader`] over every member.
+fn preferred(all: &[u64], unit: u64) -> Option<u64> {
+    if let Some(dir) = unit_directory() {
+        let d = dir.get(tenant_of_unit(unit))?;
+        if sprig_streams::seg::group_of_unit(unit).is_some() {
+            let mut voters = d.voters;
+            voters.sort_unstable();
+            return preferred_leader(&voters, unit);
+        }
+        return Some(d.home);
+    }
+    preferred_leader(all, unit)
 }
 
 /// The partition groups per tenant for this node's stream log: 0 on one
@@ -321,6 +775,7 @@ pub fn engine() -> Result<Engine> {
     ENGINE
         .get_or_init(|| {
             let mut cfg = config_from_env().map_err(|e| e.message.clone())?;
+            simulate_syncs_from_env();
             let raft = raft_from(|k| std::env::var(k).ok()).map_err(|e| e.message.clone())?;
             let dir = cfg.data_dir.display().to_string();
             if raft.is_some() {
@@ -365,13 +820,21 @@ fn start_raft(engine: &Engine, r: &RaftSetup, dir: PathBuf) -> Result<()> {
             .build()
             .map_err(|e| raft_err(e.to_string()))?,
     ));
-    let transport = sprig_raft::tcp::TcpTransport::new(r.id, rt.handle().clone(), None);
+    let tls = raft_tls(r.id)?;
+    let mtls = tls.is_some();
+    let transport = sprig_raft::tcp::TcpTransport::new(r.id, rt.handle().clone(), tls);
     for (pid, addr) in &r.peers {
         transport.set_peer(*pid, *addr);
     }
     let notes_dir = dir.with_file_name("raft-notes");
     let store = sprig_raft::EngineLogStore::open(dir, SyncMode::Full, None)
         .map_err(|e| raft_err(e.to_string()))?;
+    store.set_sync_pipeline(
+        std::env::var(RAFT_SYNC_PIPELINE_VAR)
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or_else(default_sync_pipeline),
+    );
     // Before the node opens: its recovery reads the log, whose references
     // to note blobs must be put back. Opened even with writing once off, to
     // read the blobs an earlier run wrote.
@@ -386,11 +849,22 @@ fn start_raft(engine: &Engine, r: &RaftSetup, dir: PathBuf) -> Result<()> {
     .map_err(|e| raft_err(format!("note blobs in {}: {e}", notes_dir.display())))?;
     store.set_note_blobs(Arc::clone(&blobs));
     let _ = NOTE_BLOBS.set(blobs);
+    let placed = placement_from_env();
+    let placement = if placed {
+        let dir = Arc::clone(UNITS.get_or_init(sprig_catalog::units::UnitDirectory::new));
+        let fetch_rt = rt.handle().clone();
+        Some(sprig_raft::PlacementLookup::new(move |g| {
+            placement_of(&dir, g, &fetch_rt)
+        }))
+    } else {
+        None
+    };
     let node = sprig_raft::EngineNode::open(
         engine,
         sprig_raft::EngineNodeOptions {
             id: r.id,
             config: sprig_raft::RaftConfig {
+                placement,
                 // A replacement starts no unit itself: each comes from its
                 // leader when the operator replaces the lost replica.
                 static_voters: if r.join {
@@ -425,16 +899,18 @@ fn start_raft(engine: &Engine, r: &RaftSetup, dir: PathBuf) -> Result<()> {
     voters.sort_unstable();
     let prefer = voters.clone();
     node.prefer_leaders(
-        Arc::new(move |u: sprig_engine::UnitId| preferred_leader(&prefer, u.0)),
+        Arc::new(move |u: sprig_engine::UnitId| preferred(&prefer, u.0)),
         std::time::Duration::from_millis(500),
         std::time::Duration::from_secs(10),
     )
     .map_err(|e| raft_err(e.to_string()))?;
-    tracing::info!(id = r.id, raft = %bound, voters = r.peers.len(), join = r.join, stream_groups = groups_from(|k| std::env::var(k).ok()), stream_write_once = write_once, "engine units replicate through raft");
+    tracing::info!(id = r.id, raft = %bound, voters = r.peers.len(), join = r.join, placed, mtls, stream_groups = groups_from(|k| std::env::var(k).ok()), stream_write_once = write_once, "engine units replicate through raft");
+    follow_cut_file(Arc::clone(&transport));
     let _ = RAFT.set(Raft {
         node,
         transport,
         voters,
+        placed,
     });
     Ok(())
 }
@@ -445,6 +921,114 @@ struct Raft {
     transport: Arc<sprig_raft::tcp::TcpTransport>,
     /// Every member's id, in order.
     voters: Vec<u64>,
+    /// Units are placed per tenant ([`PLACEMENT_VAR`]).
+    placed: bool,
+}
+
+/// For the catalog peer service: `Ok` when this node may run `tenant`'s
+/// catalog transactions, that is it leads the tenant's unit (or the engine
+/// doesn't replicate). A member that holds no replica yet starts it and
+/// stands for election; an election in progress is waited out for up to
+/// 3 s. Otherwise 39110 naming the leader when known (`leader node <id>`),
+/// so the caller goes there.
+///
+/// # Errors
+/// 39110 (retryable) when another node leads the unit or none is known;
+/// 39072 when units are placed per tenant and the tenant has no unit
+/// descriptor (not placed yet, or deleted).
+pub async fn lead_catalog(tenant: u64) -> Result<()> {
+    let Some(raft) = RAFT.get() else {
+        return Ok(());
+    };
+    let unit = sprig_engine::Engine::unit_of_tenant(tenant);
+    // A tenant with no descriptor in the DC tier has no unit anywhere yet,
+    // so no records: said at once (39072), not after waiting for a leader
+    // nobody can elect.
+    if raft.placed
+        && tenant != 0
+        && unit != sprig_engine::NODE_UNIT
+        && know_unit(tenant).await == Some(false)
+    {
+        return Err(SprigError::new(
+            sprig_common::SprigCode::TenantNotReady,
+            format!("tenant {tenant}'s unit isn't placed on any node yet"),
+        ));
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let engine = engine()?;
+    let node = raft.node.node();
+    let mut started = false;
+    let mut asked = std::time::Instant::now();
+    loop {
+        if engine.leader_epoch(unit) > 0 {
+            return Ok(());
+        }
+        let leader = if let Some(st) = node.status(unit.0) {
+            // A first election whose pre-votes found no voter ready (their
+            // watch hadn't delivered the new unit's descriptor yet) is
+            // asked again soon, rather than after a whole election timeout,
+            // in which a member's own timer could win it first and the
+            // leadership then move back here.
+            if (started || preferred(&raft.voters, unit.0) == Some(node.id()))
+                && st.leader.is_none()
+                && st.term == sprig_raft::INIT_TERM
+                && asked.elapsed() >= std::time::Duration::from_millis(150)
+            {
+                asked = std::time::Instant::now();
+                let _ = node.campaign(unit.0);
+            }
+            st.leader.filter(|l| *l != node.id())
+        } else {
+            // A member starts the unit; a unit nobody started on a
+            // one-cluster membership starts here too. Only the unit's home
+            // (or, with no home, this node) campaigns at once: another
+            // member points the caller at the home, so a new unit's first
+            // election isn't won elsewhere and its leadership then moved
+            // (a transfer during the tenant's bootstrap). Its own election
+            // timer still elects a leader if the home is down.
+            if !started && let Some(voters) = node.start_voters(unit.0) {
+                started = true;
+                let home = if raft.placed {
+                    preferred(&raft.voters, unit.0).filter(|h| *h != node.id())
+                } else {
+                    None
+                };
+                if let Some(h) = home {
+                    if let Err(e) = node.create_group(unit.0, &voters) {
+                        tracing::debug!(tenant, error = %e, "catalog: could not start the tenant's unit");
+                    }
+                    return Err(SprigError::new(
+                        sprig_common::SprigCode::ShardMoved,
+                        format!(
+                            "tenant {tenant}'s unit is new; its home, leader node {h}, leads it first; retry there"
+                        ),
+                    ));
+                }
+                if let Err(e) = raft.node.start_unit(unit, &voters) {
+                    tracing::debug!(tenant, error = %e, "catalog: could not start the tenant's unit");
+                }
+                continue;
+            }
+            if raft.placed {
+                preferred(&raft.voters, unit.0).filter(|p| *p != node.id())
+            } else {
+                None
+            }
+        };
+        if let Some(l) = leader {
+            return Err(SprigError::new(
+                sprig_common::SprigCode::ShardMoved,
+                format!("tenant {tenant}'s unit is led by leader node {l}; retry there"),
+            ));
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(SprigError::new(
+                sprig_common::SprigCode::ShardMoved,
+                format!("tenant {tenant}'s unit has no leader yet; retry"),
+            ));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
 }
 
 static RAFT: OnceLock<Raft> = OnceLock::new();
@@ -456,6 +1040,45 @@ static NOTE_BLOBS: OnceLock<Arc<sprig_engine::log::blobs::NoteBlobs>> = OnceLock
 #[must_use]
 pub fn note_blobs() -> Option<Arc<sprig_engine::log::blobs::NoteBlobs>> {
     NOTE_BLOBS.get().cloned()
+}
+
+/// The node-local Admin API route that lists the engine units this node
+/// holds ([`units_report`]).
+pub const UNITS_PATH: &str = "/admin/v1/engine/units";
+
+/// The units this node holds a replica of, with their membership and
+/// leader as this node knows them: `{"node": id, "placed": bool,
+/// "units": [{"unit", "home", "voters", "learners", "leader", "leading", "term",
+/// "committed", "applied"}]}`. On a one-node engine, `{"node": null}`.
+#[must_use]
+pub fn units_report() -> serde_json::Value {
+    let Some(raft) = RAFT.get() else {
+        return serde_json::json!({"node": null, "placed": false, "units": []});
+    };
+    let node = raft.node.node();
+    let mut groups = node.groups();
+    groups.sort_unstable();
+    let units: Vec<serde_json::Value> = groups
+        .into_iter()
+        .filter_map(|g| node.status(g))
+        .map(|st| {
+            let home = unit_directory()
+                .and_then(|d| d.get(tenant_of_unit(st.group)))
+                .map(|d| d.home);
+            serde_json::json!({
+                "unit": st.group,
+                "home": home,
+                "voters": st.voters,
+                "learners": st.learners,
+                "leader": st.leader,
+                "leading": st.is_leader,
+                "term": st.term,
+                "committed": st.committed,
+                "applied": st.applied,
+            })
+        })
+        .collect();
+    serde_json::json!({"node": node.id(), "placed": raft.placed, "units": units})
 }
 
 /// What [`replace_replica`] did.
@@ -542,11 +1165,13 @@ pub fn replace_replica(
 }
 
 /// On one replica of several: drops a tenant's cached catalog whenever its
-/// unit applies entries while this node doesn't lead it. A follower's
-/// catalog records change through replication, not through its own
-/// commits, so its cache would otherwise keep what it first loaded (a
-/// tenant without the users added later, say) and serve that after it
-/// takes the unit's leadership. Does nothing on a one-node engine.
+/// unit applies an entry that writes the tenant's catalog records while
+/// this node doesn't lead it. A follower's catalog records change through
+/// replication, not through its own commits, so its cache would otherwise
+/// keep what it first loaded (a tenant without the users added later, say)
+/// and serve that after it takes the unit's leadership. Entries that write
+/// only data (rows, documents, stream appends) leave the cache alone. Does
+/// nothing on a one-node engine.
 ///
 /// # Errors
 /// The engine failed to open.
@@ -572,7 +1197,7 @@ struct FollowCatalogs {
 }
 
 impl sprig_engine::ApplyObserver for FollowCatalogs {
-    fn applied(&self, unit: sprig_engine::UnitId, _entries: &[sprig_engine::log::LogEntry]) {
+    fn applied(&self, unit: sprig_engine::UnitId, entries: &[sprig_engine::log::LogEntry]) {
         // Partition groups carry stream appends only, no catalog rows.
         if unit == sprig_engine::NODE_UNIT || sprig_streams::seg::group_of_unit(unit.0).is_some() {
             return;
@@ -580,10 +1205,20 @@ impl sprig_engine::ApplyObserver for FollowCatalogs {
         let Some(e) = self.engine.upgrade() else {
             return;
         };
-        if e.leader_epoch(unit) == 0 {
+        if e.leader_epoch(unit) == 0 && writes_catalog(unit.0, entries) {
             let _ = self.cache.evict(sprig_common::ids::TenantId(unit.0));
         }
     }
+}
+
+/// Whether any of `entries` writes `tenant`'s catalog records (an entry
+/// that doesn't decode counts as one that does).
+fn writes_catalog(tenant: u64, entries: &[sprig_engine::log::LogEntry]) -> bool {
+    let prefix = crate::tenant::catalog_records::catalog_prefix(tenant);
+    entries
+        .iter()
+        .filter(|e| !e.data.is_empty())
+        .any(|e| sprig_engine::log::payload::writes_under(&e.data, &prefix).unwrap_or(true))
 }
 
 #[cfg(test)]
@@ -670,6 +1305,51 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn a_cut_file_lists_raft_ids() {
+        assert_eq!(cut_ids("2, 3\n"), [2, 3].into());
+        assert_eq!(cut_ids("4 5,x"), [4, 5].into());
+        assert!(cut_ids("").is_empty());
+    }
+
+    #[test]
+    fn only_catalog_writes_drop_a_followers_cached_catalog() {
+        use sprig_engine::Cf;
+        use sprig_engine::log::{LogEntry, Payload};
+        let tenant = 28_306_000_001;
+        let entry = |key: Vec<u8>| {
+            let mut p = Payload::new();
+            p.put(
+                Cf::Data,
+                &sprig_engine::keys::versioned(&key, sprig_engine::Ts(9)),
+                b"v",
+            );
+            LogEntry::new(6, 7, p.into_bytes())
+        };
+        let mut cat = crate::tenant::catalog_records::catalog_prefix(tenant);
+        cat.extend_from_slice(b"users/1");
+        let mut row = sprig_engine::keys::KeyPrefix {
+            tenant,
+            shard: 0,
+            object: 5,
+            kind: sprig_engine::keys::kind::PRIMARY,
+            index: 0,
+        }
+        .to_vec();
+        row.push(1);
+        let other = crate::tenant::catalog_records::catalog_prefix(tenant + 1);
+        assert!(writes_catalog(
+            tenant,
+            &[entry(row.clone()), entry(cat.clone())]
+        ));
+        assert!(!writes_catalog(tenant, &[entry(row)]));
+        assert!(!writes_catalog(tenant, &[entry(other)]));
+        // An empty entry (a new leader's) writes nothing; a malformed one
+        // counts as a catalog write.
+        assert!(!writes_catalog(tenant, &[LogEntry::new(6, 8, Vec::new())]));
+        assert!(writes_catalog(tenant, &[LogEntry::new(6, 9, vec![1, 9])]));
     }
 
     #[test]

@@ -703,6 +703,201 @@ async fn live_writes_follow_the_tenants_leader() {
     );
 }
 
+/// An idempotent producer's batches as a Kafka client sends them, with
+/// producer id, epoch and the first record's sequence.
+fn idem_batch(pid: i64, epoch: i16, seq: i32, n: usize) -> Vec<u8> {
+    RecordBatch {
+        last_offset_delta: n as i32 - 1,
+        producer_id: pid,
+        producer_epoch: epoch,
+        base_sequence: seq,
+        records: (0..n)
+            .map(|i| Record {
+                offset_delta: i as i32,
+                value: Some(format!("i-{}", seq as usize + i).into_bytes()),
+                ..Record::default()
+            })
+            .collect(),
+        ..RecordBatch::default()
+    }
+    .to_bytes()
+    .unwrap()
+}
+
+/// One produce at broker `node`: the error code and base offset.
+async fn produce_at(v: &mut View, node: i32, topic: &str, partition: i32, b: &[u8]) -> (i16, i64) {
+    let r: ProduceResponse = v
+        .conn(node)
+        .await
+        .unwrap()
+        .call(9, &produce_req(topic, partition, b.to_vec()))
+        .await
+        .unwrap();
+    let p = &r.responses[0].partition_responses[0];
+    (p.error_code, p.base_offset)
+}
+
+/// An idempotent producer across a leader move. A Kafka client that learns
+/// of a new leader while its first batch is still on its way to the old
+/// one sends the next batch to the new leader first: that batch must wait
+/// (out of order, which clients retry), or the first batch's retry is out
+/// of order for good and the partition stalls until the client gives up
+/// (OCI, 26 Nov: 120 s). A retry of a batch older than the five the
+/// partition remembers is a duplicate. With `SPRIG_KAFKA_FAILOVER` the
+/// partition's leader is then killed: the producer's state survives, so the
+/// last batch's retry gets its first offsets and the next batch follows.
+#[tokio::test]
+#[ignore = "needs three gateways whose engines replicate, with the kafka listener"]
+async fn live_idempotent_producer_across_a_leader_move() {
+    let db = env("SPRIG_KAFKA_DB").unwrap();
+    let topic = format!("{db}.idem_{}", std::process::id());
+    let mut v = View::default();
+    v.refresh(None).await;
+    let create = CreateTopicsRequest {
+        topics: vec![create_topics_request::CreatableTopic {
+            name: topic.clone(),
+            num_partitions: 3,
+            replication_factor: -1,
+            ..Default::default()
+        }],
+        timeout_ms: 30_000,
+        ..Default::default()
+    };
+    let until = Instant::now() + Duration::from_secs(30);
+    loop {
+        let controller = v.controller;
+        let r: CreateTopicsResponse = v
+            .conn(controller)
+            .await
+            .unwrap()
+            .call(7, &create)
+            .await
+            .unwrap();
+        if r.topics[0].error_code == 0 {
+            break;
+        }
+        assert!(Instant::now() < until, "{:?}", r.topics[0]);
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        v.refresh(None).await;
+    }
+    v.refresh(Some(&topic)).await;
+    // Every partition written once, so the groups' leaders have settled.
+    for p in 0..3 {
+        let _ = produce(
+            &mut v,
+            &topic,
+            p,
+            &batch("w", 0, 1),
+            Duration::from_secs(30),
+        )
+        .await;
+    }
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    v.refresh(Some(&topic)).await;
+    let part = 1;
+    let leader = v.leaders[&part];
+    let other = *v.brokers.keys().find(|b| **b != leader).unwrap();
+    let ip: InitProducerIdResponse = v
+        .conn(leader)
+        .await
+        .unwrap()
+        .call(
+            4,
+            &InitProducerIdRequest {
+                transactional_id: None,
+                transaction_timeout_ms: -1,
+                producer_id: -1,
+                producer_epoch: -1,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(ip.error_code, 0);
+    let (pid, ep) = (ip.producer_id, ip.producer_epoch);
+    println!("producer {pid} epoch {ep}; partition {part} led by {leader}, first batch to {other}");
+
+    // The first batch reaches a former leader, the second the new one.
+    let first = idem_batch(pid, ep, 0, 5);
+    let second = idem_batch(pid, ep, 5, 5);
+    let (code, _) = produce_at(&mut v, other, &topic, part, &first).await;
+    assert_eq!(code, err::NOT_LEADER_OR_FOLLOWER);
+    let (overtook, _) = produce_at(&mut v, leader, &topic, part, &second).await;
+    println!("the second batch first: error {overtook}");
+    // The client retries in order: both go in. (Had the second batch been
+    // taken, the first one's retry would get OUT_OF_ORDER here for good.)
+    let (b1, seen1) = produce(&mut v, &topic, part, &first, Duration::from_secs(10)).await;
+    let (b2, seen2) = produce(&mut v, &topic, part, &second, Duration::from_secs(10)).await;
+    println!("retries: first at {b1} {seen1:?}, second at {b2} {seen2:?}");
+    assert_eq!(
+        overtook,
+        err::OUT_OF_ORDER_SEQUENCE_NUMBER,
+        "the second batch must wait for the first"
+    );
+    assert_eq!(
+        (b1 + 5, seen1.is_empty(), seen2.is_empty()),
+        (b2, true, true)
+    );
+    // Five more batches; then the first one's retry is older than what is
+    // remembered: a duplicate (offsets unknown), not out of order.
+    let mut seq = 10;
+    let mut last = (0, Vec::new());
+    for _ in 0..5 {
+        let b = idem_batch(pid, ep, seq, 1);
+        let (off, seen) = produce(&mut v, &topic, part, &b, Duration::from_secs(10)).await;
+        assert!(seen.is_empty(), "{seen:?}");
+        last = (off, b);
+        seq += 1;
+    }
+    let (code, base) = produce_at(&mut v, leader, &topic, part, &first).await;
+    println!("a late retry of the first batch: error {code}, base {base}");
+    assert_eq!((code, base), (err::NONE, -1));
+
+    if let Some(cmd) = env("SPRIG_KAFKA_FAILOVER") {
+        let addr = v.brokers[&leader].clone();
+        println!("failover: running {cmd} {addr}");
+        let st = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("{cmd} {addr}"))
+            .status()
+            .unwrap();
+        assert!(st.success(), "{cmd}: {st}");
+        v.conns.clear();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        v.refresh(Some(&topic)).await;
+        // The producer's state moved with the partition's leader.
+        let (off, seen) = produce(&mut v, &topic, part, &last.1, Duration::from_secs(60)).await;
+        println!(
+            "after the failover: the last batch's retry at {off} (first at {}), errors on the way {seen:?}; leader {}",
+            last.0, v.leaders[&part]
+        );
+        assert_eq!(off, last.0, "a duplicate answers its first offset");
+        let (off, seen) = produce(
+            &mut v,
+            &topic,
+            part,
+            &idem_batch(pid, ep, seq, 1),
+            Duration::from_secs(30),
+        )
+        .await;
+        assert!(seen.is_empty(), "{seen:?}");
+        assert_eq!(off, last.0 + 1);
+        seq += 1;
+    }
+    let got: Vec<String> = fetch_all(&mut v, &topic, part)
+        .await
+        .into_iter()
+        .map(|(_, s)| s)
+        .filter(|s| s.starts_with("i-"))
+        .collect();
+    let want: Vec<String> = (0..seq).map(|i| format!("i-{i}")).collect();
+    assert_eq!(got, want, "every record once, in order");
+    println!(
+        "partition {part}: {} records, each once, in order",
+        got.len()
+    );
+}
+
 /// Kill loop: one writer produces to six partitions round-robin through
 /// Metadata (keeping a partition's leader when Metadata shows an older
 /// leader epoch, as Kafka's clients do) while the tenant's leading gateway

@@ -177,7 +177,7 @@ fn sql_type(ty: ColumnType, flavor: Flavor) -> Option<String> {
         .into(),
         ColumnType::Enum { members: n } => format!("ENUM({})", members(u32::from(n))),
         ColumnType::Set { members: n } => format!("SET({})", members(u32::from(n))),
-        ColumnType::Json => return None,
+        ColumnType::Json | ColumnType::Fbt(_) => return None,
     })
 }
 
@@ -482,7 +482,7 @@ fn parse_back(ty: ColumnType, s: &str) -> Option<Value> {
         }
         ColumnType::Enum { .. } => Value::Enum(s.parse().ok()?),
         ColumnType::Set { .. } => Value::Set(s.parse().ok()?),
-        ColumnType::Json => return None,
+        ColumnType::Json | ColumnType::Fbt(_) => return None,
     })
 }
 

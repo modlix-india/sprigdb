@@ -2510,6 +2510,18 @@ async fn find<T: DdlTx + ?Sized>(
         Some(o) if o.pending_job_id.is_some() || o.state != ObjectState::Active => {
             Ok(Found::Busy(format!("'{}.{}'", d.name, o.name)))
         }
+        // A MongoDB collection's object: changed through MongoDB's
+        // commands only (the document store holds the collection).
+        Some(o) if o.kind == ObjectKind::Collection && kind != ObjectKind::Collection => {
+            Err(std_err(
+                1347,
+                *b"HY000",
+                format!(
+                    "'{}.{}' is not of type 'BASE TABLE' (it is a MongoDB collection: change or drop it with MongoDB commands)",
+                    d.name, o.name
+                ),
+            ))
+        }
         // A view named in DROP TABLE, a table in ALTER VIEW: MariaDB's
         // own errors.
         Some(o) if o.kind == kind || kind.namespace() == Namespace::Relation => {

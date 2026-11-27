@@ -384,7 +384,9 @@ pub(crate) fn nullif(a: Node, b: Node, env: Env<'_>) -> Result<Node> {
     // integer 0, `NULLIF(1e16, bigint_col)` an integer.
     let was_int = a.ty.kind == Kind::Int;
     let (mut a, b) = super::cmp::fold_for_column(a, b, env);
-    let compared = a.clone();
+    // (MariaDB compares a JSON function's result by its unquoted text; the
+    // result is the value as it was.)
+    let (compared, b) = super::cmp::maria_json_pair(a.clone(), b, env);
     if !was_int && a.ty.kind == Kind::Int {
         a.ty.len = 22;
     }

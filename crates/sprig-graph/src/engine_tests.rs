@@ -288,3 +288,168 @@ async fn id_blocks_of_an_older_leader_epoch_are_dropped() {
     drop(engine);
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// The counters kept by commits equal what a fresh pass counts, after
+/// creates, label changes (self-loops too), deletes, a failed statement
+/// and a rolled-back transaction.
+#[tokio::test]
+async fn statistics_counters_follow_commits() {
+    for shards in [1, 3] {
+        let g = EngineGraph::open(path(), 7, 5, shards).unwrap();
+        // A new graph starts with exact, empty counters.
+        assert!(g.stats().is_some_and(|s| s.elements() == 0.0));
+        run(&g, "UNWIND range(1, 30) AS i CREATE (a:A {i: i}), (b:B {i: i}), (a)-[:R]->(b), (b)-[:S]->(a), (a)-[:L]->(a)")
+            .await
+            .unwrap();
+        run(&g, "MATCH (a:A) WHERE a.i % 3 = 0 SET a:C REMOVE a:A")
+            .await
+            .unwrap();
+        run(&g, "MATCH (b:B) WHERE b.i % 5 = 0 DETACH DELETE b")
+            .await
+            .unwrap();
+        run(&g, "MATCH (a)-[r:L]->(a) WHERE a.i % 7 = 0 DELETE r")
+            .await
+            .unwrap();
+        assert!(run(&g, "MATCH (a:A {i: 1}) DELETE a").await.is_err());
+        let mut tx = g.begin(true);
+        {
+            let mut s = g.store(&mut tx);
+            crate::execute(
+                &mut s,
+                "CREATE (:A), (:Z)-[:R]->(:Z)",
+                &Params::new(),
+                &Budgets::default(),
+            )
+            .await
+            .unwrap();
+        }
+        tx.rollback();
+        let kept = g.stats().unwrap();
+        let fresh = g.collect_stats().unwrap();
+        let clean = |m: &std::collections::HashMap<u32, f64>| {
+            let mut v: Vec<(u32, f64)> = m
+                .iter()
+                .filter(|(_, n)| **n > 0.0)
+                .map(|(a, b)| (*a, *b))
+                .collect();
+            v.sort_by_key(|x| x.0);
+            v
+        };
+        let clean3 = |m: &std::collections::HashMap<(u32, u32, u32), f64>| {
+            let mut v: Vec<((u32, u32, u32), f64)> = m
+                .iter()
+                .filter(|(_, n)| **n > 0.0)
+                .map(|(a, b)| (*a, *b))
+                .collect();
+            v.sort_by_key(|x| x.0);
+            v
+        };
+        assert_eq!(clean(&kept.sets), clean(&fresh.sets), "shards {shards}");
+        assert_eq!(
+            clean3(&kept.triples),
+            clean3(&fresh.triples),
+            "shards {shards}"
+        );
+        let o = run(&g, "CALL sprig.graph.analyze()").await.unwrap();
+        assert_eq!(
+            show(&o),
+            [format!(
+                "{:?}|{:?}",
+                54.0_f64,
+                fresh.triples.values().sum::<f64>()
+            )]
+        );
+    }
+}
+
+/// Range conditions, prefixes and top-k orders read through an index give
+/// the rows a scan gives, over mixed types, nulls, ties and long strings.
+#[tokio::test]
+async fn range_indexes_answer_as_scans() {
+    let g = EngineGraph::open(path(), 7, 6, 1).unwrap();
+    run(&g, "CREATE INDEX FOR (n:P) ON (n.v)").await.unwrap();
+    let long = "x".repeat(1500);
+    run(
+        &g,
+        &format!(
+            "UNWIND range(1, 60) AS i CREATE (:P {{v: CASE i % 6 WHEN 0 THEN i WHEN 1 THEN toFloat(i) / 2 WHEN 2 THEN 'k' + toString(i) WHEN 3 THEN null WHEN 4 THEN i % 5 ELSE '{long}' + toString(i % 3) END, i: i}}), (:Q {{v: i}})"
+        ),
+    )
+    .await
+    .unwrap();
+    g.analyze().unwrap();
+    let queries = [
+        "MATCH (n:P) WHERE n.v > 10 RETURN n.i ORDER BY n.i",
+        "MATCH (n:P) WHERE n.v >= 2 AND n.v < 20.5 RETURN n.i ORDER BY n.i",
+        "MATCH (n:P) WHERE 5 > n.v RETURN n.i ORDER BY n.i",
+        "MATCH (n:P) WHERE n.v STARTS WITH 'k1' RETURN n.i ORDER BY n.i",
+        "MATCH (n:P) WHERE n.v STARTS WITH 'xxx' AND n.v < 'y' RETURN n.i ORDER BY n.i",
+        "MATCH (n:P) WHERE n.v > 'k3' RETURN n.i ORDER BY n.i",
+        "MATCH (n:P) WHERE n.v > 3 AND n.v < 'z' RETURN n.i ORDER BY n.i",
+        "MATCH (n:P) RETURN n.i, n.v ORDER BY n.v LIMIT 7",
+        "MATCH (n:P) RETURN n.i, n.v ORDER BY n.v, n.i LIMIT 50",
+        "MATCH (n:P) RETURN n.i ORDER BY n.v DESC LIMIT 5",
+        "MATCH (n:P) WHERE n.v > 0 RETURN n.i, n.v ORDER BY n.v DESC LIMIT 5",
+        "MATCH (n:P) WHERE n.v < 4 RETURN n.i, n.v ORDER BY n.v LIMIT 3",
+        "MATCH (n:P) WHERE n.v >= 'k' RETURN n.i ORDER BY n.v DESC, n.i SKIP 2 LIMIT 4",
+    ];
+    let mut mem = crate::mem::MemStore::new(1);
+    crate::execute(
+        &mut mem,
+        "CREATE INDEX FOR (n:P) ON (n.v)",
+        &Params::new(),
+        &Budgets::default(),
+    )
+    .await
+    .unwrap();
+    crate::execute(
+        &mut mem,
+        &format!(
+            "UNWIND range(1, 60) AS i CREATE (:P {{v: CASE i % 6 WHEN 0 THEN i WHEN 1 THEN toFloat(i) / 2 WHEN 2 THEN 'k' + toString(i) WHEN 3 THEN null WHEN 4 THEN i % 5 ELSE '{long}' + toString(i % 3) END, i: i}}), (:Q {{v: i}})"
+        ),
+        &Params::new(),
+        &Budgets::default(),
+    )
+    .await
+    .unwrap();
+    for q in queries {
+        let a = run(&g, q).await.unwrap();
+        let b = crate::execute(&mut mem, q, &Params::new(), &Budgets::default())
+            .await
+            .unwrap();
+        assert_eq!(show(&a), show(&b), "{q}");
+    }
+}
+
+/// Batched node reads give what one-by-one reads give: the transaction's
+/// own writes and deletes, committed nodes, missing ids, any order.
+#[tokio::test]
+async fn batched_node_reads_equal_single_reads() {
+    for shards in [1, 3] {
+        let g = EngineGraph::open(path(), 7, 8, shards).unwrap();
+        run(&g, "UNWIND range(1, 40) AS i CREATE (:A {i: i})")
+            .await
+            .unwrap();
+        let mut tx = g.begin(false);
+        let mut s = g.store(&mut tx);
+        crate::execute(
+            &mut s,
+            "MATCH (a:A) WHERE a.i % 4 = 0 SET a.j = 1 WITH 1 AS x MATCH (b:A) WHERE b.i % 7 = 0 DETACH DELETE b CREATE (:A {i: 99})",
+            &Params::new(),
+            &Budgets::default(),
+        )
+        .await
+        .unwrap();
+        let mut ids: Vec<u64> = (0..1200).rev().collect();
+        ids.extend([5, 5, 3]);
+        let many = s.node_values(&ids).unwrap();
+        for (id, v) in ids.iter().zip(&many) {
+            let (d, _) = g.home(*id);
+            let key = g.space.node(d, *id);
+            assert_eq!(&s.get(&key).unwrap(), v, "node {id}, shards {shards}");
+        }
+        assert!(many.iter().filter(|v| v.is_some()).count() > 30);
+        drop(s);
+        tx.rollback();
+    }
+}

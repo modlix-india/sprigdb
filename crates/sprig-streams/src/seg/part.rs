@@ -111,6 +111,12 @@ pub struct PartState {
     pub cleaned_to: i64,
 }
 
+/// Whether sequence `a` is `b` or comes before it, within half the
+/// sequence space (sequences wrap from `i32::MAX` to 0).
+fn seq_at_or_before(a: i32, b: i32) -> bool {
+    (i64::from(b) - i64::from(a)).rem_euclid(1 << 31) < 1 << 30
+}
+
 impl PartState {
     /// An empty partition in `dir`.
     #[must_use]
@@ -142,9 +148,24 @@ impl PartState {
             return Ok(None);
         }
         let Some(p) = self.producers.get(&h.producer_id) else {
-            // An unknown producer (or one whose state expired) may start
-            // anywhere.
-            return Ok(None);
+            // A producer the partition holds nothing of starts at sequence
+            // 0: a new producer, or a new epoch once its state expired. A
+            // later batch first means an earlier one is still on its way
+            // (sent to a former leader while this one came here); taken
+            // now, the earlier batch's retry would be out of order for
+            // good. Refused as out of order, which clients retry after the
+            // earlier batch (or start a new epoch at 0).
+            return if h.base_sequence == 0 {
+                Ok(None)
+            } else {
+                Err(Outcome::Refused {
+                    code: OUT_OF_ORDER_SEQUENCE,
+                    message: format!(
+                        "producer {} sent sequence {} first, expected 0",
+                        h.producer_id, h.base_sequence
+                    ),
+                })
+            };
         };
         if h.producer_epoch < p.epoch {
             return Err(Outcome::Refused {
@@ -185,6 +206,20 @@ impl PartState {
             }));
         }
         match p.batches.back() {
+            // A retry of a batch older than the ones remembered (the
+            // producer had more in flight than that across a leader move):
+            // a producer's batches are taken from 0 on with no gap, so
+            // every sequence up to the last one taken is here. A duplicate
+            // whose offsets are no longer known, as one retention removed.
+            Some(b)
+                if seq_at_or_before(h.base_sequence, last)
+                    && seq_at_or_before(last, b.last_seq) =>
+            {
+                Ok(Some(Outcome::Duplicate {
+                    base: -1,
+                    log_start: self.log_start,
+                }))
+            }
             Some(b) if h.base_sequence != batch::wrap_seq(b.last_seq, 1) => Err(Outcome::Refused {
                 code: OUT_OF_ORDER_SEQUENCE,
                 message: format!(

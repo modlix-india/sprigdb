@@ -2061,6 +2061,7 @@ mod ddl;
 mod fk;
 mod hidden;
 mod online;
+mod stats;
 mod types;
 
 #[tokio::test]

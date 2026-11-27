@@ -39,6 +39,7 @@ pub mod graph_table;
 pub mod mapped;
 pub mod mem;
 pub mod neo4j;
+pub mod ordkey;
 pub mod parser;
 pub mod pgq;
 pub mod schema;

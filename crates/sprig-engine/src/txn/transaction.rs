@@ -748,6 +748,50 @@ impl Txn {
         Ok(mvcc::read_at(self.store(), key, rts)?.and_then(|v| v.value))
     }
 
+    /// [`Txn::get_snapshot`] for several keys, in the order given: this
+    /// transaction's own writes and versions still being applied first,
+    /// the rest read from the store in key order through one cursor.
+    ///
+    /// # Errors
+    /// The transaction is not active, or the store failed.
+    pub fn get_snapshot_many(&mut self, keys: &[&[u8]]) -> Result<Vec<Option<Bytes>>> {
+        self.ensure_active()?;
+        let mut out: Vec<Option<Bytes>> = vec![None; keys.len()];
+        let mut rest: Vec<usize> = Vec::with_capacity(keys.len());
+        for (i, key) in keys.iter().enumerate() {
+            if let Some(v) = self.writes.get(key) {
+                out[i].clone_from(v);
+            } else {
+                self.follow(key)?;
+                rest.push(i);
+            }
+        }
+        if rest.is_empty() {
+            return Ok(out);
+        }
+        let rts = self.read_ts();
+        if !self.shared().overlay.is_empty() {
+            self.shared().prune(&*self.path);
+            let mut still = Vec::with_capacity(rest.len());
+            for i in rest {
+                if let Some(p) = self.shared().overlay.read_at(keys[i], rts) {
+                    self.note_pending(&p.ticket);
+                    out[i] = p.value;
+                } else {
+                    still.push(i);
+                }
+            }
+            rest = still;
+        }
+        rest.sort_by(|a, b| keys[*a].cmp(keys[*b]));
+        let sorted: Vec<&[u8]> = rest.iter().map(|&i| keys[i]).collect();
+        let got = mvcc::read_many_at(self.store(), &sorted, rts)?;
+        for (i, v) in rest.into_iter().zip(got) {
+            out[i] = v.and_then(|v| v.value);
+        }
+        Ok(out)
+    }
+
     /// The newest version of `key`, pending or applied, with its timestamp.
     fn latest(&mut self, key: &[u8]) -> Result<Option<(Ts, Option<Bytes>)>> {
         self.follow(key)?;
@@ -846,26 +890,29 @@ impl Txn {
         }
         self.follow(&range.start)?;
         let mut pending = self.shared().overlay.range_at(range, at);
-        let mut own: Vec<(Bytes, Option<Bytes>)> = self
-            .writes
-            .range(range)
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
         if dir == Dir::Reverse {
             pending.reverse();
-            own.reverse();
         }
         let order = |a: &[u8], b: &[u8]| match dir {
             Dir::Forward => a.cmp(b),
             Dir::Reverse => b.cmp(a),
         };
         let mut pending = pending.into_iter().peekable();
-        let mut own = own.into_iter().peekable();
         let mut out = Vec::new();
         let mut live = 0;
         let mut exhausted = false;
         let mut dep = DurableTicket::Ready;
         {
+            // This transaction's own writes in the range, read as the merge
+            // reaches them: a batch takes `limit` rows, and copying every
+            // buffered write past them made a scan over a range the
+            // transaction already rewrote quadratic in the rows written.
+            let clone = |(k, v): (&Bytes, &Option<Bytes>)| (k.clone(), v.clone());
+            let own: Box<dyn Iterator<Item = (Bytes, Option<Bytes>)> + '_> = match dir {
+                Dir::Forward => Box::new(self.writes.range(range).map(clone)),
+                Dir::Reverse => Box::new(self.writes.range(range).rev().map(clone)),
+            };
+            let mut own = own.peekable();
             let mut store = VersionScan::new(self.path.store(), range, dir, at);
             let mut store_head = store.next_visible()?;
             while live < limit {

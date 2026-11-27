@@ -20,10 +20,14 @@
 //!   value, not its key, unless a part is `NULL`; a bound that reaches
 //!   into the primary-key parts of such an index is checked entry by
 //!   entry.
-//! - **Estimates.** The engine keeps no statistics yet: a table's row
-//!   count is counted up to a cap and remembered for a short while, a
-//!   range's by reading its first entries, an index's rows per value from
-//!   a sample.
+//! - **Estimates.** From the table's statistics when it has them
+//!   (`crate::engine::stats`): its row count, a range's rows by reading its
+//!   first entries and, past them, from the first part's histogram and
+//!   the index's distinct counts, an index's rows per value, and the share
+//!   of rows a condition on one column keeps. Without statistics a table's
+//!   row count is counted up to a cap and remembered for a short while, a
+//!   range's by its first entries, an index's rows per value from a
+//!   sample.
 //! - **Errors** of the store, and the statement time limit, are kept as
 //!   they are ([`TxStorage::finish`]); the executor sees a stand-in.
 
@@ -44,10 +48,12 @@ use sprig_plan::catalog::{KeyId, TableDef as PlanTable};
 use super::names::TableUse;
 use crate::engine::keys::{self, Space};
 use crate::engine::row::{self, Datum};
+use crate::engine::stats;
 use crate::engine::store::Tx;
 use crate::engine::table::{ColType, TableDef};
 
 mod coll;
+mod redis;
 
 /// Entries a scan reads per store call, at most (it starts smaller: many
 /// scans want one row).
@@ -81,6 +87,9 @@ pub(super) struct Bound {
     coll: Option<coll::CollBound>,
     /// A stream read as a table: its storage (`engine::streamtable`).
     stream: Option<Arc<dyn Storage>>,
+    /// A Redis database's table (`engine::redistable`), read in the
+    /// transaction.
+    redis: Option<crate::engine::redistable::RedisTable>,
 }
 
 impl Bound {
@@ -94,6 +103,7 @@ impl Bound {
             read: t.read.clone(),
             coll: t.coll.clone().map(coll::CollBound::new),
             stream: t.stream.as_ref().map(|s| Arc::clone(&s.storage)),
+            redis: t.stream.as_ref().and_then(|s| s.redis),
         }
     }
 
@@ -114,7 +124,7 @@ fn stream_locked() -> SqlError {
     SqlError::new(
         1235,
         "42000",
-        "This version of SprigDB doesn't yet support 'a locking read of a stream'",
+        "This version of SprigDB doesn't yet support 'a locking read of a stream or a queue'",
     )
 }
 
@@ -453,7 +463,29 @@ impl Inner {
         n
     }
 
+    /// The table's statistics, when it has them (none for storage that
+    /// holds no rows, a collection or a stream).
+    fn known(&self, b: &Bound) -> Option<stats::Known> {
+        if b.coll.is_some()
+            || b.stream.is_some()
+            || self
+                .tx
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_none()
+        {
+            return None;
+        }
+        let read = |k: &[u8]| self.with(|tx| tx.get(k)).ok().flatten().flatten();
+        let p = b.sp.rows();
+        let probe = |n: usize| self.count(&p, &keys::prefix_end(&p), n);
+        stats::known(b.sp.tenant, &b.def, b.sp.object, &read, &probe)
+    }
+
     fn table_rows(&self, b: &Bound) -> u64 {
+        if let Some(k) = self.known(b) {
+            return k.rows;
+        }
         let key = (b.sp.tenant, b.sp.object, b.sp.layout.row_gen);
         let now = Instant::now();
         if let Some((n, at)) = stats()
@@ -472,6 +504,7 @@ impl Inner {
         } else {
             n as u64
         };
+        stats::counted(b.sp.tenant, &b.def, n);
         stats()
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -497,11 +530,76 @@ fn integer_span(range: &KeyRange) -> Option<u64> {
     u64::try_from((c - a).abs() + 1).ok()
 }
 
+/// Rows of `range` of `key` from the table's statistics: the first part's
+/// share from its histogram; each further part both bounds fix narrows the
+/// first part's rows by the index's distinct counts; a further range part
+/// keeps a third. `None` when the statistics can't say.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)] // estimates
+fn range_rows(b: &Bound, k: &stats::Known, key: KeyId, range: &KeyRange) -> Option<u64> {
+    let (cols, name, desc): (Vec<usize>, &str, bool) = match key {
+        KeyId::Primary if !b.def.hidden => (
+            b.def.pk.clone(),
+            stats::PRIMARY,
+            b.def.pk_parts.first().is_some_and(|p| p.desc),
+        ),
+        KeyId::Index(ix) => {
+            let x = b.def.indexes.get(ix)?;
+            (
+                x.cols.clone(),
+                x.name.as_str(),
+                x.parts.first().is_some_and(|p| p.desc),
+            )
+        }
+        KeyId::Primary => return None,
+    };
+    let first = b.def.columns.get(*cols.first()?)?;
+    let vals = |x: &RangeBound<Vec<Datum>>| match x {
+        RangeBound::Included(v) | RangeBound::Excluded(v) => v.clone(),
+        RangeBound::Unbounded => Vec::new(),
+    };
+    let (lo, hi) = (vals(&range.start), vals(&range.end));
+    let common = lo.iter().zip(&hi).take_while(|(a, c)| a == c).count();
+    // The first part's own range, in ascending order.
+    let one = |x: &RangeBound<Vec<Datum>>, v: &[Datum]| match (x, v.first()) {
+        (_, None) => RangeBound::Unbounded,
+        (RangeBound::Excluded(_), Some(d)) if v.len() == 1 => RangeBound::Excluded(vec![d.clone()]),
+        (_, Some(d)) => RangeBound::Included(vec![d.clone()]),
+    };
+    let (start, end) = (one(&range.start, &lo), one(&range.end, &hi));
+    let first_range = if desc {
+        KeyRange {
+            start: end,
+            end: start,
+        }
+    } else {
+        KeyRange { start, end }
+    };
+    let mut share = k.stats.share(&first.name, &first.ty, &[first_range])?;
+    if common >= 2 {
+        let ix = k.stats.index(name)?;
+        let d1 = *ix.distinct.first()?;
+        let dk = *ix.distinct.get(common.min(ix.distinct.len()) - 1)?;
+        share *= (d1 / dk.max(1.0)).min(1.0);
+    }
+    if lo.len().max(hi.len()) > common.max(1) {
+        share /= 3.0;
+    }
+    Some((share * k.rows as f64).round() as u64)
+}
+
 impl Storage for TxStorage {
     fn table_rows(&self, table: &PlanTable) -> u64 {
         self.inner
             .bound(table)
             .map_or(0, |b| match (&b.coll, &b.stream) {
+                _ if b.redis.is_some() => b
+                    .redis
+                    .as_ref()
+                    .map_or(0, |r| redis::table_rows(&self.inner, r)),
                 (_, Some(s)) => s.table_rows(table),
                 (Some(c), _) => coll::table_rows(&self.inner, b, c),
                 _ => self.inner.table_rows(b),
@@ -512,6 +610,9 @@ impl Storage for TxStorage {
         let Ok(b) = self.inner.bound(table) else {
             return 0;
         };
+        if let Some(r) = &b.redis {
+            return redis::rows_in_range(&self.inner, r, key, range);
+        }
         if let Some(s) = &b.stream {
             return s.rows_in_range(table, key, range);
         }
@@ -525,9 +626,16 @@ impl Storage for TxStorage {
         if n < RANGE_PROBE {
             return n as u64;
         }
-        // More than the probe read: a tenth of the table, or what an
-        // integer key's bounds allow, whichever is less.
         let total = self.inner.table_rows(b);
+        // More than the probe read: from the statistics when the table has
+        // them.
+        if let Some(k) = self.inner.known(b)
+            && let Some(est) = range_rows(b, &k, key, range)
+        {
+            return est.clamp(RANGE_PROBE as u64, total.max(RANGE_PROBE as u64));
+        }
+        // Else a tenth of the table, or what an integer key's bounds allow,
+        // whichever is less.
         let mut est = (total / 10).max(RANGE_PROBE as u64);
         let one_part = match key {
             KeyId::Primary => b.def.pk.len() == 1,
@@ -541,6 +649,9 @@ impl Storage for TxStorage {
 
     fn rows_per_key(&self, table: &PlanTable, key: KeyId, parts: usize) -> Option<f64> {
         let b = self.inner.bound(table).ok()?;
+        if let Some(r) = &b.redis {
+            return redis::rows_per_key(r, key, parts);
+        }
         if let Some(s) = &b.stream {
             return s.rows_per_key(table, key, parts);
         }
@@ -558,6 +669,21 @@ impl Storage for TxStorage {
         };
         if parts == 0 || parts > cols.len() {
             return None;
+        }
+        if unique && parts == cols.len() {
+            return Some(1.0);
+        }
+        if let Some(k) = self.inner.known(b) {
+            let name = match key {
+                KeyId::Primary => stats::PRIMARY,
+                KeyId::Index(ix) => b.def.indexes[ix].name.as_str(),
+            };
+            if let Some(v) = k.stats.rows_per_key(name, parts) {
+                // Rows per value grow with the table since.
+                #[allow(clippy::cast_precision_loss)]
+                let grown = k.rows as f64 / (k.stats.rows.max(1)) as f64;
+                return Some((v * grown).max(1.0));
+            }
         }
         let stat_key = (
             b.sp.tenant,
@@ -617,6 +743,20 @@ impl Storage for TxStorage {
         Some(v)
     }
 
+    fn column_share(&self, table: &PlanTable, column: usize, ranges: &[KeyRange]) -> Option<f64> {
+        let b = self.inner.bound(table).ok()?;
+        let col = b.def.columns.get(column)?;
+        let k = self.inner.known(b)?;
+        k.stats.share(&col.name, &col.ty, ranges)
+    }
+
+    fn column_distinct(&self, table: &PlanTable, column: usize) -> Option<f64> {
+        let b = self.inner.bound(table).ok()?;
+        let col = b.def.columns.get(column)?;
+        let k = self.inner.known(b)?;
+        Some(k.stats.column(&col.name)?.distinct)
+    }
+
     fn get(
         &self,
         table: &PlanTable,
@@ -624,6 +764,9 @@ impl Storage for TxStorage {
         counters: &Counters,
     ) -> Result<Option<Row>, SqlError> {
         let b = self.inner.bound(table)?;
+        if let Some(r) = &b.redis {
+            return redis::get(&self.inner, b, r, key, counters);
+        }
         if let Some(s) = &b.stream {
             if b.lock.is_some() {
                 return Err(stream_locked());
@@ -647,7 +790,8 @@ impl Storage for TxStorage {
         let lock = b.lock;
         let got = self.inner.with(|tx| match lock {
             Some((mode, wait)) => Ok(tx
-                .lock_read_blocking(&Bytes::from(k.clone()), mode, wait)?
+                .lock_read_blocking(&Bytes::from(k.clone()), mode, wait)
+                .map_err(|e| crate::engine::exec::named_1020(e, &b.def.name))?
                 .flatten()),
             None => tx.get(&k),
         })?;
@@ -674,6 +818,9 @@ impl Storage for TxStorage {
     ) -> Result<Box<dyn RowCursor>, SqlError> {
         let at = self.inner.bound_at(table)?;
         let b = &self.inner.tables[at];
+        if let Some(r) = &b.redis {
+            return redis::scan(&self.inner, b, r, key, &ranges, reverse, &counters);
+        }
         if let Some(s) = &b.stream {
             if b.lock.is_some() {
                 return Err(stream_locked());
@@ -761,8 +908,11 @@ impl Cursor {
             let (lo, hi, rev) = (&r.lo, &r.hi, self.reverse);
             let lock = self.inner.tables[self.table].lock;
             let rows = self.key == KeyId::Primary;
+            let name = &self.inner.tables[self.table].def.name;
             let Some(batch) = self.inner.with(|tx| match lock {
-                Some((mode, how)) => tx.scan_lock_blocking(lo, hi, rev, want, mode, how, rows),
+                Some((mode, how)) => tx
+                    .scan_lock_blocking(lo, hi, rev, want, mode, how, rows)
+                    .map_err(|e| crate::engine::exec::named_1020(e, name)),
                 None => tx.scan(lo, hi, rev, want),
             })?
             else {
@@ -822,7 +972,8 @@ impl RowCursor for Cursor {
                         let lock = b.lock;
                         let got = inner.with(|tx| match lock {
                             Some((mode, wait)) => Ok(tx
-                                .lock_read_blocking(&Bytes::from(rk.clone()), mode, wait)?
+                                .lock_read_blocking(&Bytes::from(rk.clone()), mode, wait)
+                                .map_err(|e| crate::engine::exec::named_1020(e, &b.def.name))?
                                 .flatten()),
                             None => tx.get(&rk),
                         })?;

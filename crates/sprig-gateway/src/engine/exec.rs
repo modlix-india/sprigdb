@@ -88,6 +88,7 @@ pub(crate) enum KeyConst {
 
 /// The value of column `c` that `d` is equal to, as the comparison of the
 /// two sees them.
+#[allow(clippy::too_many_lines)] // one arm per column type
 pub(crate) fn key_const(d: &Datum, c: &Column, env: &Env) -> KeyConst {
     if d.is_null() {
         return KeyConst::NoRow;
@@ -196,6 +197,11 @@ pub(crate) fn key_const(d: &Datum, c: &Column, env: &Env) -> KeyConst {
                 }
             }
             // A string column with a number compares as numbers.
+            _ => KeyConst::Scan,
+        },
+        // A UUID or address: the compiler gave the constant as stored bytes.
+        ColType::Fbt(f) => match d {
+            Datum::Bytes(b) if b.len() == f.bytes() => KeyConst::Exact(d.clone()),
             _ => KeyConst::Scan,
         },
         ColType::Json => KeyConst::Scan,
@@ -555,6 +561,12 @@ fn check_constraints(plan: &Plan, row: &[Datum], a: &Args<'_>) -> Result<()> {
 
 /// 1020 as MariaDB 11.8 words it, naming the table the client wrote.
 fn name_table(e: SprigError, plan: &Plan) -> SprigError {
+    named_1020(e, &String::from_utf8_lossy(&plan.org_table))
+}
+
+/// 1020 (a snapshot conflict) as MariaDB 11.8 words it, naming `table`;
+/// any other error as it is.
+pub(crate) fn named_1020(e: SprigError, table: &str) -> SprigError {
     if matches!(
         e.kind,
         sprig_common::ErrorKind::Standard { errno: 1020, .. }
@@ -563,8 +575,7 @@ fn name_table(e: SprigError, plan: &Plan) -> SprigError {
             1020,
             *b"HY000",
             format!(
-                "Record has changed since last read in table '{}'; try restarting transaction",
-                String::from_utf8_lossy(&plan.org_table)
+                "Record has changed since last read in table '{table}'; try restarting transaction"
             ),
         );
     }
@@ -1500,6 +1511,13 @@ fn locate<'p>(sp: &Space, plan: &'p Plan, a: &Args<'_>) -> Result<(Found, Option
             crate::autoindex::usage::note_read(sp.tenant, def.object.0, &x.name);
             let v = expr::eval(val, &[], a)?;
             match key_const(&v, &def.columns[x.cols[0]], &a.env) {
+                // A value most rows hold: the table is read instead of the
+                // index (the filter holds the equality).
+                KeyConst::Exact(d)
+                    if super::stats::scan_cheaper(sp.tenant, sp.object, def, x.cols[0], &d) =>
+                {
+                    (whole(p), plan.filter.as_ref())
+                }
                 KeyConst::Exact(d) => {
                     let mut lo = sp.index(def, *ix);
                     if !keys::put_index_parts(&mut lo, sp, def, *ix, &[&d]) {

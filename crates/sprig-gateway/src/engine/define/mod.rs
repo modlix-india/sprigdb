@@ -279,6 +279,8 @@ pub(crate) fn tokens(sql: &str, mysql: bool) -> Result<Vec<Tok>, SprigError> {
 pub(crate) struct P<'a> {
     pub t: &'a [Tok],
     pub i: usize,
+    /// The MySQL port: MariaDB's own column types are syntax errors there.
+    pub mysql: bool,
 }
 
 impl P<'_> {
@@ -469,7 +471,11 @@ pub(crate) fn create(sql: &str, cx: &Ctx) -> Result<Created, SprigError> {
 }
 
 fn create_in(toks: &[Tok], cx: &Ctx) -> Result<Created, Fail> {
-    let mut p = P { t: toks, i: 0 };
+    let mut p = P {
+        t: toks,
+        i: 0,
+        mysql: cx.mysql,
+    };
     p.want("CREATE")?;
     if p.eat("OR") {
         p.want("REPLACE")?;
@@ -795,7 +801,12 @@ fn index_type(p: &mut P<'_>) -> Result<String, Fail> {
 pub(crate) fn column(p: &mut P<'_>, table_cs: &str) -> Result<RawCol, Fail> {
     let name = p.ident()?;
     let mut cs = CsSpec::default();
+    let at = p.i;
     let ty = types::read(p.t, &mut p.i, &name, &mut cs)?;
+    // MySQL's grammar has no `UUID`, `INET4` or `INET6`.
+    if p.mysql && matches!(ty.base.as_str(), "uuid" | "inet4" | "inet6") {
+        return Err(Fail::Syntax(at));
+    }
     let mut c = RawCol {
         col: Col {
             name,

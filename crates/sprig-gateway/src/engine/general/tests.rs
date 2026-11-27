@@ -86,6 +86,10 @@ impl Fake {
                 "items",
                 "CREATE TABLE `items` (\n  `order_id` bigint(20) NOT NULL,\n  `line` int(11) NOT NULL,\n  `sku` varchar(20) NOT NULL,\n  `qty` int(11) DEFAULT NULL,\n  `price` decimal(8,2) DEFAULT NULL,\n  PRIMARY KEY (`order_id`,`line`),\n  KEY `sku` (`sku`(3)),\n  KEY `qty` (`qty` DESC)",
             ),
+            (
+                "addrs",
+                "CREATE TABLE `addrs` (\n  `id` int(11) NOT NULL,\n  `u` uuid DEFAULT NULL,\n  `a` inet4 DEFAULT NULL,\n  `b` inet6 DEFAULT NULL,\n  PRIMARY KEY (`id`),\n  KEY `u` (`u`),\n  KEY `b` (`b`)",
+            ),
         ];
         let mut tables = HashMap::new();
         for (i, (name, body)) in defs.iter().enumerate() {
@@ -1663,4 +1667,97 @@ async fn analyze_answers_the_plan_with_the_rows_read() {
     .unwrap();
     assert!(got[0].contains("\"r_rows\": 3"), "{got:?}");
     assert!(got[0].starts_with("{\n  \"query_optimization\""), "{got:?}");
+}
+
+#[tokio::test]
+async fn mariadb_compares_json_values_with_strings_and_keeps_booleans() {
+    let (e, f, _d) = shop().await;
+    let s = seed();
+    let run = |sql: &'static str| {
+        let (e, f, s) = (&e, &f, &s);
+        async move { select_with(e, f, s, sql).await.map(|(rows, _)| rows) }
+    };
+    // A JSON function's result compares with a string by its text: a JSON
+    // string by its unquoted content, per row or constant.
+    let got = run(r#"SELECT JSON_EXTRACT(JSON_OBJECT('n', name), '$.n') = name, name = JSON_EXTRACT(JSON_OBJECT('n', name), '$.n'), JSON_EXTRACT(JSON_OBJECT('n', name), '$.n') = CONCAT('"', name, '"'), JSON_EXTRACT(JSON_ARRAY(id, 2), '$') = '[1, 2]', JSON_EXTRACT('{"name":"Ben"}', '$.name') = 'Ben' FROM customers WHERE id = 1"#).await.unwrap();
+    assert_eq!(got, ["1|1|0|1|1"]);
+    // Only the first of two JSON values is unquoted; NULLIF and a one-item
+    // IN compare like `=`, a longer IN list and LIKE as written.
+    let got = run(r#"SELECT JSON_EXTRACT('"b"', '$') = JSON_EXTRACT('"b"', '$'), JSON_EXTRACT('{"a":"\\"b\\""}', '$.a') = JSON_EXTRACT('"b"', '$'), NULLIF(JSON_EXTRACT('"b"', '$'), 'b'), NULLIF(JSON_EXTRACT('"c"', '$'), 'b'), JSON_EXTRACT('"b"', '$') IN ('b'), JSON_EXTRACT('"b"', '$') IN ('b', 'x'), JSON_EXTRACT('"b"', '$') LIKE 'b' FROM customers WHERE id = 1"#).await.unwrap();
+    assert_eq!(got, [r#"0|1|NULL|"c"|1|0|0"#]);
+    let got = run(
+        r"SELECT COUNT(*) FROM customers WHERE JSON_EXTRACT(JSON_OBJECT('n', name), '$.n') = name",
+    )
+    .await
+    .unwrap();
+    assert_eq!(got, ["24"]);
+    // `TRUE` and predicates are JSON booleans.
+    let got = run("SELECT JSON_OBJECT('b', TRUE, 'c', 1 = 1, 'd', 2 < 1, 'e', 1), JSON_ARRAY(FALSE, id = 1) FROM customers WHERE id = 1").await.unwrap();
+    assert_eq!(
+        got,
+        [r#"{"b": true, "c": true, "d": false, "e": 1}|[false, true]"#]
+    );
+}
+
+#[tokio::test]
+async fn uuid_and_address_columns_order_compare_and_convert_as_mariadb_does() {
+    let (e, f, _d) = shop().await;
+    write(
+        &e,
+        &f,
+        "INSERT INTO addrs (id, u, a, b) VALUES \
+         (1, '20000000-0000-1000-8000-000000000001', '10.0.0.1', '::1'), \
+         (2, '10000000-0000-1000-8000-000000000002', '1.2.3.4', '1.2.3.4'), \
+         (3, '00000000-0000-1000-8000-000000000003', '1.2.3.10', '2001:db8::1'), \
+         (4, '20000000-0000-0000-0000-000000000001', '255.255.255.255', '1:0:2:0:3:0:4:0'), \
+         (5, NULL, NULL, NULL)",
+    )
+    .await;
+    let run = |sql: &'static str| {
+        let (e, f) = (&e, &f);
+        async move { select(e, f, sql, &[]).await }
+    };
+    let ids = |r: Vec<String>| r.join(",");
+    // A time-ordered UUID is stored node first: it sorts by node, and
+    // before any other UUID that starts higher.
+    let got = run("SELECT id FROM addrs WHERE u IS NOT NULL ORDER BY u").await;
+    assert_eq!(ids(got.unwrap()), "1,2,3,4");
+    let got = run("SELECT id, u FROM addrs WHERE u = '00000000000010008000000000000003'")
+        .await
+        .unwrap();
+    assert_eq!(ids(got), "3|00000000-0000-1000-8000-000000000003");
+    let got =
+        run("SELECT id FROM addrs WHERE u > '10000000-0000-1000-8000-000000000002' ORDER BY id")
+            .await
+            .unwrap();
+    assert_eq!(ids(got), "3,4");
+    let got = run("SELECT id FROM addrs WHERE u = 'garbage' OR u IS NULL")
+        .await
+        .unwrap();
+    assert_eq!(ids(got), "5");
+    // Addresses order by their bytes; text is the server's.
+    let got = run("SELECT id, b FROM addrs WHERE b IS NOT NULL ORDER BY b")
+        .await
+        .unwrap();
+    assert_eq!(
+        ids(got),
+        "1|::1,2|::ffff:1.2.3.4,4|1::2:0:3:0:4:0,3|2001:db8::1"
+    );
+    let got = run("SELECT id FROM addrs WHERE a < '1.2.3.10' OR b = a ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(ids(got), "2");
+    let got = run("SELECT HEX(u), HEX(a), CAST('::ffff:0:1.2.3.4' AS INET6), CAST(a AS INET6) FROM addrs WHERE id = 2")
+        .await
+        .unwrap();
+    assert_eq!(
+        ids(got),
+        "10000000000010008000000000000002|01020304|::ffff:0:102:304|::ffff:1.2.3.4"
+    );
+    let e4078 = run("SELECT u = 1 FROM addrs").await.unwrap_err();
+    assert!(e4078.to_string().contains("uuid and int"), "{e4078}");
+    let e4079 = run("SELECT CAST(a AS SIGNED) FROM addrs")
+        .await
+        .unwrap_err();
+    assert!(e4079.to_string().contains("cast_as_signed"), "{e4079}");
 }

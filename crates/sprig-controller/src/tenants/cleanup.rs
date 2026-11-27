@@ -100,6 +100,8 @@ pub(crate) fn meta_prefixes(tenant: TenantId) -> Vec<String> {
         // objects, and its cross-tenant outbox schemas.
         "inherit-instances",
         "inherit-xo",
+        // Where its engine unit lives: gone last, after its records.
+        "units",
     ]
     .iter()
     .map(|p| format!("{p}/{tenant}/"))

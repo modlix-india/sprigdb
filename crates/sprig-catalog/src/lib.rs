@@ -69,6 +69,7 @@ pub mod rows;
 pub mod settings;
 mod sql;
 pub mod store;
+pub mod units;
 pub mod version;
 
 pub use ancestry::{AncestorRows, AncestryReport, AncestryState};

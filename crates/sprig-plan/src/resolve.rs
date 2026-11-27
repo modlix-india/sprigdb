@@ -748,8 +748,34 @@ pub(crate) fn literal(v: &Value, ty: &ExprType) -> Expr {
     }
 }
 
-fn cast_target(dt: &ast::DataType) -> Result<CastTarget> {
+fn cast_target(dt: &ast::DataType, maria: bool) -> Result<CastTarget> {
     use ast::DataType as D;
+    // MariaDB's `UUID`, `INET4` and `INET6`; MySQL's grammar has none.
+    let fbt = match dt {
+        D::Uuid => Some(sprig_engine::row::Fbt::Uuid),
+        D::Custom(name, args) if args.is_empty() => {
+            match name.to_string().to_ascii_uppercase().as_str() {
+                "INET4" => Some(sprig_engine::row::Fbt::Inet4),
+                "INET6" => Some(sprig_engine::row::Fbt::Inet6),
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    if let Some(f) = fbt {
+        if maria {
+            return Ok(CastTarget::Fbt(f));
+        }
+        return Err(SqlError::new(
+            1064,
+            "42000",
+            format!(
+                "You have an error in your SQL syntax; check the manual that corresponds to your \
+                 MySQL server version for the right syntax to use near '{})' at line 1",
+                f.name().to_ascii_uppercase()
+            ),
+        ));
+    }
     let len = |l: &Option<ast::CharacterLength>| match l {
         Some(ast::CharacterLength::IntegerLength { length, .. }) => {
             Some(u32::try_from(*length).unwrap_or(u32::MAX))
@@ -1317,14 +1343,14 @@ impl Cx<'_> {
                 expr,
                 data_type,
                 format: None,
-            } => Expr::Cast(self.boxed(expr, x)?, cast_target(data_type)?),
+            } => Expr::Cast(self.boxed(expr, x)?, cast_target(data_type, self.maria())?),
             A::Convert {
                 is_try: false,
                 expr,
                 data_type: Some(dt),
                 charset: None,
                 ..
-            } => Expr::Cast(self.boxed(expr, x)?, cast_target(dt)?),
+            } => Expr::Cast(self.boxed(expr, x)?, cast_target(dt, self.maria())?),
             // `CONVERT(e USING cs)` to a UTF-8 character set (the
             // expression engine's strings) or to `binary`; other character
             // sets stay refused.

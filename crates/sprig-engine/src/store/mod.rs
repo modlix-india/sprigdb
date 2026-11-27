@@ -319,6 +319,10 @@ pub trait CompactionGc: Send + Sync {
 /// A per-compaction GC decider: `true` drops the entry.
 pub type GcDecider = Box<dyn FnMut(&[u8], &[u8]) -> bool + Send>;
 
+/// [`SortedStore::get_versions`]' answer: per key, its newest version's
+/// timestamp and stored value, if any.
+pub type Versions = Vec<Option<(Ts, Bytes)>>;
+
 /// The ordered keyspace. RocksDB in production, [`MemStore`] in tests and
 /// the simulator. Both pass the same model tests.
 pub trait SortedStore: Send + Sync {
@@ -410,6 +414,31 @@ pub trait SortedStore: Send + Sync {
         out.clear();
         out.extend_from_slice(it.value());
         Ok(Read::Ready(Some(ts)))
+    }
+
+    /// [`SortedStore::get_version`] for several logical keys, in the order
+    /// given: each the newest version at or below `at` (timestamp and
+    /// stored value, header byte included). Keys given in ascending order
+    /// let a store share one cursor across them.
+    ///
+    /// # Errors
+    /// The store failed.
+    fn get_versions(
+        &self,
+        cf: Cf,
+        logicals: &[&[u8]],
+        at: Ts,
+        tier: ReadTier,
+    ) -> Result<Read<Versions>> {
+        let mut out = Vec::with_capacity(logicals.len());
+        let mut buf = Vec::new();
+        for l in logicals {
+            match self.get_version(cf, l, at, tier, &mut buf)? {
+                Read::Ready(ts) => out.push(ts.map(|ts| (ts, Bytes::copy_from_slice(&buf)))),
+                Read::WouldBlock => return Ok(Read::WouldBlock),
+            }
+        }
+        Ok(Read::Ready(out))
     }
 
     /// Lets go of whatever the store keeps between reads to make them

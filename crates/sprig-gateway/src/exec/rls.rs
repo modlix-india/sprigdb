@@ -442,9 +442,13 @@ impl PassSession {
         // write (the session's policies come with the statement), and reads
         // are filtered by the rewrite. Only its invisible columns and the
         // version the checks are current for are recorded.
+        // A MongoDB collection likewise: the document store applies its
+        // policies itself (`sprig_doc::docstore::guard`).
+        let collection = obj.kind == sprig_catalog::store::ObjectKind::Collection;
         if let Some(text) = crate::engine::catalog::of(&cat)
             .filter(|e| e.tables.contains_key(&object))
             .map(|e| e.texts.get(&object).map(ToString::to_string))
+            .or(collection.then_some(None))
         {
             let hidden: Vec<String> = text
                 .and_then(|t| crate::engine::define::parse_stored(&t).ok())
@@ -751,9 +755,14 @@ impl PassSession {
         let Some(sec) = RlsState::of(&cat).and_then(|s| s.security(object).copied()) else {
             return Ok(());
         };
-        // An engine table: nothing in MariaDB to verify (see
-        // `deploy_checks`).
-        if crate::engine::catalog::of(&cat).is_some_and(|e| e.tables.contains_key(&object)) {
+        // An engine table or a MongoDB collection: nothing in MariaDB to
+        // verify (see `deploy_checks`).
+        if crate::engine::catalog::of(&cat).is_some_and(|e| e.tables.contains_key(&object))
+            || cat
+                .objects
+                .get(object)
+                .is_some_and(|o| o.kind == sprig_catalog::store::ObjectKind::Collection)
+        {
             return Ok(());
         }
         let (Some(obj), Some(db)) = (
