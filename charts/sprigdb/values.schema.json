@@ -118,6 +118,23 @@
         }
       }
     },
+    "node": {
+      "type": "object",
+      "description": "Storage engine nodes: a StatefulSet on local volumes (templates/node.yaml)",
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "replicas": {"type": "integer", "minimum": 1},
+        "raftPort": {"type": "integer", "minimum": 1, "maximum": 65535},
+        "engineMb": {"type": "integer", "minimum": 64},
+        "failureDomain": {"type": "string"},
+        "storage": {"type": "object", "properties": {"size": {"type": "string"}, "storageClassName": {"type": "string"}}, "required": ["size"]},
+        "resources": {"type": "object"},
+        "terminationGracePeriodSeconds": {"type": "integer", "minimum": 1},
+        "service": {"type": "object", "properties": {"type": {"type": "string"}}},
+        "raftTlsSecret": {"type": "string"}
+      },
+      "required": ["enabled"]
+    },
     "worker": {"type": "object", "properties": {"replicas": {"type": "integer", "minimum": 0}}},
     "operator": {
       "type": "object",

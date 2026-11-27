@@ -117,6 +117,7 @@ pub mod search_loop;
 pub mod queue_forwarder_loop;
 // The key-value sweeper job.
 pub mod kv_sweep_loop;
+pub mod node_health;
 // The TTL monitor job.
 pub mod doc_ttl_loop;
 // Sink tasks.
@@ -612,6 +613,11 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
             dc.clone(),
         )))))
         .with_loop(Loop::new(doc_ttl_loop::DocTtlLoop))
+        // Engine nodes gone past replication.dead_node_minutes.
+        .with_loop(Loop::new(node_health::NodeHealthLoop::new(Some((
+            settings.live.clone(),
+            dc.clone(),
+        )))))
         // Node certificates, with SPRIGDB_CA_KEY_FILE.
         .with_loop(Loop::new(internal_ca::CaLoop::new(
             internal_ca::InternalCa::from_env()?,

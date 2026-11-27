@@ -2160,10 +2160,16 @@ impl Node {
             .map(|(id, _)| *id)
             .collect();
         g.snap_wait.retain(|id, _| waiting.contains(id));
+        // A large snapshot takes longer to send and install: allow a tick
+        // per 2 MiB on top (at 100 ms ticks, 20 MiB/s), so it isn't
+        // declared lost and sent again while it is still arriving.
+        let size_ticks =
+            u32::try_from(g.raw.store().cached_len() / (2 << 20)).unwrap_or(u32::MAX);
+        let limit = self.inner.cfg.snapshot_retry_ticks.saturating_add(size_ticks);
         for id in waiting {
             let w = g.snap_wait.entry(id).or_insert(0);
             *w += ticks;
-            if *w >= self.inner.cfg.snapshot_retry_ticks {
+            if *w >= limit {
                 g.snap_wait.remove(&id);
                 g.raw.report_snapshot(id, SnapshotStatus::Failure);
             }

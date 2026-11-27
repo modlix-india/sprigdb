@@ -61,6 +61,7 @@ mod gateway;
 mod graph;
 mod index;
 mod inherit;
+mod node;
 mod unit;
 // Token issuers (external tokens).
 mod issuer;
@@ -511,6 +512,7 @@ fn cli() -> Command {
         .subcommand(mover::job_group())
         .subcommand(gateway::group())
         .subcommand(unit::group())
+        .subcommand(node::group())
         .subcommand(check::group())
         .subcommand(logic::group())
         .subcommand(space::group())
@@ -575,7 +577,7 @@ fn main() -> ExitCode {
     };
     let name = sub.subcommand_name().unwrap_or_default().to_owned();
     let implemented = match group {
-        "dc" | "cluster" | "settings" | "index" | "job" | "gateway" | "unit" | "check"
+        "dc" | "cluster" | "settings" | "index" | "job" | "gateway" | "unit" | "node" | "check"
         | "advisor" | "shard" | "space" | "txn" | "sink" | "graph" | "search"
         | "recommendations" | "inherit" | "login" | "logout" | "whoami" | "operator" | "token"
         | "ai" | "catalog" | "ca" => true,
@@ -635,6 +637,13 @@ fn main() -> ExitCode {
             "unit" => unit::run(&client, sub, output(&matches))
                 .await
                 .map(|()| ExitCode::SUCCESS),
+            "node" => node::run(&client, sub, output(&matches)).await.map(|ok| {
+                if ok {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::FAILURE
+                }
+            }),
             "logic" => logic::run(&client, sub, output(&matches))
                 .await
                 .map(|()| ExitCode::SUCCESS),

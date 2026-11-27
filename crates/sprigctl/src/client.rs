@@ -118,6 +118,17 @@ impl AdminClient {
         })
     }
 
+    /// The same credential and TLS settings aimed at `endpoint` (a
+    /// gateway's own HTTP endpoint, `http://host:port`).
+    pub(crate) fn at(&self, endpoint: &str) -> Self {
+        Self {
+            base: endpoint.trim_end_matches('/').to_owned(),
+            token: self.token.clone(),
+            http: self.http.clone(),
+            tls: self.tls.clone(),
+        }
+    }
+
     /// `GET path`.
     ///
     /// # Errors

@@ -83,6 +83,12 @@ pub fn streams() -> Option<Arc<EngineStreams>> {
                 groups: crate::node_engine::stream_groups(),
                 blobs: crate::node_engine::note_blobs(),
                 compress: crate::node_engine::stream_compress(),
+                held: crate::node_engine::engine_raft().map(|_| {
+                    sprig_streams::seg::HeldUnits(Arc::new(|u| {
+                        crate::node_engine::engine_raft()
+                            .is_some_and(|r| r.node().status(u).is_some())
+                    }))
+                }),
                 ..SegConfig::default()
             };
             EngineStreams::open(&e, dir, cfg, TopicDefaults::default())

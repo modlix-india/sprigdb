@@ -71,6 +71,7 @@ pub fn router_guarded(svc: Arc<AdminService>) -> Router {
     }))
 }
 
+#[allow(clippy::too_many_lines)] // one line per route
 fn routes(app: Arc<App>) -> Router {
     Router::new()
         .route(
@@ -83,6 +84,10 @@ fn routes(app: Arc<App>) -> Router {
         )
         .route("/admin/v1/dcs", get(list_dcs).post(register_dc))
         .route("/admin/v1/dcs/{dc}", get(get_dc).post(dc_method))
+        .route("/admin/v1/nodes", get(list_nodes))
+        .route("/admin/v1/nodes/{node}", post(node_method))
+        .route("/admin/v1/cluster-version", get(cluster_version))
+        .route("/admin/v1/cluster-version:finalize", post(finalize_version))
         .route("/admin/v1/tenants", get(list_tenants).post(create_tenant))
         .route(
             "/admin/v1/tenants/{name}",
@@ -657,6 +662,70 @@ async fn dc_method(
                 "POST /admin/v1/dcs/{dc}: expected {{dc}}:drain or :undrain"
             ))),
         }
+    };
+    respond(r.await)
+}
+
+async fn list_nodes(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
+    let r = async {
+        authorize(&app, &headers)?;
+        app.svc.list_nodes().await
+    };
+    respond(r.await)
+}
+
+async fn node_method(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    UrlPath(node): UrlPath<String>,
+    body: Bytes,
+) -> Response {
+    let r = async {
+        authorize(&app, &headers)?;
+        let (id, method) = node
+            .rsplit_once(':')
+            .and_then(|(id, m)| Some((id.parse::<u64>().ok()?, m)))
+            .ok_or_else(|| {
+                invalid(format!(
+                    "POST /admin/v1/nodes/{node}: expected {{id}}:{{method}}"
+                ))
+            })?;
+        let reason = if body.iter().all(u8::is_ascii_whitespace) {
+            String::new()
+        } else {
+            serde_json::from_slice::<serde_json::Value>(&body)
+                .map_err(|e| invalid(format!("the body isn't JSON: {e}")))?
+                .get("reason")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_owned()
+        };
+        app.svc.node_method(id, method, &reason).await
+    };
+    respond(r.await)
+}
+
+async fn cluster_version(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
+    let r = async {
+        authorize(&app, &headers)?;
+        app.svc.cluster_version().await
+    };
+    respond(r.await)
+}
+
+async fn finalize_version(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let r = async {
+        authorize(&app, &headers)?;
+        let v: serde_json::Value = parse_required(&body)?;
+        let version = v
+            .get("version")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| invalid("'version' is required"))?;
+        app.svc.finalize_version(version).await
     };
     respond(r.await)
 }

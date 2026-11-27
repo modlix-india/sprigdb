@@ -97,6 +97,7 @@ pub mod node_engine;
 pub mod node_certs;
 pub mod observe;
 pub mod offload;
+pub mod ops;
 // The feed-driven outbox forwarder's gateway side.
 pub mod outbox_feed;
 pub mod peer;
@@ -220,6 +221,7 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
     // No start with a commit-resolve window the resolver
     // could sweep under.
     sprig_txn::settings::check_live(&live, &dc)?;
+    ops::set_settings(&live);
     // Trace sampling, the OTLP endpoint and the audit spool
     // limit follow their settings.
     let _telemetry_settings = sprig_settings::ops::apply_live(&live, &dc);
@@ -279,6 +281,10 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
             .map(sprig_catalog::records::remote::PeerPems::from_config)
             .transpose()?,
     );
+    if node_engine::replicated_from_env() {
+        // No start older than the cluster version (rolling upgrades).
+        ops::version::check(stores.dc.as_ref()).await?;
+    }
     node_engine::start_placement(
         Arc::clone(&stores.dc),
         Arc::clone(&stores.global),
@@ -795,6 +801,9 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
     metrics::gauge!("sprig_gateway_draining").set(1.0);
     let drain = Duration::from_secs(live.get(&listener::settings::DRAIN_TIMEOUT_SECONDS, &sctx));
     let lb_delay = Duration::from_secs(live.get(&lifecycle::DRAIN_LB_DELAY_SECONDS, &sctx));
+    // A replicated node first hands the units it leads to other voters, so
+    // their clients move (39502) before this node's listeners close.
+    ops::drain::shed_for_stop(drain.min(Duration::from_secs(30))).await;
     tracing::info!(event = "gateway.drain_started", %role, lb_delay_s = lb_delay.as_secs(), timeout_s = drain.as_secs(), "draining");
     tokio::time::sleep(lb_delay).await;
     // 2-4. Close the listeners; idle sessions close now, busy ones at their

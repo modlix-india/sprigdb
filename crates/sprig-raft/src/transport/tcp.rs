@@ -43,8 +43,10 @@ pub const ALPN: &[u8] = b"sprig-raft/1";
 /// What a plaintext Raft connection to a shared listener writes first.
 pub const PREFACE: &[u8] = b"SPRIG-RAFT/1\n";
 
-/// The largest frame accepted.
-pub const MAX_FRAME: usize = 64 << 20;
+/// The largest frame accepted. A unit snapshot travels as one message in
+/// one frame, so this bounds the unit a new or lagging replica can be sent
+/// (until snapshots are streamed in chunks).
+pub const MAX_FRAME: usize = 1 << 30;
 /// Frames queued per peer before new ones are dropped.
 const QUEUE: usize = 4096;
 /// Bytes gathered into one write.

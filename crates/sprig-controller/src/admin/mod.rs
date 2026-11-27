@@ -51,6 +51,7 @@ pub mod failover;
 pub mod http;
 pub mod jobs;
 pub mod mover;
+pub mod node_admin;
 pub mod placement_admin;
 // The internal CA (`sprigctl ca`).
 pub mod ca_admin;

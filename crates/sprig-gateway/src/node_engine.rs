@@ -278,14 +278,22 @@ pub fn start_placement(
         failure_domain: failure_domain_from_env().unwrap_or_default(),
         placement: placement_from_env(),
         state: "active".to_owned(),
+        version: crate::ops::node_version(),
+        since_ms: 0,
+        reason: String::new(),
     };
+    crate::ops::start(id, &dc, stop.clone());
     let store = Arc::clone(&dc);
     let until = stop.clone();
     tokio::spawn(async move {
         let mut backoff = std::time::Duration::from_millis(200);
         while !until.is_cancelled() {
-            match sprig_catalog::units::register_node(store.as_ref(), &rec).await {
-                Ok(()) => return,
+            // A draining or removed node keeps that state across its restart.
+            match sprig_catalog::units::register_starting_node(store.as_ref(), &rec).await {
+                Ok(r) => {
+                    crate::ops::nodes::note_own(r);
+                    return;
+                }
                 Err(e) => {
                     tracing::warn!(error = %e, "node registry: this node's record wasn't written; retrying");
                     tokio::time::sleep(backoff).await;
@@ -345,6 +353,7 @@ fn drop_tenant_units(tenant: u64) -> usize {
                 {
                     tracing::warn!(unit = g, error = %e, "engine: a deleted tenant's unit keys weren't cleared");
                 }
+                crate::ops::replicate::forget_streams(g);
             }
             Ok(false) => {}
             Err(e) => {
@@ -453,7 +462,7 @@ async fn know_unit(tenant: u64) -> Option<bool> {
 }
 
 /// The tenant a unit belongs to: its own, or a partition group's tenant.
-fn tenant_of_unit(unit: u64) -> u64 {
+pub(crate) fn tenant_of_unit(unit: u64) -> u64 {
     sprig_streams::seg::group_of_unit(unit).map_or(unit, |(t, _)| t)
 }
 
@@ -659,6 +668,18 @@ fn preferred_leader(voters: &[u64], unit: u64) -> Option<u64> {
 /// its partition groups spread over the tenant's own voters; otherwise as
 /// [`preferred_leader`] over every member.
 fn preferred(all: &[u64], unit: u64) -> Option<u64> {
+    // A node that is draining, gone or out of clock bounds is nobody's
+    // preferred leader: its units stay wherever their leadership went.
+    // Nor is anyone while a voter is on a lost node: leadership stays put
+    // until the unit's leader has replaced it (a transfer would stall the
+    // membership change).
+    if crate::ops::replicate::short_of_copies(unit) {
+        return None;
+    }
+    preferred_any(all, unit).filter(|n| crate::ops::nodes::takes_leadership(*n))
+}
+
+fn preferred_any(all: &[u64], unit: u64) -> Option<u64> {
     if let Some(dir) = unit_directory() {
         let d = dir.get(tenant_of_unit(unit))?;
         if sprig_streams::seg::group_of_unit(unit).is_some() {
@@ -1119,6 +1140,16 @@ pub async fn lead_catalog(tenant: u64) -> Result<()> {
 }
 
 static RAFT: OnceLock<Raft> = OnceLock::new();
+
+/// This process's Raft node over the engine, once replication started.
+pub(crate) fn engine_raft() -> Option<&'static sprig_raft::EngineNode> {
+    RAFT.get().map(|r| &r.node)
+}
+
+/// Whether units are placed per tenant on this replicated node.
+pub(crate) fn raft_placed() -> bool {
+    RAFT.get().is_some_and(|r| r.placed)
+}
 
 static NOTE_BLOBS: OnceLock<Arc<sprig_engine::log::blobs::NoteBlobs>> = OnceLock::new();
 

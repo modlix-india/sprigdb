@@ -72,13 +72,48 @@ pub struct NodeRecord {
     /// It places units per tenant (`SPRIGDB_ENGINE_PLACEMENT=on`).
     #[serde(default)]
     pub placement: bool,
-    /// `active` (takes units); `draining` and `removed` come with node
-    /// operations.
+    /// `active` (takes units); `draining` (keeps its replicas, leads
+    /// none); `dead` (the controller found it gone for
+    /// `replication.dead_node_minutes`: its units are re-replicated);
+    /// `removed` (an operator removed it: re-replicated at once).
     pub state: String,
+    /// Its binary's version, as it reported it at start.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub version: String,
+    /// When the node last started or `state` last changed (Unix
+    /// milliseconds; 0: unknown).
+    #[serde(default)]
+    pub since_ms: u64,
+    /// Why `state` last changed (an operator's reason, or the loop's).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reason: String,
 }
 
 impl Versioned for NodeRecord {
     const V: u32 = 1;
+}
+
+/// A node that takes units and leaderships.
+pub const NODE_ACTIVE: &str = "active";
+/// A node leaving its leaderships (a planned stop): keeps its replicas.
+pub const NODE_DRAINING: &str = "draining";
+/// A node gone for longer than `replication.dead_node_minutes`.
+pub const NODE_DEAD: &str = "dead";
+/// A node an operator removed.
+pub const NODE_REMOVED: &str = "removed";
+
+impl NodeRecord {
+    /// Whether its replicas must be replaced elsewhere.
+    #[must_use]
+    pub fn is_lost(&self) -> bool {
+        self.state == NODE_DEAD || self.state == NODE_REMOVED
+    }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 /// Writes (or rewrites) a node's record.
@@ -99,6 +134,281 @@ pub async fn register_node(store: &dyn MetaStore, n: &NodeRecord) -> Result<()> 
         })
         .await
         .map(|_| ())
+}
+
+/// Records a starting node: `n` as given, except that a node an operator
+/// is draining or removed keeps that state (a restart in the middle of a
+/// drain stays drained until undrained; a removed node never takes units
+/// again). A `dead` node that starts is `active` again. Returns the record
+/// stored.
+///
+/// # Errors
+/// The store's.
+pub async fn register_starting_node(store: &dyn MetaStore, n: &NodeRecord) -> Result<NodeRecord> {
+    let key = store.tier().key(&format!("nodes/{}", n.id))?;
+    for _ in 0..20 {
+        let old = store.get(&key, Consistency::Linearizable).await?;
+        let mut rec = n.clone();
+        // `since_ms` is when the node last started or changed state (the
+        // controller counts a node as seen then).
+        rec.since_ms = now_ms();
+        let guard = if let Some(kv) = &old {
+            if let Ok(prev) = Record::<NodeRecord>::decode(&kv.value) {
+                let prev = prev.body;
+                if prev.state == NODE_DRAINING || prev.state == NODE_REMOVED {
+                    rec.state = prev.state;
+                    rec.reason = prev.reason;
+                } else {
+                    "started".clone_into(&mut rec.reason);
+                }
+            }
+            Cmp::ModRev(key.clone(), kv.mod_revision)
+        } else {
+            Cmp::Missing(key.clone())
+        };
+        let r = store
+            .txn(sprig_meta::Txn {
+                when: vec![guard],
+                then: vec![Op::Put {
+                    key: key.clone(),
+                    value: Record::new(rec.clone()).encode()?,
+                    lease: None,
+                }],
+                otherwise: Vec::new(),
+            })
+            .await?;
+        if r.succeeded {
+            return Ok(rec);
+        }
+    }
+    Err(SprigError::new(
+        SprigCode::MetaUnavailable,
+        "the node's record kept changing while it was written",
+    ))
+}
+
+/// Moves node `id` to state `to` when its state is one of `from` (any
+/// state when `from` is empty), compare-and-set on the record. Returns the
+/// record now stored, or `None` when the node has no record; a node whose
+/// state isn't in `from` is returned unchanged.
+///
+/// # Errors
+/// The store's.
+pub async fn set_node_state(
+    store: &dyn MetaStore,
+    id: u64,
+    from: &[&str],
+    to: &str,
+    reason: &str,
+) -> Result<Option<NodeRecord>> {
+    let key = store.tier().key(&format!("nodes/{id}"))?;
+    for _ in 0..20 {
+        let Some(kv) = store.get(&key, Consistency::Linearizable).await? else {
+            return Ok(None);
+        };
+        let mut rec = Record::<NodeRecord>::decode(&kv.value)?.body;
+        if rec.state == to || (!from.is_empty() && !from.contains(&rec.state.as_str())) {
+            return Ok(Some(rec));
+        }
+        rec.state = to.to_owned();
+        rec.reason = reason.to_owned();
+        rec.since_ms = now_ms();
+        let r = store
+            .txn(sprig_meta::Txn {
+                when: vec![Cmp::ModRev(key.clone(), kv.mod_revision)],
+                then: vec![Op::Put {
+                    key: key.clone(),
+                    value: Record::new(rec.clone()).encode()?,
+                    lease: None,
+                }],
+                otherwise: Vec::new(),
+            })
+            .await?;
+        if r.succeeded {
+            return Ok(Some(rec));
+        }
+    }
+    Err(SprigError::new(
+        SprigCode::MetaUnavailable,
+        "the node's record kept changing while its state was set",
+    ))
+}
+
+/// Rewrites `tenant`'s own unit's descriptor with `f`, compare-and-set,
+/// raising its generation. `f` returns `false` to leave it as it is.
+/// Returns the descriptor stored (or found), `None` when there is none.
+///
+/// # Errors
+/// The store's.
+pub async fn update(
+    store: &dyn MetaStore,
+    tenant: u64,
+    mut f: impl FnMut(&mut UnitDescriptor) -> bool,
+) -> Result<Option<UnitDescriptor>> {
+    let key = unit_key(store, tenant, tenant)?;
+    for _ in 0..20 {
+        let Some(kv) = store.get(&key, Consistency::Linearizable).await? else {
+            return Ok(None);
+        };
+        let mut d = decode(&kv.value)?;
+        if !f(&mut d) {
+            return Ok(Some(d));
+        }
+        d.generation += 1;
+        let r = store
+            .txn(sprig_meta::Txn {
+                when: vec![Cmp::ModRev(key.clone(), kv.mod_revision)],
+                then: vec![Op::Put {
+                    key: key.clone(),
+                    value: Record::new(d.clone()).encode()?,
+                    lease: None,
+                }],
+                otherwise: Vec::new(),
+            })
+            .await?;
+        if r.succeeded {
+            return Ok(Some(d));
+        }
+    }
+    Err(SprigError::new(
+        SprigCode::MetaUnavailable,
+        "the unit descriptor kept changing while it was rewritten",
+    ))
+}
+
+/// The DC's node records, kept in memory by a watch of `nodes/`.
+#[derive(Default)]
+pub struct NodeDirectory {
+    nodes: RwLock<HashMap<u64, NodeRecord>>,
+    ready: AtomicBool,
+}
+
+impl std::fmt::Debug for NodeDirectory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NodeDirectory")
+            .field("nodes", &self.nodes)
+            .finish_non_exhaustive()
+    }
+}
+
+impl NodeDirectory {
+    /// An empty directory; [`NodeDirectory::follow`] fills it.
+    #[must_use]
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Node `id`'s record.
+    #[must_use]
+    pub fn get(&self, id: u64) -> Option<NodeRecord> {
+        self.nodes
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&id)
+            .cloned()
+    }
+
+    /// Every record held, by id.
+    #[must_use]
+    pub fn all(&self) -> BTreeMap<u64, NodeRecord> {
+        self.nodes
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect()
+    }
+
+    /// Whether the first listing has been read.
+    #[must_use]
+    pub fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::Acquire)
+    }
+
+    /// Node `id`'s state; `None` when it has no record (or none read yet).
+    #[must_use]
+    pub fn state(&self, id: u64) -> Option<String> {
+        self.get(id).map(|n| n.state)
+    }
+
+    /// Records a node (tests, and a node after writing its own).
+    pub fn put(&self, n: NodeRecord) {
+        self.nodes
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(n.id, n);
+    }
+
+    /// Keeps the directory equal to `store`'s node records until `stop`.
+    pub async fn follow(self: Arc<Self>, store: Arc<dyn MetaStore>, stop: CancellationToken) {
+        let mut backoff = Duration::from_millis(100);
+        while !stop.is_cancelled() {
+            match self.follow_once(store.as_ref(), &stop).await {
+                Ok(()) => return,
+                Err(e) => {
+                    tracing::warn!(error = %e, "node records: watch failed; listing again");
+                    tokio::select! {
+                        () = stop.cancelled() => return,
+                        () = tokio::time::sleep(backoff) => {}
+                    }
+                    backoff = (backoff * 2).min(Duration::from_secs(5));
+                }
+            }
+        }
+    }
+
+    async fn follow_once(&self, store: &dyn MetaStore, stop: &CancellationToken) -> Result<()> {
+        let prefix = store.tier().key("nodes/")?;
+        let page = store
+            .list(
+                &prefix,
+                ListOpts {
+                    limit: 10_000,
+                    ..ListOpts::default()
+                },
+            )
+            .await?;
+        let map: HashMap<u64, NodeRecord> = page
+            .kvs
+            .iter()
+            .filter_map(|kv| Record::<NodeRecord>::decode(&kv.value).ok())
+            .map(|r| (r.body.id, r.body))
+            .collect();
+        *self.nodes.write().unwrap_or_else(PoisonError::into_inner) = map;
+        self.ready.store(true, Ordering::Release);
+        let mut w = store.watch(&prefix, page.revision + 1).await?;
+        loop {
+            let ev = tokio::select! {
+                () = stop.cancelled() => return Ok(()),
+                ev = w.next() => ev,
+            };
+            match ev {
+                None => return Err(SprigError::internal("the node record watch ended")),
+                Some(Err(e)) => return Err(e),
+                Some(Ok(WatchEvent::Put(kv))) => {
+                    if let Ok(r) = Record::<NodeRecord>::decode(&kv.value) {
+                        self.put(r.body);
+                    }
+                }
+                Some(Ok(WatchEvent::Delete { key, .. })) => {
+                    let s = key.as_str();
+                    if let Some(id) = s
+                        .rsplit_once('/')
+                        .and_then(|(_, id)| id.parse::<u64>().ok())
+                    {
+                        self.nodes
+                            .write()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .remove(&id);
+                    }
+                }
+                Some(Ok(WatchEvent::Compacted { .. })) => {
+                    return Err(SprigError::internal("the node record watch was compacted"));
+                }
+                Some(Ok(_)) => {}
+            }
+        }
+    }
 }
 
 /// Every node record of the DC.

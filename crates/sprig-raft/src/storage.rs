@@ -122,6 +122,11 @@ impl GroupStorage {
     }
 
     /// Offers `snap` to followers that need one, without trimming the log.
+    /// The size of the snapshot held to send, in bytes (0: none).
+    pub(crate) fn cached_len(&self) -> usize {
+        self.cached.as_ref().map_or(0, |s| s.data.len())
+    }
+
     pub(crate) fn set_cached(&mut self, snap: Snapshot) {
         self.cached = Some(snap);
     }

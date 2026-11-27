@@ -133,6 +133,17 @@ pub async fn handle(core: &Arc<Core>, info: &ConnInfo, req: Request<Incoming>) -
             Err(e) => error_response(&e),
         };
     }
+    if method == Method::GET && path == crate::ops::clock::CLOCK_PATH {
+        // Unauthenticated: only this node's time (other nodes' clock watch).
+        return json_response(200, &crate::ops::clock::report());
+    }
+    if method == Method::POST
+        && (path == crate::ops::drain::DRAIN_PATH || path == crate::ops::drain::UNDRAIN_PATH)
+    {
+        return node_drain(core, req, path == crate::ops::drain::DRAIN_PATH)
+            .await
+            .unwrap_or_else(|e| error_response(&e));
+    }
     if method == Method::POST && path == crate::node_engine::REPLACE_PATH {
         return replace_replica(core, req)
             .await
@@ -174,6 +185,40 @@ pub async fn handle(core: &Arc<Core>, info: &ConnInfo, req: Request<Incoming>) -
 /// `POST /admin/v1/engine/replicas:replace` (this gateway's own engine,
 /// not a controller route): `{"dead": 1, "new": 4, "new_addr":
 /// "host:port"}` replaces a lost replica in every unit this node holds.
+/// `POST /admin/v1/engine/drain` (body `{"deadline_seconds", "reason"}`)
+/// and `/admin/v1/engine/undrain`: this gateway's own engine node; see
+/// [`crate::ops::drain`].
+async fn node_drain(
+    core: &Arc<Core>,
+    req: Request<Incoming>,
+    drain: bool,
+) -> Result<Response<Body>, SprigError> {
+    let auth = header(&req, "authorization");
+    core.admin.authorized(auth.as_deref()).await?;
+    let body = parse_json(&read_body(req, 64 << 10).await?)?;
+    let dc = crate::ops::dc().ok_or_else(|| {
+        SprigError::new(
+            SprigCode::AdminRequestInvalid,
+            "this gateway's engine doesn't replicate",
+        )
+    })?;
+    if !drain {
+        let state = crate::ops::drain::undrain_local(dc.as_ref()).await?;
+        return Ok(json_response(200, &json!({"state": state})));
+    }
+    let deadline = std::time::Duration::from_secs(
+        body.get("deadline_seconds")
+            .and_then(Value::as_u64)
+            .unwrap_or(90),
+    );
+    let reason = s(&body, "reason");
+    let report = crate::ops::drain::drain_local(dc.as_ref(), deadline, &reason).await?;
+    Ok(json_response(
+        200,
+        &serde_json::to_value(report).unwrap_or_default(),
+    ))
+}
+
 async fn replace_replica(
     core: &Arc<Core>,
     req: Request<Incoming>,

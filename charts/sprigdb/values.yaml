@@ -90,6 +90,27 @@ gateway:
     kafka: {enabled: false, port: 9092}
     amqp: {enabled: false, port: 5672}
     amqps: {enabled: false, port: 5671}
+# Storage engine nodes (templates/node.yaml): a StatefulSet on local
+# volumes, one Raft node per pod (id = ordinal + 1), units placed on three
+# nodes in distinct failure domains. Off until the engine nodes replace the
+# gateway Deployment and MariaDB pools in this chart.
+node:
+  enabled: false
+  replicas: 5
+  raftPort: 7404
+  engineMb: 4096
+  # The failure domain every pod reports; empty: each node is its own.
+  # Set it per zone with one release per zone, or leave it empty and rely
+  # on the zone anti-affinity above.
+  failureDomain: ""
+  storage: {size: 1Ti, storageClassName: local-nvme}
+  resources: {requests: {cpu: "8", memory: 64Gi}}
+  # Long enough for the stop to hand every led unit away and drain sessions.
+  terminationGracePeriodSeconds: 120
+  service: {type: LoadBalancer}
+  # The secret with ca.pem, node.pem and node-key.pem for Raft's mutual TLS
+  # (each node's certificate names it node-<raft id>), with tls.enabled.
+  raftTlsSecret: sprigdb-node-raft-tls
 worker:
   replicas: 2
 operator:

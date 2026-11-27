@@ -106,6 +106,21 @@ pub struct SegConfig {
     /// that makes them an eighth smaller ([`batch::lz4`]); batches a client
     /// compressed are stored as they arrive either way.
     pub compress: bool,
+    /// On a replicated node, whether this node holds a replica of a unit.
+    /// At open, floors kept for units it no longer holds (their replica
+    /// left while the log was closed) are dropped, so the log never waits
+    /// for a commit log the node doesn't have. `None`: every unit is held.
+    pub held: Option<HeldUnits>,
+}
+
+/// See [`SegConfig::held`].
+#[derive(Clone)]
+pub struct HeldUnits(pub Arc<dyn Fn(u64) -> bool + Send + Sync>);
+
+impl std::fmt::Debug for HeldUnits {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("HeldUnits")
+    }
 }
 
 impl Default for SegConfig {
@@ -120,6 +135,7 @@ impl Default for SegConfig {
             groups: 0,
             blobs: None,
             compress: false,
+            held: None,
         }
     }
 }
@@ -1022,6 +1038,7 @@ impl SegLog {
                 *f = held;
             }
         }
+        drop_unheld(&mut from, inner.cfg.held.as_ref(), node.0);
         {
             let mut a = lock(&inner.apply);
             a.applied.clone_from(&from);
@@ -1092,6 +1109,50 @@ impl SegLog {
     #[must_use]
     pub fn unit_of_part(&self, key: PartKey) -> u64 {
         self.inner.unit_of_part(&key)
+    }
+
+    /// The units whose floors this log keeps (every unit that ever
+    /// appended here and wasn't forgotten).
+    #[must_use]
+    pub fn floored_units(&self) -> Vec<u64> {
+        lock(&self.inner.apply).floored.iter().copied().collect()
+    }
+
+    /// Forgets `unit` on this node: its replica left the node (its tenant
+    /// was deleted, or its copy moved to another node). Its partitions'
+    /// files go and its floor is no longer kept, so later manifest writes
+    /// don't wait for a commit log this node no longer has for it. Returns
+    /// how many partitions it held.
+    pub fn forget_unit(&self, unit: u64) -> usize {
+        let gone: Vec<PartKey> = {
+            let mut a = lock(&self.inner.apply);
+            let mut w = self
+                .inner
+                .parts
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
+            let gone: Vec<PartKey> = w
+                .keys()
+                .filter(|k| self.inner.unit_of_part(k) == unit)
+                .copied()
+                .collect();
+            for k in &gone {
+                w.remove(k);
+            }
+            drop(w);
+            a.applied.remove(&unit);
+            a.floored.remove(&unit);
+            a.ingested.remove(&unit);
+            a.unit_terms.remove(&unit);
+            a.unit_epochs.remove(&unit);
+            a.dirty = true;
+            gone
+        };
+        for k in &gone {
+            let _ = fs::remove_dir_all(part_dir(&self.inner.dir, k));
+        }
+        self.inner.changed.send_modify(|g| *g += 1);
+        gone.len()
     }
 
     /// The partition groups in force (see [`SegConfig::groups`]).
@@ -1899,6 +1960,22 @@ fn give_back(taken: Vec<(Arc<Part>, Vec<(i64, u64)>, bool)>) {
             }
         }
     }
+}
+
+/// Drops the floors of units this node no longer holds (see
+/// [`SegConfig::held`]); the node's own unit always stays.
+fn drop_unheld(from: &mut BTreeMap<u64, u64>, held: Option<&HeldUnits>, node: u64) {
+    let Some(h) = held else { return };
+    from.retain(|u, _| {
+        let keep = *u == node || (h.0)(*u);
+        if !keep {
+            tracing::info!(
+                unit = *u,
+                "stream log: this node no longer holds the unit; its floor is dropped"
+            );
+        }
+        keep
+    });
 }
 
 /// The floor of every unit the log keeps entries of: its applied index.

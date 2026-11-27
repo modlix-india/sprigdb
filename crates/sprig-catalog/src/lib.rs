@@ -58,6 +58,7 @@
 pub mod ancestry;
 pub mod bootstrap;
 pub mod cache;
+pub mod cluster_version;
 pub mod ddl;
 pub mod infoschema;
 pub mod migrate;

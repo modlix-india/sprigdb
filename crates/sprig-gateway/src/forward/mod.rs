@@ -387,17 +387,50 @@ pub fn count_direct(protocol: Protocol) {
         .increment(1);
 }
 
-/// Opens the splice for `h`, following redirects: the up sender and the
-/// down stream once a node accepted.
-async fn dial(
-    host: &Host,
-    h: &Handoff,
-) -> Result<(
+type Opened = (
     mpsc::Sender<SpliceUp>,
     tonic::Streaming<sprig_api::proto::internal::SpliceDown>,
-)> {
+);
+
+/// Opens the splice for `h`: from `h.to`, and when that node can't be
+/// reached (it died; this node's idea of the leader is stale), from each
+/// other voter of the tenant's unit in turn, any of which redirects to the
+/// leader it knows.
+async fn dial(host: &Host, h: &Handoff) -> Result<Opened> {
     let me = node_engine::raft_id_from_env().unwrap_or(0);
+    let voters = node_engine::unit_directory()
+        .and_then(|d| d.get(h.tenant))
+        .map(|d| d.voters)
+        .unwrap_or_default();
+    let mut tried = vec![h.to];
+    let mut first: Option<SprigError> = None;
     let mut to = h.to;
+    loop {
+        match dial_from(host, h, to).await {
+            Ok(o) => return Ok(o),
+            Err(e) if e.code() == Some(SprigCode::ForwardFailed) => {
+                let next = voters
+                    .iter()
+                    .copied()
+                    .find(|v| *v != me && !tried.contains(v));
+                let e = first.take().unwrap_or(e);
+                let Some(n) = next else { return Err(e) };
+                tracing::debug!(tenant = h.tenant, from = to, to = n, error = %e,
+                    "forwarding: node unreachable; trying another voter");
+                first = Some(e);
+                tried.push(n);
+                to = n;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Opens the splice for `h` at node `start`, following redirects: the up
+/// sender and the down stream once a node accepted.
+async fn dial_from(host: &Host, h: &Handoff, start: u64) -> Result<Opened> {
+    let me = node_engine::raft_id_from_env().unwrap_or(0);
+    let mut to = start;
     let mut hops = 0;
     loop {
         let addr = match peer_addr(host, to).await {

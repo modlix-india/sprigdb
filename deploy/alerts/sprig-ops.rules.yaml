@@ -182,3 +182,36 @@ groups:
         annotations:
           summary: An automatic loop is undoing its own decisions
           runbook: "sprigctl explain decision shows the reverted actions and their evidence; set the loop to recommend or off at the narrowest scope (for example balancer.mode) until its inputs settle"
+
+  # Storage engine nodes (N1): copies, leaders, clocks.
+  - name: sprig-nodes
+    rules:
+      # A unit led on some node has a voter on a dead or removed node: its
+      # leader is re-replicating it (or has no usable node to put the copy on).
+      - alert: SprigUnitUnderReplicated
+        expr: sum(sprig_node_units_under_replicated) > 0
+        for: 15m
+        labels: { severity: page }
+        annotations:
+          summary: Units have run short of copies for 15 minutes
+          runbook: "sprigctl node list shows dead or removed nodes and how many units each held; each unit's leader replaces the lost copy on an active node in another failure domain (logs: unit.rereplicate). If none is usable, add a node or restore one (sprigctl node restore <id>); a unit that lost two of three copies needs sprigctl unit recover"
+      - alert: SprigUnitLeaderless
+        expr: max by (instance) (sprig_node_units_leaderless) > 0
+        for: 2m
+        labels: { severity: page }
+        annotations:
+          summary: A node holds units with no known leader
+          runbook: "Elections take 1-5 s; minutes without a leader mean a unit lost two of its three copies (or the nodes can't reach each other). sprigctl unit list --endpoint <node> shows the units and their voters; check the dead nodes (sprigctl node list) and the network between nodes"
+      - alert: SprigClockOffsetHigh
+        expr: max by (instance) (sprig_node_clock_offset_seconds) > 0.125
+        for: 2m
+        labels: { severity: ticket }
+        annotations:
+          summary: A node's clock is more than half the allowed offset from the others'
+          runbook: "Check NTP (chronyc tracking) on the node. Past 80% of replication.max_offset_ms (250 ms) the node leads no units until its clock is back"
+      - alert: SprigNodeDeclaredDead
+        expr: sum(increase(sprig_controller_nodes_declared_dead_total[15m])) > 0
+        labels: { severity: ticket }
+        annotations:
+          summary: An engine node was declared dead; its units are being re-replicated
+          runbook: "sprigctl node list shows the dead node; when it returns it becomes active and drops the copies others took over. To retire it for good: sprigctl node remove <id>"
