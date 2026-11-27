@@ -165,6 +165,21 @@ pub(crate) fn part_names(table: &TableDef, parts: &[IndexPart]) -> Vec<String> {
         .collect()
 }
 
+/// Fills an `EXPLAIN` row for the rows of a full-text search of
+/// `FULLTEXT` index `index`, as the servers show it.
+pub(crate) fn describe_fulltext(row: &mut ExplainRow, index: &str, maria: bool) {
+    row.access = Some("fulltext".into());
+    row.key = Some(index.to_owned());
+    row.key_len = Some("0".into());
+    row.key_parts = Vec::new();
+    row.r#ref = Some(if maria { String::new() } else { "const".into() });
+    row.rows = Some(1);
+    row.extra.retain(|e| e != "Using index");
+    if !maria {
+        row.extra.push("Ft_hints: sorted".into());
+    }
+}
+
 /// Fills an `EXPLAIN` row for a scan of `key`.
 pub(crate) fn describe_path(
     row: &mut ExplainRow,

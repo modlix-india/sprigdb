@@ -12,6 +12,10 @@
 //! - [`build`], Tantivy queries from the AST;
 //! - [`search`], an index's partitions, global BM25, merges and facets;
 //! - [`highlight`], highlights from fetched text;
+//! - [`ftindex`], the files of one apply-time full-text index (a `FULLTEXT`
+//!   key of an engine table on one unit);
+//! - [`innodb`], SQL `MATCH ... AGAINST` as `InnoDB` serves it (word rules,
+//!   both query languages, relevance);
 //! - [`sqlscan`], `MATCH ... AGAINST` and `sprig_search()` in SQL text;
 //! - [`copy`], one copy of an index kept current from the change feed,
 //!   on a worker with the search role or in a gateway;
@@ -38,7 +42,9 @@ pub mod def;
 pub mod ft;
 pub mod ft_agg;
 pub mod ft_query;
+pub mod ftindex;
 pub mod highlight;
+pub mod innodb;
 pub mod mongo_score;
 pub mod partition;
 pub mod placement;

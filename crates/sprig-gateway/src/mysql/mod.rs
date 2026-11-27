@@ -23,6 +23,7 @@
 
 pub(crate) mod answer;
 pub mod dispatch;
+pub(crate) mod handoff;
 pub mod listener_hooks;
 pub(crate) mod local;
 pub mod login;
@@ -277,11 +278,18 @@ async fn connection(
     // waits (a failure delay, the RSA key the first plain-TCP login waits
     // for) don't count, and a refusal whose delay began still ends with its
     // ERR packet, not a dropped connection.
+    let mut handoff = None;
     let phase = sprig_auth::login_waits::with_deadline(
         conn.listener.handshake_timeout,
-        login_phase(&shared, &ctx, &settings, &mut session, conn),
+        login_phase(&shared, &ctx, &settings, &mut session, conn, &mut handoff),
     )
     .await;
+    // Served by another node: relayed there for the connection's life,
+    // outside the login's deadline.
+    if let Some(h) = handoff {
+        handoff::hand_over(&shared, h).await;
+        return Ok(());
+    }
     let mut logged_in = match phase {
         None => {
             tracing::debug!(session = %session.id, "connection phase timed out");
@@ -325,32 +333,42 @@ async fn login_phase(
     settings: &FrontendSettings,
     session: &mut Session,
     mut conn: ClientConn,
+    handoff: &mut Option<handoff::Pending>,
 ) -> Result<Option<LoggedIn>> {
     let persona = shared.cfg.persona;
-    let policy = match conn.in_protocol_tls {
-        InProtocolTls::NotOffered => TlsPolicy::Off,
-        InProtocolTls::Allowed => TlsPolicy::Optional,
-        InProtocolTls::Required => TlsPolicy::Required,
+    // A connection another node accepted and handed here: its greeting (and
+    // TLS) happened there; the client's login packet comes next.
+    let resumed = handoff::resume_of(&conn);
+    let policy = match (&resumed, conn.in_protocol_tls) {
+        (Some(r), _) => r.policy(),
+        (None, InProtocolTls::NotOffered) => TlsPolicy::Off,
+        (None, InProtocolTls::Allowed) => TlsPolicy::Optional,
+        (None, InProtocolTls::Required) => TlsPolicy::Required,
     };
-    // An address refused for too many failed logins gets 39300 in place of
-    // the greeting.
-    if let Err(e) = shared.cfg.login.admit(conn.peer.ip()) {
-        let p = ErrPacket::from_error(persona, &e);
-        let mut seq = 0;
-        let _ = write_packet(&mut conn.stream, &mut seq, &p.encode(Caps::empty())).await;
-        return Ok(None);
-    }
-    let nonce = new_nonce()?;
-    let server = server_caps(persona, policy.offered(), settings.compression);
-    let hs = greeting(
-        persona,
-        settings.version(persona),
-        session.id.0,
-        &nonce,
-        server,
-    );
-    let mut seq = 0u8;
-    write_packet(&mut conn.stream, &mut seq, &hs.encode()).await?;
+    let (nonce, server, mut seq) = if let Some(r) = &resumed {
+        (r.nonce, Caps::from_bits_retain(r.server_caps), r.seq)
+    } else {
+        // An address refused for too many failed logins gets 39300 in place
+        // of the greeting.
+        if let Err(e) = shared.cfg.login.admit(conn.peer.ip()) {
+            let p = ErrPacket::from_error(persona, &e);
+            let mut seq = 0;
+            let _ = write_packet(&mut conn.stream, &mut seq, &p.encode(Caps::empty())).await;
+            return Ok(None);
+        }
+        let nonce = new_nonce()?;
+        let server = server_caps(persona, policy.offered(), settings.compression);
+        let hs = greeting(
+            persona,
+            settings.version(persona),
+            session.id.0,
+            &nonce,
+            server,
+        );
+        let mut seq = 0u8;
+        write_packet(&mut conn.stream, &mut seq, &hs.encode()).await?;
+        (nonce, server, seq)
+    };
 
     let refuse = async |stream: &mut MaybeTls<TcpStream>, seq: &mut u8, r: Refusal, caps: Caps| {
         count_refusal(persona, r);
@@ -373,12 +391,24 @@ async fn login_phase(
         ClientHello::SslRequest(s) => s.caps,
         ClientHello::Response(r) => r.caps,
     } & Caps::PROTOCOL_41;
-    if let Err(r) = check_transport(policy, &hello, false) {
+    if let Err(r) = check_transport(policy, &hello, resumed.as_ref().is_some_and(|r| r.tls)) {
         refuse(&mut conn.stream, &mut seq, r, hello_caps).await;
         return Ok(None);
     }
+    // The login packet as the client sent it, for a hand-off.
+    let mut resp_raw = first;
     let resp = match hello {
         ClientHello::Response(r) => r,
+        ClientHello::SslRequest(_) if resumed.is_some() => {
+            refuse(
+                &mut conn.stream,
+                &mut seq,
+                Refusal::BadHandshake,
+                hello_caps,
+            )
+            .await;
+            return Ok(None);
+        }
         ClientHello::SslRequest(_) => {
             conn = match conn.start_tls().await {
                 Ok(c) => c,
@@ -391,7 +421,9 @@ async fn login_phase(
             let Ok(p) = read_packet(&mut conn.stream, &mut seq, MAX_CONNECTION_PACKET).await else {
                 return Ok(None);
             };
-            match parse_client_hello(&p) {
+            let parsed = parse_client_hello(&p);
+            resp_raw = p;
+            match parsed {
                 Ok(hello @ ClientHello::Response(_)) => {
                     if let Err(r) = check_transport(policy, &hello, true) {
                         refuse(&mut conn.stream, &mut seq, r, hello_caps).await;
@@ -429,9 +461,29 @@ async fn login_phase(
             .increment(dropped as u64);
     }
 
+    // Served by another node (the one leading the tenant's unit): the
+    // connection goes there from its login packet on, before any of the
+    // tenant's credentials are read here.
+    if resumed.is_none()
+        && crate::forward::enabled()
+        && let Some(to) = handoff::target(shared, &conn, &resp.user).await
+    {
+        *handoff = Some(handoff::Pending {
+            conn,
+            to,
+            resume: handoff::MysqlResume::new(nonce, server, seq, policy),
+            login_packet: resp_raw,
+            caps,
+        });
+        return Ok(None);
+    }
+    if resumed.is_none() {
+        crate::forward::count_direct(protocol_of(persona));
+    }
+
     // Login.
     session.set_state(SessionState::Authenticating);
-    let tls = matches!(conn.stream, MaybeTls::Tls(_));
+    let tls = conn.tls_info().is_some();
     if tls && session.tls.is_none() {
         session.tls = conn.tls_info();
     }

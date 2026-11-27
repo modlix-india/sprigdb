@@ -707,6 +707,27 @@ impl Engine {
         // Without a transaction storage holds no rows: the plan is only
         // described.
         let dry = tx.is_none();
+        // `MATCH ... AGAINST` over the tables' full-text indexes.
+        let fulltext = if dry {
+            None
+        } else {
+            crate::engine::fulltext::manager().and_then(|m| {
+                let tables = g
+                    .tables
+                    .iter()
+                    .zip(&spaces)
+                    .filter(|(t, _)| !t.def.fulltext.is_empty())
+                    .map(|(t, sp)| crate::engine::fulltext::StmtTable {
+                        schema: t.plan.schema.clone(),
+                        name: t.plan.name.clone(),
+                        tenant: t.tenant.unwrap_or(a.tenant),
+                        def: Arc::clone(&t.def),
+                        sp: sp.clone(),
+                    })
+                    .collect();
+                crate::engine::fulltext::StmtSearch::new(m, tables)
+            })
+        };
         let bounds: Vec<Bound> = g
             .tables
             .iter()
@@ -740,7 +761,10 @@ impl Engine {
             && tokio::runtime::Handle::try_current()
                 .is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread);
         let catalog = names::PlanCatalog::new(g);
-        let session = a.seed.now();
+        let mut session = a.seed.now();
+        if let Some(f) = fulltext {
+            session.info.fulltext = Some(f as Arc<dyn sprig_exec::FullText>);
+        }
         let run = || -> std::result::Result<Rows, SqlError> {
             let mut planner = Planner::new(&catalog, storage.shared(), &session);
             planner.options = PlanOptions {

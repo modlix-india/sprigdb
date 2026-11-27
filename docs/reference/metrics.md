@@ -9,7 +9,7 @@ source: the metric macros in the source tree, and docs/metrics-help.toml
 
 Every metric SprigDB records, as exported on each process's telemetry port (`/metrics`, Prometheus text) and through OTLP. Counters end in `_total`; durations are histograms in seconds.
 
-473 metrics in 54 groups.
+476 metrics in 55 groups.
 
 ## `sprig_advisor_*`
 
@@ -517,6 +517,14 @@ Every metric SprigDB records, as exported on each process's telemetry port (`/me
 | Metric | Type | Labels | Recorded by | Description |
 |---|---|---|---|---|
 | `sprig_names_foreign_names_total` | counter | - | sprig-gateway | Physical schema names found in results that don't belong to the session's tenant; should stay at 0. Unit: count. |
+
+## `sprig_node_*`
+
+| Metric | Type | Labels | Recorded by | Description |
+|---|---|---|---|---|
+| `sprig_node_direct_connections_total` | counter | `protocol` | sprig-gateway | Client connections whose tenant this node served itself after their login named it (no hand-off); `protocol` is the listener's protocol. With `sprig_node_forwarded_connections_total` it gives the forwarded ratio. Unit: count. |
+| `sprig_node_forwarded_connections_total` | counter | `protocol`, `result` | sprig-gateway | Client connections this node handed to the node leading their tenant's unit at the login message (`NodeForward.Splice` on the peer listener); `protocol` is the listener's protocol, `result` is `ok`, `unreachable`, `refused` or `redirect_loop`. Unit: count. |
+| `sprig_node_sessions_moved_total` | counter | - | sprig-gateway | Sessions marked to close at their next safe point because another node now leads their tenant's unit (39502 ER_SPRIG_SESSION_MOVED; clients reconnect). Unit: count. |
 
 ## `sprig_operator_*`
 

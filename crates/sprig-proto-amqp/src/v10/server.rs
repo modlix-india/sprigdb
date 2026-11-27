@@ -111,6 +111,8 @@ pub(crate) async fn run<S>(
     svc: &Services,
     cfg: Config,
     close: CancellationToken,
+    resumed: bool,
+    handoff: &std::sync::Mutex<Option<crate::server::HandOff>>,
 ) -> Result<(), MqError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -119,31 +121,55 @@ where
     let mut inb = BytesMut::with_capacity(16 * 1024);
     let mut out = BytesMut::new();
     let deadline = Instant::now() + cfg.handshake_timeout;
-    // SASL layer.
-    out.extend_from_slice(&AMQP_10_SASL);
+    // SASL layer. A connection handed here was sent the header and the
+    // mechanisms by the node that accepted it.
     let offered = auth::offered(&cfg.mechanisms, &info, true);
-    put_frame(
-        &mut out,
-        FRAME_SASL,
-        0,
-        &Performative::SaslMechanisms {
-            mechanisms: offered.clone(),
-        }
-        .to_value(),
-        &[],
-    );
-    write(&mut wr, &mut out).await?;
+    if !resumed {
+        out.extend_from_slice(&AMQP_10_SASL);
+        put_frame(
+            &mut out,
+            FRAME_SASL,
+            0,
+            &Performative::SaslMechanisms {
+                mechanisms: offered.clone(),
+            }
+            .to_value(),
+            &[],
+        );
+        write(&mut wr, &mut out).await?;
+    }
     let f = next_frame(&mut rd, &mut inb, MIN_MAX_FRAME_SIZE * 128, deadline).await?;
+    let init = perf(&f)?;
+    let init_value = init.to_value();
     let Performative::SaslInit {
         mechanism,
         initial_response,
         ..
-    } = perf(&f)?
+    } = init
     else {
         return Err(MqError::new(MqCode::SaslFailed, "expected sasl-init"));
     };
     let response = initial_response.unwrap_or_default();
     let creds = auth::credentials(&mechanism, &response, &offered, &info);
+    // A tenant served by another node: the connection goes there from
+    // this sasl-init on, before the login is answered.
+    if !resumed
+        && let Some(auth::Credentials::Password { user, .. }) = &creds
+        && let Some((node, tenant)) = svc.identity.serve_elsewhere(&info, user).await
+    {
+        let mut prelude = BytesMut::new();
+        put_frame(&mut prelude, FRAME_SASL, 0, &init_value, &[]);
+        prelude.extend_from_slice(&inb);
+        *handoff
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(crate::server::HandOff {
+            node,
+            tenant,
+            prelude: prelude.to_vec(),
+            v10: true,
+        });
+        return Ok(());
+    }
     let principal = match creds {
         Some(c) => svc.identity.login(&info, c).await.map_err(|e| e.0),
         None => Err(format!(

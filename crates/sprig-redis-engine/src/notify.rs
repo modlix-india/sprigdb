@@ -28,7 +28,9 @@ use std::sync::{Arc, OnceLock};
 
 use bytes::Bytes;
 use sprig_proto_redis::Frame;
-use sprig_redis::keyspace::{EXPIRED, GENERIC, HASH, KEYMISS, LIST, NEW, SET, STRING, ZSET, sends};
+use sprig_redis::keyspace::{
+    EXPIRED, GENERIC, HASH, KEYMISS, LIST, NEW, SET, STREAM, STRING, ZSET, sends,
+};
 
 use crate::exec::{self, Cx};
 use crate::layout::{Body, OBJECT_BASE, Space};
@@ -129,6 +131,15 @@ pub fn class(name: &str) -> u16 {
         "zadd" | "zincr" | "zrem" | "zremrangebyrank" | "zremrangebyscore" | "zremrangebylex"
         | "zpopmin" | "zpopmax" | "zunionstore" | "zinterstore" | "zdiffstore" | "zrangestore"
         | "geosearchstore" | "georadiusstore" => ZSET,
+        "xadd"
+        | "xdel"
+        | "xtrim"
+        | "xsetid"
+        | "xgroup-create"
+        | "xgroup-createconsumer"
+        | "xgroup-delconsumer"
+        | "xgroup-destroy"
+        | "xgroup-setid" => STREAM,
         _ => GENERIC,
     }
 }
@@ -240,6 +251,7 @@ struct Target {
 pub struct Before {
     keys: Vec<Target>,
     touched_from: usize,
+    events_from: usize,
 }
 
 /// The state of the keys command `a` (named `name`) may write, before it
@@ -265,6 +277,7 @@ pub fn before<B: Batch>(cx: &mut Cx<'_, B>, name: &str, a: &[Bytes]) -> Result<B
     Ok(Before {
         keys,
         touched_from: cx.touched.len(),
+        events_from: cx.events.len(),
     })
 }
 
@@ -437,6 +450,16 @@ pub fn after<B: Batch>(
             name: ev,
             key: k.key.clone(),
         });
+    }
+    // Events the command recorded itself (streams), after its own.
+    for (space, key, ev) in cx.events.get(b.events_from..).unwrap_or_default() {
+        if flags & class(ev) != 0 {
+            out.push(Event {
+                db: db_of(*space),
+                name: ev,
+                key: key.clone(),
+            });
+        }
     }
     Ok(())
 }
@@ -814,6 +837,32 @@ fn rules(x: &mut Rules<'_>, name: &str, a: &[Bytes], r: &Frame) {
         "georadius" | "georadiusbymember" => {
             if ok && !x.keys.is_empty() {
                 x.store(0, "georadiusstore");
+            }
+        }
+        // Streams; group and consumer events come from the command itself.
+        "xadd" => {
+            if matches!(r, Frame::Bulk(_)) {
+                x.write(0, "xadd");
+            }
+        }
+        "xdel" => {
+            if int(r) > 0 {
+                x.ev(0, "xdel");
+            }
+        }
+        "xtrim" => {
+            if int(r) > 0 {
+                x.ev(0, "xtrim");
+            }
+        }
+        "xsetid" => {
+            if ok {
+                x.ev(0, "xsetid");
+            }
+        }
+        "xgroup" => {
+            if ok {
+                x.new_if(0);
             }
         }
         _ => {}

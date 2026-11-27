@@ -2,6 +2,7 @@
 //! arguments to a typed closure.
 
 mod datetime;
+pub(crate) mod fulltext;
 mod hash;
 pub(crate) mod json;
 pub(crate) mod jsontable;
@@ -41,6 +42,14 @@ pub(crate) fn build(name: &str, args: &[Expr], env: Env<'_>) -> Result<Node> {
             .map(|a| build_expr(a, env))
             .collect::<Result<Vec<_>>>()?;
         return uservar::build(name, args, nodes, env);
+    }
+    if name == fulltext::NAME {
+        let nodes = args
+            .iter()
+            .skip(1)
+            .map(|a| build_expr(a, env))
+            .collect::<Result<Vec<_>>>()?;
+        return fulltext::build(args, nodes, env);
     }
     if sequence::NAMES.contains(&name) {
         let nodes = args
@@ -665,6 +674,10 @@ fn unit_of(args: &[Expr]) -> Result<datetime::Unit> {
 
 /// Writes a function call as SQL text.
 pub(crate) fn write_sql(out: &mut String, name: &str, args: &[Expr]) {
+    if name == fulltext::NAME {
+        fulltext::write_sql(out, args);
+        return;
+    }
     if let ("REGEXP", [s, p]) = (name, args) {
         out.push('(');
         out.push_str(&s.to_sql());

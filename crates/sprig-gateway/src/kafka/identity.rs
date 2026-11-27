@@ -134,6 +134,23 @@ impl Identity for KafkaIdentity {
         decide(login, outcome, path).await
     }
 
+    async fn serve_elsewhere(&self, c: &ConnInfo, user: &str) -> Option<(u64, u64)> {
+        if !crate::forward::enabled() {
+            return None;
+        }
+        let tenant = self
+            .svc
+            .tenant_of(user, c.sni.as_deref(), sprig_auth::admin::MAX_NAME)
+            .await?;
+        match crate::forward::route(tenant.0, crate::frontend::Protocol::Kafka).await {
+            crate::forward::Route::Node(n) => Some((n, tenant.0)),
+            crate::forward::Route::Here => {
+                crate::forward::count_direct(crate::frontend::Protocol::Kafka);
+                None
+            }
+        }
+    }
+
     async fn scram(&self, c: &ConnInfo, mech: ScramMechanism, user: &str) -> ScramLookup {
         let admitted = self.svc.admit(c.peer.ip()).is_ok();
         let req = Self::request(c, user);

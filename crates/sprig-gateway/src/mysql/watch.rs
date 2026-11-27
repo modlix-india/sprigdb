@@ -25,7 +25,7 @@ impl ClientWatch {
     /// disconnect).
     pub(crate) fn new(stream: &MaybeTls<TcpStream>) -> Self {
         Self {
-            dup: dup(tcp_of(stream)),
+            dup: tcp_of(stream).and_then(dup),
         }
     }
 

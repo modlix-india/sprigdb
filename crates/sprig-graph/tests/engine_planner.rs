@@ -409,6 +409,36 @@ const PLANNED: &[(&str, &str, &[&str])] = &[
         &["personId", "firstName"],
     ),
     (
+        "P11 into",
+        "MATCH (a:Person {id: $personId})-[:KNOWS]-(b:Person) MATCH (b)-[r:KNOWS]-(a) RETURN b.id, r.creationDate",
+        &["personId"],
+    ),
+    (
+        "P12 into dir",
+        "MATCH (m:Post {id: $messageId})-[:HAS_CREATOR]->(c:Person), (l:Person)-[:LIKES]->(m) OPTIONAL MATCH (l)-[k:KNOWS]->(c) RETURN l.id, c.id, k IS NULL AS stranger",
+        &["messageId"],
+    ),
+    (
+        "P13 var both",
+        "MATCH (a:Person {id: $personId}), (b:Person {id: $person2Id}) MATCH (a)-[:KNOWS*1..2]-(b) RETURN count(*)",
+        &["personId", "person2Id"],
+    ),
+    (
+        "P14 all shortest",
+        "MATCH (a:Person {id: $personId}), (b:Person {id: $person2Id}) MATCH p = allShortestPaths((a)-[:KNOWS*..4]-(b)) RETURN count(p), min(length(p))",
+        &["personId", "person2Id"],
+    ),
+    (
+        "P15 var end",
+        "MATCH (a:Person)-[:KNOWS*2..2]->(b:Person {id: $personId}) RETURN count(DISTINCT a)",
+        &["personId"],
+    ),
+    (
+        "P16 var cost",
+        "MATCH (a:Person {firstName: $firstName})-[:KNOWS*1..2]->(b:Person {id: $personId}) RETURN count(*)",
+        &["firstName", "personId"],
+    ),
+    (
         "P10 range join",
         "MATCH (p:Person)<-[:HAS_CREATOR]-(m:Post) WHERE m.creationDate >= $lo AND m.creationDate < $hi2 RETURN p.id, m.id",
         &["lo", "hi2"],
@@ -708,7 +738,11 @@ async fn planner_answers_equal() {
             .plan
             .iter()
             .flatten()
-            .filter(|l| l.starts_with("Planner") || l.starts_with("NodeScan"))
+            .filter(|l| {
+                l.starts_with("Planner")
+                    || l.starts_with("NodeScan")
+                    || l.starts_with("Expand(Into)")
+            })
             .collect();
         if lines.iter().any(|l| l.starts_with("Planner")) {
             planned += 1;
@@ -746,6 +780,46 @@ async fn planner_speed() {
         st.triples.values().sum::<f64>()
     );
     let mut r = Rng(11);
+    if env("SPRIG_TEST_PLAN_PROFILE").is_some() {
+        set_planner(true);
+        for (name, q, names) in all_queries() {
+            if only.as_ref().is_some_and(|o| !name.starts_with(o.as_str())) {
+                continue;
+            }
+            let p = mparams(&params(names, &mut r, &f.data));
+            for _ in 0..3 {
+                let _ = on_engine(&f.g, q, &p).await;
+            }
+            let o = on_engine(&f.g, &format!("PROFILE {q}"), &p)
+                .await
+                .unwrap_or_else(|e| panic!("{name} profile: {e}"));
+            eprintln!("== {name} ({} rows)", o.rows.len());
+            for l in o.plan.iter().flatten() {
+                eprintln!("   {l}");
+            }
+        }
+    }
+    // Each selected query run over and over for this many seconds (for a
+    // sampling profiler).
+    if let Some(secs) = env("SPRIG_TEST_PLAN_SPIN").and_then(|v| v.parse::<u64>().ok()) {
+        set_planner(true);
+        for (name, q, names) in all_queries() {
+            if only.as_ref().is_some_and(|o| !name.starts_with(o.as_str())) {
+                continue;
+            }
+            let sets: Vec<Params> = (0..31)
+                .map(|_| mparams(&params(names, &mut r, &f.data)))
+                .collect();
+            eprintln!("spinning {name} for {secs} s (pid {})", std::process::id());
+            let t = Instant::now();
+            let mut n = 0usize;
+            while t.elapsed() < Duration::from_secs(secs) {
+                let _ = on_engine(&f.g, q, &sets[n % sets.len()]).await;
+                n += 1;
+            }
+            eprintln!("spun {name}: {n} runs");
+        }
+    }
     eprintln!("| query | planner off p50 | planner on p50 | ratio | rows |");
     eprintln!("|---|---|---|---|---|");
     for (name, q, names) in all_queries() {
@@ -804,10 +878,17 @@ async fn planner_speed() {
             "MATCH (p:Person {id: $personId})-[:KNOWS]-(f:Person)<-[:HAS_CREATOR]-(m:Post) RETURN max(m.creationDate)",
             &["personId"],
         ),
+        (READS[7].0, READS[7].1, READS[7].2),
+        (READS[9].0, READS[9].1, READS[9].2),
+        (READS[1].0, READS[1].1, READS[1].2),
+        (READS[2].0, READS[2].1, READS[2].2),
     ];
     eprintln!("| query | one by one p50 | batched p50 | ratio | rows |");
     eprintln!("|---|---|---|---|---|");
     for (name, q, names) in far {
+        if only.as_ref().is_some_and(|o| !name.starts_with(o.as_str()) && !name.starts_with('F')) {
+            continue;
+        }
         let sets: Vec<Params> = (0..31)
             .map(|_| mparams(&params(names, &mut r, &f.data)))
             .collect();

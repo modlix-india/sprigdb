@@ -275,19 +275,28 @@ const PARSED_MAX: usize = 512;
 /// # Errors
 /// As [`parse`] (failures aren't kept).
 pub fn parse_cached(src: &str) -> Result<Query> {
+    parse_shared(src).map(|q| (*q).clone())
+}
+
+/// [`parse_cached`] without copying the statement: the cached parse
+/// itself, shared.
+///
+/// # Errors
+/// As [`parse`] (failures aren't kept).
+pub fn parse_shared(src: &str) -> Result<std::sync::Arc<Query>> {
     use std::collections::HashMap;
-    use std::sync::{Mutex, OnceLock, PoisonError};
-    static PARSED: OnceLock<Mutex<HashMap<String, Query>>> = OnceLock::new();
+    use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+    static PARSED: OnceLock<Mutex<HashMap<String, Arc<Query>>>> = OnceLock::new();
     let m = PARSED.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(q) = m.lock().unwrap_or_else(PoisonError::into_inner).get(src) {
-        return Ok(q.clone());
+        return Ok(Arc::clone(q));
     }
-    let q = parse(src)?;
+    let q = Arc::new(parse(src)?);
     let mut g = m.lock().unwrap_or_else(PoisonError::into_inner);
     if g.len() >= PARSED_MAX {
         g.clear();
     }
-    g.insert(src.to_owned(), q.clone());
+    g.insert(src.to_owned(), Arc::clone(&q));
     Ok(q)
 }
 

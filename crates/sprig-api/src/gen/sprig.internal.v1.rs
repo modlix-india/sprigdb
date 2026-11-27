@@ -3604,3 +3604,404 @@ pub mod catalog_peer_server {
         const NAME: &'static str = SERVICE_NAME;
     }
 }
+/// The client's TLS as the accepting node negotiated it.
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SpliceTls {
+    /// "1.2" or "1.3".
+    #[prost(string, tag = "1")]
+    pub version: ::prost::alloc::string::String,
+    /// The IANA cipher suite name.
+    #[prost(string, tag = "2")]
+    pub cipher: ::prost::alloc::string::String,
+    /// The server name the client asked for; empty for none.
+    #[prost(string, tag = "3")]
+    pub sni: ::prost::alloc::string::String,
+    /// The client presented a certificate the listener verified.
+    #[prost(bool, tag = "4")]
+    pub client_cert: bool,
+    /// That certificate's subject and issuer; empty without one.
+    #[prost(string, tag = "5")]
+    pub client_subject: ::prost::alloc::string::String,
+    #[prost(string, tag = "6")]
+    pub client_issuer: ::prost::alloc::string::String,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SpliceOpen {
+    /// The listener name the client connected to (`mysql`, `mariadb`,
+    /// `redis`, `mongo`, `kafka`, `amqp`, `amqps`, `bolt`).
+    #[prost(string, tag = "1")]
+    pub listener: ::prost::alloc::string::String,
+    /// The client address the accepting node saw (after its PROXY header).
+    #[prost(string, tag = "2")]
+    pub client_addr: ::prost::alloc::string::String,
+    /// Absent: plaintext.
+    #[prost(message, optional, tag = "3")]
+    pub tls: ::core::option::Option<SpliceTls>,
+    /// The tenant the login names.
+    #[prost(uint64, tag = "4")]
+    pub tenant_id: u64,
+    /// Nodes this connection was already handed to before (0 on the first).
+    #[prost(uint32, tag = "5")]
+    pub hops: u32,
+    /// The accepting node's Raft id, for the receiver's logs.
+    #[prost(uint64, tag = "6")]
+    pub from_node: u64,
+    /// What the front end had already established with the client, as the
+    /// protocol's own JSON (nonce, connection id, negotiated options).
+    #[prost(string, tag = "7")]
+    pub resume_json: ::prost::alloc::string::String,
+    /// The client's bytes from its login message on, already read.
+    #[prost(bytes = "vec", tag = "8")]
+    pub prelude: ::prost::alloc::vec::Vec<u8>,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SpliceUp {
+    #[prost(oneof = "splice_up::Msg", tags = "1, 2")]
+    pub msg: ::core::option::Option<splice_up::Msg>,
+}
+/// Nested message and enum types in `SpliceUp`.
+pub mod splice_up {
+    #[allow(clippy::all)]
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Msg {
+        #[prost(message, tag = "1")]
+        Open(super::SpliceOpen),
+        /// Client bytes.
+        #[prost(bytes, tag = "2")]
+        Data(::prost::alloc::vec::Vec<u8>),
+    }
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SpliceRefused {
+    /// A SprigDB error code (sprig_common::SprigCode) and its message.
+    #[prost(uint32, tag = "1")]
+    pub code: u32,
+    #[prost(string, tag = "2")]
+    pub message: ::prost::alloc::string::String,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SpliceDown {
+    #[prost(oneof = "splice_down::Msg", tags = "1, 2, 3, 4")]
+    pub msg: ::core::option::Option<splice_down::Msg>,
+}
+/// Nested message and enum types in `SpliceDown`.
+pub mod splice_down {
+    #[allow(clippy::all)]
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Msg {
+        /// This node serves the connection.
+        #[prost(bool, tag = "1")]
+        Accepted(bool),
+        /// Another node leads the tenant's unit: try it (its Raft id).
+        #[prost(uint64, tag = "2")]
+        Redirect(u64),
+        #[prost(message, tag = "3")]
+        Refused(super::SpliceRefused),
+        /// Bytes for the client.
+        #[prost(bytes, tag = "4")]
+        Data(::prost::alloc::vec::Vec<u8>),
+    }
+}
+/// Generated client implementations.
+pub mod node_forward_client {
+    #![allow(
+        unused_variables,
+        dead_code,
+        missing_docs,
+        clippy::wildcard_imports,
+        clippy::let_unit_value,
+    )]
+    use tonic::codegen::*;
+    use tonic::codegen::http::Uri;
+    #[derive(Debug, Clone)]
+    pub struct NodeForwardClient<T> {
+        inner: tonic::client::Grpc<T>,
+    }
+    impl<T> NodeForwardClient<T>
+    where
+        T: tonic::client::GrpcService<tonic::body::Body>,
+        T::Error: Into<StdError>,
+        T::ResponseBody: Body<Data = Bytes> + std::marker::Send + 'static,
+        <T::ResponseBody as Body>::Error: Into<StdError> + std::marker::Send,
+    {
+        pub fn new(inner: T) -> Self {
+            let inner = tonic::client::Grpc::new(inner);
+            Self { inner }
+        }
+        pub fn with_origin(inner: T, origin: Uri) -> Self {
+            let inner = tonic::client::Grpc::with_origin(inner, origin);
+            Self { inner }
+        }
+        pub fn with_interceptor<F>(
+            inner: T,
+            interceptor: F,
+        ) -> NodeForwardClient<InterceptedService<T, F>>
+        where
+            F: tonic::service::Interceptor,
+            T::ResponseBody: Default,
+            T: tonic::codegen::Service<
+                http::Request<tonic::body::Body>,
+                Response = http::Response<
+                    <T as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody,
+                >,
+            >,
+            <T as tonic::codegen::Service<
+                http::Request<tonic::body::Body>,
+            >>::Error: Into<StdError> + std::marker::Send + std::marker::Sync,
+        {
+            NodeForwardClient::new(InterceptedService::new(inner, interceptor))
+        }
+        /// Compress requests with the given encoding.
+        ///
+        /// This requires the server to support it otherwise it might respond with an
+        /// error.
+        #[must_use]
+        pub fn send_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.inner = self.inner.send_compressed(encoding);
+            self
+        }
+        /// Enable decompressing responses.
+        #[must_use]
+        pub fn accept_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.inner = self.inner.accept_compressed(encoding);
+            self
+        }
+        /// Limits the maximum size of a decoded message.
+        ///
+        /// Default: `4MB`
+        #[must_use]
+        pub fn max_decoding_message_size(mut self, limit: usize) -> Self {
+            self.inner = self.inner.max_decoding_message_size(limit);
+            self
+        }
+        /// Limits the maximum size of an encoded message.
+        ///
+        /// Default: `usize::MAX`
+        #[must_use]
+        pub fn max_encoding_message_size(mut self, limit: usize) -> Self {
+            self.inner = self.inner.max_encoding_message_size(limit);
+            self
+        }
+        /// One client connection. The first up frame is `open`; the first down
+        /// frame answers it (`accepted`, `redirect` or `refused`). After an
+        /// acceptance both directions carry the connection's bytes; either side
+        /// ending its stream closes the connection.
+        pub async fn splice(
+            &mut self,
+            request: impl tonic::IntoStreamingRequest<Message = super::SpliceUp>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::SpliceDown>>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/sprig.internal.v1.NodeForward/Splice",
+            );
+            let mut req = request.into_streaming_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("sprig.internal.v1.NodeForward", "Splice"));
+            self.inner.streaming(req, path, codec).await
+        }
+    }
+}
+/// Generated server implementations.
+pub mod node_forward_server {
+    #![allow(
+        unused_variables,
+        dead_code,
+        missing_docs,
+        clippy::wildcard_imports,
+        clippy::let_unit_value,
+    )]
+    use tonic::codegen::*;
+    /// Generated trait containing gRPC methods that should be implemented for use with NodeForwardServer.
+    #[async_trait]
+    pub trait NodeForward: std::marker::Send + std::marker::Sync + 'static {
+        /// Server streaming response type for the Splice method.
+        type SpliceStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::SpliceDown, tonic::Status>,
+            >
+            + std::marker::Send
+            + 'static;
+        /// One client connection. The first up frame is `open`; the first down
+        /// frame answers it (`accepted`, `redirect` or `refused`). After an
+        /// acceptance both directions carry the connection's bytes; either side
+        /// ending its stream closes the connection.
+        async fn splice(
+            &self,
+            request: tonic::Request<tonic::Streaming<super::SpliceUp>>,
+        ) -> std::result::Result<tonic::Response<Self::SpliceStream>, tonic::Status>;
+    }
+    #[derive(Debug)]
+    pub struct NodeForwardServer<T> {
+        inner: Arc<T>,
+        accept_compression_encodings: EnabledCompressionEncodings,
+        send_compression_encodings: EnabledCompressionEncodings,
+        max_decoding_message_size: Option<usize>,
+        max_encoding_message_size: Option<usize>,
+    }
+    impl<T> NodeForwardServer<T> {
+        pub fn new(inner: T) -> Self {
+            Self::from_arc(Arc::new(inner))
+        }
+        pub fn from_arc(inner: Arc<T>) -> Self {
+            Self {
+                inner,
+                accept_compression_encodings: Default::default(),
+                send_compression_encodings: Default::default(),
+                max_decoding_message_size: None,
+                max_encoding_message_size: None,
+            }
+        }
+        pub fn with_interceptor<F>(
+            inner: T,
+            interceptor: F,
+        ) -> InterceptedService<Self, F>
+        where
+            F: tonic::service::Interceptor,
+        {
+            InterceptedService::new(Self::new(inner), interceptor)
+        }
+        /// Enable decompressing requests with the given encoding.
+        #[must_use]
+        pub fn accept_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.accept_compression_encodings.enable(encoding);
+            self
+        }
+        /// Compress responses with the given encoding, if the client supports it.
+        #[must_use]
+        pub fn send_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.send_compression_encodings.enable(encoding);
+            self
+        }
+        /// Limits the maximum size of a decoded message.
+        ///
+        /// Default: `4MB`
+        #[must_use]
+        pub fn max_decoding_message_size(mut self, limit: usize) -> Self {
+            self.max_decoding_message_size = Some(limit);
+            self
+        }
+        /// Limits the maximum size of an encoded message.
+        ///
+        /// Default: `usize::MAX`
+        #[must_use]
+        pub fn max_encoding_message_size(mut self, limit: usize) -> Self {
+            self.max_encoding_message_size = Some(limit);
+            self
+        }
+    }
+    impl<T, B> tonic::codegen::Service<http::Request<B>> for NodeForwardServer<T>
+    where
+        T: NodeForward,
+        B: Body + std::marker::Send + 'static,
+        B::Error: Into<StdError> + std::marker::Send + 'static,
+    {
+        type Response = http::Response<tonic::body::Body>;
+        type Error = std::convert::Infallible;
+        type Future = BoxFuture<Self::Response, Self::Error>;
+        fn poll_ready(
+            &mut self,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::result::Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+        fn call(&mut self, req: http::Request<B>) -> Self::Future {
+            match req.uri().path() {
+                "/sprig.internal.v1.NodeForward/Splice" => {
+                    #[allow(non_camel_case_types)]
+                    struct SpliceSvc<T: NodeForward>(pub Arc<T>);
+                    impl<T: NodeForward> tonic::server::StreamingService<super::SpliceUp>
+                    for SpliceSvc<T> {
+                        type Response = super::SpliceDown;
+                        type ResponseStream = T::SpliceStream;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::ResponseStream>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<tonic::Streaming<super::SpliceUp>>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as NodeForward>::splice(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = SpliceSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                _ => {
+                    Box::pin(async move {
+                        let mut response = http::Response::new(
+                            tonic::body::Body::default(),
+                        );
+                        let headers = response.headers_mut();
+                        headers
+                            .insert(
+                                tonic::Status::GRPC_STATUS,
+                                (tonic::Code::Unimplemented as i32).into(),
+                            );
+                        headers
+                            .insert(
+                                http::header::CONTENT_TYPE,
+                                tonic::metadata::GRPC_CONTENT_TYPE,
+                            );
+                        Ok(response)
+                    })
+                }
+            }
+        }
+    }
+    impl<T> Clone for NodeForwardServer<T> {
+        fn clone(&self) -> Self {
+            let inner = self.inner.clone();
+            Self {
+                inner,
+                accept_compression_encodings: self.accept_compression_encodings,
+                send_compression_encodings: self.send_compression_encodings,
+                max_decoding_message_size: self.max_decoding_message_size,
+                max_encoding_message_size: self.max_encoding_message_size,
+            }
+        }
+    }
+    /// Generated gRPC service name
+    pub const SERVICE_NAME: &str = "sprig.internal.v1.NodeForward";
+    impl<T> tonic::server::NamedService for NodeForwardServer<T> {
+        const NAME: &'static str = SERVICE_NAME;
+    }
+}

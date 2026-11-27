@@ -259,14 +259,24 @@ impl Versions {
 /// waits on, oldest first. A batch that writes a key wakes the oldest
 /// client waiting on it; a client that got an item wakes the next one, so
 /// clients are served in the order they blocked. A wake is a permit, so
-/// one that arrives between two attempts isn't lost.
+/// one that arrives between two attempts isn't lost. Stream readers
+/// (`XREAD`, `XREADGROUP`) are all woken by every write to their keys:
+/// they don't take what another reader sees.
 #[derive(Debug, Default)]
 pub struct Waiters {
-    map: Mutex<HashMap<Bytes, std::collections::VecDeque<Arc<Notify>>>>,
+    map: Mutex<HashMap<Bytes, std::collections::VecDeque<Waiter>>>,
     blocked: AtomicUsize,
     /// Counts the writes that woke anyone (a waiter that can't use a wake
     /// passes it on once per write).
     wakes: AtomicU64,
+}
+
+/// One blocked client in [`Waiters`].
+#[derive(Debug)]
+struct Waiter {
+    note: Arc<Notify>,
+    /// A stream reader: woken by every write, never by a pass-on.
+    all: bool,
 }
 
 /// A blocked client's place in [`Waiters`]; dropping it (the client got
@@ -275,26 +285,33 @@ struct Registration<'a> {
     waiters: &'a Waiters,
     metas: Vec<Bytes>,
     note: Arc<Notify>,
+    all: bool,
 }
 
 impl Drop for Registration<'_> {
     fn drop(&mut self) {
-        // A wake this client may not have used goes to the next in line.
-        self.waiters.wake_first(&self.metas, Some(&self.note));
+        // A wake this client may not have used goes to the next in line
+        // (stream readers were all woken anyway).
+        if !self.all {
+            self.waiters.wake_first(&self.metas, Some(&self.note));
+        }
         self.waiters.unregister(&self.metas, &self.note);
     }
 }
 
 impl Waiters {
-    fn lock(&self) -> MutexGuard<'_, HashMap<Bytes, std::collections::VecDeque<Arc<Notify>>>> {
+    fn lock(&self) -> MutexGuard<'_, HashMap<Bytes, std::collections::VecDeque<Waiter>>> {
         self.map.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn register(&self, metas: Vec<Bytes>) -> Registration<'_> {
+    fn register(&self, metas: Vec<Bytes>, all: bool) -> Registration<'_> {
         let note = Arc::new(Notify::new());
         let mut m = self.lock();
         for k in &metas {
-            m.entry(k.clone()).or_default().push_back(Arc::clone(&note));
+            m.entry(k.clone()).or_default().push_back(Waiter {
+                note: Arc::clone(&note),
+                all,
+            });
         }
         drop(m);
         self.blocked.fetch_add(1, Ordering::AcqRel);
@@ -302,6 +319,7 @@ impl Waiters {
             waiters: self,
             metas,
             note,
+            all,
         }
     }
 
@@ -309,7 +327,7 @@ impl Waiters {
         let mut m = self.lock();
         for k in metas {
             if let Some(v) = m.get_mut(k) {
-                v.retain(|x| !Arc::ptr_eq(x, n));
+                v.retain(|x| !Arc::ptr_eq(&x.note, n));
                 if v.is_empty() {
                     m.remove(k);
                 }
@@ -319,29 +337,39 @@ impl Waiters {
         self.blocked.fetch_sub(1, Ordering::AcqRel);
     }
 
-    /// Wakes the oldest client waiting on each of `metas` (other than
-    /// `except`).
+    /// Wakes the oldest client (not a stream reader) waiting on each of
+    /// `metas` (other than `except`).
     fn wake_first(&self, metas: &[Bytes], except: Option<&Arc<Notify>>) {
         if self.blocked.load(Ordering::Acquire) == 0 {
             return;
         }
         let m = self.lock();
         for k in metas {
-            if let Some(n) = m
-                .get(k)
-                .and_then(|v| v.iter().find(|x| except.is_none_or(|e| !Arc::ptr_eq(x, e))))
-            {
-                n.notify_one();
+            if let Some(w) = m.get(k).and_then(|v| {
+                v.iter()
+                    .find(|x| !x.all && except.is_none_or(|e| !Arc::ptr_eq(&x.note, e)))
+            }) {
+                w.note.notify_one();
             }
         }
     }
 
+    /// A write to `metas`: the oldest client waiting on each, and every
+    /// stream reader.
     fn wake(&self, metas: &[Bytes]) {
         if self.blocked.load(Ordering::Acquire) == 0 {
             return;
         }
         self.wakes.fetch_add(1, Ordering::AcqRel);
         self.wake_first(metas, None);
+        let m = self.lock();
+        for k in metas {
+            if let Some(v) = m.get(k) {
+                for w in v.iter().filter(|w| w.all) {
+                    w.note.notify_one();
+                }
+            }
+        }
     }
 }
 
@@ -546,6 +574,7 @@ impl<U: Unit> EngineDb<U> {
             uids,
             resp3: false,
             touched: Vec::new(),
+            events: Vec::new(),
         };
         let mut replies = Vec::with_capacity(cmds.len());
         // Keyspace notifications: off costs this one load.
@@ -694,11 +723,20 @@ impl<U: Unit> EngineDb<U> {
     /// Runs blocking command `c` (named `name`): attempts until one pops
     /// something or the timeout passes, holding no key while it waits.
     async fn run_blocking(&self, c: &[Bytes], name: &str, resp3: bool) -> Frame {
+        let stream = exec::blocking::wakes_all(name);
+        // `XREAD ... $`: the streams' last IDs now, for every attempt.
+        let resolved;
+        let c = if name == "xread" {
+            resolved = self.resolve_dollar(c).await;
+            &resolved[..]
+        } else {
+            c
+        };
         let metas: Vec<Bytes> = exec::blocking::wait_keys(name, c)
             .iter()
             .map(|k| self.space.meta(k))
             .collect();
-        let reg = self.waiters.register(metas);
+        let reg = self.waiters.register(metas, stream);
         let mut deadline = None;
         let mut first = true;
         let mut passed = None;
@@ -713,6 +751,7 @@ impl<U: Unit> EngineDb<U> {
             // another type is an error, as there); the wake goes on to the
             // next client, once per write.
             let wrong = !first
+                && !stream
                 && !matches!(name, "blmove" | "brpoplpush")
                 && matches!(&r, Frame::Error(e) if e.starts_with(b"WRONGTYPE"));
             first = false;
@@ -725,7 +764,9 @@ impl<U: Unit> EngineDb<U> {
             }
             if !matches!(r, Frame::Null(_)) && !wrong {
                 // Served: the next client in line may find more.
-                self.waiters.wake_first(&reg.metas, Some(&reg.note));
+                if !stream {
+                    self.waiters.wake_first(&reg.metas, Some(&reg.note));
+                }
                 break r;
             }
             // The attempt checked the arguments, so the timeout is valid.
@@ -747,6 +788,42 @@ impl<U: Unit> EngineDb<U> {
         out
     }
 
+    /// `XREAD` command `c` with each `$` ID replaced by its stream's last
+    /// ID now (`0-0` for a missing key), so every attempt of a blocked read
+    /// asks for the same entries.
+    async fn resolve_dollar(&self, c: &[Bytes]) -> Vec<Bytes> {
+        let mut out = c.to_vec();
+        let Ok(r) = exec::streams::read_args(c, false) else {
+            return out;
+        };
+        if !c[r.keys_at + r.n..].iter().any(|i| i.as_ref() == b"$") {
+            return out;
+        }
+        let Ok(mut b) = self.unit.begin(Vec::new()).await else {
+            return out;
+        };
+        let now = self.unit.now_ms();
+        for i in 0..r.n {
+            if c[r.keys_at + r.n + i].as_ref() != b"$" {
+                continue;
+            }
+            let last = b
+                .get(&self.space.meta(&c[r.keys_at + i]))
+                .ok()
+                .flatten()
+                .and_then(|v| crate::layout::Meta::decode(&v))
+                .filter(|m| !m.expired(now))
+                .and_then(|m| match m.body {
+                    crate::layout::Body::Stream(s) => Some(s.last),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            out[r.keys_at + r.n + i] = Bytes::from(last.to_string());
+        }
+        let _ = b.commit();
+        out
+    }
+
     /// Runs `cmds` as one batch (see [`EngineDatabase::run`]), for a RESP2
     /// client.
     pub async fn run_batch(&self, cmds: &[&[Bytes]]) -> Vec<Frame> {
@@ -757,13 +834,18 @@ impl<U: Unit> EngineDb<U> {
     /// blocking command among them runs on its own, in order.
     pub async fn run_batch_as(&self, cmds: &[&[Bytes]], resp3: bool) -> Vec<Frame> {
         let names: Vec<String> = cmds.iter().map(|c| lower(c)).collect();
-        if !names.iter().any(|n| exec::blocking::is_blocking(n)) {
+        let blocks: Vec<bool> = names
+            .iter()
+            .zip(cmds)
+            .map(|(n, c)| exec::blocking::blocks(n, c))
+            .collect();
+        if !blocks.iter().any(|b| *b) {
             return self.run_plain(cmds, resp3).await;
         }
         let mut out = Vec::with_capacity(cmds.len());
         let mut start = 0;
         for (i, n) in names.iter().enumerate() {
-            if exec::blocking::is_blocking(n) {
+            if blocks[i] {
                 if start < i {
                     out.extend(self.run_plain(&cmds[start..i], resp3).await);
                 }
@@ -876,10 +958,24 @@ impl<U: Unit> EngineDb<U> {
                 .iter()
                 .flat_map(|w| std::iter::repeat_n(w.resp3, w.cmds.len()))
                 .collect();
-            match self
-                .execute(vec![key.clone()], &cmds, &names, &protos)
-                .await
-            {
+            // A round refused before its commit was queued changed nothing
+            // (a leader change rolled its transaction back): it runs again,
+            // as multi-key batches do, so a failover's first moments don't
+            // reach the clients as TRYAGAIN.
+            let mut attempt = 0;
+            let out = loop {
+                match self
+                    .execute(vec![key.clone()], &cmds, &names, &protos)
+                    .await
+                {
+                    Err(e) if e.retryable && attempt < BATCH_RETRIES => {
+                        attempt += 1;
+                        tokio::time::sleep(Duration::from_millis(1 << attempt)).await;
+                    }
+                    other => break other,
+                }
+            };
+            match out {
                 Ok((replies, ticket)) => {
                     let mut it = replies.into_iter();
                     for w in batch {
@@ -1007,5 +1103,63 @@ mod uid_tests {
         assert_ne!(uids.reserve(1).await.unwrap().0, vec![3]);
         drop(engine);
         let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+    use crate::mem::MemUnit;
+
+    fn db(unit: &Arc<MemUnit>) -> Arc<EngineDb<MemUnit>> {
+        let all: Arc<[Space]> = (0..16).map(|d| Space::redis(9, d)).collect();
+        EngineDb::new(
+            Arc::clone(unit),
+            all[0],
+            Arc::clone(&all),
+            Uids::new(Arc::clone(unit), 9),
+            Versions::new(),
+            Arc::new(Waiters::default()),
+        )
+    }
+
+    fn cmd(s: &str) -> Vec<Bytes> {
+        s.split(' ')
+            .map(|a| Bytes::copy_from_slice(a.as_bytes()))
+            .collect()
+    }
+
+    /// A one-key round whose commit is refused as retryable (a leader
+    /// change rolled it back) runs again; nothing applies twice.
+    #[tokio::test]
+    async fn hot_key_rounds_run_again_after_a_retryable_refusal() {
+        let unit = Arc::new(MemUnit::new());
+        let d = db(&unit);
+        unit.fail_next_commits(2);
+        let c = cmd("INCR k");
+        assert_eq!(d.run_batch(&[&c[..]]).await, vec![Frame::Integer(1)]);
+        let x = cmd("XADD s 1-1 f v");
+        unit.fail_next_commits(1);
+        assert_eq!(
+            d.run_batch(&[&x[..]]).await,
+            vec![Frame::Bulk(Bytes::from_static(b"1-1"))]
+        );
+        let g = cmd("GET k");
+        assert_eq!(
+            d.run_batch(&[&g[..]]).await,
+            vec![Frame::Bulk(Bytes::from_static(b"1"))]
+        );
+        // Past the retries the client gets TRYAGAIN, and nothing changed.
+        unit.fail_next_commits(100);
+        let r = d.run_batch(&[&c[..]]).await;
+        assert!(
+            matches!(&r[0], Frame::Error(e) if e.starts_with(b"TRYAGAIN")),
+            "{r:?}"
+        );
+        unit.fail_next_commits(0);
+        assert_eq!(
+            d.run_batch(&[&g[..]]).await,
+            vec![Frame::Bulk(Bytes::from_static(b"1"))]
+        );
     }
 }

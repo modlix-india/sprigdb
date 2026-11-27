@@ -185,6 +185,8 @@ pub async fn run_stream(
         fused: None,
         read_only: false,
         then: None,
+        top_clauses: Vec::new(),
+        texts: std::collections::HashMap::new(),
     };
     let mut clauses = q.parts[0].clauses.clone();
     // SKIP and LIMIT apply to the whole stream, not to each page.

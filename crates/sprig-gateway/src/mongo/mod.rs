@@ -36,6 +36,7 @@ pub mod engine_changes;
 pub mod explain;
 pub mod failpoint;
 pub mod feed_relay;
+pub(crate) mod handoff;
 pub mod logic;
 pub mod publish;
 pub mod qsettings;

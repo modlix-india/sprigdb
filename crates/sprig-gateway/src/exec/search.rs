@@ -329,8 +329,11 @@ impl PassSession {
             return Ok(None);
         };
         // `FULLTEXT` keys inside `CREATE TABLE`: the table
-        // without them, then each as a converted search index.
+        // without them, then each as a converted search index. On engine
+        // databases they are the table's own keys.
+        let engine_ft = self.engine_fulltext();
         match sprig_search::ddl::create_table_fulltext(sql) {
+            Ok(Some(_)) if engine_ft => return Ok(None),
             Ok(None) => {}
             Ok(Some(c)) => {
                 let Ok(svc) = self.search_service() else {
@@ -379,7 +382,13 @@ impl PassSession {
             Ok(Some(d)) => d,
             Err(e) => return Ok(Some(self.fail(out, &e).await?)),
         };
-        // MySQL FULLTEXT DDL: kept for MariaDB unless converted.
+        // MySQL FULLTEXT DDL: kept for MariaDB unless converted; on engine
+        // databases the engine's own.
+        if let SearchDdl::Fulltext { .. } = &ddl
+            && engine_ft
+        {
+            return Ok(None);
+        }
         if let SearchDdl::Fulltext { .. } = &ddl {
             let Ok(svc) = self.search_service() else {
                 return Ok(None);
@@ -894,6 +903,16 @@ impl PassSession {
         Ok(rows.join(" UNION ALL "))
     }
 
+    /// Whether the session's tenant has engine databases: their tables'
+    /// `FULLTEXT` keys and `MATCH ... AGAINST` are the engine's own
+    /// (`crate::engine::fulltext`), not search indexes.
+    fn engine_fulltext(&self) -> bool {
+        self.tenant
+            .as_deref()
+            .and_then(|ts| ts.catalog())
+            .is_some_and(|c| crate::engine::catalog::of(c).is_some())
+    }
+
     /// `MATCH ... AGAINST` and `sprig_search()`: runs each search and the
     /// statement with them replaced; `None` when the text has none (or
     /// only `MATCH` calls on tables without search indexes).
@@ -922,8 +941,13 @@ impl PassSession {
         } else {
             Vec::new()
         };
+        let engine_ft = self.engine_fulltext();
         let scan = match sqlscan::scan(sql) {
-            Ok(s) if s.matches.is_empty() && s.searches.is_empty() && likes.is_empty() => {
+            Ok(s)
+                if (s.matches.is_empty() || engine_ft)
+                    && s.searches.is_empty()
+                    && likes.is_empty() =>
+            {
                 return Ok(None);
             }
             Ok(s) => s,
@@ -962,7 +986,7 @@ impl PassSession {
     /// (CONCAT(?) IS NULL))` as a value); `None` when no `MATCH` is on a
     /// search index (MariaDB's `FULLTEXT` takes it).
     pub(super) async fn search_prepare_text(&mut self, sql: &[u8]) -> Result<Option<String>> {
-        if !sqlscan::mentions(sql) || crate::search::service().is_none() {
+        if !sqlscan::mentions(sql) || crate::search::service().is_none() || self.engine_fulltext() {
             return Ok(None);
         }
         let Ok(sql) = std::str::from_utf8(sql) else {

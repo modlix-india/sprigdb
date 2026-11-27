@@ -604,6 +604,7 @@ pub fn encoding(m: &Meta) -> &'static str {
         Body::Hash(HashBody::Split { .. }) | Body::Set(SetBody::Split { .. }) => "hashtable",
         Body::Set(SetBody::Inline { ints: true, .. }) => "intset",
         Body::ZSet(ZBody::Split { .. }) => "skiplist",
+        Body::Stream(_) => "stream",
     }
 }
 
@@ -829,9 +830,16 @@ fn sort<B: Batch>(cx: &mut Cx<'_, B>, a: &[Bytes], ro: bool) -> Out {
 /// Whether `t` names a type (`SCAN … TYPE`).
 #[must_use]
 pub fn is_type(t: &str) -> bool {
-    [Type::String, Type::Hash, Type::List, Type::Set, Type::ZSet]
-        .iter()
-        .any(|x| x.name() == t)
+    [
+        Type::String,
+        Type::Hash,
+        Type::List,
+        Type::Set,
+        Type::ZSet,
+        Type::Stream,
+    ]
+    .iter()
+    .any(|x| x.name() == t)
 }
 
 #[cfg(test)]

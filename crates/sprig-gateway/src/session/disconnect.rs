@@ -19,12 +19,14 @@ use crate::frontend::MaybeTls;
 /// stays set until the bytes are read, so it can't simply be awaited.
 const PENDING_RECHECK: Duration = Duration::from_millis(100);
 
-/// The TCP socket under a possibly-TLS client stream.
+/// The TCP socket under a possibly-TLS client stream; `None` for a
+/// connection another node accepted and handed here.
 #[must_use]
-pub fn tcp_of(stream: &MaybeTls<TcpStream>) -> &TcpStream {
+pub fn tcp_of(stream: &MaybeTls<TcpStream>) -> Option<&TcpStream> {
     match stream {
-        MaybeTls::Plain(s) => s,
-        MaybeTls::Tls(s) => s.get_ref().0,
+        MaybeTls::Plain(s) => Some(s),
+        MaybeTls::Tls(s) => Some(s.get_ref().0),
+        MaybeTls::Forwarded(_) => None,
     }
 }
 
@@ -55,7 +57,11 @@ pub async fn peer_closed(sock: &TcpStream) {
 /// [`peer_closed`] for a front end's client stream. With TLS, the FIN after
 /// the client's `close_notify` is what counts.
 pub async fn client_gone(stream: &MaybeTls<TcpStream>) {
-    peer_closed(tcp_of(stream)).await;
+    match stream {
+        MaybeTls::Forwarded(f) => f.gone().await,
+        MaybeTls::Plain(s) => peer_closed(s).await,
+        MaybeTls::Tls(s) => peer_closed(s.get_ref().0).await,
+    }
 }
 
 /// How a watched statement ended.

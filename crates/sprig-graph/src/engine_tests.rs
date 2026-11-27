@@ -362,6 +362,253 @@ async fn statistics_counters_follow_commits() {
     }
 }
 
+/// Waits for a background statistics pass to end.
+async fn settle(g: &Arc<EngineGraph>) {
+    while g.collecting.load(std::sync::atomic::Ordering::Acquire) {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
+type Counts = (Vec<(u32, f64)>, Vec<((u32, u32, u32), f64)>);
+
+fn counts_of(st: &stats::GraphStats) -> Counts {
+    let mut a: Vec<(u32, f64)> = st
+        .sets
+        .iter()
+        .filter(|(_, n)| **n > 0.0)
+        .map(|(x, y)| (*x, *y))
+        .collect();
+    a.sort_by_key(|x| x.0);
+    let mut b: Vec<((u32, u32, u32), f64)> = st
+        .triples
+        .iter()
+        .filter(|(_, n)| **n > 0.0)
+        .map(|(x, y)| (*x, *y))
+        .collect();
+    b.sort_by_key(|x| x.0);
+    (a, b)
+}
+
+/// The counters survive reopening the graph exactly: the stored record
+/// plus the deltas committed since (auto-commit statements, an explicit
+/// transaction, `CALL { } IN TRANSACTIONS` batches, a rollback that
+/// stores nothing); many deltas are folded into the record; a pass deletes
+/// the deltas it counted.
+#[tokio::test]
+async fn statistics_counters_survive_reopening() {
+    for shards in [1, 3] {
+        let p = path();
+        let g = EngineGraph::open(p.clone(), 7, 8, shards).unwrap();
+        run(&g, "UNWIND range(1, 20) AS i CREATE (a:A {i: i}), (b:B {i: i}), (a)-[:R]->(b), (a)-[:L]->(a)")
+            .await
+            .unwrap();
+        run(&g, "MATCH (a:A) WHERE a.i % 3 = 0 SET a:C REMOVE a:A")
+            .await
+            .unwrap();
+        run(&g, "MATCH (b:B) WHERE b.i % 4 = 0 DETACH DELETE b")
+            .await
+            .unwrap();
+        run(
+            &g,
+            "UNWIND range(1, 9) AS i CALL { WITH i CREATE (:T {i: i})-[:R]->(:B) } IN TRANSACTIONS OF 2 ROWS",
+        )
+        .await
+        .unwrap();
+        // An explicit transaction of two statements.
+        let mut tx = g.begin(false);
+        for q in ["CREATE (:X)-[:R]->(:Y)", "MATCH (x:X) SET x:Z"] {
+            let mut s = g.store(&mut tx);
+            crate::execute(&mut s, q, &Params::new(), &Budgets::default())
+                .await
+                .unwrap();
+        }
+        tx.commit(&g).await.unwrap();
+        // Rolled back: nothing stored.
+        let mut tx = g.begin(false);
+        {
+            let mut s = g.store(&mut tx);
+            crate::execute(&mut s, "CREATE (:A)", &Params::new(), &Budgets::default())
+                .await
+                .unwrap();
+        }
+        tx.rollback();
+        let fresh = g.collect_stats().unwrap();
+        assert_eq!(counts_of(&g.stats().unwrap()), counts_of(&fresh));
+        let stored = g.stored_deltas(usize::MAX).unwrap().len();
+        assert!(stored >= 9, "{stored} deltas stored");
+        settle(&g).await;
+        drop(g);
+        let g = EngineGraph::open(p.clone(), 7, 8, shards).unwrap();
+        assert_eq!(
+            counts_of(&g.stats().unwrap()),
+            counts_of(&fresh),
+            "shards {shards} after reopening"
+        );
+        // More deltas than the fold threshold: folded at the next open.
+        for i in 0..=stats::FOLD_AT {
+            run(&g, &format!("CREATE (:F {{i: {i}}})")).await.unwrap();
+        }
+        let fresh = g.collect_stats().unwrap();
+        settle(&g).await;
+        drop(g);
+        let g = EngineGraph::open(p.clone(), 7, 8, shards).unwrap();
+        assert_eq!(counts_of(&g.stats().unwrap()), counts_of(&fresh));
+        assert!(g.stored_deltas(usize::MAX).unwrap().len() <= stats::FOLD_AT);
+        settle(&g).await;
+        drop(g);
+        let g = EngineGraph::open(p.clone(), 7, 8, shards).unwrap();
+        assert_eq!(counts_of(&g.stats().unwrap()), counts_of(&fresh));
+        // A pass folds the deltas into the record.
+        g.analyze().unwrap();
+        assert!(g.stored_deltas(usize::MAX).unwrap().is_empty());
+        run(&g, "CREATE (:G)").await.unwrap();
+        assert_eq!(g.stored_deltas(usize::MAX).unwrap().len(), 1);
+        g.analyze().unwrap();
+        assert!(g.stored_deltas(usize::MAX).unwrap().len() <= stats::FOLD_AT);
+        settle(&g).await;
+        drop(g);
+        let g = EngineGraph::open(p, 7, 8, shards).unwrap();
+        assert_eq!(
+            counts_of(&g.stats().unwrap()),
+            counts_of(&g.collect_stats().unwrap())
+        );
+    }
+}
+
+/// Indexes and constraints made before ordered keys are rebuilt into them
+/// online when the graph opens, with writers running: one index each in
+/// `SHOW` throughout, the same answers as a scan, uniqueness kept, the
+/// layout invariants whole, and ranges served after.
+#[tokio::test]
+async fn equality_indexes_are_rebuilt_ordered() {
+    for shards in [1, 3] {
+        let p = path();
+        let g = EngineGraph::open(p.clone(), 7, 9, shards).unwrap();
+        upgrade::set_legacy_indexes(true);
+        run(&g, "CREATE INDEX idx_v FOR (n:P) ON (n.v)")
+            .await
+            .unwrap();
+        run(&g, "CREATE CONSTRAINT u_k FOR (n:P) REQUIRE n.k IS UNIQUE")
+            .await
+            .unwrap();
+        upgrade::set_legacy_indexes(false);
+        run(
+            &g,
+            "UNWIND range(1, 300) AS i CREATE (:P {v: CASE WHEN i % 5 = 0 THEN toFloat(i % 17) ELSE i % 17 END, k: i})",
+        )
+        .await
+        .unwrap();
+        assert!(g.defs().iter().all(|d| !g.is_ordered(d.id)));
+        assert!(g.needs_upgrade());
+        let show = "SHOW INDEXES YIELD name RETURN name ORDER BY name";
+        let names = show_of(&run(&g, show).await.unwrap());
+        drop(g);
+        // Reopened: the rebuild starts in the background; writers run
+        // meanwhile.
+        let g = EngineGraph::open(p.clone(), 7, 9, shards).unwrap();
+        let g2 = Arc::clone(&g);
+        let n_shown = names.len();
+        let writers = tokio::spawn(async move {
+            for i in 0..40 {
+                run(
+                    &g2,
+                    &format!("CREATE (:P {{v: {}, k: {}}})", i % 17, 1000 + i),
+                )
+                .await
+                .unwrap();
+                run(
+                    &g2,
+                    &format!("MATCH (n:P {{k: {}}}) SET n.v = 99", i * 7 + 1),
+                )
+                .await
+                .unwrap();
+                assert_eq!(show_of(&run(&g2, show).await.unwrap()).len(), n_shown);
+                tokio::task::yield_now().await;
+            }
+        });
+        g.upgrade_indexes().await.unwrap();
+        writers.await.unwrap();
+        g.upgrade_indexes().await.unwrap();
+        assert!(!g.needs_upgrade());
+        assert!(
+            g.defs()
+                .iter()
+                .all(|d| g.is_ordered(d.id) && d.state == "online")
+        );
+        assert_eq!(g.defs().len(), 2);
+        assert_eq!(show_of(&run(&g, show).await.unwrap()), names);
+        assert_eq!(check_invariants(&g).unwrap(), Vec::<String>::new());
+        for (q, scan) in [
+            (
+                "MATCH (n:P) WHERE n.v = 5 RETURN count(n)",
+                "MATCH (n:P) WHERE n.v + 0 = 5 RETURN count(n)",
+            ),
+            (
+                "MATCH (n:P) WHERE n.v IN [3, 99] RETURN count(n)",
+                "MATCH (n:P) WHERE n.v + 0 IN [3, 99] RETURN count(n)",
+            ),
+            (
+                "MATCH (n:P) WHERE n.v > 10 AND n.v <= 15 RETURN count(n)",
+                "MATCH (n:P) WHERE n.v + 0 > 10 AND n.v + 0 <= 15 RETURN count(n)",
+            ),
+            (
+                "MATCH (n:P {k: 77}) RETURN n.v",
+                "MATCH (n:P) WHERE n.k + 0 = 77 RETURN n.v",
+            ),
+        ] {
+            assert_eq!(
+                show_of(&run(&g, q).await.unwrap()),
+                show_of(&run(&g, scan).await.unwrap()),
+                "{q}"
+            );
+        }
+        assert!(run(&g, "CREATE (:P {k: 5})").await.is_err());
+        // Reopened again: nothing left to do.
+        drop(g);
+        let g = EngineGraph::open(p.clone(), 7, 9, shards).unwrap();
+        assert!(!g.needs_upgrade());
+        run(&g, "DROP INDEX idx_v").await.unwrap();
+        assert_eq!(show_of(&run(&g, show).await.unwrap()).len(), n_shown - 1);
+        assert_eq!(check_invariants(&g).unwrap(), Vec::<String>::new());
+    }
+}
+
+/// `DROP INDEX` while a rebuild is half done drops both definitions; the
+/// rebuild then removes what its twin had.
+#[tokio::test]
+async fn dropping_an_index_mid_rebuild_drops_its_twin() {
+    let p = path();
+    let g = EngineGraph::open(p.clone(), 7, 10, 1).unwrap();
+    upgrade::set_legacy_indexes(true);
+    run(&g, "CREATE INDEX idx_w FOR (n:P) ON (n.w)")
+        .await
+        .unwrap();
+    upgrade::set_legacy_indexes(false);
+    run(&g, "UNWIND range(1, 50) AS i CREATE (:P {w: i})")
+        .await
+        .unwrap();
+    let old = g.defs()[0].clone();
+    let show = "SHOW INDEXES YIELD name RETURN name";
+    let n_shown = show_of(&run(&g, show).await.unwrap()).len();
+    let twin = g.publish_twin(&old).await.unwrap();
+    assert_eq!(g.defs().len(), 2);
+    assert_eq!(show_of(&run(&g, show).await.unwrap()).len(), n_shown);
+    // A write keeps the twin's entries too.
+    run(&g, "CREATE (:P {w: 1000})").await.unwrap();
+    run(&g, "DROP INDEX idx_w").await.unwrap();
+    assert!(g.defs().is_empty());
+    g.backfill(&twin).await.unwrap();
+    g.upgrade_indexes().await.unwrap();
+    assert!(!g.swap_twin(&old, &twin).await.unwrap());
+    assert!(g.defs().is_empty());
+    assert_eq!(check_invariants(&g).unwrap(), Vec::<String>::new());
+    assert_eq!(show_of(&run(&g, show).await.unwrap()).len(), n_shown - 1);
+}
+
+fn show_of(o: &crate::Output) -> Vec<String> {
+    show(o)
+}
+
 /// Range conditions, prefixes and top-k orders read through an index give
 /// the rows a scan gives, over mixed types, nulls, ties and long strings.
 #[tokio::test]

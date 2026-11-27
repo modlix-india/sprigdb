@@ -645,6 +645,9 @@ struct Path {
     covering: bool,
     /// The local conditions still to check on the rows read.
     kept: Vec<usize>,
+    /// A full-text search's rows: the `FULLTEXT` index's name. The ranges
+    /// are the rows' primary keys, best first, in no key order.
+    ft: Option<String>,
 }
 
 impl Path {
@@ -851,6 +854,8 @@ fn pick_path(
     for (p, path) in info.paths.iter().enumerate() {
         let served = if path.empty() {
             Some(false)
+        } else if path.ft.is_some() {
+            None
         } else {
             Cx::order_served(table, path.key, path.const_parts(), const_cols, want)
         };
@@ -1269,6 +1274,7 @@ impl<'a> Cx<'a> {
             cost: SCAN_START + n * ROW,
             covering: false,
             kept: all.clone(),
+            ft: None,
         }];
         let eval = |e: &Expr| self.eval_const(e);
         // Keys of columns, then keys over values inside JSON columns (read
@@ -1335,6 +1341,7 @@ impl<'a> Cx<'a> {
                         rows,
                         covering,
                         kept,
+                        ft: None,
                     });
                 }
                 None if covering => paths.push(Path {
@@ -1346,11 +1353,64 @@ impl<'a> Cx<'a> {
                     cost: SCAN_START + n * ENTRY,
                     covering: true,
                     kept: all.clone(),
+                    ft: None,
                 }),
                 None => {}
             }
         }
+        if let Some(p) = self.fulltext_path(table, local, &all, possible) {
+            paths.push(p);
+        }
         paths
+    }
+
+    /// A full-text search among the local conditions (a bare `MATCH` the
+    /// host serves): its rows as point reads of the primary key, best
+    /// first, as the servers read a `FULLTEXT` index. It is preferred to a
+    /// scan, as on the servers.
+    fn fulltext_path(
+        &self,
+        table: &Arc<TableDef>,
+        local: &[Expr],
+        all: &[usize],
+        possible: &mut Vec<String>,
+    ) -> Option<Path> {
+        table.primary.as_ref()?;
+        let ft = self.session.info.fulltext.clone()?;
+        for c in local {
+            let Expr::Func(name, args) = c else {
+                continue;
+            };
+            if name != sprig_exec::FtSpec::FUNCTION {
+                continue;
+            }
+            let spec = sprig_exec::FtSpec::of_call(args)?;
+            if spec.schema != table.schema || spec.table != table.name {
+                continue;
+            }
+            let (q, ty) = self.eval_const(args.get(1)?)?;
+            if q.is_null() {
+                return None;
+            }
+            let q = sprig_exec::value_text(&q, &ty, self.session.persona)?;
+            let (index, keys) = ft.hits(&spec, &q).ok()??;
+            if !possible.contains(&index) {
+                possible.push(index.clone());
+            }
+            let rows = keys.len() as f64;
+            return Some(Path {
+                key: KeyId::Primary,
+                ranges: keys.into_iter().map(KeyRange::point).collect(),
+                full: false,
+                set: None,
+                rows,
+                cost: rows * ROW,
+                covering: false,
+                kept: all.to_vec(),
+                ft: Some(index),
+            });
+        }
+        None
     }
 
     /// The share of `table`'s rows each condition of `local` keeps: from
@@ -1775,6 +1835,7 @@ impl<'a> Cx<'a> {
                         cost: 2.0,
                         covering: false,
                         kept: (0..local.len()).collect(),
+                        ft: None,
                     }],
                     10.0,
                 ),
@@ -1791,6 +1852,7 @@ impl<'a> Cx<'a> {
                             cost: rows * 0.2,
                             covering: false,
                             kept: (0..local.len()).collect(),
+                            ft: None,
                         }],
                         rows,
                     )
@@ -1916,6 +1978,7 @@ impl<'a> Cx<'a> {
                                             cost: SCAN_START + rows * (ENTRY + FETCH),
                                             covering: false,
                                             kept: kept.clone(),
+                                            ft: None,
                                         });
                                     }
                                 }
@@ -2047,6 +2110,13 @@ impl<'a> Cx<'a> {
                             path.rows,
                             by_order,
                         );
+                        if let Some(index) = &path.ft {
+                            crate::explain::describe_fulltext(
+                                row,
+                                index,
+                                cx.session.persona == sprig_exec::Persona::MariaDb,
+                            );
+                        }
                         let scan = ScanSource {
                             storage: cx.storage.clone(),
                             table: table.clone(),

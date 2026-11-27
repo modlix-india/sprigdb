@@ -1167,13 +1167,17 @@ async fn check_invariants<U: Unit>(unit: &U, space: Space, ctx: &str) {
                     assert!(u64::from(c) < chunks, "chunk past the end of {key:?} {ctx}");
                 }
             }
+            Body::Stream(st) => {
+                let entries = ks.iter().filter(|k| k.get(27) == Some(&b'e')).count() as u64;
+                assert_eq!(entries, st.length, "length of stream {key:?} {ctx}");
+            }
             other => panic!("elements under a non-split value {other:?} {ctx}"),
         }
     }
     for (uid, (key, m)) in &uids {
         let has = per.get(uid).map_or(0, Vec::len);
         // A chunked string's chunks of zeros aren't stored.
-        let chunked = matches!(m.body, Body::Chunked { .. });
+        let chunked = matches!(m.body, Body::Chunked { .. } | Body::Stream(_));
         assert!(
             has > 0 || chunked,
             "split value {key:?} without elements {m:?} {ctx}"

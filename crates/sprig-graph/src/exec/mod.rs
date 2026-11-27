@@ -317,14 +317,6 @@ async fn run_with(
     lazy: bool,
 ) -> Result<Output> {
     let store_late = store.late_props();
-    // Reads that follow links backwards ask the mirrors' gate now, while
-    // their first statements run.
-    if q.explain != Explain::Explain && !has_writes(q) {
-        let text = format!("{q:?}");
-        if text.contains("dir: In") || text.contains("dir: Both") {
-            store.warm_mirrors();
-        }
-    }
     let mut ex = Exec {
         store,
         params,
@@ -351,6 +343,15 @@ async fn run_with(
         fused: None,
         read_only: !has_writes(q),
         then: None,
+        top_clauses: q
+            .parts
+            .iter()
+            .map(|p| {
+                let r = p.clauses.as_ptr_range();
+                (r.start as usize, r.end as usize)
+            })
+            .collect(),
+        texts: HashMap::new(),
     };
     if q.explain == Explain::Explain {
         let mut plan = explain(q);
@@ -752,6 +753,11 @@ pub(crate) struct Exec<'a> {
     /// pattern being matched ends at: that node's variable and the next
     /// pattern's first step, which may be read with this pattern's last.
     pub(crate) then: Option<(String, crate::ast::RelPat, crate::ast::NodePat)>,
+    /// The statement's own clauses (address ranges of their lists): their
+    /// syntax texts are kept in [`Exec::texts`] for the run.
+    pub(crate) top_clauses: Vec<(usize, usize)>,
+    /// Syntax texts of the statement's clauses, by address.
+    pub(crate) texts: HashMap<usize, Arc<String>>,
 }
 
 /// [`Exec::prune`]: the variable, the sort keys over it alone with their
@@ -808,14 +814,19 @@ impl Prune {
 /// name counts as used when it appears anywhere in the clauses' syntax
 /// tree (as a variable, a pattern's name, or even a string), and nothing
 /// is dropped before a `*` projection.
-fn dead_vars(row: Option<&Row>, rest: &[Clause]) -> Vec<String> {
+fn dead_vars(row: Option<&Row>, rest: &[Arc<String>]) -> Vec<String> {
     let Some(row) = row else { return Vec::new() };
-    let text = format!("{rest:?}");
-    if text.contains("star: true") {
+    if rest.iter().any(|t| t.contains("star: true")) {
         return Vec::new();
     }
     row.keys()
-        .filter(|k| !k.starts_with(' ') && !text.contains(&format!("{k:?}")))
+        .filter(|k| {
+            if k.starts_with(' ') {
+                return false;
+            }
+            let quoted = format!("{k:?}");
+            !rest.iter().any(|t| t.contains(&quoted))
+        })
         .cloned()
         .collect()
 }
@@ -848,6 +859,27 @@ fn dup_insensitive(rest: &[Clause]) -> bool {
 }
 
 impl Exec<'_> {
+    /// The syntax texts of `cs`: kept for the run when they are the
+    /// statement's own clauses (whose addresses can't be reused while it
+    /// runs), made afresh for others (subqueries' copies).
+    fn clause_texts(&mut self, cs: &[Clause]) -> Vec<Arc<String>> {
+        cs.iter()
+            .map(|c| {
+                let at = std::ptr::from_ref(c) as usize;
+                let own = self.top_clauses.iter().any(|(a, b)| at >= *a && at < *b);
+                if own {
+                    Arc::clone(
+                        self.texts
+                            .entry(at)
+                            .or_insert_with(|| Arc::new(format!("{c:?}"))),
+                    )
+                } else {
+                    Arc::new(format!("{c:?}"))
+                }
+            })
+            .collect()
+    }
+
     pub(crate) fn check_time(&self) -> Result<()> {
         if self.started.elapsed() > self.b.max_time {
             return Err(budget_error(
@@ -1719,7 +1751,8 @@ impl Exec<'_> {
                     where_,
                 } => {
                     let mult_ok = dup_insensitive(&clauses[i + 1..]);
-                    let dead = dead_vars(rows.first(), &clauses[i..]);
+                    let texts = self.clause_texts(&clauses[i..]);
+                    let dead = dead_vars(rows.first(), &texts);
                     if !dead.is_empty() {
                         for r in &mut rows {
                             for d in &dead {
@@ -1793,7 +1826,8 @@ impl Exec<'_> {
                     // each row is copied once per element (LDBC
                     // IC9's `WITH collect(f) AS friends UNWIND friends AS
                     // friend` copied the whole list into every row).
-                    let dead = dead_vars(rows.first(), &clauses[i + 1..]);
+                    let texts = self.clause_texts(&clauses[i + 1..]);
+                    let dead = dead_vars(rows.first(), &texts);
                     self.late(&mut rows, &[expr]).await?;
                     let mut out = Vec::new();
                     for mut r in rows {
@@ -2179,8 +2213,21 @@ impl Exec<'_> {
         };
         self.prune_sql(patterns, where_, n);
         self.prune_scan_top(patterns, where_, n);
+        // A shortest path gives at most a path per row (all shortest paths
+        // a few), and one breadth-first search per start node serves every
+        // row of a chunk: the rows go in one chunk, so the search runs once
+        // (LDBC IC1's 881 rows from one person ran it seven times), up to
+        // a bound on the rows held at once.
+        let chunk_rows = if patterns
+            .iter()
+            .any(|q| q.kind != crate::ast::PathKind::Normal)
+        {
+            rows.len().clamp(MATCH_CHUNK, 16_384)
+        } else {
+            MATCH_CHUNK
+        };
         while !rows.is_empty() {
-            let rest = rows.split_off(MATCH_CHUNK.min(rows.len()));
+            let rest = rows.split_off(chunk_rows.min(rows.len()));
             let chunk = std::mem::replace(&mut rows, rest);
             let mut out = self
                 .match_clause(chunk, patterns, where_, optional, mult_ok)
@@ -2204,7 +2251,7 @@ impl Exec<'_> {
         self.prune = None;
         Self::keep_top(&mut kept, p, n);
         self.plan.push(format!(
-            "Top {n}: the MATCH kept only the rows the next projection keeps, in chunks of {MATCH_CHUNK} incoming rows"
+            "Top {n}: the MATCH kept only the rows the next projection keeps, in chunks of {chunk_rows} incoming rows"
         ));
         Ok(kept.into_iter().map(|(_, _, r)| r).collect())
     }

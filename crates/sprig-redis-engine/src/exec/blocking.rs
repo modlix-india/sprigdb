@@ -4,6 +4,9 @@
 //! [`crate::db`] waits for a push to one of the keys and tries again, with
 //! no engine lock held while it waits. Inside `MULTI` one attempt is all
 //! there is, as in Redis.
+//!
+//! `XREAD` and `XREADGROUP` with `BLOCK` wait the same way; their attempts
+//! are the plain commands ([`super::streams`]).
 
 use bytes::Bytes;
 use sprig_proto_redis::Frame;
@@ -23,6 +26,30 @@ pub fn is_blocking(name: &str) -> bool {
     )
 }
 
+/// Whether command `a` (named `name`) waits when it finds nothing: the
+/// blocking commands, and `XREAD`/`XREADGROUP` with `BLOCK` (a group read
+/// only for new entries, `>`).
+#[must_use]
+pub fn blocks(name: &str, a: &[Bytes]) -> bool {
+    match name {
+        "xread" | "xreadgroup" => {
+            let group = name == "xreadgroup";
+            super::streams::read_args(a, group).is_ok_and(|r| {
+                r.block.is_some()
+                    && (!group || a[r.keys_at + r.n..].iter().all(|id| id.as_ref() == b">"))
+            })
+        }
+        _ => is_blocking(name),
+    }
+}
+
+/// Whether a blocked command is a stream read: every write to its keys
+/// wakes it (readers don't take entries from each other).
+#[must_use]
+pub fn wakes_all(name: &str) -> bool {
+    matches!(name, "xread" | "xreadgroup")
+}
+
 /// The reply when nothing arrives in time.
 #[must_use]
 pub fn timed_out(name: &str) -> Frame {
@@ -38,6 +65,10 @@ pub fn timed_out(name: &str) -> Frame {
 /// # Errors
 /// The reply for a bad timeout.
 pub fn timeout(name: &str, a: &[Bytes]) -> Arg<f64> {
+    if wakes_all(name) {
+        let r = super::streams::read_args(a, name == "xreadgroup")?;
+        return Ok(r.block.unwrap_or(0) as f64 / 1000.0);
+    }
     let t = match name {
         "blmove" => &a[5],
         "brpoplpush" => &a[3],
@@ -58,6 +89,7 @@ pub fn wait_keys(name: &str, a: &[Bytes]) -> Vec<Bytes> {
         "blmove" | "brpoplpush" => vec![a[1].clone()],
         "blmpop" => mpop_args(a, 2).map(|x| x.0).unwrap_or_default(),
         "bzmpop" => zmpop_args(a, 2).map(|x| x.0).unwrap_or_default(),
+        "xread" | "xreadgroup" => super::streams::read_keys(a, name == "xreadgroup"),
         _ => a[1..a.len() - 1].to_vec(),
     }
 }

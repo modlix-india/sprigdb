@@ -48,6 +48,12 @@ const PAGE: usize = 4096;
 const BUILD_CAP: usize = 65_536;
 /// The `M | n` family of the statistics record.
 const STATS_FAMILY: u16 = 4;
+/// The `M | n` family of committed transactions' counter deltas.
+const DELTA_FAMILY: u16 = 5;
+/// Stored deltas past which opening a graph folds them into the record.
+pub const FOLD_AT: usize = 1000;
+/// Deltas folded or deleted per transaction.
+const FOLD_PAGE: usize = 1000;
 
 /// Whether statistics are kept and used (`SPRIGDB_GRAPH_STATS`, on unless
 /// `off`).
@@ -232,6 +238,9 @@ pub struct GraphStats {
     pub props: HashMap<(u32, String), PropStat>,
     /// Nodes and relationships when the last pass ran.
     pub elements_at_pass: f64,
+    /// The counters have followed every commit since the graph was new
+    /// (passes refresh only the histograms then).
+    pub exact: bool,
 }
 
 /// A (label, key)'s sampled nodes: their weight, and each value's key
@@ -246,6 +255,12 @@ struct Record {
     indexes: Vec<(u32, Hist)>,
     props: Vec<(u32, String, PropStat)>,
     elements: f64,
+    /// Elements changed since the pass, from deltas folded into the record.
+    #[serde(default)]
+    changes: u64,
+    /// [`GraphStats::exact`].
+    #[serde(default)]
+    exact: bool,
 }
 
 impl GraphStats {
@@ -264,6 +279,8 @@ impl GraphStats {
                 .map(|((l, k2), p)| (*l, k2.clone(), p.clone()))
                 .collect(),
             elements: self.elements_at_pass,
+            changes: 0,
+            exact: self.exact,
         };
         r.sets.sort_by_key(|x| x.0);
         r.triples.sort_by_key(|x| (x.0, x.1, x.2));
@@ -283,6 +300,7 @@ impl GraphStats {
             indexes: r.indexes.into_iter().collect(),
             props: r.props.into_iter().map(|(l, k2, p)| ((l, k2), p)).collect(),
             elements_at_pass: r.elements,
+            exact: r.exact,
         }
     }
 
@@ -333,6 +351,69 @@ impl Delta {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.changes == 0
+    }
+
+    /// The stored form: counts of label sets and triples, then each
+    /// `(label set, n)` and `(source set, type, destination set, n)`, then
+    /// the changes; integers big-endian.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(16 + self.sets.len() * 12 + self.triples.len() * 20);
+        out.extend_from_slice(&u32::try_from(self.sets.len()).unwrap_or(0).to_be_bytes());
+        out.extend_from_slice(&u32::try_from(self.triples.len()).unwrap_or(0).to_be_bytes());
+        for (s, n) in &self.sets {
+            out.extend_from_slice(&s.to_be_bytes());
+            out.extend_from_slice(&n.to_be_bytes());
+        }
+        for ((a, t, b), n) in &self.triples {
+            out.extend_from_slice(&a.to_be_bytes());
+            out.extend_from_slice(&t.to_be_bytes());
+            out.extend_from_slice(&b.to_be_bytes());
+            out.extend_from_slice(&n.to_be_bytes());
+        }
+        out.extend_from_slice(&self.changes.to_be_bytes());
+        out
+    }
+
+    /// Reads [`Delta::encode`]'s form (`None`: not one).
+    #[must_use]
+    pub fn decode(b: &[u8]) -> Option<Self> {
+        let mut at = 0usize;
+        let mut take = |n: usize| -> Option<&[u8]> {
+            let s = b.get(at..at + n)?;
+            at += n;
+            Some(s)
+        };
+        let u32_of = |s: &[u8]| s.try_into().ok().map(u32::from_be_bytes);
+        let i64_of = |s: &[u8]| s.try_into().ok().map(i64::from_be_bytes);
+        let ns = u32_of(take(4)?)?;
+        let nt = u32_of(take(4)?)?;
+        let mut d = Delta::default();
+        for _ in 0..ns {
+            let s = u32_of(take(4)?)?;
+            let n = i64_of(take(8)?)?;
+            *d.sets.entry(s).or_default() += n;
+        }
+        for _ in 0..nt {
+            let a = u32_of(take(4)?)?;
+            let t = u32_of(take(4)?)?;
+            let c = u32_of(take(4)?)?;
+            let n = i64_of(take(8)?)?;
+            *d.triples.entry((a, t, c)).or_default() += n;
+        }
+        d.changes = take(8)?.try_into().ok().map(u64::from_be_bytes)?;
+        Some(d)
+    }
+
+    /// Adds `o` to this.
+    pub fn merge(&mut self, o: &Delta) {
+        for (s, n) in &o.sets {
+            *self.sets.entry(*s).or_default() += n;
+        }
+        for (t, n) in &o.triples {
+            *self.triples.entry(*t).or_default() += n;
+        }
+        self.changes += o.changes;
     }
 }
 
@@ -401,14 +482,149 @@ impl EngineGraph {
         self.space.prefix(0, kind::META, STATS_FAMILY)
     }
 
-    /// Loads the stored statistics (at open).
-    pub(super) fn load_stats(&self) -> Result<Option<GraphStats>> {
+    /// Loads the stored statistics (at open), with the counters'
+    /// deltas committed since added, and the changes since the last pass.
+    /// More than [`FOLD_AT`] stored deltas are folded into the record.
+    pub(super) fn load_stats(&self) -> Result<Option<(GraphStats, u64)>> {
         let mut t = Txn::begin_on(Arc::clone(&self.path), self.opts);
         let v = t.read_current(&self.stats_key());
         t.rollback();
-        Ok(v?
-            .and_then(|b| serde_json::from_slice::<Record>(&b).ok())
-            .map(GraphStats::from_record))
+        let Some(rec) = v?.and_then(|b| serde_json::from_slice::<Record>(&b).ok()) else {
+            return Ok(None);
+        };
+        let mut changes = rec.changes;
+        let mut st = GraphStats::from_record(rec);
+        let deltas = self.stored_deltas(usize::MAX)?;
+        let mut sum = Delta::default();
+        for (_, d) in &deltas {
+            sum.merge(d);
+        }
+        self.bump_delta_seq(deltas.last().map(|(k, _)| k.as_slice()));
+        st.add(&sum);
+        changes += sum.changes;
+        if deltas.len() > FOLD_AT {
+            self.fold_deltas()?;
+        }
+        Ok(Some((st, changes)))
+    }
+
+    /// Stores empty statistics for a new graph (its counters are exact
+    /// from the start).
+    pub(super) fn store_empty_stats(&self) -> Result<()> {
+        let body = serde_json::to_vec(&Self::empty_stats().to_record())
+            .map_err(|e| sprig_common::SprigError::internal(e.to_string()))?;
+        let mut t = Txn::begin_on(Arc::clone(&self.path), self.opts);
+        if let Err(e) = t.put(self.stats_key(), body) {
+            t.rollback();
+            return Err(e);
+        }
+        t.commit()?;
+        Ok(())
+    }
+
+    /// A new graph's statistics: empty, and exact from now on.
+    pub(super) fn empty_stats() -> GraphStats {
+        GraphStats {
+            exact: true,
+            ..GraphStats::default()
+        }
+    }
+
+    /// The prefix of the stored deltas.
+    fn delta_prefix(&self) -> Vec<u8> {
+        self.space.prefix(0, kind::META, DELTA_FAMILY)
+    }
+
+    /// The first `limit` stored deltas, in sequence order, with their keys.
+    pub(super) fn stored_deltas(&self, limit: usize) -> Result<Vec<(Vec<u8>, Delta)>> {
+        let p = self.delta_prefix();
+        let mut t = Txn::begin_on(Arc::clone(&self.path), self.opts);
+        let rows = t.scan_current(&KeyRange::prefix(&p), ScanDir::Forward, limit);
+        t.rollback();
+        Ok(rows?
+            .into_iter()
+            .filter_map(|(k2, v)| Delta::decode(&v).map(|d| (k2.to_vec(), d)))
+            .collect())
+    }
+
+    /// Keeps the delta sequence above the stored key `last`.
+    fn bump_delta_seq(&self, last: Option<&[u8]>) {
+        let p = self.delta_prefix().len();
+        if let Some(n) = last.and_then(|k2| be64(k2, p).ok()) {
+            self.delta_seq.fetch_max(n + 1, Ordering::AcqRel);
+        }
+    }
+
+    /// Writes `d` as a stored delta in `t` (the committing transaction),
+    /// when statistics are on and it changed something.
+    ///
+    /// # Errors
+    /// The engine's.
+    pub(super) fn stage_delta(&self, t: &mut Txn, d: &Delta) -> Result<()> {
+        if !enabled() || d.is_empty() || self.dropped.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let mut key = self.delta_prefix();
+        key.extend_from_slice(&self.delta_seq.fetch_add(1, Ordering::AcqRel).to_be_bytes());
+        t.put(key, d.encode())
+    }
+
+    /// Folds the stored deltas into the statistics record, a page per
+    /// transaction: each adds the page to the record as stored and deletes
+    /// the page's deltas, so the result is exact whatever commits
+    /// meanwhile. Waits for (and then holds off) a pass.
+    ///
+    /// # Errors
+    /// The engine's.
+    pub fn fold_deltas(&self) -> Result<()> {
+        while self.collecting.swap(true, Ordering::AcqRel) {
+            std::thread::yield_now();
+        }
+        let r = self.fold_pages();
+        self.collecting.store(false, Ordering::Release);
+        r
+    }
+
+    fn fold_pages(&self) -> Result<()> {
+        loop {
+            let page = self.stored_deltas(FOLD_PAGE)?;
+            if page.is_empty() {
+                return Ok(());
+            }
+            let mut t = Txn::begin_on(Arc::clone(&self.path), self.opts);
+            let r: Result<()> = (|| {
+                let Some(mut rec) = t
+                    .read_current(&self.stats_key())?
+                    .and_then(|b| serde_json::from_slice::<Record>(&b).ok())
+                else {
+                    // No record to fold into: the next pass counts them.
+                    return Ok(());
+                };
+                let mut sum = Delta::default();
+                for (key, d) in &page {
+                    sum.merge(d);
+                    t.delete(key.clone())?;
+                }
+                rec.changes += sum.changes;
+                let changes = rec.changes;
+                let mut st = GraphStats::from_record(rec);
+                st.add(&sum);
+                let mut rec = st.to_record();
+                rec.changes = changes;
+                let body = serde_json::to_vec(&rec)
+                    .map_err(|e| sprig_common::SprigError::internal(e.to_string()))?;
+                t.put(self.stats_key(), body)?;
+                Ok(())
+            })();
+            if let Err(e) = r {
+                t.rollback();
+                return Err(e);
+            }
+            t.commit()?;
+            if page.len() < FOLD_PAGE {
+                return Ok(());
+            }
+        }
     }
 
     /// Whether the graph has no node.
@@ -611,19 +827,85 @@ impl EngineGraph {
     /// # Errors
     /// The engine's.
     pub fn analyze(&self) -> Result<()> {
+        while self.collecting.swap(true, Ordering::AcqRel) {
+            std::thread::yield_now();
+        }
+        let r = self.analyze_held();
+        self.collecting.store(false, Ordering::Release);
+        r
+    }
+
+    /// [`EngineGraph::analyze`] with the pass flag held. Exact counters
+    /// ([`GraphStats::exact`]) stay as the commits keep them: the pass
+    /// refreshes the histograms, and the stored deltas are folded into the
+    /// record. Otherwise the pass's counts replace the counters and the
+    /// deltas committed before it started are deleted (a delta committed
+    /// while it runs may be counted twice until the next pass).
+    fn analyze_held(&self) -> Result<()> {
         let before = self.changes.load(Ordering::Acquire);
-        let st = self.collect_stats()?;
+        let exact = self
+            .stats
+            .read()
+            .unwrap_or_else(poisoned)
+            .as_ref()
+            .is_some_and(|s| s.exact);
+        let seen = if exact {
+            Vec::new()
+        } else {
+            self.stored_deltas(usize::MAX)?
+        };
+        let mut st = self.collect_stats()?;
         if !self.dropped.load(Ordering::Acquire) {
             let mut t = Txn::begin_on(Arc::clone(&self.path), self.opts);
-            let body = serde_json::to_vec(&st.to_record())
-                .map_err(|e| sprig_common::SprigError::internal(e.to_string()))?;
-            if let Err(e) = t.put(self.stats_key(), body) {
+            let r: Result<()> = (|| {
+                let mut rec = st.to_record();
+                if exact {
+                    // The counters as stored (the deltas add to them).
+                    if let Some(old) = t
+                        .read_current(&self.stats_key())?
+                        .and_then(|b| serde_json::from_slice::<Record>(&b).ok())
+                    {
+                        rec.sets = old.sets;
+                        rec.triples = old.triples;
+                    }
+                    rec.exact = true;
+                }
+                let body = serde_json::to_vec(&rec)
+                    .map_err(|e| sprig_common::SprigError::internal(e.to_string()))?;
+                t.put(self.stats_key(), body)?;
+                for (key, _) in seen.iter().take(FOLD_PAGE) {
+                    t.delete(key.clone())?;
+                }
+                Ok(())
+            })();
+            if let Err(e) = r {
                 t.rollback();
                 return Err(e);
             }
             t.commit()?;
+            for page in seen.chunks(FOLD_PAGE).skip(1) {
+                let mut t = Txn::begin_on(Arc::clone(&self.path), self.opts);
+                for (key, _) in page {
+                    if let Err(e) = t.delete(key.clone()) {
+                        t.rollback();
+                        return Err(e);
+                    }
+                }
+                t.commit()?;
+            }
+            if exact {
+                self.fold_pages()?;
+            }
         }
-        *self.stats.write().unwrap_or_else(poisoned) = Some(st);
+        {
+            let mut s = self.stats.write().unwrap_or_else(poisoned);
+            if exact && let Some(cur) = s.as_ref() {
+                st.sets.clone_from(&cur.sets);
+                st.triples.clone_from(&cur.triples);
+                st.exact = true;
+            }
+            *s = Some(st);
+        }
         self.changes.fetch_sub(before, Ordering::AcqRel);
         Ok(())
     }
@@ -665,7 +947,7 @@ impl EngineGraph {
             return;
         };
         let job = move || {
-            if let Err(e) = me.analyze() {
+            if let Err(e) = me.analyze_held() {
                 tracing::warn!(error = %e, graph = me.graph_id, "graph statistics pass failed");
             }
             me.collecting.store(false, Ordering::Release);

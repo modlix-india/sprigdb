@@ -13,7 +13,9 @@
 //! `redis.lua_time_limit_ms` is Redis's busy threshold here
 //! (`busy-reply-threshold`, once called `lua-time-limit`): a script running
 //! longer makes the tenant's other connections answer `BUSY`, and `SCRIPT
-//! KILL` / `FUNCTION KILL` stop it. There is no hard limit, as in Redis.
+//! KILL` / `FUNCTION KILL` stop it. Unlike Redis, a script still running at
+//! twice the threshold is stopped and rolled back (39850): a node serves
+//! many tenants, and a script whose client went away has nobody to kill it.
 //!
 //! The script cache and the function libraries are kept on the engine
 //! ([`LuaStore`]), so every gateway sees them; `FLUSHALL` doesn't remove
@@ -30,8 +32,14 @@ use crate::ctx::upper;
 use crate::engine::{EngineDatabase, EngineScript, LuaStore, ScriptFailed};
 use crate::{lua, reply};
 
-/// A wall-time budget no script reaches: scripts on the engine have none.
-const NO_WALL: Duration = Duration::from_secs(365 * 24 * 3600);
+/// A script on the engine stops at this many times the busy threshold.
+const HARD_LIMIT_TIMES: u32 = 2;
+
+/// The wall-time budget of a script on the engine: twice the busy
+/// threshold.
+fn hard_limit(threshold: Duration) -> Duration {
+    threshold.saturating_mul(HARD_LIMIT_TIMES)
+}
 
 /// The commands this module answers on an engine database.
 pub(super) fn handles(name: &str) -> bool {
@@ -608,7 +616,7 @@ impl Session {
             p.args.clone(),
             self.resp3(),
             &cfg,
-            NO_WALL,
+            hard_limit(cfg.lua_time_limit),
         );
         let guard = RunGuard {
             id: env.scripts.add(&scope, p.function, &started.state),

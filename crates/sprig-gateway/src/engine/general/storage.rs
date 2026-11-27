@@ -94,13 +94,23 @@ pub(super) struct Bound {
 
 impl Bound {
     pub(super) fn new(t: &TableUse, sp: Space, lock: Option<(LockMode, Wait)>) -> Self {
+        // A table with `FULLTEXT` keys hands over its primary key too:
+        // `MATCH` finds a row's score by it.
+        let mut read = t.read.clone();
+        if !t.def.fulltext.is_empty() {
+            for &c in &t.def.pk {
+                if let Some(r) = read.get_mut(c) {
+                    *r = true;
+                }
+            }
+        }
         Self {
             lock,
             def: Arc::clone(&t.def),
             plan: Arc::clone(&t.plan),
             sp,
-            all: t.read.iter().all(|r| *r),
-            read: t.read.clone(),
+            all: read.iter().all(|r| *r),
+            read,
             coll: t.coll.clone().map(coll::CollBound::new),
             stream: t.stream.as_ref().map(|s| Arc::clone(&s.storage)),
             redis: t.stream.as_ref().and_then(|s| s.redis),

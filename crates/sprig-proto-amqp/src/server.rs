@@ -85,7 +85,7 @@ impl std::fmt::Debug for Services {
 /// # Errors
 /// What ended the connection abnormally (logged by the caller).
 pub async fn serve<S>(
-    mut io: S,
+    io: S,
     info: ConnInfo,
     svc: &Services,
     cfg: Config,
@@ -94,6 +94,58 @@ pub async fn serve<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    serve_resumed(io, info, svc, cfg, close, None)
+        .await
+        .map(|_| ())
+}
+
+/// A connection to hand to the node that serves its tenant
+/// ([`serve_resumed`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandOff {
+    /// That node.
+    pub node: u64,
+    /// The tenant.
+    pub tenant: u64,
+    /// The client's bytes from its login frame on (`connection.start-ok`
+    /// or `sasl-init`), as frames.
+    pub prelude: Vec<u8>,
+    /// AMQP 1.0 (else 0-9-1).
+    pub v10: bool,
+}
+
+/// [`serve`] for a connection another node began (`resumed`: `Some(v10)`,
+/// its protocol header read and its `connection.start` or
+/// `sasl-mechanisms` sent there; the login frame comes next), and that
+/// ends early when a password login names a tenant served by another node
+/// ([`Identity::serve_elsewhere`]), before anything about it is answered.
+///
+/// # Errors
+/// What ended the connection abnormally (logged by the caller).
+pub async fn serve_resumed<S>(
+    mut io: S,
+    info: ConnInfo,
+    svc: &Services,
+    cfg: Config,
+    close: CancellationToken,
+    resumed: Option<bool>,
+) -> Result<Option<HandOff>, MqError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let handoff = std::sync::Mutex::new(None);
+    if let Some(v10) = resumed {
+        let label = if v10 { "1.0" } else { "0-9-1" };
+        let gauge = metrics::gauge!("sprig_amqp_connections", "protocol" => label);
+        gauge.increment(1.0);
+        let r = if v10 {
+            crate::v10::server::run(io, info, svc, cfg, close, true, &handoff).await
+        } else {
+            crate::v091::server::run(io, info, svc, cfg, close, true, &handoff).await
+        };
+        gauge.decrement(1.0);
+        return r.map(|()| None);
+    }
     let mut header = [0u8; 8];
     match tokio::time::timeout(cfg.handshake_timeout, io.read_exact(&mut header)).await {
         Ok(Ok(_)) => {}
@@ -120,11 +172,17 @@ where
     let gauge = metrics::gauge!("sprig_amqp_connections", "protocol" => detected.label());
     gauge.increment(1.0);
     let r = match detected {
-        Detected::Amqp091 => crate::v091::server::run(io, info, svc, cfg, close).await,
-        _ => crate::v10::server::run(io, info, svc, cfg, close).await,
+        Detected::Amqp091 => {
+            crate::v091::server::run(io, info, svc, cfg, close, false, &handoff).await
+        }
+        _ => crate::v10::server::run(io, info, svc, cfg, close, false, &handoff).await,
     };
     gauge.decrement(1.0);
-    r
+    r?;
+    Ok(handoff
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take())
 }
 
 pub(crate) fn io_err(e: &std::io::Error) -> MqError {

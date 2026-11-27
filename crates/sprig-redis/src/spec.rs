@@ -308,8 +308,8 @@ pub const ALL: &[Spec] = specs! {
     "xrange" -4 "rx" 1 1 1;
     "xrevrange" -4 "rx" 1 1 1;
     "xlen" 2 "rx" 1 1 1;
-    "xread" -4 "rx" 0 0 0;
-    "xreadgroup" -7 "wx" 0 0 0;
+    "xread" -4 "rbx" 0 0 0;
+    "xreadgroup" -7 "wbx" 0 0 0;
     "xgroup" -2 "wx" 0 0 0;
     "xack" -4 "wx" 1 1 1;
     "xdel" -3 "wx" 1 1 1;

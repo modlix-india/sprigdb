@@ -23,8 +23,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sprig_catalog::version::VersionKind;
-use sprig_common::ids::TenantId;
 use sprig_common::Result;
+use sprig_common::ids::TenantId;
 use sprig_inherit::msg::store::MsgStore;
 use sprig_inherit::msg::{DefKey, DefKind, Definition, InstanceState};
 use sprig_meta::{ListOpts, Record, Versioned};
@@ -37,6 +37,14 @@ use crate::tenant::TenantServices;
 async fn remove_one(svc: &Arc<TenantServices>, t: TenantId, def: &Definition) -> Result<()> {
     match def.kind {
         DefKind::Exchange | DefKind::Queue => super::mq::remove(svc, t, def).await,
+        // A stream instance is the member's engine stream of that name.
+        DefKind::Stream => {
+            if let Some(eng) = crate::kafka::engine::streams() {
+                eng.drop_stream(t.0, &format!("{}.{}", def.db_name, def.name))
+                    .await?;
+            }
+            super::delete_index(svc, t, def.key()).await
+        }
         _ => Ok(()),
     }
 }

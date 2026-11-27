@@ -454,6 +454,20 @@ pub(crate) struct TableDef {
     /// `PARTITION BY ...`: what a row may hold, and which rows a partition
     /// has.
     pub partition: Option<Arc<super::partition::Rule>>,
+    /// The `FULLTEXT` keys: no entries in the keyspace, an apply-time
+    /// full-text index each (`super::fulltext`).
+    pub fulltext: Vec<FtKey>,
+}
+
+/// A `FULLTEXT` key of a table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FtKey {
+    /// The key's name.
+    pub name: String,
+    /// Its columns' positions in the definition, in key order.
+    pub cols: Vec<usize>,
+    /// `WITH PARSER name` (MySQL's `ngram`), lower case.
+    pub parser: Option<String>,
 }
 
 impl TableDef {
@@ -1270,6 +1284,7 @@ pub(crate) fn parse(object: ObjectId, version: u64, db: DbId, create_sql: &str) 
     let mut cols: Vec<RawCol> = Vec::new();
     let mut pk: Vec<RawPart> = Vec::new();
     let mut keys: Vec<(String, Vec<RawPart>, bool, bool)> = Vec::new();
+    let mut fts: Vec<(String, Vec<RawPart>, Option<String>)> = Vec::new();
     // `CHECK` constraints: the column they were declared on, their name,
     // their expression.
     let mut raw_checks: Vec<(Option<usize>, Option<String>, String)> = Vec::new();
@@ -1482,7 +1497,35 @@ pub(crate) fn parse(object: ObjectId, version: u64, db: DbId, create_sql: &str) 
                 };
                 keys.push((n, l, unique, ignored));
             }
-            Some(Tok::Word(w)) if w == "FULLTEXT" || w == "SPATIAL" || w == "VECTOR" => {
+            Some(Tok::Word(w)) if w == "FULLTEXT" => {
+                p.i += 1;
+                if !p.word("KEY") {
+                    let _ = p.word("INDEX");
+                }
+                let Some(n) = p.ident() else {
+                    return bad("a fulltext index name");
+                };
+                let Some(l) = p.key_parts() else {
+                    return bad("fulltext index parts");
+                };
+                let mut parser = None;
+                loop {
+                    if p.word("WITH") {
+                        if !p.word("PARSER") {
+                            return bad("WITH after a fulltext index");
+                        }
+                        parser = p.ident().map(|x| x.to_ascii_lowercase());
+                    } else if p.word("COMMENT") {
+                        if !matches!(p.next(), Some(Tok::Str(_))) {
+                            return bad("an index comment");
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                fts.push((n, l, parser));
+            }
+            Some(Tok::Word(w)) if w == "SPATIAL" || w == "VECTOR" => {
                 return bad(&format!("a {} index", w.to_ascii_lowercase()));
             }
             Some(Tok::Word(w)) if w == "CONSTRAINT" => {
@@ -1937,8 +1980,23 @@ pub(crate) fn parse(object: ObjectId, version: u64, db: DbId, create_sql: &str) 
         generated_cols: Vec::new(),
         fks: Vec::new(),
         partition: None,
+        fulltext: Vec::new(),
     };
     def.index_sigs = super::indexes::sigs(&def);
+    for (n, l, parser) in fts {
+        let mut cols = Vec::with_capacity(l.len());
+        for rp in &l {
+            let Some(i) = def.column(&rp.name) else {
+                return bad("a fulltext index column");
+            };
+            cols.push(i);
+        }
+        def.fulltext.push(FtKey {
+            name: n,
+            cols,
+            parser,
+        });
+    }
     for f in raw_fks {
         let mut cols = Vec::with_capacity(f.cols.len());
         for c in &f.cols {
@@ -2152,7 +2210,7 @@ pub(crate) fn check_create(text: &str) -> std::result::Result<(), String> {
             _ => None,
         };
         match word(0) {
-            Some("FULLTEXT" | "SPATIAL" | "VECTOR") => {
+            Some("SPATIAL" | "VECTOR") => {
                 return Err(format!(
                     "a {} index",
                     word(0).unwrap_or_default().to_ascii_lowercase()
@@ -2161,7 +2219,7 @@ pub(crate) fn check_create(text: &str) -> std::result::Result<(), String> {
             // Foreign keys are enforced by the engine.
             Some("FOREIGN" | "CONSTRAINT" | "CHECK") => continue,
             Some("PERIOD") => return Err("an application-time period".into()),
-            Some("PRIMARY" | "UNIQUE" | "KEY" | "INDEX") if e.len() > 1 => continue,
+            Some("PRIMARY" | "UNIQUE" | "KEY" | "INDEX" | "FULLTEXT") if e.len() > 1 => continue,
             _ => {}
         }
         // A column: its name, then its type.
@@ -2469,7 +2527,11 @@ mod tests {
             .is_ok()
         );
         assert!(
-            check_create("CREATE TABLE t (id INT PRIMARY KEY, b TEXT, FULLTEXT KEY (b))").is_err()
+            check_create("CREATE TABLE t (id INT PRIMARY KEY, b TEXT, FULLTEXT KEY (b))").is_ok()
+        );
+        assert!(
+            check_create("CREATE TABLE t (id INT PRIMARY KEY, g GEOMETRY, SPATIAL KEY (g))")
+                .is_err()
         );
         assert!(
             check_create(

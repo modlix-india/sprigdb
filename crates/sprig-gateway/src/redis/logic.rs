@@ -114,8 +114,10 @@ fn sprig_error(code: u16, message: &str) -> Frame {
 /// A failed call as Redis shows it.
 fn error(e: &SqlError) -> Frame {
     match e.errno {
-        // Redis's own text for an unknown function.
-        Some(39860) => Frame::err("Function not found"),
+        // Redis's own text for an unknown function; also when the
+        // database it would be looked up in doesn't exist (a tenant whose
+        // Redis data is only on the engine has no `redis` SQL database).
+        Some(39860 | 1049) => Frame::err("Function not found"),
         Some(1792) => Frame::err(&format!(
             "Write commands are not allowed from read-only scripts. {}",
             e.message
@@ -139,6 +141,17 @@ mod tests {
             Some(event.as_bytes().to_vec()),
             Some(result.to_string().into_bytes()),
         ]
+    }
+
+    #[test]
+    fn unknown_functions_and_databases_are_not_found() {
+        for errno in [39860, 1049] {
+            let e = SqlError {
+                errno: Some(errno),
+                message: "x".into(),
+            };
+            assert_eq!(error(&e), Frame::err("Function not found"));
+        }
     }
 
     #[test]

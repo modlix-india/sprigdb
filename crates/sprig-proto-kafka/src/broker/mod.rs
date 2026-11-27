@@ -107,6 +107,38 @@ pub trait Identity: Send + Sync + 'static {
     async fn plain(&self, c: &ConnInfo, creds: PlainCredentials) -> Result<Principal, AuthFailure>;
     /// The SCRAM verifier of `user` (as sent), or a decoy.
     async fn scram(&self, c: &ConnInfo, mech: ScramMechanism, user: &str) -> ScramLookup;
+
+    /// Where the tenant `user` (as sent) names is served, when the
+    /// connection should go to another node: `(node, tenant)`. The
+    /// connection is then handed there from its SASL token on, before it
+    /// is answered (the default: served here).
+    async fn serve_elsewhere(&self, _c: &ConnInfo, _user: &str) -> Option<(u64, u64)> {
+        None
+    }
+}
+
+/// A connection to hand to the node that serves its tenant
+/// ([`Broker::serve_until_handoff`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandOff {
+    /// That node.
+    pub node: u64,
+    /// The tenant.
+    pub tenant: u64,
+    /// The client's bytes from its SASL token's request on (size-prefixed
+    /// frames, as sent).
+    pub prelude: Vec<u8>,
+    /// What the SASL handshake settled here, for [`Broker::serve_resumed`].
+    pub resume: Resume,
+}
+
+/// The SASL handshake as settled before a hand-off.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Resume {
+    /// The mechanism's name (`PLAIN`, `SCRAM-SHA-256`, `SCRAM-SHA-512`).
+    pub mechanism: String,
+    /// SaslHandshake v0: tokens come as bare frames.
+    pub raw: bool,
 }
 
 /// A broker in Metadata: one gateway.
@@ -318,6 +350,22 @@ enum Mech {
     Scram(ScramMechanism),
 }
 
+/// The SASL state a connection continues from: where another node's
+/// handshake left it, or the start.
+fn resumed_sasl(resume: Option<Resume>) -> Result<SaslState, ConnError> {
+    let Some(r) = resume else {
+        return Ok(SaslState::Start);
+    };
+    let mech = if r.mechanism.eq_ignore_ascii_case("PLAIN") {
+        Mech::Plain
+    } else {
+        Mech::Scram(ScramMechanism::from_name(&r.mechanism).ok_or_else(|| {
+            ConnError::Protocol(format!("unknown SASL mechanism {}", r.mechanism))
+        })?)
+    };
+    Ok(SaslState::Handshaken { mech, raw: r.raw })
+}
+
 enum SaslState {
     Start,
     Handshaken {
@@ -401,9 +449,29 @@ impl Broker {
         info: ConnInfo,
         close: CancellationToken,
     ) -> Result<(), ConnError> {
+        self.serve_resumed(stream, info, close, None)
+            .await
+            .map(|_| ())
+    }
+
+    /// [`Self::serve`] for a connection that may continue a SASL handshake
+    /// another node began (`resume`), and that ends early, with its
+    /// replies so far flushed, when its login names a tenant served by
+    /// another node ([`Identity::serve_elsewhere`]).
+    ///
+    /// # Errors
+    /// [`ConnError`]; the caller logs it and closes the socket.
+    pub async fn serve_resumed<S: AsyncRead + AsyncWrite + Unpin + Send>(
+        &self,
+        stream: &mut S,
+        info: ConnInfo,
+        close: CancellationToken,
+        resume: Option<Resume>,
+    ) -> Result<Option<HandOff>, ConnError> {
+        let handoff = std::sync::Mutex::new(None);
         let (mut rd, mut wr) = tokio::io::split(stream);
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Out>(MAX_IN_FLIGHT);
-        let reader = self.read_loop(&mut rd, info, close, tx);
+        let reader = self.read_loop(&mut rd, info, close, tx, resume, &handoff);
         let writer = async {
             while let Some(o) = rx.recv().await {
                 match o {
@@ -446,7 +514,7 @@ impl Broker {
         };
         tokio::pin!(reader);
         tokio::pin!(writer);
-        tokio::select! {
+        let r = tokio::select! {
             w = &mut writer => w,
             r = &mut reader => {
                 // The reader is done (the client closed, or a request
@@ -454,6 +522,58 @@ impl Broker {
                 let w = writer.await;
                 r.and(w)
             }
+        };
+        r?;
+        Ok(handoff
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take())
+    }
+
+    /// The hand-off for `frame` when it carries the SASL token of a login
+    /// whose tenant another node serves ([`Identity::serve_elsewhere`]).
+    async fn login_handoff(
+        &self,
+        mech: &Mech,
+        raw: bool,
+        info: &ConnInfo,
+        frame: &[u8],
+    ) -> Option<HandOff> {
+        let token = if raw {
+            frame.to_vec()
+        } else {
+            let mut r = Reader::new(frame);
+            let h = RequestHeader::decode(&mut r)
+                .ok()
+                .filter(|h| h.api_key == api::SASL_AUTHENTICATE)?;
+            decode::<SaslAuthenticateRequest>(r.rest(), h.api_version)
+                .ok()?
+                .auth_bytes
+        };
+        let user = Self::token_user(mech, &token)?;
+        let (node, tenant) = self.identity.serve_elsewhere(info, &user).await?;
+        let mut prelude = Vec::with_capacity(frame.len() + 4);
+        prelude.extend_from_slice(&u32::try_from(frame.len()).unwrap_or(0).to_be_bytes());
+        prelude.extend_from_slice(frame);
+        Some(HandOff {
+            node,
+            tenant,
+            prelude,
+            resume: Resume {
+                mechanism: match mech {
+                    Mech::Plain => "PLAIN".to_owned(),
+                    Mech::Scram(m) => m.name().to_owned(),
+                },
+                raw,
+            },
+        })
+    }
+
+    /// The user a SASL token names under `mech`.
+    fn token_user(mech: &Mech, token: &[u8]) -> Option<String> {
+        match mech {
+            Mech::Plain => parse_plain(token).ok().map(|c| c.user),
+            Mech::Scram(m) => ScramServer::new(*m).client_first(token).ok(),
         }
     }
 
@@ -465,10 +585,12 @@ impl Broker {
         info: ConnInfo,
         close: CancellationToken,
         tx: tokio::sync::mpsc::Sender<Out>,
+        resume: Option<Resume>,
+        handoff: &std::sync::Mutex<Option<HandOff>>,
     ) -> Result<(), ConnError> {
         let mut c = Conn {
             info,
-            sasl: SaslState::Start,
+            sasl: resumed_sasl(resume)?,
             principal: None,
         };
         let send = |o: Out| {
@@ -506,6 +628,20 @@ impl Broker {
                 })?;
             let mut frame = vec![0u8; size];
             stream.read_exact(&mut frame).await?;
+            // A login for a tenant served by another node: hand the
+            // connection there from this frame on.
+            let handed = match &c.sasl {
+                SaslState::Handshaken { mech, raw } => {
+                    self.login_handoff(mech, *raw, &c.info, &frame).await
+                }
+                _ => None,
+            };
+            if let Some(h) = handed {
+                *handoff
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(h);
+                return Ok(());
+            }
             // SaslHandshake v0: the next frames are bare SASL tokens.
             if let SaslState::Handshaken { raw: true, .. }
             | SaslState::ScramFinal { raw: true, .. } = c.sasl

@@ -176,6 +176,10 @@ pub(crate) fn ranges_of(
     m.into_iter().collect()
 }
 
+/// Levels a variable-length step is costed with past its minimum (an
+/// unbounded or long one).
+const VAR_LEVELS: u32 = 3;
+
 /// Default shares where the statistics don't know.
 const EQ_GUESS: f64 = 0.05;
 const RANGE_GUESS: f64 = 0.3;
@@ -411,9 +415,30 @@ impl Exec<'_> {
             else {
                 return Ok(None);
             };
-            let read = cur * deg;
+            // A variable-length step: the walks of each length in its
+            // range (lengths past a few levels counted as a few levels).
+            let (read, reached) = match rp.range {
+                None => (cur * deg, cur * deg),
+                Some((lo, hi)) => {
+                    let lo = lo.unwrap_or(1);
+                    let hi = hi.unwrap_or(lo.max(1) + VAR_LEVELS).min(lo + VAR_LEVELS);
+                    let mut level = cur;
+                    let mut read = 0.0;
+                    let mut reached = 0.0;
+                    for k in 0..=hi {
+                        if k >= lo {
+                            reached += level;
+                        }
+                        if k < hi {
+                            read += level * deg;
+                            level *= deg;
+                        }
+                    }
+                    (read, reached)
+                }
+            };
             cost += read;
-            cur = read * keep;
+            cur = reached * keep;
             labels[to] = far_label;
             if let Some(v) = &nodes[to].var {
                 seen.insert(v.clone());
@@ -449,10 +474,6 @@ impl Exec<'_> {
                 .iter()
                 .any(|np| Self::score(np, rows, conj) >= 500)
         {
-            return Ok(None);
-        }
-        if var_len {
-            // Variable-length steps: the fixed rules stay.
             return Ok(None);
         }
         let indexes = self.store.indexes();

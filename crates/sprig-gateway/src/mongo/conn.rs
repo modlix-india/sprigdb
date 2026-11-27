@@ -194,7 +194,13 @@ pub async fn serve(shared: Arc<Shared>, mut conn: ClientConn) -> Result<()> {
         close_now: false,
         raw: None,
     };
+    // A connection another node accepted and handed here: what its
+    // `hello`s settled there.
+    super::handoff::resume(&conn, &mut st);
     let close = conn.close_soon.clone();
+    // Another node leads the logged-in tenant's unit now: close between
+    // messages, so the driver reconnects where the tenant is served.
+    let mut moved: Option<crate::forward::watch::Watched> = None;
     let mut next_id = 1i32;
     // A streaming `hello` (exhaust): the request answered again, with
     // `moreToCome`, and the last reply's id that the next one answers.
@@ -203,8 +209,14 @@ pub async fn serve(shared: Arc<Shared>, mut conn: ClientConn) -> Result<()> {
     // Reads go through a buffer: a message's header and body
     // then come from one `recv` instead of two or three.
     let mut stream = tokio::io::BufReader::with_capacity(8 * 1024, &mut conn.stream);
-    let r: Result<()> = async {
+    let r: Result<Option<(u64, u64, Vec<u8>)>> = async {
         loop {
+            if moved.is_none()
+                && crate::forward::enabled()
+                && let Some(t) = st.principal.as_ref().and_then(|p| p.tenant)
+            {
+                moved = Some(crate::forward::watch::Watched::new(t.0));
+            }
             let repeat = again.is_some();
             let msg = if let Some(m) = again.take() {
                 Some(m)
@@ -218,7 +230,13 @@ pub async fn serve(shared: Arc<Shared>, mut conn: ClientConn) -> Result<()> {
                 loop {
                     tokio::select! {
                         m = &mut read => break m.map_err(|e| codec_err(&e))?,
-                        () = close.cancelled() => return Ok(()),
+                        () = close.cancelled() => return Ok(None),
+                        () = async {
+                            match &moved {
+                                Some(w) => w.moved().await,
+                                None => std::future::pending().await,
+                            }
+                        } => return Ok(None),
                         () = tokio::time::sleep(KEEP_IDLE), if kept => {
                             kept = false;
                             if let Some(s) = st.sql.as_mut() {
@@ -228,8 +246,25 @@ pub async fn serve(shared: Arc<Shared>, mut conn: ClientConn) -> Result<()> {
                     }
                 }
             };
-            let Some(msg) = msg else { return Ok(()) };
+            let Some(msg) = msg else { return Ok(None) };
             let (h, frame, comp) = codec::decode(&msg).map_err(|e| codec_err(&e))?;
+            // A login for a tenant served by another node: the connection
+            // goes there from this message on, before it is answered.
+            if st.principal.is_none()
+                && !repeat
+                && crate::forward::enabled()
+                && let Some(user) = super::handoff::login_user(&frame)
+                && let Some((to, tenant)) = super::handoff::target(
+                    &Arc::clone(&st.shared),
+                    st.tls.as_ref().and_then(|t| t.sni.clone()).as_deref(),
+                    &user,
+                )
+                .await
+            {
+                let mut prelude = msg.clone();
+                prelude.extend_from_slice(stream.buffer());
+                return Ok(Some((to, tenant, prelude)));
+            }
             let (reply, used) = match frame {
                 Frame::Query(q) => {
                     let cmd = q
@@ -319,7 +354,7 @@ pub async fn serve(shared: Arc<Shared>, mut conn: ClientConn) -> Result<()> {
                         && m.body.get("maxAwaitTimeMS").ok().flatten().is_some();
                     let (name, body) = Box::pin(st.guarded_reply(m, msg.len())).await;
                     if st.close_now {
-                        return Ok(());
+                        return Ok(None);
                     }
                     let comp = comp.filter(|_| !NEVER_COMPRESSED.contains(&name.as_str()));
                     if more {
@@ -371,11 +406,30 @@ pub async fn serve(shared: Arc<Shared>, mut conn: ClientConn) -> Result<()> {
         }
     }
     .await;
+    drop(stream);
+    drop(moved);
     if let Some(s) = st.sql.take() {
         s.close().await;
     }
     metrics::gauge!("sprig_mongo_connections", "dc" => "").decrement(1.0);
-    r
+    let Some((to, tenant, prelude)) = r? else {
+        return Ok(());
+    };
+    let h = crate::forward::Handoff {
+        listener: conn.listener.name,
+        protocol: crate::frontend::Protocol::Mongo,
+        peer: conn.peer,
+        tls: conn.tls_info(),
+        tenant,
+        resume: super::handoff::resume_json(&st),
+        prelude: prelude.into(),
+        to,
+    };
+    if let Err(e) = crate::forward::splice(&mut conn.stream, h).await {
+        // The driver sees the connection close and retries elsewhere.
+        tracing::debug!(peer = %conn.peer, error = %e, "MongoDB connection not handed over");
+    }
+    Ok(())
 }
 
 impl Conn {

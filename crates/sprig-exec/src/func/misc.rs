@@ -607,6 +607,9 @@ pub struct SessionInfo {
     /// The user variables a statement reads and assigns (`@v`, `@v :=
     /// e`); `None` where none are served.
     pub user_vars: Option<std::sync::Arc<dyn super::uservar::UserVars>>,
+    /// The full-text indexes `MATCH ... AGAINST` searches; `None` where
+    /// none are served.
+    pub fulltext: Option<std::sync::Arc<dyn super::fulltext::FullText>>,
 }
 
 /// The session's own values: `DATABASE()`, `USER()`, ... (none takes an

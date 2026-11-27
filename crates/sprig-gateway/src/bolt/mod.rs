@@ -490,6 +490,24 @@ struct ConnService {
 
 #[async_trait]
 impl BoltService for ConnService {
+    async fn serve_elsewhere(&self, info: &ConnInfo, principal: &str) -> Option<(u64, u64)> {
+        if !crate::forward::enabled() {
+            return None;
+        }
+        let tenant = self
+            .inner
+            .login
+            .tenant_of(principal, info.sni.as_deref(), sprig_auth::admin::MAX_NAME)
+            .await?;
+        match crate::forward::route(tenant.0, Protocol::Bolt).await {
+            crate::forward::Route::Node(n) => Some((n, tenant.0)),
+            crate::forward::Route::Here => {
+                crate::forward::count_direct(Protocol::Bolt);
+                None
+            }
+        }
+    }
+
     async fn logon(
         &self,
         info: &ConnInfo,
@@ -673,10 +691,30 @@ impl Frontend for BoltFrontend {
             tokio::spawn(async move {
                 tokio::select! {
                     () = h.flags().killed() => close.cancel(),
+                    // Another node leads the tenant's unit now (or the
+                    // session was revoked): close between requests.
+                    () = h.flags().close_wanted() => close.cancel(),
                     () = close.cancelled() => {}
                 }
             });
         }
+        // A connection another node accepted and handed here: its
+        // handshake (and 5.1+ HELLO) happened there.
+        let resume = match &conn.stream {
+            crate::frontend::MaybeTls::Forwarded(f) => f.take_resume().and_then(|j| {
+                let v: serde_json::Value = serde_json::from_str(&j).ok()?;
+                Some(sprig_proto_bolt::server::Resume {
+                    version: sprig_proto_bolt::BoltVersion::new(
+                        u8::try_from(v.get("major")?.as_u64()?).ok()?,
+                        u8::try_from(v.get("minor")?.as_u64()?).ok()?,
+                    ),
+                    connection_id: v.get("connection_id")?.as_str()?.to_owned(),
+                    user_agent: v.get("user_agent")?.as_str()?.to_owned(),
+                    hello_done: v.get("hello_done")?.as_bool()?,
+                })
+            }),
+            _ => None,
+        };
         let tls = conn.stream.tls_info();
         let svc = ConnService {
             inner: Arc::clone(&self.service),
@@ -688,19 +726,45 @@ impl Frontend for BoltFrontend {
         };
         let cfg = self.config(conn.listener.handshake_timeout);
         let peer = conn.peer;
-        let r = sprig_proto_bolt::server::serve(
+        let listener = conn.listener.name;
+        let r = sprig_proto_bolt::server::serve_until_handoff(
             conn.stream,
             peer,
             tls.is_some(),
-            tls.and_then(|t| t.sni),
+            tls.as_ref().and_then(|t| t.sni.clone()),
             &svc,
             &cfg,
             close.clone(),
+            resume,
         )
         .await;
         close.cancel();
         match r {
-            Ok(end) => tracing::debug!(%peer, ?end, "Bolt connection ended"),
+            Ok((sprig_proto_bolt::server::End::HandOff(h), Some(mut stream))) => {
+                let handoff = crate::forward::Handoff {
+                    listener,
+                    protocol: Protocol::Bolt,
+                    peer,
+                    tls,
+                    tenant: h.tenant,
+                    resume: serde_json::json!({
+                        "major": h.resume.version.major,
+                        "minor": h.resume.version.minor,
+                        "connection_id": h.resume.connection_id,
+                        "user_agent": h.resume.user_agent,
+                        "hello_done": h.resume.hello_done,
+                    })
+                    .to_string(),
+                    prelude: h.prelude.into(),
+                    to: h.node,
+                };
+                // On failure the driver sees the connection close and
+                // retries.
+                if let Err(e) = crate::forward::splice(&mut stream, handoff).await {
+                    tracing::debug!(%peer, error = %e, "Bolt connection not handed over");
+                }
+            }
+            Ok((end, _)) => tracing::debug!(%peer, ?end, "Bolt connection ended"),
             Err(e) => tracing::debug!(%peer, error = %e, "Bolt connection ended"),
         }
         Ok(())

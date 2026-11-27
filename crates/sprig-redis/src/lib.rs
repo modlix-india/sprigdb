@@ -70,4 +70,4 @@ pub mod session;
 pub mod spec;
 
 pub use env::{Config, Env};
-pub use session::{Auth, Login, Session};
+pub use session::{Auth, HandOff, Login, Session};

@@ -79,6 +79,7 @@ pub(crate) mod engine;
 pub mod docs;
 pub mod exec;
 pub mod failover;
+pub mod forward;
 pub mod frontend;
 // Native graphs in the tenant catalog.
 pub mod graphs;
@@ -667,6 +668,7 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
             )
         })?,
     };
+    let peer_tls_fwd = peer_tls.clone();
     let peer_server = peer::serve(peer_bind, peer_tls, peer_host, stop.clone()).await?;
     if let Some((addr, _)) = &peer_server {
         redis_peer.start(&redis_env, stop.clone());
@@ -708,6 +710,14 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
         )
         .with_bind_overrides(binds),
     );
+    // Connections of tenants served elsewhere are handed to that node, and
+    // sessions of tenants this node stops leading close at a safe point.
+    forward::init(forward::Host {
+        listeners: Arc::clone(&listeners),
+        peers: Arc::clone(&peers),
+        tls: peer_tls_fwd,
+    });
+    forward::watch::start(Arc::clone(&sessions), stop.clone());
     // Subscribe before the first apply, so no change falls in between.
     let changes = live.subscribe(listener::live::LISTENER_KEYS);
     let report = listener::live::apply_current(&live, &dc, &certs, &listeners).await;

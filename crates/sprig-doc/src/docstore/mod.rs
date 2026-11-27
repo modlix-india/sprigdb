@@ -41,7 +41,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use bson::{Document, doc};
 use bytes::Bytes;
-use sprig_common::SprigError;
+use sprig_common::{SprigCode, SprigError};
 use sprig_engine::keys::KeyRange;
 use sprig_engine::locks::Wait;
 use sprig_engine::txn::{CommitPath, Dir, Isolation, LockRequest, Txn, TxnOptions};
@@ -121,6 +121,23 @@ pub fn engine_error(e: &SprigError, multi: bool) -> MongoError {
             code::WRITE_CONFLICT,
             "Write conflict during plan execution and yielding is disabled. :: Please retry your operation or multi-document transaction.",
         );
+        return if multi {
+            m.label("TransientTransactionError")
+        } else {
+            m
+        };
+    }
+    // The unit's leadership moved (or is moving): the driver retries on
+    // the primary it finds next, as after a MongoDB step-down.
+    if matches!(
+        e.code(),
+        Some(SprigCode::ShardMoved | SprigCode::NotLeader | SprigCode::SessionMoved)
+    ) {
+        let m = MongoError::new(
+            code::NOT_WRITABLE_PRIMARY,
+            format!("not primary: {}", e.message),
+        )
+        .label("RetryableWriteError");
         return if multi {
             m.label("TransientTransactionError")
         } else {

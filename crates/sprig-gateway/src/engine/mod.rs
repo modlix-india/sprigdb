@@ -39,6 +39,7 @@
 #![allow(clippy::many_single_char_names)]
 
 pub(crate) mod alter;
+pub(crate) mod applyidx;
 pub(crate) mod assign;
 pub(crate) mod catalog;
 pub(crate) mod collection;
@@ -50,6 +51,7 @@ pub(crate) mod define;
 pub(crate) mod exec;
 pub(crate) mod expr;
 pub(crate) mod fk;
+pub(crate) mod fulltext;
 pub(crate) mod general;
 pub(crate) mod graphsql;
 pub(crate) mod indexes;
@@ -260,7 +262,12 @@ pub(crate) fn engine() -> Result<&'static Engine> {
     ENGINE
         .get_or_init(|| {
             crate::node_engine::engine()
-                .map(Engine::new)
+                .map(|e| {
+                    // The apply-time indexes (full text) follow every apply
+                    // from before the first statement.
+                    fulltext::start(&e);
+                    Engine::new(e)
+                })
                 .map_err(|e| e.message)
         })
         .as_ref()

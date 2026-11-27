@@ -951,6 +951,29 @@ impl LoginService {
         &self.source
     }
 
+    /// The id of the tenant the login name `login_name` (or the server name
+    /// `sni`) names, read from the tenant directory only, before anything
+    /// of its credentials: where a node routes the connection. `None` for
+    /// the accounts file, a name that names no tenant, an unknown tenant or
+    /// a directory that can't be read (the login then decides as usual).
+    pub async fn tenant_of(
+        &self,
+        login_name: &str,
+        sni: Option<&str>,
+        max_user: usize,
+    ) -> Option<TenantId> {
+        let LoginSource::Catalog(c) = &self.source else {
+            return None;
+        };
+        let parsed = parse_login(login_name, sni, &c.sni_suffixes(), max_user)?;
+        c.tenants()
+            .lookup(&parsed.tenant)
+            .await
+            .ok()
+            .flatten()
+            .map(|t| t.id)
+    }
+
     /// The fast cache.
     #[must_use]
     pub fn fast_cache(&self) -> &Arc<FastCache> {

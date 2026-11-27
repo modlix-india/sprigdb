@@ -480,6 +480,24 @@ pub trait GraphStore: Send {
         self.edges_at(at).await
     }
 
+    /// Expand(Into): the links of `types` (not empty) between each pair's
+    /// near node and its far node, in `dir` from the near one (both ways
+    /// for `Both`, a self-loop once), each with `true` when it goes out of
+    /// the near node, in relationship-id order. A point check per pair
+    /// rather than a read of every link of the near node. `None`: the
+    /// store can't (the caller reads the near nodes' links).
+    ///
+    /// # Errors
+    /// The store's.
+    async fn links_between(
+        &mut self,
+        _pairs: &[(u64, u64)],
+        _types: &[u32],
+        _dir: Dir,
+    ) -> Result<Option<Vec<(Link, bool)>>> {
+        Ok(None)
+    }
+
     /// [`GraphStore::links`] both ways in one step where the store can:
     /// each link with `true` when it goes out of `from`.
     async fn links_both(&mut self, from: &[u64], types: &[u32]) -> Result<Vec<(Link, bool)>> {

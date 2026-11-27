@@ -483,6 +483,8 @@ pub async fn serve(
     // Tenants' catalog records in this node's engine, for the controller
     // and workers.
     routes = routes.add_service(crate::tenant::catalog_records::CatalogService::server());
+    // Client connections handed here by the node that accepted them.
+    routes = routes.add_service(crate::forward::service::ForwardService::server());
     let routes = routes.prepare();
     tracing::info!(bind = %local, mtls = acceptor.is_some(), "peer service listening");
     let task = tokio::spawn(async move {

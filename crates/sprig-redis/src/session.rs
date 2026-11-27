@@ -52,6 +52,22 @@ pub trait Auth: Send + Sync {
     /// Logs `user` in (`None`: one-argument `AUTH`). `Err` holds the
     /// `-...` reply.
     async fn login(&self, user: Option<&[u8]>, pass: &[u8]) -> Result<Login, Frame>;
+
+    /// Where the tenant `user` names is served, when that is another node:
+    /// the connection is then handed there from this command on, before
+    /// anything is answered (the default: served here).
+    async fn serve_elsewhere(&self, _user: Option<&[u8]>) -> Option<HandOff> {
+        None
+    }
+}
+
+/// A connection to hand to the node that serves its tenant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HandOff {
+    /// That node's Raft id.
+    pub node: u64,
+    /// The tenant.
+    pub tenant: u64,
 }
 
 /// The `WRONGPASS` reply.
@@ -87,6 +103,9 @@ pub struct Session {
     rx: Option<UnboundedReceiver<Msg>>,
     /// The client sent `QUIT`: close after replying.
     pub closing: bool,
+    /// The login names a tenant served by another node: the connection
+    /// loop hands the connection there, from the current command on.
+    pub handoff: Option<HandOff>,
     peer: String,
     created: Instant,
     /// The data center named by `CLIENT SETNAME` (`app~fra1`).
@@ -152,6 +171,7 @@ impl Session {
             tx,
             rx: Some(rx),
             closing: false,
+            handoff: None,
             peer: peer.to_owned(),
             created: Instant::now(),
             dc_hint: None,
@@ -1073,6 +1093,12 @@ impl Session {
         while i < a.len() {
             match upper(&a[i]).as_str() {
                 "AUTH" if i + 2 < a.len() => {
+                    if self.login.is_none()
+                        && let Some(h) = self.auth.serve_elsewhere(Some(&a[i + 1])).await
+                    {
+                        self.handoff = Some(h);
+                        return Frame::ok();
+                    }
                     match self.auth.login(Some(&a[i + 1]), &a[i + 2]).await {
                         Ok(l) => self.set_login(l).await,
                         Err(f) => return f,
@@ -1149,6 +1175,17 @@ impl Session {
     }
 
     async fn auth_cmd(&mut self, a: &[Bytes]) -> Frame {
+        let user = match a.len() {
+            3 => Some(&a[1][..]),
+            _ => None,
+        };
+        if self.login.is_none()
+            && (2..=3).contains(&a.len())
+            && let Some(h) = self.auth.serve_elsewhere(user).await
+        {
+            self.handoff = Some(h);
+            return Frame::ok();
+        }
         let r = match a.len() {
             2 => self.auth.login(None, &a[1]).await,
             3 => self.auth.login(Some(&a[1]), &a[2]).await,

@@ -20,19 +20,47 @@ use sprig_proto_redis::{Command, Decoder, Frame, Limits, encode};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::batch::GROUP_MAX_COMMANDS;
-use crate::session::Session;
+use crate::session::{HandOff, Session};
+
+/// `c` as the client could have sent it: a RESP array of bulk strings.
+fn encode_command(c: &Command, out: &mut BytesMut) {
+    out.extend_from_slice(format!("*{}\r\n", c.args.len()).as_bytes());
+    for a in &c.args {
+        out.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+        out.extend_from_slice(a);
+        out.extend_from_slice(b"\r\n");
+    }
+}
 
 /// Serves `sess` on `stream` until the client quits, the stream ends, or
 /// `stop` completes.
 ///
 /// # Errors
 /// I/O errors on the stream.
-pub async fn serve<S, F>(
+pub async fn serve<S, F>(stream: S, sess: Session, limits: Limits, stop: F) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+    F: Future<Output = ()> + Send,
+{
+    serve_until_handoff(stream, sess, limits, stop)
+        .await
+        .map(|_| ())
+}
+
+/// [`serve`], ending early when a login names a tenant served by another
+/// node ([`crate::session::Auth::serve_elsewhere`]): the replies so far are
+/// flushed, and the hand-off comes back with the client's bytes from the
+/// login command on (re-encoded commands, then what was buffered), for the
+/// caller to send to that node.
+///
+/// # Errors
+/// I/O errors on the stream.
+pub async fn serve_until_handoff<S, F>(
     mut stream: S,
     mut sess: Session,
     limits: Limits,
     stop: F,
-) -> std::io::Result<()>
+) -> std::io::Result<Option<(HandOff, BytesMut)>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
     F: Future<Output = ()> + Send,
@@ -98,15 +126,28 @@ where
                         }
                     };
                     let Some(replies) = replies else {
-                        return Ok(());
+                        return Ok(None);
                     };
+                    if let Some(h) = sess.handoff.take() {
+                        // The login command's answer is the serving node's.
+                        if !out.is_empty() {
+                            stream.write_all(&out).await?;
+                            stream.flush().await?;
+                        }
+                        let mut rest = BytesMut::new();
+                        for c in &cmds[at..] {
+                            encode_command(c, &mut rest);
+                        }
+                        rest.extend_from_slice(&inbuf);
+                        return Ok(Some((h, rest)));
+                    }
                     at += replies.len().max(1);
                     for f in replies.iter().flatten() {
                         encode(f, sess.proto, &mut out);
                     }
                     if sess.closing {
                         stream.write_all(&out).await?;
-                        return Ok(());
+                        return Ok(None);
                     }
                     if out.len() > 64 * 1024 {
                         stream.write_all(&out).await?;
@@ -116,7 +157,7 @@ where
                 if let Some(e) = bad {
                     encode(&Frame::err(&e.to_string()), sess.proto, &mut out);
                     stream.write_all(&out).await?;
-                    return Ok(());
+                    return Ok(None);
                 }
             }
             if !out.is_empty() {
@@ -127,7 +168,7 @@ where
             tokio::select! {
                 n = stream.read_buf(&mut inbuf) => {
                     if n? == 0 {
-                        return Ok(());
+                        return Ok(None);
                     }
                 }
                 m = async {
@@ -142,7 +183,7 @@ where
                         encode(&f, sess.proto, &mut out);
                     }
                 }
-                () = &mut stop => return Ok(()),
+                () = &mut stop => return Ok(None),
             }
         }
     }

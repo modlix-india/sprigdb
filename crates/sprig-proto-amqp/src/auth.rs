@@ -116,6 +116,14 @@ pub trait Identity: Send + Sync + 'static {
     /// Checks credentials: the tenant from the TLS server name, a
     /// `tenant.user` name, or the listener's bound tenant.
     async fn login(&self, c: &ConnInfo, creds: Credentials) -> Result<Principal, AuthFailure>;
+
+    /// Where the tenant `user` (as sent) names is served, when the
+    /// connection should go to another node: `(node, tenant)`. The
+    /// connection is then handed there from its login frame on, before it
+    /// is answered (the default: served here).
+    async fn serve_elsewhere(&self, _c: &ConnInfo, _user: &str) -> Option<(u64, u64)> {
+        None
+    }
 }
 
 /// Parses a SASL `PLAIN` response: `[authzid] NUL authcid NUL passwd`. An

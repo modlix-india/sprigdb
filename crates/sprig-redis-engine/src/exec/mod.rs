@@ -11,7 +11,8 @@
 //! - [`keys`]: the keyspace (`EXISTS`, `RENAME`, `SCAN`, ...);
 //! - [`strings`]: strings, bitmaps and bitfields;
 //! - [`hashes`], [`lists`], [`sets`], [`zsets`]: the collections;
-//! - [`hll`] and [`geo`]: `HyperLogLog` (on strings) and geo (on sorted sets).
+//! - [`hll`] and [`geo`]: `HyperLogLog` (on strings) and geo (on sorted sets);
+//! - [`streams`]: streams and their consumer groups.
 
 pub mod blocking;
 pub mod geo;
@@ -20,6 +21,7 @@ pub mod hll;
 pub mod keys;
 pub mod lists;
 pub mod sets;
+pub mod streams;
 pub mod strings;
 pub mod zsets;
 
@@ -231,6 +233,22 @@ pub const COMMANDS: &[&str] = &[
     "georadius_ro",
     "georadiusbymember",
     "georadiusbymember_ro",
+    // Streams.
+    "xadd",
+    "xrange",
+    "xrevrange",
+    "xlen",
+    "xdel",
+    "xtrim",
+    "xsetid",
+    "xread",
+    "xreadgroup",
+    "xgroup",
+    "xack",
+    "xpending",
+    "xclaim",
+    "xautoclaim",
+    "xinfo",
 ];
 
 /// Whether the engine runs `name`.
@@ -316,6 +334,13 @@ pub fn write_targets(name: &str, a: &[Bytes], space: Space, all: &[Space]) -> Ve
             v
         }
         "bitop" => a.get(2).map(here).into_iter().collect(),
+        "xreadgroup" => streams::read_keys(a, true).iter().map(here).collect(),
+        "xgroup" => match a.get(1).map(|s| upper(s)).as_deref() {
+            Some("CREATE" | "SETID" | "DESTROY" | "CREATECONSUMER" | "DELCONSUMER") => {
+                a.get(2).map(here).into_iter().collect()
+            }
+            _ => Vec::new(),
+        },
         _ => sprig_redis::engine::lookup(name)
             .map(|s| s.key_indexes(a.len()))
             .unwrap_or_default()
@@ -361,6 +386,13 @@ pub fn uids_needed(name: &str) -> usize {
                     | "flushall"
                     | "pfadd"
                     | "pfmerge"
+                    | "xreadgroup"
+                    | "xack"
+                    | "xdel"
+                    | "xtrim"
+                    | "xsetid"
+                    | "xclaim"
+                    | "xautoclaim"
             ),
     )
 }
@@ -383,6 +415,10 @@ pub struct Cx<'a, B: Batch> {
     /// The metadata entries of the keys the batch changed: they wake
     /// blocked clients and fail `EXEC`s that watch them.
     pub touched: Vec<Bytes>,
+    /// Keyspace events a command records itself, beyond those its reply
+    /// and keys tell ([`crate::notify`]): a stream consumer it created, a
+    /// trim inside `XADD`.
+    pub events: Vec<(Space, Bytes, &'static str)>,
 }
 
 /// An argument in upper case, for matching options.
@@ -692,6 +728,7 @@ impl<B: Batch> Cx<'_, B> {
                 Body::ZSet(crate::layout::ZBody::Split { uid, count })
             }
             Body::Chunked { len, .. } => Body::Chunked { uid, len },
+            Body::Stream(s) => Body::Stream(crate::layout::StreamMeta { uid, ..s }),
             b => b,
         };
         Ok(out)
@@ -710,6 +747,7 @@ fn body_entries(m: &Meta) -> u64 {
         | Body::ZSet(ZBody::Split { count, .. }) => *count,
         Body::List(ListBody::Split { head, tail, .. }) => tail.saturating_sub(*head).unsigned_abs(),
         Body::Chunked { len, .. } => len.div_ceil(crate::layout::CHUNK as u64),
+        Body::Stream(s) => s.length,
         _ => 0,
     }
 }
@@ -796,6 +834,9 @@ pub fn run<B: Batch>(cx: &mut Cx<'_, B>, name: &str, a: &[Bytes]) -> Out {
     if let Some(out) = geo::run(cx, name, a) {
         return out;
     }
+    if let Some(out) = streams::run(cx, name, a) {
+        return out;
+    }
     Ok(reply::unknown(&a[0], &a[1..]))
 }
 
@@ -833,6 +874,7 @@ pub fn expire_due_keys<B: Batch>(
         uids: &mut none,
         resp3: false,
         touched: Vec::new(),
+        events: Vec::new(),
     };
     let mut gone = Vec::new();
     for (at, key) in due {
@@ -871,6 +913,7 @@ pub fn expire_fields<B: Batch>(
         uids: &mut none,
         resp3: false,
         touched: Vec::new(),
+        events: Vec::new(),
     };
     for (at, key) in due {
         hashes::sweep_hash(&mut cx, *at, key)?;
@@ -898,6 +941,7 @@ pub fn expire_fields_keys<B: Batch>(
         uids: &mut none,
         resp3: false,
         touched: Vec::new(),
+        events: Vec::new(),
     };
     let mut out = Vec::new();
     for (at, key) in due {

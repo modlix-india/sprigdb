@@ -273,6 +273,8 @@ pub(crate) async fn run<S>(
     svc: &Services,
     cfg: Config,
     close: CancellationToken,
+    resumed: bool,
+    handoff: &std::sync::Mutex<Option<crate::server::HandOff>>,
 ) -> Result<(), MqError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -282,19 +284,23 @@ where
     let mut out = BytesMut::new();
     let deadline = Instant::now() + cfg.handshake_timeout;
     let offered = auth::offered(&cfg.mechanisms, &info, false);
-    put_method(
-        &mut out,
-        0,
-        &ConnectionStart {
-            version_major: 0,
-            version_minor: 9,
-            server_properties: server_properties(&cfg),
-            mechanisms: Bytes::from(offered.join(" ")),
-            locales: Bytes::from_static(b"en_US"),
-        }
-        .into(),
-    );
-    flush(&mut wr, &mut out).await?;
+    // A connection handed here was sent its `connection.start` by the
+    // node that accepted it.
+    if !resumed {
+        put_method(
+            &mut out,
+            0,
+            &ConnectionStart {
+                version_major: 0,
+                version_minor: 9,
+                server_properties: server_properties(&cfg),
+                mechanisms: Bytes::from(offered.join(" ")),
+                locales: Bytes::from_static(b"en_US"),
+            }
+            .into(),
+        );
+        flush(&mut wr, &mut out).await?;
+    }
     let hs_max = cfg.frame_max.max(FRAME_MIN_SIZE);
     let Method::ConnectionStartOk(start_ok) = expect(&mut rd, &mut inb, hs_max, deadline).await?
     else {
@@ -305,6 +311,25 @@ where
     };
     let caps = ClientCaps::of(&start_ok.client_properties);
     let creds = auth::credentials(&start_ok.mechanism, &start_ok.response, &offered, &info);
+    // A tenant served by another node: the connection goes there from
+    // this start-ok on, before the login is answered.
+    if !resumed
+        && let Some(Credentials::Password { user, .. }) = &creds
+        && let Some((node, tenant)) = svc.identity.serve_elsewhere(&info, user).await
+    {
+        let mut prelude = BytesMut::new();
+        put_method(&mut prelude, 0, &Method::ConnectionStartOk(start_ok));
+        prelude.extend_from_slice(&inb);
+        *handoff
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(crate::server::HandOff {
+            node,
+            tenant,
+            prelude: prelude.to_vec(),
+            v10: false,
+        });
+        return Ok(());
+    }
     let login_user = match &creds {
         Some(Credentials::Password { user, .. }) => user.clone(),
         Some(Credentials::External { login }) => login.clone(),

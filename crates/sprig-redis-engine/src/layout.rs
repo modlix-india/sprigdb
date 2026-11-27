@@ -23,6 +23,8 @@
 //!             prefix(E, 0) | uid u64 | chunk u32               -> bytes  (chunked string)
 //!             prefix(E, 0) | uid u64 | crc32(member) u32 | str(member)
 //!                                                -> (empty) (set) | score f64 (sorted set)
+//!             prefix(E, 0) | uid u64 | tag u8 | ...            (stream: entries, groups,
+//!                                                consumers, pending; exec::streams)
 //! score index prefix(Z, 0) | uid u64 | enc(score) u64 | str(member) -> (empty)
 //! field expiry prefix(E, 1) | uid u64 | at_ms u64 | str(field) -> (empty)
 //! expiry      prefix(X, 0) | at_ms u64 | str(key)              -> (empty)
@@ -644,6 +646,8 @@ pub enum Type {
     Set,
     /// A sorted set.
     ZSet,
+    /// A stream.
+    Stream,
 }
 
 impl Type {
@@ -656,6 +660,7 @@ impl Type {
             Self::List => "list",
             Self::Set => "set",
             Self::ZSet => "zset",
+            Self::Stream => "stream",
         }
     }
 }
@@ -730,6 +735,105 @@ pub enum ListBody {
     },
 }
 
+/// A stream entry's ID: milliseconds, then a sequence number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct StreamId {
+    /// Milliseconds part.
+    pub ms: u64,
+    /// Sequence part.
+    pub seq: u64,
+}
+
+impl StreamId {
+    /// `0-0`.
+    pub const MIN: Self = Self { ms: 0, seq: 0 };
+    /// The last possible ID.
+    pub const MAX: Self = Self {
+        ms: u64::MAX,
+        seq: u64::MAX,
+    };
+
+    /// The ID right after this one, if any.
+    #[must_use]
+    pub const fn next(self) -> Option<Self> {
+        if self.seq < u64::MAX {
+            Some(Self {
+                ms: self.ms,
+                seq: self.seq + 1,
+            })
+        } else if self.ms < u64::MAX {
+            Some(Self {
+                ms: self.ms + 1,
+                seq: 0,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// The ID right before this one, if any.
+    #[must_use]
+    pub const fn prev(self) -> Option<Self> {
+        if self.seq > 0 {
+            Some(Self {
+                ms: self.ms,
+                seq: self.seq - 1,
+            })
+        } else if self.ms > 0 {
+            Some(Self {
+                ms: self.ms - 1,
+                seq: u64::MAX,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// The ID's 16 bytes, in order.
+    #[must_use]
+    pub fn bytes(self) -> [u8; 16] {
+        let mut b = [0u8; 16];
+        b[..8].copy_from_slice(&self.ms.to_be_bytes());
+        b[8..].copy_from_slice(&self.seq.to_be_bytes());
+        b
+    }
+
+    /// The ID of 16 bytes [`StreamId::bytes`] wrote.
+    #[must_use]
+    pub fn of_bytes(b: &[u8]) -> Option<Self> {
+        Some(Self {
+            ms: u64::from_be_bytes(b.get(..8)?.try_into().ok()?),
+            seq: u64::from_be_bytes(b.get(8..16)?.try_into().ok()?),
+        })
+    }
+}
+
+impl std::fmt::Display for StreamId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}-{}", self.ms, self.seq)
+    }
+}
+
+/// A stream's counters, kept in its metadata entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StreamMeta {
+    /// The stream's uid: its entries, groups, consumers and pending
+    /// entries live under it.
+    pub uid: u64,
+    /// Entries now.
+    pub length: u64,
+    /// The last ID generated or set (`last-generated-id`).
+    pub last: StreamId,
+    /// The first entry's ID (`recorded-first-entry-id`; `0-0` when empty).
+    pub first: StreamId,
+    /// The largest ID `XDEL` removed (`max-deleted-entry-id`).
+    pub max_deleted: StreamId,
+    /// Entries ever added (`entries-added`).
+    pub added: u64,
+    /// Consumer groups.
+    pub groups: u64,
+}
+
 /// A key's value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Body {
@@ -743,6 +847,9 @@ pub enum Body {
     Set(SetBody),
     /// A sorted set.
     ZSet(ZBody),
+    /// A stream: its counters here, its entries, groups, consumers and
+    /// pending entries under its uid ([`crate::exec::streams`]).
+    Stream(StreamMeta),
     /// A string held in chunks of [`CHUNK`] bytes (a missing chunk reads
     /// as zeros).
     Chunked {
@@ -774,6 +881,7 @@ const TAG_ZSET_INLINE: u8 = 9;
 const TAG_ZSET_SPLIT: u8 = 10;
 const TAG_HASH_SPLIT_TTL: u8 = 11;
 const TAG_STR_CHUNKED: u8 = 12;
+const TAG_STREAM: u8 = 13;
 const FLAG_EXP: u8 = 1;
 
 fn put_varint(b: &mut BytesMut, mut v: u64) {
@@ -833,6 +941,7 @@ impl Meta {
             Body::List(_) => Type::List,
             Body::Set(_) => Type::Set,
             Body::ZSet(_) => Type::ZSet,
+            Body::Stream(_) => Type::Stream,
         }
     }
 
@@ -850,7 +959,8 @@ impl Meta {
             | Body::List(ListBody::Split { uid, .. })
             | Body::Set(SetBody::Split { uid, .. })
             | Body::ZSet(ZBody::Split { uid, .. })
-            | Body::Chunked { uid, .. } => Some(uid),
+            | Body::Chunked { uid, .. }
+            | Body::Stream(StreamMeta { uid, .. }) => Some(uid),
             _ => None,
         }
     }
@@ -877,6 +987,7 @@ impl Meta {
             Body::Set(SetBody::Split { .. }) => TAG_SET_SPLIT,
             Body::ZSet(ZBody::Inline(_)) => TAG_ZSET_INLINE,
             Body::ZSet(ZBody::Split { .. }) => TAG_ZSET_SPLIT,
+            Body::Stream(_) => TAG_STREAM,
         };
         b.put_u8(tag);
         b.put_u8(if self.exp.is_some() { FLAG_EXP } else { 0 });
@@ -925,6 +1036,15 @@ impl Meta {
                     b.put_f64(*s);
                     put_blob(&mut b, m);
                 }
+            }
+            Body::Stream(st) => {
+                b.put_u64(st.uid);
+                b.put_u64(st.length);
+                b.put_slice(&st.last.bytes());
+                b.put_slice(&st.first.bytes());
+                b.put_slice(&st.max_deleted.bytes());
+                b.put_u64(st.added);
+                b.put_u64(st.groups);
             }
         }
         b.freeze()
@@ -1004,6 +1124,25 @@ impl Meta {
                 uid: get_u64(src, &mut at)?,
                 count: get_u64(src, &mut at)?,
             }),
+            TAG_STREAM => {
+                let uid = get_u64(src, &mut at)?;
+                let length = get_u64(src, &mut at)?;
+                let mut id = || {
+                    let ms = get_u64(src, &mut at)?;
+                    let seq = get_u64(src, &mut at)?;
+                    Some(StreamId { ms, seq })
+                };
+                let (last, first, max_deleted) = (id()?, id()?, id()?);
+                Body::Stream(StreamMeta {
+                    uid,
+                    length,
+                    last,
+                    first,
+                    max_deleted,
+                    added: get_u64(src, &mut at)?,
+                    groups: get_u64(src, &mut at)?,
+                })
+            }
             _ => return None,
         };
         Some(Self { exp, body })
@@ -1040,6 +1179,24 @@ mod tests {
                 .prop_map(|z| Body::ZSet(ZBody::Inline(z))),
             (any::<u64>(), any::<u64>())
                 .prop_map(|(uid, count)| Body::ZSet(ZBody::Split { uid, count })),
+            (any::<[u64; 10]>()).prop_map(|v| Body::Stream(StreamMeta {
+                uid: v[0],
+                length: v[1],
+                last: StreamId {
+                    ms: v[2],
+                    seq: v[3]
+                },
+                first: StreamId {
+                    ms: v[4],
+                    seq: v[5]
+                },
+                max_deleted: StreamId {
+                    ms: v[6],
+                    seq: v[7]
+                },
+                added: v[8],
+                groups: v[9],
+            })),
         ];
         (proptest::option::of(any::<i64>()), body).prop_map(|(exp, body)| Meta { exp, body })
     }

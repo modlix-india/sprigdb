@@ -186,6 +186,9 @@ pub enum MaybeTls<S> {
     Plain(S),
     /// TLS, after a completed handshake.
     Tls(Box<tokio_rustls::server::TlsStream<S>>),
+    /// A connection another node accepted and handed here: its bytes come
+    /// over the peer listener, with that node's view of the client's TLS.
+    Forwarded(Box<crate::forward::io::Spliced>),
 }
 
 impl<S> fmt::Debug for MaybeTls<S> {
@@ -193,6 +196,7 @@ impl<S> fmt::Debug for MaybeTls<S> {
         f.write_str(match self {
             MaybeTls::Plain(_) => "MaybeTls::Plain",
             MaybeTls::Tls(_) => "MaybeTls::Tls",
+            MaybeTls::Forwarded(_) => "MaybeTls::Forwarded",
         })
     }
 }
@@ -201,7 +205,11 @@ impl<S> MaybeTls<S> {
     /// The negotiated TLS parameters, or `None` for plaintext.
     #[must_use]
     pub fn tls_info(&self) -> Option<TlsInfo> {
-        let MaybeTls::Tls(s) = self else { return None };
+        let s = match self {
+            MaybeTls::Plain(_) => return None,
+            MaybeTls::Forwarded(f) => return f.tls_info(),
+            MaybeTls::Tls(s) => s,
+        };
         let conn = s.get_ref().1;
         Some(TlsInfo {
             version: match conn.protocol_version() {
@@ -235,6 +243,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for MaybeTls<S> {
         match self.get_mut() {
             MaybeTls::Plain(s) => Pin::new(s).poll_read(cx, buf),
             MaybeTls::Tls(s) => Pin::new(s.as_mut()).poll_read(cx, buf),
+            MaybeTls::Forwarded(s) => Pin::new(s.as_mut()).poll_read(cx, buf),
         }
     }
 }
@@ -248,6 +257,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for MaybeTls<S> {
         match self.get_mut() {
             MaybeTls::Plain(s) => Pin::new(s).poll_write(cx, buf),
             MaybeTls::Tls(s) => Pin::new(s.as_mut()).poll_write(cx, buf),
+            MaybeTls::Forwarded(s) => Pin::new(s.as_mut()).poll_write(cx, buf),
         }
     }
 
@@ -255,6 +265,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for MaybeTls<S> {
         match self.get_mut() {
             MaybeTls::Plain(s) => Pin::new(s).poll_flush(cx),
             MaybeTls::Tls(s) => Pin::new(s.as_mut()).poll_flush(cx),
+            MaybeTls::Forwarded(s) => Pin::new(s.as_mut()).poll_flush(cx),
         }
     }
 
@@ -262,6 +273,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for MaybeTls<S> {
         match self.get_mut() {
             MaybeTls::Plain(s) => Pin::new(s).poll_shutdown(cx),
             MaybeTls::Tls(s) => Pin::new(s.as_mut()).poll_shutdown(cx),
+            MaybeTls::Forwarded(s) => Pin::new(s.as_mut()).poll_shutdown(cx),
         }
     }
 }

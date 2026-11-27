@@ -50,6 +50,7 @@ use crate::pipeline::{
     SharedExecutor, Wire,
 };
 use crate::session::{Session, SessionState, SessionTable};
+use tokio::io::AsyncWriteExt as _;
 
 type Text = Cow<'static, str>;
 
@@ -361,28 +362,58 @@ impl Frontend for RedisFrontend {
             max_command: cfg.max_command_bytes,
         };
         self.env.set_config(cfg);
+        let moved = sprig_common::CancellationToken::new();
+        let done = sprig_common::CancellationToken::new();
         let auth: Arc<dyn Auth> = Arc::new(GatewayAuth {
             d: Arc::clone(&self.d),
             peer: conn.peer,
             listener: conn.listener.name,
             generation: conn.generation,
             tls: conn.tls_info(),
+            moved: moved.clone(),
+            done: done.clone(),
         });
         let peer = conn.peer;
         let sess = sprig_redis::Session::new(Arc::clone(&self.env), auth, &peer.to_string());
         let stop = conn.close_soon.clone();
         metrics::gauge!("sprig_redis_connections", "dc" => self.d.dc.to_string()).increment(1.0);
+        let mut conn = conn;
+        // Closes between commands on a drain or a listener change, or when
+        // another node leads the tenant's unit now (the client reconnects).
         let r =
-            sprig_redis::conn::serve(
-                conn.stream,
-                sess,
-                limits,
-                async move { stop.cancelled().await },
-            )
+            sprig_redis::conn::serve_until_handoff(&mut conn.stream, sess, limits, async move {
+                tokio::select! {
+                    () = stop.cancelled() => {}
+                    () = moved.cancelled() => {}
+                }
+            })
             .await;
+        done.cancel();
         metrics::gauge!("sprig_redis_connections", "dc" => self.d.dc.to_string()).decrement(1.0);
-        if let Err(e) = r {
-            tracing::debug!(%peer, error = %e, "redis connection ended");
+        match r {
+            Ok(Some((h, rest))) => {
+                let handoff = crate::forward::Handoff {
+                    listener: conn.listener.name,
+                    protocol: Protocol::Redis,
+                    peer,
+                    tls: conn.tls_info(),
+                    tenant: h.tenant,
+                    resume: String::new(),
+                    prelude: rest.freeze(),
+                    to: h.node,
+                };
+                if let Err(e) = crate::forward::splice(&mut conn.stream, handoff).await {
+                    tracing::debug!(%peer, error = %e, "redis connection not handed over");
+                    let msg = e.to_string().replace(['\r', '\n'], " ");
+                    let _ = conn
+                        .stream
+                        .write_all(format!("-ERR {msg}\r\n").as_bytes())
+                        .await;
+                    let _ = conn.stream.flush().await;
+                }
+            }
+            Ok(None) => {}
+            Err(e) => tracing::debug!(%peer, error = %e, "redis connection ended"),
         }
         Ok(())
     }
@@ -395,9 +426,27 @@ struct GatewayAuth {
     listener: &'static str,
     generation: u64,
     tls: Option<TlsInfo>,
+    /// Cancelled when another node leads the logged-in tenant's unit.
+    moved: sprig_common::CancellationToken,
+    /// Cancelled when the connection ends.
+    done: sprig_common::CancellationToken,
 }
 
 impl GatewayAuth {
+    /// The login name an `AUTH` with `user` (`None`: the default user)
+    /// stands for.
+    fn named(&self, user: Option<&[u8]>) -> Option<String> {
+        let user = match user {
+            Some(u) => String::from_utf8_lossy(u).into_owned(),
+            None => self
+                .d
+                .live
+                .get(&DEFAULT_USER, &SettingCtx::process(&self.d.dc))
+                .into_owned(),
+        };
+        (!user.is_empty()).then(|| self.login_name(&user))
+    }
+
     /// `user` as sent, or `<listener tenant>.<user>`.
     fn login_name(&self, user: &str) -> String {
         let bound = self
@@ -427,6 +476,29 @@ impl GatewayAuth {
 
 #[async_trait]
 impl Auth for GatewayAuth {
+    async fn serve_elsewhere(&self, user: Option<&[u8]>) -> Option<sprig_redis::HandOff> {
+        if !crate::forward::enabled() {
+            return None;
+        }
+        let name = self.named(user)?;
+        let sni = self.tls.as_ref().and_then(|t| t.sni.as_deref());
+        let tenant = self
+            .d
+            .login
+            .tenant_of(&name, sni, sprig_auth::admin::MAX_NAME)
+            .await?;
+        match crate::forward::route(tenant.0, Protocol::Redis).await {
+            crate::forward::Route::Node(node) => Some(sprig_redis::HandOff {
+                node,
+                tenant: tenant.0,
+            }),
+            crate::forward::Route::Here => {
+                crate::forward::count_direct(Protocol::Redis);
+                None
+            }
+        }
+    }
+
     async fn login(&self, user: Option<&[u8]>, pass: &[u8]) -> std::result::Result<Login, Frame> {
         let user = if let Some(u) = user {
             String::from_utf8_lossy(u).into_owned()
@@ -482,6 +554,18 @@ impl Auth for GatewayAuth {
             }
         };
         metrics::counter!("sprig_redis_auth_total", "result" => "ok").increment(1);
+        if let Some(t) = principal.tenant
+            && crate::forward::enabled()
+        {
+            let (moved, done) = (self.moved.clone(), self.done.clone());
+            tokio::spawn(async move {
+                let w = crate::forward::watch::Watched::new(t.0);
+                tokio::select! {
+                    () = w.moved() => moved.cancel(),
+                    () = done.cancelled() => {}
+                }
+            });
+        }
         let scope = principal
             .tenant
             .map_or_else(String::new, |t| t.0.to_string());

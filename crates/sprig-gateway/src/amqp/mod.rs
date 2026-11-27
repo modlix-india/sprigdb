@@ -30,7 +30,7 @@ use sprig_proto_amqp::backend::{ConnKey, EventSender, QueueBackend, Vhost};
 use sprig_proto_amqp::error::MqError;
 use sprig_proto_amqp::mem::{MemBackend, default_database};
 use sprig_proto_amqp::reply_to::DirectReplyTo;
-use sprig_proto_amqp::server::{Config, Services, serve};
+use sprig_proto_amqp::server::{Config, Services, serve_resumed};
 use sprig_queues::{EngineDeps, QueueEngine};
 use sprig_settings::{Apply, HardBounds, LiveSettings, Scopes, Setting, SettingCtx};
 
@@ -516,8 +516,40 @@ impl Frontend for AmqpFrontend {
         let cfg = self.config(conn.listener.handshake_timeout);
         let close = conn.close_soon.clone();
         let peer = conn.peer;
-        if let Err(e) = serve(conn.stream, info, &self.services, cfg, close).await {
-            tracing::debug!(%peer, error = %e, "AMQP connection ended");
+        let mut conn = conn;
+        // A connection another node accepted and handed here: which AMQP
+        // it speaks (its header and the server's first frame were
+        // exchanged there).
+        let resumed = match &conn.stream {
+            crate::frontend::MaybeTls::Forwarded(f) => f
+                .take_resume()
+                .and_then(|j| serde_json::from_str::<serde_json::Value>(&j).ok())
+                .and_then(|v| v.get("v10").and_then(serde_json::Value::as_bool)),
+            _ => None,
+        };
+        let h = match serve_resumed(&mut conn.stream, info, &self.services, cfg, close, resumed)
+            .await
+        {
+            Ok(Some(h)) => h,
+            Ok(None) => return Ok(()),
+            Err(e) => {
+                tracing::debug!(%peer, error = %e, "AMQP connection ended");
+                return Ok(());
+            }
+        };
+        let handoff = crate::forward::Handoff {
+            listener: conn.listener.name,
+            protocol: Protocol::Amqp,
+            peer,
+            tls,
+            tenant: h.tenant,
+            resume: serde_json::json!({ "v10": h.v10 }).to_string(),
+            prelude: h.prelude.into(),
+            to: h.node,
+        };
+        // On failure the client sees the connection close and reconnects.
+        if let Err(e) = crate::forward::splice(&mut conn.stream, handoff).await {
+            tracing::debug!(%peer, error = %e, "AMQP connection not handed over");
         }
         Ok(())
     }

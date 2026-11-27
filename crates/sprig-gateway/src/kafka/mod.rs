@@ -232,12 +232,46 @@ impl Frontend for KafkaFrontend {
                 .map(|d| (d.subject, d.issuer)),
         };
         let close = conn.close_soon.clone();
-        match self.broker.serve(&mut conn.stream, info, close).await {
-            Ok(()) => Ok(()),
+        // A connection another node accepted and handed here: the SASL
+        // handshake it settled there.
+        let resume = match &conn.stream {
+            crate::frontend::MaybeTls::Forwarded(f) => f.take_resume().and_then(|j| {
+                let v: serde_json::Value = serde_json::from_str(&j).ok()?;
+                Some(sprig_proto_kafka::broker::Resume {
+                    mechanism: v.get("mechanism")?.as_str()?.to_owned(),
+                    raw: v.get("raw")?.as_bool()?,
+                })
+            }),
+            _ => None,
+        };
+        let h = match self
+            .broker
+            .serve_resumed(&mut conn.stream, info, close, resume)
+            .await
+        {
+            Ok(Some(h)) => h,
+            Ok(None) => return Ok(()),
             Err(e) => {
                 tracing::debug!(peer = %conn.peer, error = %e, "kafka connection ended");
-                Ok(())
+                return Ok(());
             }
+        };
+        let handoff = crate::forward::Handoff {
+            listener: conn.listener.name,
+            protocol: Protocol::Kafka,
+            peer: conn.peer,
+            tls,
+            tenant: h.tenant,
+            resume: serde_json::json!({"mechanism": h.resume.mechanism, "raw": h.resume.raw})
+                .to_string(),
+            prelude: h.prelude.into(),
+            to: h.node,
+        };
+        // On failure the client sees the connection close and bootstraps
+        // again.
+        if let Err(e) = crate::forward::splice(&mut conn.stream, handoff).await {
+            tracing::debug!(peer = %conn.peer, error = %e, "kafka connection not handed over");
         }
+        Ok(())
     }
 }

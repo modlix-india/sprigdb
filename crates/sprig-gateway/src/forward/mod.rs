@@ -1,0 +1,429 @@
+//! Whole-connection forwarding: any node accepts any client connection.
+//!
+//! A tenant's sessions run on the node that leads its unit, so `KILL`,
+//! `SHOW PROCESSLIST`, locks, temporary tables and prepared statements keep
+//! one server's behaviour. Each front end serves a connection where it was
+//! accepted until it has read the client's login message, which names the
+//! tenant. Before answering it, the front end asks [`route`] where the
+//! tenant is served; when that is another node it hands the connection over
+//! with [`splice`]: the bytes read from the login message on, and a small
+//! JSON of what it had already established with the client (its "resume"),
+//! go to that node over the peer listener (`NodeForward.Splice`, mutual
+//! TLS), whose front end continues from the login message as if the client
+//! had connected there and checks the password itself. From then on this
+//! node only copies bytes both ways.
+//!
+//! The receiving side is [`service`]: it serves the connection unless it
+//! knows another node leads the tenant's unit, in which case it answers with
+//! that node and the sender tries it (at most [`MAX_HOPS`] times).
+
+pub mod io;
+pub mod service;
+pub mod watch;
+
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::time::{Duration, Instant};
+
+use bytes::Bytes;
+use sprig_api::proto::internal::node_forward_client::NodeForwardClient;
+use sprig_api::proto::internal::{SpliceOpen, SpliceTls, SpliceUp, splice_down, splice_up};
+use sprig_common::{Result, SprigCode, SprigError};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::mpsc;
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
+
+use crate::frontend::{Protocol, TlsInfo};
+use crate::listener::ListenerManager;
+use crate::node_engine::{self, UnitLeader};
+use crate::peer::{PeerTls, Peers};
+
+/// How many times a connection may be sent on to another node before the
+/// node it reaches serves it whatever it knows.
+pub const MAX_HOPS: u32 = 3;
+
+/// How long a login waits for an election to name a leader before it goes
+/// to the unit's home node.
+const LEADER_WAIT: Duration = Duration::from_secs(2);
+
+/// How long node addresses read from the registry are reused.
+const ADDR_TTL: Duration = Duration::from_secs(2);
+
+/// Bytes read from the client per up frame.
+const CHUNK: usize = 32 * 1024;
+
+/// What forwarding needs from the running node.
+pub struct Host {
+    /// The client listeners: a forwarded connection is served by the
+    /// listener of the same name here.
+    pub listeners: Arc<ListenerManager>,
+    /// The other nodes' registration records (address, peer port, Raft id).
+    pub peers: Arc<Peers>,
+    /// The peer service's mutual TLS identity (`[tls]`); `None` in
+    /// development on loopback.
+    pub tls: Option<PeerTls>,
+}
+
+static HOST: OnceLock<Host> = OnceLock::new();
+
+/// Sets the node's forwarding host, once, after its listeners exist.
+pub fn init(host: Host) {
+    let _ = HOST.set(host);
+}
+
+pub(crate) fn host() -> Option<&'static Host> {
+    HOST.get()
+}
+
+/// Where a tenant's sessions are served.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Route {
+    /// On this node.
+    Here,
+    /// On another node, by Raft id.
+    Node(u64),
+}
+
+/// Whether this process forwards at all: a replicated engine node with the
+/// peer service's host set.
+#[must_use]
+pub fn enabled() -> bool {
+    HOST.get().is_some() && node_engine::raft_id_from_env().is_some()
+}
+
+/// Where `tenant`'s sessions for `protocol` are served, as this node knows
+/// now: the node leading its unit. During an election this waits up to 2 s
+/// for a leader, then names the unit's home node. Kafka connections are
+/// served by any node that holds a replica of the tenant (Metadata sends
+/// clients on to each partition's leader); only other nodes forward them.
+pub async fn route(tenant: u64, protocol: Protocol) -> Route {
+    if !enabled() || tenant == 0 {
+        return Route::Here;
+    }
+    let Some(me) = node_engine::raft_id_from_env() else {
+        return Route::Here;
+    };
+    let descriptor = node_engine::unit_directory().and_then(|d| d.get(tenant));
+    if protocol == Protocol::Kafka {
+        match &descriptor {
+            Some(d) if !d.voters.contains(&me) => {}
+            _ => return Route::Here,
+        }
+    }
+    let deadline = Instant::now() + LEADER_WAIT;
+    loop {
+        match node_engine::tenant_leader(tenant) {
+            UnitLeader::Here | UnitLeader::Any => return Route::Here,
+            UnitLeader::Node(n) if n == me => return Route::Here,
+            UnitLeader::Node(n) => return Route::Node(n),
+            UnitLeader::Unknown if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            UnitLeader::Unknown => {
+                return match descriptor
+                    .or_else(|| node_engine::unit_directory().and_then(|d| d.get(tenant)))
+                {
+                    Some(d) if d.home != me => Route::Node(d.home),
+                    _ => Route::Here,
+                };
+            }
+        }
+    }
+}
+
+/// A connection to hand over.
+#[derive(Debug)]
+pub struct Handoff {
+    /// The listener the client connected to.
+    pub listener: &'static str,
+    /// Its protocol (metrics).
+    pub protocol: Protocol,
+    /// The client address.
+    pub peer: SocketAddr,
+    /// The client's TLS here.
+    pub tls: Option<TlsInfo>,
+    /// The tenant the login names.
+    pub tenant: u64,
+    /// The protocol's resume JSON.
+    pub resume: String,
+    /// The client's bytes from its login message on.
+    pub prelude: Bytes,
+    /// The first node to try.
+    pub to: u64,
+}
+
+fn failed(msg: impl Into<String>) -> SprigError {
+    SprigError::new(SprigCode::ForwardFailed, msg)
+}
+
+/// Peer-service channels for splices: no per-call timeout (a splice lasts
+/// as long as its connection), one HTTP/2 connection per node.
+struct Channels {
+    addrs: Mutex<(Option<Instant>, HashMap<u64, String>)>,
+    channels: Mutex<HashMap<String, Channel>>,
+}
+
+static CHANNELS: OnceLock<Channels> = OnceLock::new();
+
+fn channels() -> &'static Channels {
+    CHANNELS.get_or_init(|| Channels {
+        addrs: Mutex::new((None, HashMap::new())),
+        channels: Mutex::new(HashMap::new()),
+    })
+}
+
+/// The peer address (`host:port`) of the node with Raft id `node`.
+async fn peer_addr(host: &Host, node: u64) -> Result<String> {
+    let c = channels();
+    {
+        let a = c.addrs.lock().unwrap_or_else(PoisonError::into_inner);
+        if a.0.is_some_and(|t| t.elapsed() < ADDR_TTL)
+            && let Some(s) = a.1.get(&node)
+        {
+            return Ok(s.clone());
+        }
+    }
+    let recs = host.peers.gateways().await?;
+    let map: HashMap<u64, String> = recs
+        .iter()
+        .filter_map(|r| {
+            let port = r.listeners.get("peer")?;
+            Some((r.raft_node?, format!("{}:{port}", r.addr)))
+        })
+        .collect();
+    let found = map.get(&node).cloned();
+    *c.addrs.lock().unwrap_or_else(PoisonError::into_inner) = (Some(Instant::now()), map);
+    found.ok_or_else(|| failed(format!("node {node} has no peer listener registered")))
+}
+
+fn channel(host: &Host, addr: &str) -> Result<Channel> {
+    let c = channels();
+    let scheme = if host.tls.is_some() { "https" } else { "http" };
+    let uri = format!("{scheme}://{addr}");
+    let mut chans = c.channels.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(ch) = chans.get(&uri) {
+        return Ok(ch.clone());
+    }
+    let mut ep = Endpoint::from_shared(uri.clone())
+        .map_err(|e| failed(format!("peer address {addr}: {e}")))?
+        .connect_timeout(Duration::from_secs(2))
+        .tcp_nodelay(true)
+        .http2_keep_alive_interval(Duration::from_secs(10))
+        .keep_alive_while_idle(true);
+    if let Some(t) = &host.tls {
+        let domain = addr.rsplit_once(':').map_or(addr, |(h, _)| h).to_owned();
+        let cfg = ClientTlsConfig::new()
+            .ca_certificate(Certificate::from_pem(&t.ca_pem))
+            .identity(Identity::from_pem(&t.cert_pem, &t.key_pem))
+            .domain_name(domain);
+        ep = ep
+            .tls_config(cfg)
+            .map_err(|e| failed(format!("peer TLS: {e}")))?;
+    }
+    let ch = ep.connect_lazy();
+    chans.insert(uri, ch.clone());
+    Ok(ch)
+}
+
+fn forget_channel(addr: &str) {
+    let c = channels();
+    c.channels
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .retain(|k, _| !k.ends_with(addr));
+    c.addrs.lock().unwrap_or_else(PoisonError::into_inner).0 = None;
+}
+
+fn splice_tls(t: &TlsInfo) -> SpliceTls {
+    let (subject, issuer) = t
+        .client_dn
+        .as_ref()
+        .map(|d| (d.subject.clone(), d.issuer.clone()))
+        .unwrap_or_default();
+    SpliceTls {
+        version: t.version.to_owned(),
+        cipher: t.cipher.to_owned(),
+        sni: t.sni.clone().unwrap_or_default(),
+        client_cert: t.client_cert,
+        client_subject: subject,
+        client_issuer: issuer,
+    }
+}
+
+/// Counts a hand-off's outcome.
+fn count(protocol: Protocol, result: &'static str) {
+    metrics::counter!("sprig_node_forwarded_connections_total", "protocol" => protocol.as_str(), "result" => result)
+        .increment(1);
+}
+
+/// Counts a connection served on this node that came straight from a
+/// client (the other half of `sprig_node_forwarded_ratio`).
+pub fn count_direct(protocol: Protocol) {
+    metrics::counter!("sprig_node_direct_connections_total", "protocol" => protocol.as_str())
+        .increment(1);
+}
+
+/// Opens the splice for `h`, following redirects: the up sender and the
+/// down stream once a node accepted.
+async fn dial(
+    host: &Host,
+    h: &Handoff,
+) -> Result<(
+    mpsc::Sender<SpliceUp>,
+    tonic::Streaming<sprig_api::proto::internal::SpliceDown>,
+)> {
+    let me = node_engine::raft_id_from_env().unwrap_or(0);
+    let mut to = h.to;
+    let mut hops = 0;
+    loop {
+        let addr = match peer_addr(host, to).await {
+            Ok(a) => a,
+            Err(e) => {
+                count(h.protocol, "unreachable");
+                return Err(e);
+            }
+        };
+        let (tx, rx) = mpsc::channel::<SpliceUp>(8);
+        let open = SpliceUp {
+            msg: Some(splice_up::Msg::Open(SpliceOpen {
+                listener: h.listener.to_owned(),
+                client_addr: h.peer.to_string(),
+                tls: h.tls.as_ref().map(splice_tls),
+                tenant_id: h.tenant,
+                hops,
+                from_node: me,
+                resume_json: h.resume.clone(),
+                prelude: h.prelude.to_vec(),
+            })),
+        };
+        let _ = tx.send(open).await;
+        let mut client_rpc = NodeForwardClient::new(channel(host, &addr)?)
+            .max_decoding_message_size(64 << 20)
+            .max_encoding_message_size(64 << 20);
+        let req =
+            futures::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|m| (m, rx)) });
+        let resp = match tokio::time::timeout(Duration::from_secs(5), client_rpc.splice(req)).await
+        {
+            Ok(Ok(r)) => r.into_inner(),
+            Ok(Err(e)) => {
+                forget_channel(&addr);
+                count(h.protocol, "unreachable");
+                return Err(failed(format!("node {to} ({addr}): {}", e.message())));
+            }
+            Err(_) => {
+                forget_channel(&addr);
+                count(h.protocol, "unreachable");
+                return Err(failed(format!("node {to} ({addr}) didn't answer in 5 s")));
+            }
+        };
+        let mut resp = resp;
+        let first = match tokio::time::timeout(Duration::from_secs(5), resp.message()).await {
+            Ok(Ok(Some(m))) => m,
+            Ok(Ok(None)) => {
+                count(h.protocol, "unreachable");
+                return Err(failed(format!("node {to} ended the hand-off")));
+            }
+            Ok(Err(e)) => {
+                count(h.protocol, "unreachable");
+                return Err(failed(format!("node {to}: {}", e.message())));
+            }
+            Err(_) => {
+                count(h.protocol, "unreachable");
+                return Err(failed(format!("node {to} didn't accept in 5 s")));
+            }
+        };
+        match first.msg {
+            Some(splice_down::Msg::Accepted(_)) => return Ok((tx, resp)),
+            Some(splice_down::Msg::Redirect(n)) if hops + 1 < MAX_HOPS && n != me => {
+                tracing::debug!(
+                    tenant = h.tenant,
+                    from = to,
+                    to = n,
+                    "forwarded connection redirected"
+                );
+                to = n;
+                hops += 1;
+            }
+            Some(splice_down::Msg::Redirect(n)) => {
+                count(h.protocol, "redirect_loop");
+                return Err(failed(format!(
+                    "the nodes disagree about who serves this tenant (last: node {n}); retry"
+                )));
+            }
+            Some(splice_down::Msg::Refused(r)) => {
+                count(h.protocol, "refused");
+                let code = u16::try_from(r.code)
+                    .ok()
+                    .and_then(SprigCode::from_number)
+                    .unwrap_or(SprigCode::ForwardFailed);
+                return Err(SprigError::new(code, r.message));
+            }
+            Some(splice_down::Msg::Data(_)) | None => {
+                count(h.protocol, "unreachable");
+                return Err(failed(format!(
+                    "node {to} answered the hand-off out of turn"
+                )));
+            }
+        }
+    }
+}
+
+/// Hands `client` over as `h` says and copies bytes both ways until either
+/// side ends. Nothing has been written to the client by then on failure, so
+/// the caller can answer in its protocol.
+///
+/// # Errors
+/// 39788 (retryable) when no node accepted the connection; the receiving
+/// node's refusal (its code) otherwise. Errors after the hand-off end the
+/// connection and are returned only for the log.
+pub async fn splice<S>(client: S, h: Handoff) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let host = HOST
+        .get()
+        .ok_or_else(|| failed("forwarding is not set up on this node"))?;
+    let (up_tx, mut down) = dial(host, &h).await?;
+    count(h.protocol, "ok");
+    tracing::debug!(tenant = h.tenant, to = h.to, listener = h.listener, peer = %h.peer, "connection forwarded");
+    let (mut rd, mut wr) = tokio::io::split(client);
+    let upward = async move {
+        let mut buf = vec![0u8; CHUNK];
+        loop {
+            match rd.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let m = SpliceUp {
+                        msg: Some(splice_up::Msg::Data(buf[..n].to_vec())),
+                    };
+                    if up_tx.send(m).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+        // Dropping the sender ends the up stream: the home node sees the
+        // client's end of file.
+    };
+    let downward = async move {
+        while let Ok(Some(m)) = down.message().await {
+            if let Some(splice_down::Msg::Data(d)) = m.msg
+                && (wr.write_all(&d).await.is_err() || wr.flush().await.is_err())
+            {
+                break;
+            }
+        }
+        let _ = wr.shutdown().await;
+    };
+    let mut downward = std::pin::pin!(downward);
+    tokio::select! {
+        () = upward => {
+            // The client stopped sending: let the home node's last answer
+            // (and its close) through, briefly.
+            let _ = tokio::time::timeout(Duration::from_secs(2), &mut downward).await;
+        }
+        () = &mut downward => {}
+    }
+    Ok(())
+}

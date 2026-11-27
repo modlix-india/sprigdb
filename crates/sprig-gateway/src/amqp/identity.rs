@@ -130,6 +130,24 @@ async fn decide(
 
 #[async_trait]
 impl Identity for AmqpIdentity {
+    async fn serve_elsewhere(&self, c: &ConnInfo, user: &str) -> Option<(u64, u64)> {
+        if !crate::forward::enabled() {
+            return None;
+        }
+        let name = self.login_name(c, user);
+        let tenant = self
+            .svc
+            .tenant_of(&name, c.sni.as_deref(), sprig_auth::admin::MAX_NAME)
+            .await?;
+        match crate::forward::route(tenant.0, crate::frontend::Protocol::Amqp).await {
+            crate::forward::Route::Node(n) => Some((n, tenant.0)),
+            crate::forward::Route::Here => {
+                crate::forward::count_direct(crate::frontend::Protocol::Amqp);
+                None
+            }
+        }
+    }
+
     async fn login(&self, c: &ConnInfo, creds: Credentials) -> Result<Principal, AuthFailure> {
         if let Err(e) = self.svc.admit(c.peer.ip()) {
             return Err(AuthFailure(e.to_string()));

@@ -1540,6 +1540,53 @@ pub(crate) fn add_check(def: &mut Def, name: Option<String>, e: E) -> Result<(),
     Ok(())
 }
 
+/// A `FULLTEXT` key's parts as both servers take them: character columns
+/// of one character set (1283), whole columns (a prefix length is
+/// dropped), no order (MySQL refuses `DESC`, 1221).
+fn fulltext_key(k: &mut Key, cols: &[Col], cx: &Ctx) -> Result<(), Fail> {
+    let mut charset: Option<String> = None;
+    for part in &mut k.parts {
+        let Some(c) = cols.iter().find(|c| c.name.eq_ignore_ascii_case(&part.col)) else {
+            return Err(err(
+                1072,
+                "42000",
+                format!("Key column '{}' doesn't exist in table", part.col),
+            ));
+        };
+        let cannot = || {
+            err(
+                1283,
+                "HY000",
+                format!("Column '{}' cannot be part of FULLTEXT index", c.name),
+            )
+        };
+        let text = matches!(
+            c.ty.base.as_str(),
+            "char" | "varchar" | "tinytext" | "text" | "mediumtext" | "longtext"
+        );
+        let cs = c.ty.cs.as_ref().map(|(cs, _)| cs.to_ascii_lowercase());
+        if !text || cs.as_deref() == Some("binary") {
+            return Err(cannot());
+        }
+        match (&charset, cs) {
+            (None, cs) => charset = cs,
+            (Some(a), Some(b)) if *a != b => return Err(cannot()),
+            _ => {}
+        }
+        if part.desc && cx.mysql {
+            return Err(err(
+                1221,
+                "HY000",
+                "Incorrect usage of spatial/fulltext/hash index and explicit index order",
+            ));
+        }
+        part.len = None;
+        part.desc = false;
+    }
+    k.using = None;
+    Ok(())
+}
+
 /// The checks every finished definition passes, and the server's
 /// rewrites that depend on the whole table: key prefixes, the order of
 /// keys, `AUTO_INCREMENT` rules, defaults in each column's form.
@@ -1558,6 +1605,10 @@ pub(crate) fn settle(def: &mut Def, cx: &Ctx) -> Result<(), Fail> {
     }
     // Keys: prefixes and lengths.
     for k in &mut def.keys {
+        if k.kind == KeyKind::Fulltext {
+            fulltext_key(k, &def.cols, cx)?;
+            continue;
+        }
         for part in &mut k.parts {
             let Some(ci) = def
                 .cols
@@ -1610,8 +1661,8 @@ pub(crate) fn settle(def: &mut Def, cx: &Ctx) -> Result<(), Fail> {
                 }
             }
         }
-        if k.kind == KeyKind::Fulltext || k.kind == KeyKind::Spatial {
-            return Err(refuse("FULLTEXT and SPATIAL keys"));
+        if k.kind == KeyKind::Spatial {
+            return Err(refuse("SPATIAL keys"));
         }
     }
     // AUTO_INCREMENT: one column, numeric, first in some key, NOT NULL.

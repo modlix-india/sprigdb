@@ -13,9 +13,9 @@
 //! SHOW INHERITED DEFINITIONS | INSTANCES | OVERRIDES [FOR kind name]
 //! ```
 //!
-//! `CREATE STREAM ... FOR EACH TENANT`, and publishes `FOR TENANT`, `IN
-//! TENANT` or `FOR ALL TENANTS`, answer 1235: streams are stored on the
-//! engine, whose inherited instances aren't built yet.
+//! `CREATE STREAM ... FOR EACH TENANT` and publishes `FOR TENANT` or `FOR
+//! ALL TENANTS` are [`streams`]' (instances on the engine's stream log);
+//! `IN TENANT` publishes answer 1235.
 
 // Lexing options are passed by reference, as the lexer takes them.
 #![allow(clippy::trivially_copy_pass_by_ref)]
@@ -47,6 +47,8 @@ use crate::inherited::{self, MsgWrite, target_err, triggers};
 use crate::pipeline::{ExecCtx, ResultSink, RowFormat};
 use crate::tenant::TenantServices;
 use crate::tenant::session::{LocalWarning, TenantSession};
+
+mod streams;
 
 /// What a statement answers.
 enum Reply {
@@ -255,7 +257,10 @@ impl PassSession {
                     return self.inherit_shadow_check(sql, lex_opts, cat, chain);
                 };
                 match grammar::ddl_kind(sql, lex_opts) {
-                    Some((DefKind::Stream, false)) => Err(streams_not_built()),
+                    Some((DefKind::Stream, false)) => self
+                        .define_stream(svc, cat, own, sql, lex_opts, &f)
+                        .await
+                        .map(Some),
                     Some((DefKind::Trigger, false)) => self
                         .define_trigger(svc, cat, chain, own, sql, lex_opts, &f)
                         .await
@@ -285,12 +290,20 @@ impl PassSession {
                 None => Ok(None),
             },
             "unbind" => self.unbind_def(svc, cat, own, sql, lex_opts).await,
-            "insert" => match grammar::insert_target(sql, lex_opts)? {
+            "insert" => {
                 // `INSERT ... FOR TENANT | IN TENANT | FOR ALL TENANTS`
                 // publish into inherited streams.
-                Some(_) => Err(streams_not_built()),
-                None => Ok(None),
-            },
+                if let Some(it) = grammar::insert_target(sql, lex_opts)? {
+                    return self
+                        .publish_inherited(svc, cat, chain, own, sql, lex_opts, &it)
+                        .await
+                        .map(Some);
+                }
+                // A member's first publish into an inherited stream makes
+                // its instance.
+                self.member_instance(svc, cat, chain, sql, lex_opts).await?;
+                Ok(None)
+            }
             _ => Ok(None),
         }
     }

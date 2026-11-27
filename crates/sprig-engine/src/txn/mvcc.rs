@@ -127,6 +127,12 @@ pub struct VersionScan<'a> {
     /// key in the range can have versions past `end`.
     edge_from: Option<usize>,
     edge: Edge,
+    /// Serves several ranges in turn through one cursor
+    /// ([`VersionScan::new_multi`]): the scan seeks to each range's start
+    /// and stops at its end itself.
+    multi: bool,
+    /// The cursor's own range end (multi scans).
+    outer_end: Option<Vec<u8>>,
 }
 
 /// The logical key whose versions straddle the range's end.
@@ -177,6 +183,42 @@ impl<'a> VersionScan<'a> {
             } else {
                 Edge::Done
             },
+            multi: false,
+            outer_end: None,
+        }
+    }
+
+    /// A forward scan whose one store cursor, over `outer`, serves several
+    /// ranges inside it in turn ([`VersionScan::retarget`]): many short
+    /// ranges (a hop's adjacency prefixes) without a store cursor each.
+    /// Call `retarget` before each range.
+    #[must_use]
+    pub fn new_multi(store: &'a dyn SortedStore, outer: &KeyRange, at: Ts) -> Self {
+        let mut s = Self::new(store, outer, Dir::Forward, at);
+        s.multi = true;
+        s.outer_end.clone_from(&outer.end);
+        s
+    }
+
+    /// Moves a multi scan to `range` (inside its outer range). The cursor
+    /// isn't bounded at `range`'s end, so the versions of a key that sort
+    /// past that end are read through; only at the outer range's end does
+    /// the edge lookup apply.
+    pub fn retarget(&mut self, range: &KeyRange) {
+        debug_assert!(self.multi && self.dir == Dir::Forward);
+        self.start.clone_from(&range.start);
+        self.end.clone_from(&range.end);
+        self.started = false;
+        if range.end.is_some() && range.end == self.outer_end {
+            self.edge_from = edge_from(&range.start, range.end.as_deref());
+            self.edge = if self.edge_from.is_some() {
+                Edge::Pending
+            } else {
+                Edge::Done
+            };
+        } else {
+            self.edge_from = None;
+            self.edge = Edge::Done;
         }
     }
 
@@ -242,6 +284,10 @@ impl<'a> VersionScan<'a> {
         if !self.started {
             self.started = true;
             match self.dir {
+                Dir::Forward if self.multi => {
+                    let start = self.start.clone();
+                    self.it.seek(&start);
+                }
                 Dir::Forward => self.it.seek_to_first(),
                 Dir::Reverse => {
                     self.it.seek_to_last();
@@ -276,6 +322,10 @@ impl<'a> VersionScan<'a> {
                 continue;
             };
             let logical = lk.to_vec();
+            // A multi scan's range ends here (the cursor goes on).
+            if self.multi && self.end.as_deref().is_some_and(|e| logical.as_slice() >= e) {
+                return Ok(None);
+            }
             // A key below the start whose versions sort after it, or the
             // key already returned from past the end.
             let skip = logical.as_slice() < self.start.as_slice()

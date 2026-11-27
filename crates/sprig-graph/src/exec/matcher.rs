@@ -2158,7 +2158,12 @@ impl Exec<'_> {
         ));
         let mut cur = cur;
         let ids = Self::frontier(&cur);
-        let hops = if self.late && rp.props.is_none() {
+        // Expand(Into): the far node is bound in every row, so only the
+        // links between each row's two nodes are read, a point check each.
+        let into = self.expand_into(&cur, rp, np, &types).await?;
+        let hops = if let Some(h) = into {
+            h
+        } else if self.late && rp.props.is_none() {
             // Links, and the far nodes' labels when the pattern names or
             // labels them; properties are read when a clause needs them
             // (here, the keys a property map on the far node compares).
@@ -2263,6 +2268,84 @@ impl Exec<'_> {
             self.check_rows(out.len())?;
         }
         Ok(out)
+    }
+
+    /// [`GraphStore::links_between`] for a hop whose far node every row
+    /// has bound (no label or map on it, no map on the relationship, no
+    /// top-k pruning), with the rows' own far nodes; `None` when it
+    /// doesn't apply or the store can't.
+    async fn expand_into(
+        &mut self,
+        cur: &[(Row, Arc<Node>)],
+        rp: &RelPat,
+        np: &NodePat,
+        types: &[u32],
+    ) -> Result<Option<Hops>> {
+        let Some(v) = np.var.as_ref() else {
+            return Ok(None);
+        };
+        if !self.late
+            || types.is_empty()
+            || cur.is_empty()
+            || rp.props.is_some()
+            || np.labels.is_some()
+            || np.props.is_some()
+            || self.prune.is_some()
+            || !super::plan::planner_on()
+        {
+            return Ok(None);
+        }
+        let mut fars: HashMap<u64, Arc<Node>> = HashMap::new();
+        let mut pairs: Vec<(u64, u64)> = Vec::with_capacity(cur.len());
+        let mut seen: HashSet<(u64, u64)> = HashSet::new();
+        for (r, n) in cur {
+            match r.get(v) {
+                Some(Value::Node(f)) => {
+                    if seen.insert((n.id, f.id)) {
+                        pairs.push((n.id, f.id));
+                    }
+                    fars.entry(f.id).or_insert_with(|| Arc::clone(f));
+                }
+                // A null or another value: the general hop decides.
+                _ => return Ok(None),
+            }
+        }
+        let Some(links) = self.store.links_between(&pairs, types, rp.dir).await? else {
+            return Ok(None);
+        };
+        self.plan
+            .push(format!("Expand(Into) {v}: {} point check(s)", pairs.len()));
+        // A first hop read with the start scan isn't this one's.
+        self.fused = None;
+        let graph = self.store.graph_id();
+        let mut out: Hops = HashMap::new();
+        for (l, out_link) in links {
+            let (near, far) = if out_link {
+                (l.src, l.dst)
+            } else {
+                (l.dst, l.src)
+            };
+            let Some(f) = fars.get(&far) else { continue };
+            let rel = match self.seen_rels.get(&l.id) {
+                Some(r) => Arc::clone(r),
+                None => Arc::new(Rel {
+                    graph,
+                    id: l.id,
+                    src: l.src,
+                    dst: l.dst,
+                    src_rk: l.src_rk,
+                    dst_rk: l.dst_rk,
+                    rtype: self
+                        .store
+                        .type_name(l.rtype)
+                        .unwrap_or_else(|| format!("#{}", l.rtype)),
+                    props: crate::value::Props::new(),
+                    partial: Some(Arc::from(Vec::<String>::new())),
+                }),
+            };
+            out.entry(near).or_default().push((rel, Arc::clone(f)));
+        }
+        Ok(Some(out))
     }
 
     fn max_hops(&self, hi: Option<u32>) -> Result<(u32, bool)> {

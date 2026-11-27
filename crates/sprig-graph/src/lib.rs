@@ -61,7 +61,8 @@ pub async fn execute(
     params: &eval::Params,
     budgets: &Budgets,
 ) -> sprig_common::Result<Output> {
-    let q = parser::parse(text)?;
+    // Parsed once per text (a driver sends the same few texts).
+    let q = parser::parse_shared(text)?;
     let started = std::time::Instant::now();
     let r = exec::run(store, &q, params, budgets).await;
     let kind = if r.as_ref().is_ok_and(|o| o.qtype != "r") {

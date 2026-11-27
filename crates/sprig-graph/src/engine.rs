@@ -215,6 +215,12 @@ pub struct EngineGraph {
     changes: std::sync::atomic::AtomicU64,
     /// A statistics pass is running.
     collecting: std::sync::atomic::AtomicBool,
+    /// The next stored counter delta's sequence number ([`stats`]).
+    delta_seq: std::sync::atomic::AtomicU64,
+    /// Indexes whose rebuild into ordered keys failed ([`upgrade`]).
+    upgrade_failed: Mutex<HashSet<u32>>,
+    /// Held while indexes are rebuilt (one rebuild at a time).
+    upgrade_lock: tokio::sync::Mutex<()>,
     /// This graph, for background passes.
     me: std::sync::Weak<EngineGraph>,
 }
@@ -269,20 +275,40 @@ impl EngineGraph {
             stats: RwLock::new(None),
             changes: std::sync::atomic::AtomicU64::new(0),
             collecting: std::sync::atomic::AtomicBool::new(false),
+            // Above every earlier process's (raised past the stored ones
+            // when they load).
+            delta_seq: std::sync::atomic::AtomicU64::new(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(1, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX >> 1)),
+            ),
+            upgrade_failed: Mutex::new(HashSet::new()),
+            upgrade_lock: tokio::sync::Mutex::new(()),
             me: me.clone(),
         });
         g.reload()?;
         if stats::enabled() {
             match g.load_stats()? {
-                Some(st) => *g.stats.write().unwrap_or_else(poisoned) = Some(st),
+                Some((st, changes)) => {
+                    *g.stats.write().unwrap_or_else(poisoned) = Some(st);
+                    g.changes
+                        .store(changes, std::sync::atomic::Ordering::Release);
+                }
                 // A new graph's counters start at zero and stay exact;
                 // an older one gets a pass in the background.
                 None if g.is_empty()? => {
-                    *g.stats.write().unwrap_or_else(poisoned) = Some(stats::GraphStats::default());
+                    // Stored too, so the deltas of later commits add to it
+                    // after a restart (best effort: a read-only copy
+                    // can't write, and a later pass counts anyway).
+                    if let Err(e) = g.store_empty_stats() {
+                        tracing::debug!(error = %e, "graph statistics record not stored");
+                    }
+                    *g.stats.write().unwrap_or_else(poisoned) = Some(EngineGraph::empty_stats());
                 }
                 None => g.analyze_in_background(),
             }
         }
+        g.upgrade_in_background();
         Ok(g)
     }
 
@@ -963,7 +989,12 @@ impl GraphTxn {
             self.rollback();
             return Err(e);
         }
-        let t = self.txn.take().ok_or_else(gone)?;
+        let mut t = self.txn.take().ok_or_else(gone)?;
+        // The counters' delta commits with the data.
+        if let Err(e) = g.stage_delta(&mut t, &self.delta) {
+            t.rollback();
+            return Err(e);
+        }
         let ticket = t.commit()?;
         self.tickets.push(ticket);
         for tk in &self.tickets {
@@ -1124,6 +1155,26 @@ impl EngineStore<'_> {
         self.scan_range(p, &end, usize::MAX)
     }
 
+    /// [`Self::scan_prefix`] of each of `ps`, all inside the key family
+    /// `family`: through one engine cursor when batched reads are on
+    /// ([`set_batched_reads`]).
+    fn scan_prefixes(&mut self, ps: &[&[u8]], family: &[u8]) -> Result<Vec<KeyRows>> {
+        if ps.len() < 2 || !BATCHED_READS.load(std::sync::atomic::Ordering::Relaxed) {
+            return ps.iter().map(|p| self.scan_prefix(p)).collect();
+        }
+        let ranges: Vec<KeyRange> = ps
+            .iter()
+            .map(|p| KeyRange::new(*p, k::end_of(p).as_slice()))
+            .collect();
+        let outer = KeyRange::new(family, k::end_of(family).as_slice());
+        Ok(self
+            .t()?
+            .scan_many(&ranges, &outer, usize::MAX)?
+            .into_iter()
+            .map(|rows| rows.into_iter().map(|(k2, v)| (k2.to_vec(), v)).collect())
+            .collect())
+    }
+
     /// The latest committed version of a key under this transaction's
     /// writes (for keys it holds or is about to change).
     fn current(&mut self, key: &[u8]) -> Result<Option<Bytes>> {
@@ -1254,44 +1305,61 @@ impl EngineStore<'_> {
         };
         let mut out = Vec::new();
         let mut seen: HashSet<u64> = HashSet::new();
+        let mut ts = types.to_vec();
+        ts.sort_unstable();
+        ts.dedup();
+        // (shard, direction) -> (prefix, near's routing hash) to read.
+        let mut jobs: PrefixJobs = BTreeMap::new();
         for &near in from {
             if !seen.insert(near) {
                 continue;
             }
             let (d, near_rk) = self.g.home(near);
             for &dr in dirs {
-                let prefixes: Vec<Vec<u8>> = if types.is_empty() {
-                    vec![self.g.space.adj_prefix(d, dr, near, None)]
+                let job = jobs.entry((d, dr)).or_default();
+                if ts.is_empty() {
+                    job.push((self.g.space.adj_prefix(d, dr, near, None), near_rk));
                 } else {
-                    let mut ts = types.to_vec();
-                    ts.sort_unstable();
-                    ts.dedup();
-                    ts.iter()
-                        .map(|t| self.g.space.adj_prefix(d, dr, near, Some(*t)))
-                        .collect()
-                };
-                for p in prefixes {
-                    self.stats.shard_queries += 1;
-                    let rows: Vec<(Vec<u8>, Bytes)> = if current {
-                        self.scan_current(&p)?
+                    for t in &ts {
+                        job.push((self.g.space.adj_prefix(d, dr, near, Some(*t)), near_rk));
+                    }
+                }
+            }
+        }
+        for ((d, dr), mut job) in jobs {
+            self.stats.shard_queries += job.len() as u64;
+            job.sort_unstable();
+            let results: Vec<KeyRows> = if current {
+                let mut v = Vec::with_capacity(job.len());
+                for (p, _) in &job {
+                    v.push(
+                        self.scan_current(p)?
                             .into_iter()
                             .map(|(k2, v)| (k2.to_vec(), v))
-                            .collect()
-                    } else {
-                        self.scan_prefix(&p)?
-                    };
-                    for (key, value) in rows {
-                        let (n, etype, far, edge) = adj_parts(&key)?;
-                        out.push(Adj {
-                            near: n,
-                            near_rk,
-                            etype,
-                            far,
-                            edge,
-                            out: dr == OUT,
-                            value,
-                        });
-                    }
+                            .collect(),
+                    );
+                }
+                v
+            } else {
+                let family = self
+                    .g
+                    .space
+                    .prefix(d, sprig_engine::keys::kind::ADJACENCY, dr);
+                let ps: Vec<&[u8]> = job.iter().map(|(p, _)| p.as_slice()).collect();
+                self.scan_prefixes(&ps, &family)?
+            };
+            for ((_, near_rk), rows) in job.iter().zip(results) {
+                for (key, value) in rows {
+                    let (n, etype, far, edge) = adj_parts(&key)?;
+                    out.push(Adj {
+                        near: n,
+                        near_rk: *near_rk,
+                        etype,
+                        far,
+                        edge,
+                        out: dr == OUT,
+                        value,
+                    });
                 }
             }
         }
@@ -1899,7 +1967,13 @@ impl EngineStore<'_> {
         // No writer is in flight while the schema lock is held: the
         // definition becomes visible to every later writer at once.
         let mut x = self.g.schema_exclusive().await?;
-        let existing = self.g.defs();
+        // Twins being rebuilt ([`upgrade`]) are not indexes of their own.
+        let existing: Vec<IndexDef> = self
+            .g
+            .defs()
+            .into_iter()
+            .filter(|d| d.state != upgrade::UPGRADING)
+            .collect();
         if let Schema::Drop { .. } = cmd {
             let d = match plan_drop(&existing, cmd) {
                 Ok(Some(d)) => d,
@@ -1913,6 +1987,15 @@ impl EngineStore<'_> {
                 }
             };
             x.delete(self.g.space.index_def(d.id))?;
+            // Its twin, when it is being rebuilt, goes with it.
+            let twin = self
+                .g
+                .defs()
+                .into_iter()
+                .find(|y| y.name == d.name && y.state == upgrade::UPGRADING);
+            if let Some(t) = &twin {
+                x.delete(self.g.space.index_def(t.id))?;
+            }
             // Out of memory while the lock is held: no writer keeps entries
             // of it once the lock goes (commit releases it at once).
             self.g
@@ -1922,6 +2005,9 @@ impl EngineStore<'_> {
                 .retain(|y| y.name != d.name);
             x.commit()?.wait_async().await?;
             self.g.delete_entries(&d).await?;
+            if let Some(t) = &twin {
+                self.g.delete_entries(t).await?;
+            }
             return Ok(vec![(
                 if d.unique {
                     "constraints-removed"
@@ -1960,8 +2046,11 @@ impl EngineStore<'_> {
                 })?;
             d.state = "building".into();
             // New indexes and constraints keep ordered keys.
-            self.g.ordered.write().unwrap_or_else(poisoned).insert(d.id);
-            x.put(self.g.space.index_def(d.id), encode_def(&d, true))?;
+            let ordered = !upgrade::legacy_indexes();
+            if ordered {
+                self.g.ordered.write().unwrap_or_else(poisoned).insert(d.id);
+            }
+            x.put(self.g.space.index_def(d.id), encode_def(&d, ordered))?;
             Ok(())
         }
         .await;
@@ -2002,7 +2091,10 @@ impl EngineStore<'_> {
         }
         d.state = "online".into();
         let mut t = Txn::begin_on(Arc::clone(&self.g.path), self.g.opts);
-        t.put(self.g.space.index_def(d.id), encode_def(&d, true))?;
+        t.put(
+            self.g.space.index_def(d.id),
+            encode_def(&d, self.g.is_ordered(d.id)),
+        )?;
         t.commit()?.wait_async().await?;
         let unique = d.unique;
         for y in self.g.indexes.write().unwrap_or_else(poisoned).iter_mut() {
@@ -2090,17 +2182,28 @@ impl GraphStore for EngineStore<'_> {
         };
         if let Some(ids) = fixed {
             self.stats.shard_queries += 1;
+            let ids: Vec<u64> = ids
+                .into_iter()
+                .filter(|id| s.after.is_none_or(|a| *id > a))
+                .collect();
             let mut out = Vec::new();
-            for id in ids {
-                if s.after.is_some_and(|a| id <= a) {
-                    continue;
-                }
-                if let Some(n) = self.read_node(id, read_keys.as_deref())?
-                    && keep(&n)
-                {
-                    out.push(trim(n));
-                    if out.len() >= limit {
-                        break;
+            // Read in batches (an index's ids: one cursor per batch),
+            // small ones first while a limit may stop early.
+            let mut at = 0;
+            let mut batch = 64;
+            while at < ids.len() {
+                let part = &ids[at..(at + batch).min(ids.len())];
+                at += part.len();
+                batch = (batch * 4).min(4096);
+                let vals = self.node_values(part)?;
+                for (&id, v) in part.iter().zip(vals) {
+                    let Some(v) = v else { continue };
+                    let n = self.node_row(id, rk_of(id), &v, read_keys.as_deref())?;
+                    if keep(&n) {
+                        out.push(trim(n));
+                        if out.len() >= limit {
+                            return Ok(out);
+                        }
                     }
                 }
             }
@@ -2271,6 +2374,75 @@ impl GraphStore for EngineStore<'_> {
             .iter()
             .map(Self::link_of)
             .collect())
+    }
+
+    async fn links_between(
+        &mut self,
+        pairs: &[(u64, u64)],
+        types: &[u32],
+        dir: Dir,
+    ) -> Result<Option<Vec<(Link, bool)>>> {
+        if types.is_empty() {
+            return Ok(None);
+        }
+        let dirs: &[u16] = match dir {
+            Dir::Out => &[OUT],
+            Dir::In => &[IN],
+            Dir::Both => &[OUT, IN],
+        };
+        let mut ts = types.to_vec();
+        ts.sort_unstable();
+        ts.dedup();
+        let mut seen: HashSet<(u64, u64, u64)> = HashSet::new();
+        let mut adj: Vec<Adj> = Vec::new();
+        // (shard, direction) -> (prefix, near's routing hash).
+        let mut jobs: PrefixJobs = BTreeMap::new();
+        for &(near, far) in pairs {
+            let (d, near_rk) = self.g.home(near);
+            for &dr in dirs {
+                for t in &ts {
+                    // `A | dir | near | type | sort | far`: the sort slot
+                    // is empty, so the far node's links are one prefix.
+                    let mut p = self.g.space.adj_prefix(d, dr, near, Some(*t));
+                    p.push(crate::engine_keys::NO_SORT);
+                    p.extend_from_slice(&far.to_be_bytes());
+                    jobs.entry((d, dr)).or_default().push((p, near_rk));
+                }
+            }
+        }
+        for ((d, dr), mut job) in jobs {
+            self.stats.shard_queries += job.len() as u64;
+            job.sort_unstable();
+            let family = self
+                .g
+                .space
+                .prefix(d, sprig_engine::keys::kind::ADJACENCY, dr);
+            let ps: Vec<&[u8]> = job.iter().map(|(p, _)| p.as_slice()).collect();
+            let results = self.scan_prefixes(&ps, &family)?;
+            for ((_, near_rk), rows) in job.iter().zip(results) {
+                for (key, value) in rows {
+                    let (n, etype, f, edge) = adj_parts(&key)?;
+                    // A self-loop is in both directions' entries.
+                    if !seen.insert((n, f, edge)) {
+                        continue;
+                    }
+                    adj.push(Adj {
+                        near: n,
+                        near_rk: *near_rk,
+                        etype,
+                        far: f,
+                        edge,
+                        out: dr == OUT,
+                        value,
+                    });
+                }
+            }
+        }
+        self.stats.sql_rows += adj.len() as u64;
+        adj.sort_by_key(|a| (a.edge, !a.out));
+        Ok(Some(
+            adj.iter().map(|a| (Self::link_of(a), a.out)).collect(),
+        ))
     }
 
     async fn links_both(&mut self, from: &[u64], types: &[u32]) -> Result<Vec<(Link, bool)>> {
@@ -2773,9 +2945,13 @@ impl GraphStore for EngineStore<'_> {
         } else {
             Ok(())
         };
-        let t = self.tx.txn.take().ok_or_else(gone)?;
+        let mut t = self.tx.txn.take().ok_or_else(gone)?;
         let r = match r {
-            Ok(()) if ok => match t.commit() {
+            Ok(()) if ok => match self
+                .g
+                .stage_delta(&mut t, &self.tx.delta)
+                .and_then(|()| t.commit())
+            {
                 Ok(tk) => {
                     self.tx.tickets.push(tk);
                     self.g.apply_delta(&self.tx.delta);
@@ -2802,7 +2978,9 @@ impl GraphStore for EngineStore<'_> {
     }
 
     fn indexes(&self) -> Vec<IndexDef> {
-        self.g.defs()
+        let mut v = self.g.defs();
+        v.retain(|d| d.state != upgrade::UPGRADING);
+        v
     }
 
     async fn schema(&mut self, cmd: &Schema) -> Result<SchemaCounts> {
@@ -3155,8 +3333,18 @@ impl EngineStore<'static> {
     }
 }
 
+/// Keys and values a range read gives.
+type KeyRows = Vec<(Vec<u8>, Bytes)>;
+
+/// Adjacency prefixes to read, per (shard, direction), each with its near
+/// node's routing hash.
+type PrefixJobs = BTreeMap<(u32, u16), Vec<(Vec<u8>, u64)>>;
+
 #[path = "engine_stats.rs"]
 pub mod stats;
+
+#[path = "engine_upgrade.rs"]
+pub mod upgrade;
 
 #[cfg(test)]
 #[path = "engine_tests.rs"]

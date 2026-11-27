@@ -178,6 +178,42 @@ pub trait BoltService: Send + Sync {
         info: &ConnInfo,
         auth: &PackValue,
     ) -> Result<Box<dyn BoltSession>, BoltFailure>;
+
+    /// Where the tenant the login `principal` (as sent) names is served,
+    /// when the connection should go to another node: `(node, tenant)`.
+    /// The connection is then handed there from its credentials message
+    /// on, before it is answered (the default: served here).
+    async fn serve_elsewhere(&self, _info: &ConnInfo, _principal: &str) -> Option<(u64, u64)> {
+        None
+    }
+}
+
+/// What the handshake settled before a hand-off, for the node that
+/// continues the connection ([`serve_until_handoff`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Resume {
+    /// The negotiated version.
+    pub version: BoltVersion,
+    /// The `connection_id` the client was given.
+    pub connection_id: String,
+    /// The client's `user_agent`.
+    pub user_agent: String,
+    /// 5.1+: `HELLO` was answered; `LOGON` comes next.
+    pub hello_done: bool,
+}
+
+/// A connection to hand to the node that serves its tenant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandOff {
+    /// That node.
+    pub node: u64,
+    /// The tenant.
+    pub tenant: u64,
+    /// The client's bytes from its credentials message on (chunked, as
+    /// sent).
+    pub prelude: Vec<u8>,
+    /// What the handshake settled.
+    pub resume: Resume,
 }
 
 /// Server settings.
@@ -242,6 +278,8 @@ pub enum End {
     Timeout,
     /// The gateway drains.
     Drained,
+    /// The login names a tenant served by another node.
+    HandOff(HandOff),
 }
 
 struct Conn {
@@ -735,7 +773,7 @@ fn scheme_of(auth: &PackValue) -> &'static str {
 /// # Errors
 /// I/O errors of the socket.
 pub async fn serve<S>(
-    mut io: S,
+    io: S,
     peer: SocketAddr,
     tls: bool,
     sni: Option<String>,
@@ -746,15 +784,67 @@ pub async fn serve<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    serve_until_handoff(io, peer, tls, sni, svc, cfg, close, None)
+        .await
+        .map(|(e, _)| e)
+}
+
+/// [`serve`] for a connection another node began (`resume`: the
+/// handshake, and on 5.1+ `HELLO`, happened there), that ends early
+/// with [`End::HandOff`] when its credentials name a tenant served by
+/// another node ([`BoltService::serve_elsewhere`]). The stream comes back
+/// with a hand-off, for the caller to send there.
+///
+/// # Errors
+/// I/O errors of the socket.
+#[allow(clippy::too_many_arguments)]
+pub async fn serve_until_handoff<S>(
+    mut io: S,
+    peer: SocketAddr,
+    tls: bool,
+    sni: Option<String>,
+    svc: &dyn BoltService,
+    cfg: &Config,
+    close: CancellationToken,
+    resume: Option<Resume>,
+) -> std::io::Result<(End, Option<S>)>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    if let Some(r) = resume {
+        let conn = Conn {
+            state: if r.hello_done {
+                State::Authentication
+            } else {
+                State::Connected
+            },
+            in_tx: false,
+            info: ConnInfo {
+                peer,
+                tls,
+                sni,
+                version: r.version,
+                connection_id: r.connection_id,
+                user_agent: r.user_agent,
+            },
+            session: None,
+            results: Vec::new(),
+            next_qid: 0,
+            out: BytesMut::new(),
+        };
+        return run_conn(io, conn, svc, cfg, close).await;
+    }
     let mut hs = [0u8; 20];
     match tokio::time::timeout(cfg.handshake_timeout, io.read_exact(&mut hs)).await {
         Ok(Ok(_)) => {}
-        Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(End::Closed),
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+            return Ok((End::Closed, None));
+        }
         Ok(Err(e)) => return Err(e),
-        Err(_) => return Ok(End::Timeout),
+        Err(_) => return Ok((End::Timeout, None)),
     }
     if hs[..4] != MAGIC {
-        return Ok(End::Defunct("bad magic preamble".into()));
+        return Ok((End::Defunct("bad magic preamble".into()), None));
     }
     let mut props = [[0u8; 4]; 4];
     for (i, p) in props.iter_mut().enumerate() {
@@ -763,11 +853,11 @@ where
     let Some(version) = negotiate(&props, &cfg.versions) else {
         tracing::info!(%peer, proposals = ?props, code = 39912, "Bolt: no version in common");
         io.write_all(&[0, 0, 0, 0]).await?;
-        return Ok(End::NoVersion);
+        return Ok((End::NoVersion, None));
     };
     io.write_all(&version.to_bytes()).await?;
     let id = NEXT_CONN.fetch_add(1, Ordering::Relaxed);
-    let mut conn = Conn {
+    let conn = Conn {
         state: State::Connected,
         in_tx: false,
         info: ConnInfo {
@@ -783,6 +873,20 @@ where
         next_qid: 0,
         out: BytesMut::new(),
     };
+    run_conn(io, conn, svc, cfg, close).await
+}
+
+async fn run_conn<S>(
+    io: S,
+    mut conn: Conn,
+    svc: &dyn BoltService,
+    cfg: &Config,
+    close: CancellationToken,
+) -> std::io::Result<(End, Option<S>)>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let version = conn.info.version;
     let gauge = metrics::gauge!("sprig_bolt_connections", "version" => version.to_string());
     gauge.increment(1.0);
     // Writes go through a shared half: keep-alives are written by a task
@@ -792,7 +896,23 @@ where
     let r = run_loop(&mut rd, &wr, &mut conn, svc, cfg, close).await;
     gauge.decrement(1.0);
     conn.reset_session().await;
-    r
+    let end = r?;
+    // Before a login no request runs, so no keep-alive task holds the
+    // writer: the stream is whole again for the hand-off.
+    let io = match &end {
+        End::HandOff(_) => Arc::try_unwrap(wr).ok().map(|w| rd.unsplit(w.into_inner())),
+        _ => None,
+    };
+    Ok((end, io))
+}
+
+/// A message as chunks on the wire.
+fn chunked(msg: &[u8], out: &mut Vec<u8>) {
+    for c in msg.chunks(0xffff) {
+        out.extend_from_slice(&u16::try_from(c.len()).unwrap_or(0).to_be_bytes());
+        out.extend_from_slice(c);
+    }
+    out.extend_from_slice(&[0, 0]);
 }
 
 /// The connection's write half, shared with the keep-alive task.
@@ -820,7 +940,53 @@ where
         loop {
             match dechunk.next(&mut inbuf) {
                 Ok(Some(msg)) => match Request::decode(&msg) {
-                    Ok(req) => handle_alive(wr, conn, req, svc, cfg).await?,
+                    Ok(req) => {
+                        // Credentials for a tenant served by another node:
+                        // the connection goes there from this message on.
+                        let creds = match (&conn.state, &req) {
+                            (State::Connected, Request::Hello(m))
+                                if conn.info.version < BoltVersion::new(5, 1) =>
+                            {
+                                Some(m)
+                            }
+                            (State::Authentication, Request::Logon(m)) => Some(m),
+                            _ => None,
+                        };
+                        if let Some(principal) = creds
+                            .and_then(|m| m.get("principal"))
+                            .and_then(PackValue::as_str)
+                            && let Some((node, tenant)) =
+                                svc.serve_elsewhere(&conn.info, principal).await
+                        {
+                            if !conn.out.is_empty() {
+                                let mut w = wr.lock().await;
+                                w.write_all(&conn.out).await?;
+                                w.flush().await?;
+                                conn.out.clear();
+                            }
+                            let mut prelude = Vec::with_capacity(msg.len() + inbuf.len() + 8);
+                            chunked(&msg, &mut prelude);
+                            prelude.extend_from_slice(&inbuf);
+                            if let Request::Hello(m) = &req {
+                                m.get("user_agent")
+                                    .and_then(PackValue::as_str)
+                                    .unwrap_or_default()
+                                    .clone_into(&mut conn.info.user_agent);
+                            }
+                            return Ok(End::HandOff(HandOff {
+                                node,
+                                tenant,
+                                prelude,
+                                resume: Resume {
+                                    version: conn.info.version,
+                                    connection_id: conn.info.connection_id.clone(),
+                                    user_agent: conn.info.user_agent.clone(),
+                                    hello_done: conn.state == State::Authentication,
+                                },
+                            }));
+                        }
+                        handle_alive(wr, conn, req, svc, cfg).await?;
+                    }
                     Err(e) => {
                         conn.fail(&BoltFailure::invalid(e.to_string()));
                         conn.state = State::Defunct;

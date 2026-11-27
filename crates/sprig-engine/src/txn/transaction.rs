@@ -839,6 +839,40 @@ impl Txn {
         Ok(rows.into_iter().map(|(k, v)| (k.to_vec(), v)).collect())
     }
 
+    /// Snapshot reads of several ranges, each up to `limit` live keys in
+    /// ascending order, as [`Txn::scan`] with [`ReadMode::Snapshot`] gives
+    /// them one by one, through one store cursor over `outer`, which must
+    /// hold every range: many short ranges (a hop's adjacency prefixes)
+    /// without making a store cursor for each.
+    ///
+    /// # Errors
+    /// The transaction is not active, or the store failed.
+    pub fn scan_many(
+        &mut self,
+        ranges: &[KeyRange],
+        outer: &KeyRange,
+        limit: usize,
+    ) -> Result<Vec<Vec<(Bytes, Bytes)>>> {
+        self.ensure_active()?;
+        for r in ranges {
+            self.follow(&r.start)?;
+        }
+        let rts = self.read_ts();
+        let path = Arc::clone(&self.path);
+        let mut vs = VersionScan::new_multi(path.store(), outer, rts);
+        let mut out = Vec::with_capacity(ranges.len());
+        for r in ranges {
+            vs.retarget(r);
+            let (rows, _) = self.scan_rows_on(r, Dir::Forward, limit, rts, false, Some(&mut vs))?;
+            out.push(
+                rows.into_iter()
+                    .filter_map(|x| x.value.map(|v| (x.key, v)))
+                    .collect(),
+            );
+        }
+        Ok(out)
+    }
+
     /// A current read of a range without locking: up to `limit` live keys
     /// of `range` in `dir` order, each this transaction's own write, else
     /// the latest committed version (pending included). It opens no read
@@ -884,6 +918,20 @@ impl Txn {
         at: Ts,
         want_dead: bool,
     ) -> Result<(Vec<Seen>, bool)> {
+        self.scan_rows_on(range, dir, limit, at, want_dead, None)
+    }
+
+    /// [`Txn::scan_rows`], through `ext`'s store cursor when given (a multi
+    /// scan retargeted to `range`, [`Txn::scan_many`]).
+    fn scan_rows_on(
+        &mut self,
+        range: &KeyRange,
+        dir: Dir,
+        limit: usize,
+        at: Ts,
+        want_dead: bool,
+        ext: Option<&mut VersionScan<'_>>,
+    ) -> Result<(Vec<Seen>, bool)> {
         self.ensure_active()?;
         if range.end.as_ref().is_some_and(|e| *e <= range.start) {
             return Ok((Vec::new(), true));
@@ -913,7 +961,13 @@ impl Txn {
                 Dir::Reverse => Box::new(self.writes.range(range).rev().map(clone)),
             };
             let mut own = own.peekable();
-            let mut store = VersionScan::new(self.path.store(), range, dir, at);
+            let mut local;
+            let store: &mut dyn Visible = if let Some(v) = ext {
+                v
+            } else {
+                local = VersionScan::new(self.path.store(), range, dir, at);
+                &mut local
+            };
             let mut store_head = store.next_visible()?;
             while live < limit {
                 // The first key (in scan order) among the three heads.
@@ -2123,6 +2177,19 @@ impl Txn {
             self.shared().txn_closed();
         }
         self.phase = phase;
+    }
+}
+
+/// A store scan's next visible version ([`VersionScan`]), as a trait so a
+/// scan made for one range and a multi scan lent by the caller
+/// ([`Txn::scan_many`]) are used alike.
+trait Visible {
+    fn next_visible(&mut self) -> Result<Option<(Bytes, super::mvcc::Version)>>;
+}
+
+impl Visible for VersionScan<'_> {
+    fn next_visible(&mut self) -> Result<Option<(Bytes, super::mvcc::Version)>> {
+        VersionScan::next_visible(self)
     }
 }
 

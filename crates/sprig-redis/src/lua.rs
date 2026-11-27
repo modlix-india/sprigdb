@@ -1389,7 +1389,7 @@ pub fn start_with(
     let st2 = Arc::clone(&st);
     let cfg = cfg.clone();
     let done = tokio::task::spawn_blocking(move || {
-        run_blocking(&body, &keys, &args, tx, st2, &cfg, resp3_client)
+        run_blocking(&body, &keys, &args, tx, st2, &cfg, wall, resp3_client)
     });
     Started {
         calls: rx,
@@ -1398,7 +1398,11 @@ pub fn start_with(
     }
 }
 
-#[allow(clippy::too_many_lines, clippy::needless_pass_by_value)]
+#[allow(
+    clippy::too_many_lines,
+    clippy::needless_pass_by_value,
+    clippy::too_many_arguments
+)]
 fn run_blocking(
     body: &Body,
     keys: &[Bytes],
@@ -1406,6 +1410,7 @@ fn run_blocking(
     tx: UnboundedSender<Call>,
     st: Arc<RunState>,
     cfg: &crate::env::Config,
+    wall: Duration,
     _resp3_client: bool,
 ) -> Outcome {
     let budget = |st: &RunState, at: Option<(String, i64)>| -> Outcome {
@@ -1429,9 +1434,15 @@ fn run_blocking(
                     "memory: the script used more than redis.lua_memory_limit_mb = {} MB",
                     cfg.lua_memory_bytes >> 20
                 )
-            } else {
+            } else if wall == cfg.lua_time_limit {
                 format!(
                     "wall time: the script ran past redis.lua_time_limit_ms = {} ms",
+                    cfg.lua_time_limit.as_millis()
+                )
+            } else {
+                format!(
+                    "wall time: the script ran past {} ms, twice redis.lua_time_limit_ms = {} ms (the busy threshold)",
+                    wall.as_millis(),
                     cfg.lua_time_limit.as_millis()
                 )
             };
@@ -1615,6 +1626,58 @@ mod tests {
             sha1_hex(b"return 1"),
             "e0e1f9fabfc9d4800c877a703b823ac0578ff8db"
         );
+    }
+
+    /// An endless loop that catches every error still stops at its wall
+    /// budget (a caught stop is raised again), and a cancel stops it too.
+    #[tokio::test]
+    async fn endless_loops_stop_even_inside_pcall() {
+        let cfg = crate::env::Config::default();
+        for body in [
+            "while true do pcall(function() end) end",
+            "while true do local ok = pcall(error, 'x') end",
+            "while true do xpcall(function() end, function() end) end",
+        ] {
+            let t = Instant::now();
+            let s = start_with(
+                Body::Script {
+                    source: body.into(),
+                    name: "f".into(),
+                },
+                Vec::new(),
+                Vec::new(),
+                false,
+                &cfg,
+                Duration::from_millis(300),
+            );
+            let out = tokio::time::timeout(Duration::from_secs(20), s.done)
+                .await
+                .expect("the loop never stopped")
+                .unwrap();
+            assert!(
+                matches!(&out, Outcome::Abort(Frame::Error(e)) if String::from_utf8_lossy(e).contains("39850")),
+                "{body}: {out:?}"
+            );
+            assert!(t.elapsed() < Duration::from_secs(10), "{body}");
+        }
+        let s = start_with(
+            Body::Script {
+                source: "while true do pcall(function() end) end".into(),
+                name: "f".into(),
+            },
+            Vec::new(),
+            Vec::new(),
+            false,
+            &cfg,
+            Duration::from_secs(3600),
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        s.state.cancel();
+        let out = tokio::time::timeout(Duration::from_secs(20), s.done)
+            .await
+            .expect("the cancelled loop never stopped")
+            .unwrap();
+        assert!(matches!(out, Outcome::Abort(_)), "{out:?}");
     }
 
     #[test]

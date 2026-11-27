@@ -252,6 +252,17 @@ impl<U: Unit> ScriptTxn<U> {
             "zunionstore" | "zinterstore" | "zdiffstore" | "blmpop" | "bzmpop" => Some(2),
             _ => None,
         };
+        // Stream reads name their keys after STREAMS, or after a
+        // subcommand.
+        match name {
+            "xread" => want.extend(
+                exec::streams::read_keys(a, false)
+                    .iter()
+                    .map(|k| self.space.meta(k)),
+            ),
+            "xinfo" => want.extend(a.get(2).map(|k| self.space.meta(k))),
+            _ => {}
+        }
         if let Some(at) = counted {
             let n = a
                 .get(at)
@@ -331,6 +342,7 @@ impl<U: Unit> EngineScript for ScriptTxn<U> {
             uids: &mut uids,
             resp3,
             touched: Vec::new(),
+            events: Vec::new(),
         };
         let r = if flags == 0 {
             exec::run(&mut cx, &name, a)

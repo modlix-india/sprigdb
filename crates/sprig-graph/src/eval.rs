@@ -3,7 +3,7 @@
 //! the function library (scalar, list, string and math functions; the
 //! aggregates are in [`crate::exec`]).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use sprig_common::{Result, SprigCode, SprigError};
@@ -11,8 +11,170 @@ use sprig_common::{Result, SprigCode, SprigError};
 use crate::ast::{BinOp, Expr, MapItem, UnOp};
 use crate::value::{Value, fmt_float, type_error};
 
-/// One binding row: variable name to value.
-pub type Row = HashMap<String, Value, RowState>;
+/// One binding row: variable names and their values, as slots in the
+/// order they were bound. Names are shared between the copies of a row, so
+/// copying a row (once per relationship a hop finds) copies its values and
+/// bumps its names' counts with one allocation, where a hash map copied
+/// every name; lookups compare a few short names.
+#[derive(Clone, Default)]
+pub struct Row {
+    slots: Vec<(Arc<String>, Value)>,
+}
+
+impl Row {
+    /// An empty row with room for `n` variables.
+    #[must_use]
+    pub fn with_capacity(n: usize) -> Self {
+        Self {
+            slots: Vec::with_capacity(n),
+        }
+    }
+
+    fn find(&self, k: &str) -> Option<usize> {
+        self.slots.iter().position(|(n, _)| n.as_str() == k)
+    }
+
+    /// The value of `k`.
+    #[must_use]
+    pub fn get(&self, k: &str) -> Option<&Value> {
+        self.slots
+            .iter()
+            .find(|(n, _)| n.as_str() == k)
+            .map(|(_, v)| v)
+    }
+
+    /// The value of `k`, to change.
+    pub fn get_mut(&mut self, k: &str) -> Option<&mut Value> {
+        self.slots
+            .iter_mut()
+            .find(|(n, _)| n.as_str() == k)
+            .map(|(_, v)| v)
+    }
+
+    /// Whether `k` is bound.
+    #[must_use]
+    pub fn contains_key(&self, k: &str) -> bool {
+        self.find(k).is_some()
+    }
+
+    /// Binds `k`, giving back its former value.
+    pub fn insert(&mut self, k: String, v: Value) -> Option<Value> {
+        if let Some(i) = self.find(&k) {
+            return Some(std::mem::replace(&mut self.slots[i].1, v));
+        }
+        self.slots.push((Arc::new(k), v));
+        None
+    }
+
+    /// Binds `k` by a shared name (no allocation for the name).
+    pub fn insert_name(&mut self, k: &Arc<String>, v: Value) -> Option<Value> {
+        if let Some(i) = self.find(k) {
+            return Some(std::mem::replace(&mut self.slots[i].1, v));
+        }
+        self.slots.push((Arc::clone(k), v));
+        None
+    }
+
+    /// Unbinds `k`, giving back its value.
+    pub fn remove(&mut self, k: &str) -> Option<Value> {
+        self.find(k).map(|i| self.slots.remove(i).1)
+    }
+
+    /// The bound names, in binding order.
+    pub fn keys(&self) -> impl Iterator<Item = &String> + '_ {
+        self.slots.iter().map(|(n, _)| &**n)
+    }
+
+    /// The values, in binding order.
+    pub fn values(&self) -> impl Iterator<Item = &Value> + '_ {
+        self.slots.iter().map(|(_, v)| v)
+    }
+
+    /// The values, to change.
+    pub fn values_mut(&mut self) -> impl Iterator<Item = &mut Value> + '_ {
+        self.slots.iter_mut().map(|(_, v)| v)
+    }
+
+    /// Names and values.
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &Value)> + '_ {
+        self.slots.iter().map(|(n, v)| (&**n, v))
+    }
+
+    /// Names and values, to change.
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = (&String, &mut Value)> + '_ {
+        self.slots.iter_mut().map(|(n, v)| (&**n, v))
+    }
+
+    /// Keeps the bindings `f` keeps.
+    pub fn retain(&mut self, mut f: impl FnMut(&String, &mut Value) -> bool) {
+        self.slots.retain_mut(|(n, v)| f(n, v));
+    }
+
+    /// Variables bound.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Whether nothing is bound.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+}
+
+impl PartialEq for Row {
+    /// The same bindings, in any order.
+    fn eq(&self, other: &Self) -> bool {
+        self.len() == other.len() && self.iter().all(|(k, v)| other.get(k) == Some(v))
+    }
+}
+
+impl std::fmt::Debug for Row {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_map().entries(self.iter()).finish()
+    }
+}
+
+impl FromIterator<(String, Value)> for Row {
+    fn from_iter<I: IntoIterator<Item = (String, Value)>>(it: I) -> Self {
+        let mut r = Row::default();
+        r.extend(it);
+        r
+    }
+}
+
+impl Extend<(String, Value)> for Row {
+    fn extend<I: IntoIterator<Item = (String, Value)>>(&mut self, it: I) {
+        for (k, v) in it {
+            self.insert(k, v);
+        }
+    }
+}
+
+impl IntoIterator for Row {
+    type Item = (String, Value);
+    type IntoIter = std::iter::Map<
+        std::vec::IntoIter<(Arc<String>, Value)>,
+        fn((Arc<String>, Value)) -> (String, Value),
+    >;
+    fn into_iter(self) -> Self::IntoIter {
+        self.slots
+            .into_iter()
+            .map(|(n, v)| (Arc::try_unwrap(n).unwrap_or_else(|a| (*a).clone()), v))
+    }
+}
+
+impl<'a> IntoIterator for &'a Row {
+    type Item = (&'a String, &'a Value);
+    type IntoIter = std::iter::Map<
+        std::slice::Iter<'a, (Arc<String>, Value)>,
+        fn(&'a (Arc<String>, Value)) -> (&'a String, &'a Value),
+    >;
+    fn into_iter(self) -> Self::IntoIter {
+        self.slots.iter().map(|(n, v)| (&**n, v))
+    }
+}
 
 /// The hasher of [`Row`]s' keys: variable names of the statement, short
 /// and the statement's own, so a multiply-rotate hash (as rustc's `FxHash`)
@@ -77,6 +239,56 @@ fn arith_err(msg: &str) -> SprigError {
 /// 39909 for type errors, 39901 for unknown functions, 39900 for unknown
 /// variables and parameters.
 pub fn eval(e: &Expr, row: &Row, params: &Params) -> Result<Value> {
+    eval_in(e, row, params)
+}
+
+/// What an expression's variables are bound to: a [`Row`], or another
+/// row form (the operator planner's slot rows).
+pub trait Vars {
+    /// The value of variable `name`.
+    fn var(&self, name: &str) -> Option<&Value>;
+}
+
+impl Vars for Row {
+    fn var(&self, name: &str) -> Option<&Value> {
+        self.get(name)
+    }
+}
+
+/// One local variable over an outer scope (a comprehension's).
+struct Scope<'a> {
+    outer: &'a dyn Vars,
+    name: &'a str,
+    value: Value,
+}
+
+impl<'a> Scope<'a> {
+    fn new(outer: &'a dyn Vars, name: &'a str, value: Value) -> Self {
+        Self { outer, name, value }
+    }
+
+    fn into_value(self) -> Value {
+        self.value
+    }
+}
+
+impl Vars for Scope<'_> {
+    fn var(&self, name: &str) -> Option<&Value> {
+        if name == self.name {
+            Some(&self.value)
+        } else {
+            self.outer.var(name)
+        }
+    }
+}
+
+/// Evaluates `e` over the variables `row` holds ([`eval`] over any
+/// [`Vars`], such as the operator planner's slot rows).
+///
+/// # Errors
+/// 39909 for type errors, 39901 for unknown functions, 39900 for unknown
+/// variables and parameters.
+pub fn eval_in(e: &Expr, row: &dyn Vars, params: &Params) -> Result<Value> {
     Ok(match e {
         Expr::Lit(v) => v.clone(),
         Expr::Param(p) => params.get(p).cloned().ok_or_else(|| {
@@ -86,37 +298,37 @@ pub fn eval(e: &Expr, row: &Row, params: &Params) -> Result<Value> {
             )
             .with_neo4j("Neo.ClientError.Statement.ParameterMissing")
         })?,
-        Expr::Var(v) | Expr::Slot(v) => row.get(v).cloned().ok_or_else(|| {
+        Expr::Var(v) | Expr::Slot(v) => row.var(v).cloned().ok_or_else(|| {
             SprigError::new(
                 SprigCode::GraphSyntax,
                 format!("Variable `{v}` not defined"),
             )
         })?,
-        Expr::Prop(b, k) => prop(&eval(b, row, params)?, k)?,
-        Expr::Index(b, i) => index(&eval(b, row, params)?, &eval(i, row, params)?)?,
+        Expr::Prop(b, k) => prop(&eval_in(b, row, params)?, k)?,
+        Expr::Index(b, i) => index(&eval_in(b, row, params)?, &eval_in(i, row, params)?)?,
         Expr::Slice(b, lo, hi) => {
-            let v = eval(b, row, params)?;
-            let lo = lo.as_ref().map(|x| eval(x, row, params)).transpose()?;
-            let hi = hi.as_ref().map(|x| eval(x, row, params)).transpose()?;
+            let v = eval_in(b, row, params)?;
+            let lo = lo.as_ref().map(|x| eval_in(x, row, params)).transpose()?;
+            let hi = hi.as_ref().map(|x| eval_in(x, row, params)).transpose()?;
             slice(&v, lo.as_ref(), hi.as_ref())?
         }
         Expr::List(l) => Value::List(
             l.iter()
-                .map(|x| eval(x, row, params))
+                .map(|x| eval_in(x, row, params))
                 .collect::<Result<_>>()?,
         ),
         Expr::Map(m) => Value::Map(
             m.iter()
-                .map(|(k, x)| Ok((k.clone(), eval(x, row, params)?)))
+                .map(|(k, x)| Ok((k.clone(), eval_in(x, row, params)?)))
                 .collect::<Result<_>>()?,
         ),
-        Expr::Unary(op, x) => unary(*op, eval(x, row, params)?)?,
+        Expr::Unary(op, x) => unary(*op, eval_in(x, row, params)?)?,
         Expr::Binary(BinOp::And, a, b) => {
-            let l = eval(a, row, params)?.truth()?;
+            let l = eval_in(a, row, params)?.truth()?;
             if l == Some(false) {
                 return Ok(Value::Bool(false));
             }
-            let r = eval(b, row, params)?.truth()?;
+            let r = eval_in(b, row, params)?.truth()?;
             tri(match (l, r) {
                 (_, Some(false)) => Some(false),
                 (Some(true), Some(true)) => Some(true),
@@ -124,20 +336,20 @@ pub fn eval(e: &Expr, row: &Row, params: &Params) -> Result<Value> {
             })
         }
         Expr::Binary(BinOp::Or, a, b) => {
-            let l = eval(a, row, params)?.truth()?;
+            let l = eval_in(a, row, params)?.truth()?;
             if l == Some(true) {
                 return Ok(Value::Bool(true));
             }
-            let r = eval(b, row, params)?.truth()?;
+            let r = eval_in(b, row, params)?.truth()?;
             tri(match (l, r) {
                 (_, Some(true)) => Some(true),
                 (Some(false), Some(false)) => Some(false),
                 _ => None,
             })
         }
-        Expr::Binary(op, a, b) => binary(*op, eval(a, row, params)?, eval(b, row, params)?)?,
-        Expr::IsNull(x, neg) => Value::Bool(eval(x, row, params)?.is_null() != *neg),
-        Expr::HasLabels(x, l) => match eval(x, row, params)? {
+        Expr::Binary(op, a, b) => binary(*op, eval_in(a, row, params)?, eval_in(b, row, params)?)?,
+        Expr::IsNull(x, neg) => Value::Bool(eval_in(x, row, params)?.is_null() != *neg),
+        Expr::HasLabels(x, l) => match eval_in(x, row, params)? {
             Value::Null => Value::Null,
             Value::Node(n) => Value::Bool(l.matches(&n.labels)),
             other => {
@@ -152,18 +364,21 @@ pub fn eval(e: &Expr, row: &Row, params: &Params) -> Result<Value> {
             whens,
             else_,
         } => {
-            let s = subject.as_ref().map(|x| eval(x, row, params)).transpose()?;
+            let s = subject
+                .as_ref()
+                .map(|x| eval_in(x, row, params))
+                .transpose()?;
             for (w, t) in whens {
                 let hit = match &s {
-                    Some(sv) => sv.cypher_eq(&eval(w, row, params)?) == Some(true),
-                    None => eval(w, row, params)?.truth()? == Some(true),
+                    Some(sv) => sv.cypher_eq(&eval_in(w, row, params)?) == Some(true),
+                    None => eval_in(w, row, params)?.truth()? == Some(true),
                 };
                 if hit {
-                    return eval(t, row, params);
+                    return eval_in(t, row, params);
                 }
             }
             match else_ {
-                Some(x) => eval(x, row, params)?,
+                Some(x) => eval_in(x, row, params)?,
                 None => Value::Null,
             }
         }
@@ -173,23 +388,22 @@ pub fn eval(e: &Expr, row: &Row, params: &Params) -> Result<Value> {
             pred,
             map,
         } => {
-            let l = match eval(list, row, params)? {
+            let l = match eval_in(list, row, params)? {
                 Value::Null => return Ok(Value::Null),
                 Value::List(l) => l,
                 other => return Err(type_error(format!("IN over a {}", other.type_name()))),
             };
-            let mut inner = row.clone();
             let mut out = Vec::new();
             for x in l {
-                inner.insert(var.clone(), x.clone());
+                let inner = Scope::new(row, var, x);
                 if let Some(p) = pred
-                    && eval(p, &inner, params)?.truth()? != Some(true)
+                    && eval_in(p, &inner, params)?.truth()? != Some(true)
                 {
                     continue;
                 }
                 out.push(match map {
-                    Some(m) => eval(m, &inner, params)?,
-                    None => x,
+                    Some(m) => eval_in(m, &inner, params)?,
+                    None => inner.into_value(),
                 });
             }
             Value::List(out)
@@ -201,18 +415,17 @@ pub fn eval(e: &Expr, row: &Row, params: &Params) -> Result<Value> {
             list,
             expr,
         } => {
-            let start = eval(init, row, params)?;
-            let l = match eval(list, row, params)? {
+            let start = eval_in(init, row, params)?;
+            let l = match eval_in(list, row, params)? {
                 Value::Null => return Ok(Value::Null),
                 Value::List(l) => l,
                 other => return Err(type_error(format!("IN over a {}", other.type_name()))),
             };
-            let mut inner = row.clone();
             let mut a = start;
             for x in l {
-                inner.insert(acc.clone(), a);
-                inner.insert(var.clone(), x);
-                a = eval(expr, &inner, params)?;
+                let outer = Scope::new(row, acc, a);
+                let inner = Scope::new(&outer, var, x);
+                a = eval_in(expr, &inner, params)?;
             }
             a
         }
@@ -222,16 +435,15 @@ pub fn eval(e: &Expr, row: &Row, params: &Params) -> Result<Value> {
             list,
             pred,
         } => {
-            let l = match eval(list, row, params)? {
+            let l = match eval_in(list, row, params)? {
                 Value::Null => return Ok(Value::Null),
                 Value::List(l) => l,
                 other => return Err(type_error(format!("IN over a {}", other.type_name()))),
             };
-            let mut inner = row.clone();
             let (mut t, mut f, mut n) = (0usize, 0usize, 0usize);
             for x in l {
-                inner.insert(var.clone(), x);
-                match eval(pred, &inner, params)?.truth()? {
+                let inner = Scope::new(row, var, x);
+                match eval_in(pred, &inner, params)?.truth()? {
                     Some(true) => t += 1,
                     Some(false) => f += 1,
                     None => n += 1,
@@ -287,7 +499,7 @@ pub fn eval(e: &Expr, row: &Row, params: &Params) -> Result<Value> {
             }
             let vals = args
                 .iter()
-                .map(|x| eval(x, row, params))
+                .map(|x| eval_in(x, row, params))
                 .collect::<Result<Vec<_>>>()?;
             call(name, vals)?
         }
@@ -304,7 +516,7 @@ pub fn eval(e: &Expr, row: &Row, params: &Params) -> Result<Value> {
             ));
         }
         Expr::MapProjection(b, items) => {
-            let base = eval(b, row, params)?;
+            let base = eval_in(b, row, params)?;
             match &base {
                 Value::Null => return Ok(Value::Null),
                 Value::Node(_) | Value::Rel(_) | Value::Map(_) => {}
@@ -337,10 +549,10 @@ pub fn eval(e: &Expr, row: &Row, params: &Params) -> Result<Value> {
                         out.insert(k.clone(), one(k)?);
                     }
                     MapItem::Lit(k, e) => {
-                        out.insert(k.clone(), eval(e, row, params)?);
+                        out.insert(k.clone(), eval_in(e, row, params)?);
                     }
                     MapItem::Var(v) => {
-                        out.insert(v.clone(), eval(&Expr::Var(v.clone()), row, params)?);
+                        out.insert(v.clone(), eval_in(&Expr::Var(v.clone()), row, params)?);
                     }
                 }
             }

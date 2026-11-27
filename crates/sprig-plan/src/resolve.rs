@@ -997,6 +997,104 @@ impl Cx<'_> {
         Err(unknown_column(text, x.clause, self.maria()))
     }
 
+    /// `MATCH (columns) AGAINST (text [modifier])`: the host's full-text
+    /// search, as `SPRIG_FT_MATCH(spec, text, primary key columns...)`
+    /// (`sprig_exec::FullText`). The columns must be one stored table's,
+    /// and the table must have a primary key: the host answers each row's
+    /// score by it.
+    fn match_against(
+        &mut self,
+        columns: &[ast::ObjectName],
+        value: &ast::ValueWithSpan,
+        modifier: Option<&ast::SearchModifier>,
+        x: &mut ExprCx<'_, '_>,
+    ) -> Result<Expr> {
+        let bad = || SqlError::new(1210, "HY000", "Incorrect arguments to MATCH");
+        let mut at: Option<usize> = None;
+        let mut names = Vec::with_capacity(columns.len());
+        for c in columns {
+            let parts: Vec<ast::Ident> =
+                c.0.iter()
+                    .filter_map(|p| match p {
+                        ast::ObjectNamePart::Identifier(i) => Some(i.clone()),
+                        ast::ObjectNamePart::Function(_) => None,
+                    })
+                    .collect();
+            let Expr::Column(cr) = self.name_expr(&parts, x, false)? else {
+                return Err(bad());
+            };
+            let r = x
+                .scope
+                .rels
+                .iter()
+                .position(|r| cr.slot >= r.base && cr.slot < r.base + r.width)
+                .ok_or_else(bad)?;
+            if at.is_some_and(|a| a != r) {
+                return Err(bad());
+            }
+            at = Some(r);
+            names.push(cr);
+        }
+        let rel = &x.scope.rels[at.ok_or_else(bad)?];
+        let RelKind::Table(t) = &rel.kind else {
+            return Err(unsupported("MATCH over a derived table"));
+        };
+        // The row's key: the primary key, or the hidden row number a table
+        // without one is keyed by (its last, invisible column).
+        let key_cols: Vec<usize> = match &t.primary {
+            Some(pk) => pk.parts.iter().map(|p| p.column).collect(),
+            None => match t.columns.last() {
+                Some(c) if c.invisible && c.name == "_sprig_hidden_row" => {
+                    vec![t.columns.len() - 1]
+                }
+                _ => return Err(unsupported("MATCH on a table without a primary key")),
+            },
+        };
+        let columns = names
+            .iter()
+            .map(|c| {
+                t.columns
+                    .get(c.slot - rel.base)
+                    .map_or_else(|| c.name.clone(), |d| d.name.clone())
+            })
+            .collect();
+        let mode = match modifier {
+            None | Some(ast::SearchModifier::InNaturalLanguageMode) => sprig_exec::FtMode::Natural,
+            Some(ast::SearchModifier::InBooleanMode) => sprig_exec::FtMode::Boolean,
+            Some(
+                ast::SearchModifier::InNaturalLanguageModeWithQueryExpansion
+                | ast::SearchModifier::WithQueryExpansion,
+            ) => sprig_exec::FtMode::Expansion,
+        };
+        let spec = sprig_exec::FtSpec {
+            schema: t.schema.clone(),
+            table: t.name.clone(),
+            columns,
+            mode,
+        };
+        let text = match &value.value {
+            SqlValue::SingleQuotedString(s) | SqlValue::DoubleQuotedString(s) => {
+                Expr::Str(s.clone())
+            }
+            SqlValue::Null => Expr::Null,
+            SqlValue::Number(n, _) => number(n),
+            SqlValue::Placeholder(p) => self.param(p)?,
+            _ => return Err(bad()),
+        };
+        let mut args = vec![Expr::Keyword(spec.encode()), text];
+        for col in key_cols {
+            let c = t.columns.get(col).ok_or_else(bad)?;
+            args.push(Expr::Column(ColumnRef {
+                slot: rel.base + col,
+                ty: c.ty,
+                nullable: c.nullable,
+                name: c.name.clone(),
+                mb3: c.mb3,
+            }));
+        }
+        Ok(Expr::Func(sprig_exec::FtSpec::FUNCTION.into(), args))
+    }
+
     fn boxed(&mut self, e: &ast::Expr, x: &mut ExprCx<'_, '_>) -> Result<Box<Expr>> {
         Ok(Box::new(self.expr_in(e, x, false)?))
     }
@@ -1443,6 +1541,11 @@ impl Cx<'_> {
                 }
             }
             A::Function(f) => self.function(f, x)?,
+            A::MatchAgainst {
+                columns,
+                match_value,
+                opt_search_modifier,
+            } => self.match_against(columns, match_value, opt_search_modifier.as_ref(), x)?,
             A::Subquery(q) => self.scalar_subquery(q, x)?,
             A::InSubquery {
                 expr,

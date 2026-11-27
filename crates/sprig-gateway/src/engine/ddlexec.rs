@@ -760,6 +760,13 @@ impl Hook {
                 }
             });
         }
+        // The tables' full-text indexes follow their definitions (built
+        // before the statement answers, as the servers build them).
+        if let Outcome::Published(cat) = outcome
+            && let Some(ec) = catalog::of(cat)
+        {
+            super::fulltext::after_ddl(self.tenant.0, ec).await;
+        }
         report
     }
 }

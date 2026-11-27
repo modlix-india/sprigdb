@@ -137,6 +137,9 @@ pub enum CloseReason {
     /// The session's tenant (or an ancestor) was suspended
     /// (`auth.close_sessions_on_revoke`): 39306.
     Suspended,
+    /// The session's tenant is now served by another node (its unit's
+    /// leadership moved): 39502, retryable; the client reconnects.
+    Moved,
 }
 
 impl CloseReason {
@@ -163,6 +166,10 @@ impl CloseReason {
                 SprigCode::SessionRevoked,
                 "this session was closed: its tenant was suspended",
             ),
+            CloseReason::Moved => SprigError::new(
+                SprigCode::SessionMoved,
+                "this tenant is served by another node now; reconnect",
+            ),
         }
     }
 
@@ -173,6 +180,7 @@ impl CloseReason {
             CloseReason::Revoked => 3,
             CloseReason::OutcomeUnknown => 4,
             CloseReason::Suspended => 5,
+            CloseReason::Moved => 6,
         }
     }
 
@@ -183,6 +191,7 @@ impl CloseReason {
             3 => Some(CloseReason::Revoked),
             4 => Some(CloseReason::OutcomeUnknown),
             5 => Some(CloseReason::Suspended),
+            6 => Some(CloseReason::Moved),
             _ => None,
         }
     }

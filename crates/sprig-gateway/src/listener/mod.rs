@@ -53,7 +53,7 @@ use tokio_util::task::TaskTracker;
 
 pub use self::proxy::{Cidr, ProxyMode, ProxyPolicy};
 pub use self::settings::{LISTENERS, ListenerKeys, Resolution, resolve};
-use crate::frontend::{ConnTransport, Frontend, GatewayContext, Protocol, TlsInfo};
+use crate::frontend::{ClientConn, ConnTransport, Frontend, GatewayContext, Protocol, TlsInfo};
 use crate::tls::{self, CertBundle};
 
 /// A listener's TLS mode, ordered from loosest to strictest.
@@ -464,6 +464,69 @@ impl ListenerManager {
     pub fn with_bind_overrides(mut self, binds: HashMap<String, SocketAddr>) -> Self {
         self.binds = binds;
         self
+    }
+
+    /// Serves a connection that another node accepted on its listener
+    /// `name` and handed here (`NodeForward.Splice`): this node's listener of
+    /// the same name runs it, under its current generation, with the TLS the
+    /// accepting node negotiated. Returns once the connection is started.
+    ///
+    /// # Errors
+    /// 39788 when this node doesn't serve that listener.
+    pub async fn serve_forwarded(
+        &self,
+        name: &str,
+        stream: crate::forward::io::Spliced,
+        peer: SocketAddr,
+    ) -> sprig_common::Result<()> {
+        let unserved = || {
+            sprig_common::SprigError::new(
+                sprig_common::SprigCode::ForwardFailed,
+                format!("listener {name} isn't serving on this node"),
+            )
+        };
+        let active = {
+            let slots = self.slots.lock().await;
+            slots.get(name).and_then(|s| s.active.load_full())
+        }
+        .ok_or_else(unserved)?;
+        let fe = self
+            .shared
+            .frontends
+            .0
+            .get(&active.spec.protocol)
+            .cloned()
+            .ok_or_else(unserved)?;
+        let ctx = Arc::clone(&self.shared.ctx);
+        let group = active.group.clone();
+        let slot = group.join();
+        slot.transport.set(stream.tls_info().as_ref());
+        let listener = active.spec.name;
+        let conn = ClientConn {
+            stream: crate::frontend::MaybeTls::Forwarded(Box::new(stream)),
+            peer,
+            listener: Arc::clone(&active.spec),
+            generation: active.generation,
+            in_protocol_tls: crate::frontend::InProtocolTls::NotOffered,
+            retired: slot.close.clone(),
+            close_soon: slot.soft.clone(),
+            transport: Arc::clone(&slot.transport),
+            acceptor: None,
+        };
+        group.tracker.spawn(async move {
+            let close = slot.close.clone();
+            let _slot = slot;
+            tokio::select! {
+                biased;
+                () = close.cancelled() => {}
+                r = fe.serve(conn, ctx) => {
+                    if let Err(e) = r {
+                        tracing::debug!(listener, %peer, error = %e, "forwarded connection ended with an error");
+                    }
+                }
+            }
+        });
+        Ok(())
     }
 
     /// Makes the listeners match `res`: listeners whose spec changed are

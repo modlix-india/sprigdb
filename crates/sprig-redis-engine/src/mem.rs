@@ -8,7 +8,9 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use bytes::Bytes;
 use tokio::sync::OwnedMutexGuard;
 
-use crate::store::{Batch, StoreResult, Ticket, Unit};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use crate::store::{Batch, StoreError, StoreResult, Ticket, Unit};
 
 /// [`MemUnit`]'s commits are durable at once.
 #[derive(Debug, Clone, Copy)]
@@ -34,6 +36,9 @@ pub struct MemUnit {
     clock: Mutex<Option<i64>>,
     /// The notes of committed batches, in commit order.
     notes: Notes,
+    /// Commits still to refuse as retryable, as an engine refuses a
+    /// transaction whose unit's leadership changed (tests of retries).
+    fail_commits: Arc<AtomicUsize>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -50,6 +55,11 @@ impl MemUnit {
     /// Fixes the clock at `ms` (`None`: the system's again).
     pub fn set_clock(&self, ms: Option<i64>) {
         *lock(&self.clock) = ms;
+    }
+
+    /// Makes the next `n` commits fail as retryable, changing nothing.
+    pub fn fail_next_commits(&self, n: usize) {
+        self.fail_commits.store(n, Ordering::Release);
     }
 
     /// Takes the notes committed so far: (tenant, note).
@@ -77,6 +87,7 @@ pub struct MemBatch {
     writes: BTreeMap<Bytes, Option<Bytes>>,
     notes: Vec<(u64, Vec<u8>)>,
     committed_notes: Notes,
+    fail_commits: Arc<AtomicUsize>,
 }
 
 impl Unit for MemUnit {
@@ -95,6 +106,7 @@ impl Unit for MemUnit {
             writes: BTreeMap::new(),
             notes: Vec::new(),
             committed_notes: Arc::clone(&self.notes),
+            fail_commits: Arc::clone(&self.fail_commits),
         })
     }
 
@@ -205,6 +217,15 @@ impl Batch for MemBatch {
     }
 
     fn commit(mut self) -> StoreResult<MemTicket> {
+        if self
+            .fail_commits
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Err(StoreError::retry(
+                "the data's leader changed (a test's refused commit)",
+            ));
+        }
         lock(&self.committed_notes).append(&mut self.notes);
         let writes = std::mem::take(&mut self.writes);
         let mut d = lock(&self.data);

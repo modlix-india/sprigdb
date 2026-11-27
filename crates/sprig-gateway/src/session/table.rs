@@ -270,6 +270,23 @@ impl SessionTable {
         })
     }
 
+    /// Marks `close_at_safe_point` on every session of `tenant` not marked
+    /// yet, because another node leads its unit now. Returns how many.
+    pub fn close_moved(&self, tenant: TenantId) -> usize {
+        self.mark(CloseReason::Moved, |h| {
+            !h.flags().close_requested() && h.activity().tenant == Some(tenant)
+        })
+    }
+
+    /// The tenants with sessions here.
+    #[must_use]
+    pub fn tenants(&self) -> std::collections::BTreeSet<TenantId> {
+        self.read()
+            .values()
+            .filter_map(|h| h.activity().tenant)
+            .collect()
+    }
+
     /// Marks `close_at_safe_point` on every session (the gateway is
     /// draining). Returns how many.
     pub fn close_all_at_safe_point(&self) -> usize {
