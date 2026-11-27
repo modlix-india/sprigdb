@@ -9,9 +9,20 @@
 //! a service_token_files secret     that service          the same
 //! [controller] gateway_token_file  service "gateway"     the same
 //! [controller] admin_token_file    bootstrap (platform)  39310, or break glass
-//! (no admin token configured)      bootstrap, loopback   39310
+//! (no admin token configured)      bootstrap, local only 39310
 //! [controller] dc_operator_token   DC operator of here   39310
 //! ```
+//!
+//! **No admin token.** A controller without `admin_token_file` listens on a
+//! loopback address, and until the first operator logs in it has nobody to
+//! check a caller against. It then treats a call as the bootstrap principal
+//! only when the call is local ([`is_local`]): the TCP peer is this
+//! machine, no gateway relayed it for a client on another machine, and no
+//! proxy header says it travelled. A gateway on the same machine relays
+//! `/admin/v1/` from its public HTTP port and looks like a loopback peer,
+//! so every relayed call names its client's address, and anything else gets
+//! 39793. To administer from another machine, configure `admin_token_file`
+//! (or create the first operator locally and log in).
 //!
 //! A DC operator reaches only its DCs' controllers; there it reads
 //! everything and changes clusters, mover and other jobs, in-doubt
@@ -117,6 +128,49 @@ fn same(got: &str, want: &str) -> bool {
     diff == 0
 }
 
+fn loopback(ip: IpAddr) -> bool {
+    ip.to_canonical().is_loopback()
+}
+
+/// Whether a call provably comes from the controller's own machine: its
+/// TCP `peer` is a loopback address, a relaying gateway's
+/// [`CLIENT_ADDR_HEADER`] (when present) names a loopback address too, and
+/// it carries none of the headers a reverse proxy adds. An unknown peer or
+/// an address that doesn't parse is not local.
+///
+/// Only the anonymous bootstrap principal depends on this (see the module
+/// notes), so a caller gains nothing by sending these headers: they can
+/// only take the local standing away.
+#[must_use]
+pub fn is_local(headers: &HeaderMap, peer: Option<SocketAddr>) -> bool {
+    let Some(peer) = peer else {
+        return false;
+    };
+    if !loopback(peer.ip())
+        || sprig_common::https::PROXY_HEADERS
+            .iter()
+            .any(|h| headers.contains_key(*h))
+    {
+        return false;
+    }
+    let mut relayed_for = headers.get_all(CLIENT_ADDR_HEADER).iter();
+    relayed_for.all(|v| {
+        v.to_str()
+            .ok()
+            .and_then(|v| v.trim().parse::<IpAddr>().ok())
+            .is_some_and(loopback)
+    })
+}
+
+fn local_only() -> SprigError {
+    SprigError::new(
+        SprigCode::AdminUnauthenticated,
+        "this controller has no admin token, so until the first operator logs in it answers \
+         only calls made on its own machine: run sprigctl there, or set [controller] \
+         admin_token_file and present that token",
+    )
+}
+
 fn login_required() -> SprigError {
     SprigError::new(
         SprigCode::OperatorLoginRequired,
@@ -186,12 +240,25 @@ impl Guard {
         &self.ops
     }
 
-    /// The caller of a request.
+    /// The caller of a request that isn't known to be local: as
+    /// [`Self::authenticate_from`] with `local` false.
     ///
     /// # Errors
-    /// 39793 for a wrong credential; 39310 for the bootstrap or legacy
-    /// credentials (or none) after the switch; 39316 for an ended token.
+    /// As [`Self::authenticate_from`].
     pub async fn authenticate(&self, headers: &HeaderMap) -> Result<Principal> {
+        self.authenticate_from(headers, false).await
+    }
+
+    /// The caller of a request; `local` is [`is_local`] of the request as
+    /// it arrived. Without an admin token, only a local call is the
+    /// bootstrap principal (module notes).
+    ///
+    /// # Errors
+    /// 39793 for a wrong credential, or for a call from another machine
+    /// while no admin token is configured; 39310 for the bootstrap or
+    /// legacy credentials (or none) after the switch; 39316 for an ended
+    /// token.
+    pub async fn authenticate_from(&self, headers: &HeaderMap, local: bool) -> Result<Principal> {
         let presented = bearer(headers).filter(|b| !b.is_empty());
         if let Some(b) = presented
             && (b.starts_with(op::TOKEN_PREFIX) || b.starts_with(op::SERVICE_PREFIX))
@@ -228,7 +295,8 @@ impl Guard {
             });
         }
         match &self.admin_token {
-            None => Ok(Principal::bootstrap()),
+            None if local => Ok(Principal::bootstrap()),
+            None => Err(local_only()),
             Some(_) if is_admin => Ok(Principal::bootstrap()),
             Some(_) => Err(unauthenticated()),
         }
@@ -398,13 +466,21 @@ fn establish_client(g: &Guard, parts: &mut axum::http::request::Parts) -> Client
 pub async fn layer(State(g): State<Arc<Guard>>, req: Request, next: Next) -> Response {
     let (mut parts, body) = req.into_parts();
     parts.headers.remove(AUTHN_HEADER);
+    // Before the relay headers are replaced: whether the call is local.
+    let local = is_local(
+        &parts.headers,
+        parts
+            .extensions
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|c| c.0),
+    );
     let client = establish_client(&g, &mut parts);
     let method = parts.method.clone();
     let path = parts.uri.path().to_owned();
     if !path.starts_with("/admin/v1/") || public(&method, &path) {
         return next.run(Request::from_parts(parts, body)).await;
     }
-    let p = match g.authenticate(&parts.headers).await {
+    let p = match g.authenticate_from(&parts.headers, local).await {
         Ok(p) => p,
         Err(e) => return error_response(&e),
     };

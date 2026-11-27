@@ -700,6 +700,11 @@ async fn admin_call<R: AdminReq>(
     }
     let auth = meta(&req, "authorization");
     let info = req.extensions().get::<ConnInfo>().cloned();
+    // Who the call is relayed for; with no connection record, nobody on
+    // this machine.
+    let client = super::admin::RelayClient::of(info.as_ref().map(|i| i.peer.ip()), |h| {
+        req.metadata().contains_key(h)
+    });
     let r = req.into_inner();
     let route = by_name(rpc).ok_or_else(|| Status::unimplemented(rpc.to_owned()))?;
     // `studio.operator_mtls` covers the Operators service.
@@ -724,6 +729,7 @@ async fn admin_call<R: AdminReq>(
                 route.rpc,
                 vars.get("name").map(String::as_str),
                 auth.as_deref(),
+                client,
             )
             .await
             .map_err(|e| st(&e))?;
@@ -741,15 +747,16 @@ async fn admin_call<R: AdminReq>(
         path.push_str(query.trim_start_matches('?'));
     }
     let method = Method::from_bytes(route.method.as_bytes()).unwrap_or(Method::GET);
-    // The controller records the client's address.
+    // The controller records the client's address, and without an admin
+    // token answers an anonymous call only for a client on its machine.
     let reply = core
         .admin
-        .forward_from(
+        .forward_for(
             &method,
             &path,
             auth.as_deref(),
             Bytes::from(body.to_owned()),
-            info.as_ref().map(|i| i.peer.ip()),
+            Some(client),
         )
         .await
         .map_err(|e| st(&e))?;

@@ -173,10 +173,12 @@ pub trait LogStore: Send + Sync {
         self.write_all(batches, sync)
     }
 
-    /// Makes everything written before the call durable. It may run
-    /// alongside writes and other syncs; one that finds nothing new to sync
-    /// returns at once, so a caller counts a write as durable only once
-    /// every sync that began before its own has returned too.
+    /// Makes everything written before the call durable: when it returns,
+    /// every write that finished before the call is on the disk. It may run
+    /// alongside writes and other syncs. A call with nothing new to sync
+    /// may return at once only when a finished sync already covers the last
+    /// write; while the sync that covers it is still running (another
+    /// caller's), the call waits for it.
     ///
     /// # Errors
     /// The sync failed. The driver stops.
@@ -773,7 +775,9 @@ impl LogStore for EngineLogStore {
                 .map_err(|e| RaftError::Storage(format!("note blobs: sync: {e}")))
         };
         // Both files' syncs at once: on a journaling file system both
-        // files' size changes then ride one journal commit.
+        // files' size changes then ride one journal commit. Each returns
+        // only once its file's writes made before this call are durable
+        // (a sync still running for them is waited for).
         std::thread::scope(|s| {
             let synced = std::thread::Builder::new()
                 .name("sprig-raft-blob-sync".into())

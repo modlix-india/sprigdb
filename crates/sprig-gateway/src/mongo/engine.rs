@@ -473,14 +473,15 @@ fn guarded_refusal(
             }
         }
         "aggregate" => {
-            let coll = named("aggregate");
-            for st in body
+            // Every stage at any depth: a statistics stage may open a
+            // sub-pipeline on another collection (`$unionWith`, `$lookup`).
+            let top = named("aggregate");
+            let pipeline = body
                 .get_array("pipeline")
                 .map(Vec::as_slice)
-                .unwrap_or_default()
-            {
-                let Some(st) = st.as_document() else { continue };
-                if let Some(coll) = &coll
+                .unwrap_or_default();
+            for (on, st) in pipeline_stages(top.as_deref(), pipeline) {
+                if let Some(coll) = &on
                     && (st.contains_key("$collStats") || st.contains_key("$indexStats"))
                     && binds(db, coll)
                 {
@@ -632,26 +633,91 @@ async fn bulk_write(
     Some(run(c, &s, "bulkWrite", body, db).await)
 }
 
-/// The collections an aggregation stage reads (`$lookup`, `$graphLookup`,
-/// `$unionWith`) or writes (`$out`, `$merge`), as needs.
+/// The collection a `$lookup`, `$graphLookup` or `$unionWith`
+/// specification reads: `from` (or `coll`) as a name, or as a document
+/// with `coll`. The store reads that collection in the command's own
+/// database whatever `db` the document carries, so that is the namespace
+/// to check; a different `db` in the document is checked as well.
+fn stage_source(spec: &Document, key: &str, db: &str) -> Vec<(String, String)> {
+    match spec.get(key) {
+        Some(Bson::String(f)) => vec![(db.to_owned(), f.clone())],
+        Some(Bson::Document(d)) => {
+            let Ok(coll) = d.get_str("coll") else {
+                return Vec::new();
+            };
+            let mut out = vec![(db.to_owned(), coll.to_owned())];
+            if let Ok(other) = d.get_str("db")
+                && other != db
+            {
+                out.push((other.to_owned(), coll.to_owned()));
+            }
+            out
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Every stage of `pipeline` and of the pipelines nested in it at any
+/// depth (`$lookup` and `$unionWith` sub-pipelines, each `$facet` branch),
+/// with the collection its own pipeline runs on (`on` for the top level;
+/// `None` where a sub-pipeline names none).
+fn pipeline_stages<'a>(
+    on: Option<&str>,
+    pipeline: &'a [Bson],
+) -> Vec<(Option<String>, &'a Document)> {
+    let mut out = Vec::new();
+    // Pipelines still to read; a list, not recursion, so a deeply nested
+    // command can't exhaust the stack.
+    let mut todo: Vec<(Option<String>, &'a [Bson])> = vec![(on.map(str::to_owned), pipeline)];
+    while let Some((on, stages)) = todo.pop() {
+        for st in stages {
+            let Some(st) = st.as_document() else { continue };
+            out.push((on.clone(), st));
+            for (k, v) in st {
+                match (k.as_str(), v) {
+                    ("$lookup", Bson::Document(d)) => {
+                        if let Ok(p) = d.get_array("pipeline") {
+                            let from = match d.get("from") {
+                                Some(Bson::String(f)) => Some(f.clone()),
+                                Some(Bson::Document(f)) => {
+                                    f.get_str("coll").ok().map(str::to_owned)
+                                }
+                                _ => None,
+                            };
+                            todo.push((from, p.as_slice()));
+                        }
+                    }
+                    ("$unionWith", Bson::Document(d)) => {
+                        if let Ok(p) = d.get_array("pipeline") {
+                            todo.push((d.get_str("coll").ok().map(str::to_owned), p.as_slice()));
+                        }
+                    }
+                    ("$facet", Bson::Document(d)) => {
+                        for branch in d.values() {
+                            if let Bson::Array(p) = branch {
+                                todo.push((on.clone(), p.as_slice()));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The collections one aggregation stage itself reads (`$lookup`,
+/// `$graphLookup`, `$unionWith`) or writes (`$out`, `$merge`), as needs.
+/// Stages nested in it are separate stages of [`pipeline_stages`].
 fn stage_needs(st: &Document, db: &str, out: &mut Vec<(Action, String, Option<String>)>) {
     for (k, v) in st {
         // Collections a stage reads or writes.
-        let (named, writes) = match (k.as_str(), v) {
-            ("$lookup" | "$graphLookup", Bson::Document(d)) => (
-                d.get_str("from")
-                    .ok()
-                    .map(|f| (db.to_owned(), f.to_owned())),
-                false,
-            ),
-            ("$unionWith", Bson::String(f)) => (Some((db.to_owned(), f.clone())), false),
-            ("$unionWith", Bson::Document(d)) => (
-                d.get_str("coll")
-                    .ok()
-                    .map(|f| (db.to_owned(), f.to_owned())),
-                false,
-            ),
-            ("$out" | "$merge", Bson::String(f)) => (Some((db.to_owned(), f.clone())), true),
+        let (named, writes): (Vec<(String, String)>, bool) = match (k.as_str(), v) {
+            ("$lookup" | "$graphLookup", Bson::Document(d)) => (stage_source(d, "from", db), false),
+            ("$unionWith", Bson::String(f)) => (vec![(db.to_owned(), f.clone())], false),
+            ("$unionWith", Bson::Document(d)) => (stage_source(d, "coll", db), false),
+            ("$out" | "$merge", Bson::String(f)) => (vec![(db.to_owned(), f.clone())], true),
             ("$out" | "$merge", Bson::Document(d)) => {
                 let into = d.get("into").or_else(|| d.get("coll"));
                 let target = match into {
@@ -669,17 +735,18 @@ fn stage_needs(st: &Document, db: &str, out: &mut Vec<(Action, String, Option<St
                     }),
                     _ => None,
                 };
-                (target, true)
+                (target.into_iter().collect(), true)
             }
-            _ => (None, false),
+            _ => (Vec::new(), false),
         };
-        let Some((d, c)) = named else { continue };
-        if writes {
-            for a in [Action::Insert, Action::Update, Action::Delete] {
-                out.push((a, d.clone(), Some(c.clone())));
+        for (d, c) in named {
+            if writes {
+                for a in [Action::Insert, Action::Update, Action::Delete] {
+                    out.push((a, d.clone(), Some(c.clone())));
+                }
+            } else {
+                out.push((Action::Select, d, Some(c)));
             }
-        } else {
-            out.push((Action::Select, d, Some(c)));
         }
     }
 }
@@ -755,14 +822,15 @@ fn needs(name: &str, body: &Document, db: &str) -> Vec<(Action, String, Option<S
         _ => out.push((action_of(name), db.to_owned(), coll)),
     }
     if name == "aggregate" {
-        for st in body
+        // The whole pipeline tree: a `$lookup` or `$unionWith` inside a
+        // sub-pipeline or a `$facet` branch reads its collection just the
+        // same.
+        let pipeline = body
             .get_array("pipeline")
             .map(Vec::as_slice)
-            .unwrap_or_default()
-        {
-            if let Some(st) = st.as_document() {
-                stage_needs(st, db, &mut out);
-            }
+            .unwrap_or_default();
+        for (_, st) in pipeline_stages(None, pipeline) {
+            stage_needs(st, db, &mut out);
         }
     }
     out
@@ -1096,6 +1164,106 @@ mod tests {
         );
         assert!(n.contains(&(Action::Create, "b".to_owned(), Some("y".to_owned()))));
         assert!(n.contains(&(Action::Drop, "a".to_owned(), Some("x".to_owned()))));
+    }
+
+    fn reads(n: &[(Action, String, Option<String>)], db: &str, coll: &str) -> bool {
+        n.contains(&(Action::Select, db.to_owned(), Some(coll.to_owned())))
+    }
+
+    /// A user granted one collection can't read another through a stage
+    /// nested inside the pipeline: every collection named at any depth is
+    /// on the list the grants are checked against.
+    #[test]
+    fn needs_name_collections_nested_at_any_depth() {
+        let n = needs(
+            "aggregate",
+            &doc! {"aggregate": "mine", "pipeline": [
+                // A pipeline inside a $lookup's pipeline.
+                {"$lookup": {"from": "mine", "as": "x", "pipeline": [
+                    {"$lookup": {"from": "secret_a", "as": "y", "pipeline": [
+                        {"$unionWith": "secret_b"},
+                        {"$unionWith": {"coll": "secret_c", "pipeline": [
+                            {"$graphLookup": {"from": "secret_d", "startWith": "$a",
+                                "connectFromField": "a", "connectToField": "b", "as": "g"}},
+                        ]}},
+                    ]}},
+                ]}},
+                // Branches of a $facet.
+                {"$facet": {
+                    "one": [{"$lookup": {"from": "secret_e", "as": "z"}}],
+                    "two": [{"$match": {}}, {"$unionWith": {"coll": "secret_f"}}],
+                }},
+                // `from` as a document, and a $lookup with only a pipeline.
+                {"$lookup": {"from": {"coll": "secret_g"}, "as": "w"}},
+                {"$lookup": {"as": "v", "pipeline": [
+                    {"$documents": [{}]},
+                    {"$lookup": {"from": {"db": "other", "coll": "secret_h"}, "as": "u"}},
+                ]}},
+            ]},
+            "d",
+        );
+        for coll in [
+            "mine", "secret_a", "secret_b", "secret_c", "secret_d", "secret_e", "secret_f",
+            "secret_g", "secret_h",
+        ] {
+            assert!(reads(&n, "d", coll), "{coll} missing from {n:?}");
+        }
+        // The store reads `secret_h` in the command's database; the
+        // database the document names is checked too.
+        assert!(reads(&n, "other", "secret_h"), "{n:?}");
+        // The same through explain.
+        let n = needs(
+            "explain",
+            &doc! {"explain": {"aggregate": "mine", "pipeline": [
+                {"$facet": {"a": [{"$lookup": {"from": "mine", "as": "x", "pipeline": [
+                    {"$unionWith": "secret"}]}}]}},
+            ]}},
+            "d",
+        );
+        assert!(reads(&n, "d", "secret"), "{n:?}");
+        // Writes named at the top level stay as they were.
+        let n = needs(
+            "aggregate",
+            &doc! {"aggregate": "mine", "pipeline": [
+                {"$lookup": {"from": "f", "as": "x", "pipeline": [{"$unionWith": "g"}]}},
+                {"$merge": {"into": {"db": "o", "coll": "t"}}},
+            ]},
+            "d",
+        );
+        assert!(reads(&n, "d", "f") && reads(&n, "d", "g"), "{n:?}");
+        assert!(n.contains(&(Action::Insert, "o".to_owned(), Some("t".to_owned()))));
+    }
+
+    #[test]
+    fn stages_are_listed_with_the_collection_their_pipeline_runs_on() {
+        let p = doc! {"p": [
+            {"$match": {}},
+            {"$unionWith": {"coll": "other", "pipeline": [{"$collStats": {"count": {}}}]}},
+            {"$lookup": {"from": {"coll": "third"}, "as": "x", "pipeline": [
+                {"$facet": {"a": [{"$indexStats": {}}]}}]}},
+        ]};
+        let stages = pipeline_stages(Some("top"), p.get_array("p").unwrap());
+        let on = |stage: &str| {
+            stages
+                .iter()
+                .find(|(_, st)| st.contains_key(stage))
+                .map(|(on, _)| on.clone())
+                .unwrap()
+        };
+        assert_eq!(on("$match").as_deref(), Some("top"));
+        assert_eq!(on("$collStats").as_deref(), Some("other"));
+        assert_eq!(on("$indexStats").as_deref(), Some("third"));
+        // A very deep nest is walked without recursion.
+        let mut deep = doc! {"$unionWith": "bottom"};
+        for _ in 0..300 {
+            deep = doc! {"$unionWith": {"coll": "c", "pipeline": [deep]}};
+        }
+        let n = needs(
+            "aggregate",
+            &doc! {"aggregate": "mine", "pipeline": [deep]},
+            "d",
+        );
+        assert!(reads(&n, "d", "bottom"));
     }
 
     #[test]

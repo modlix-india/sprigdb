@@ -4,8 +4,11 @@
 //! check_destination(tenant T, host h, port n):
 //!  1. sink.enabled and the target kind in sink.allowed_kinds, else 39230
 //!  2. e := the most specific allowlist entry matching (h, n), else 39213
-//!  3. resolve h; refuse private, loopback, link-local, shared and unspecified
-//!     addresses unless e lists the address itself (39213); connect to the
+//!  3. resolve h (a literal address is its own result); an internal address
+//!     (private, loopback, link-local, shared, unspecified, reserved) is
+//!     refused unless e lists the address itself AND the operator's
+//!     sink.internal_destinations covers it (39213); instance metadata
+//!     needs sink.platform_identity = full as well (39228); connect to the
 //!     address checked, so a second lookup can't swap it
 //!  4. T has a residency policy P: tags := e.tags, else the built-in region
 //!     table; no tags → 39214; P doesn't admit tags → 39214
@@ -18,12 +21,20 @@
 //! entry allows 80 and 443, plus the default port of the connection's kind
 //! (5432, 3306, 9092 or 9093) for database and Kafka connections.
 //!
+//! The allowlist is the tenant's own setting, so by itself it never opens
+//! the platform's network: `sink.internal_destinations` and
+//! `sink.platform_identity` are operator-only, and a sink's `WITH` can set
+//! neither ([`crate::settings::with_may_set`]). A platform connection's
+//! hosts were listed by an operator and need no second listing.
+//!
 //! The residency policy is an expression over tags; the caller
 //! evaluates it ([`Residency`]), so this crate needs no controller types.
 
 use std::net::{IpAddr, SocketAddr};
 
 use serde_json::{Map, Value};
+use sprig_common::outbound::InternalAllow;
+pub use sprig_common::outbound::{is_internal, is_metadata};
 use sprig_common::{Result, SprigCode};
 
 use crate::model::{ConnKind, TargetKind, err};
@@ -134,7 +145,8 @@ pub fn default_port(kind: Option<ConnKind>) -> Option<u16> {
 pub enum Matched {
     /// By name: internal addresses still refused.
     ByName,
-    /// The entry is this literal address: internal addresses allowed.
+    /// The entry is this literal address: an internal address is allowed
+    /// when the operator's list covers it too.
     Literal,
 }
 
@@ -186,36 +198,6 @@ pub fn match_entry<'a>(
             },
         )
     })
-}
-
-/// Whether `ip` is private, loopback, link-local, shared, unspecified,
-/// broadcast or multicast: reached only when listed literally.
-#[must_use]
-pub fn is_internal(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v) => {
-            let o = v.octets();
-            v.is_private()
-                || v.is_loopback()
-                || v.is_link_local()
-                || v.is_unspecified()
-                || v.is_broadcast()
-                || v.is_multicast()
-                || o[0] == 0
-                || (o[0] == 100 && (64..128).contains(&o[1]))
-        }
-        IpAddr::V6(v) => {
-            if let Some(v4) = v.to_ipv4_mapped() {
-                return is_internal(IpAddr::V4(v4));
-            }
-            let s = v.segments();
-            v.is_loopback()
-                || v.is_unspecified()
-                || v.is_multicast()
-                || (s[0] & 0xfe00) == 0xfc00
-                || (s[0] & 0xffc0) == 0xfe80
-        }
-    }
 }
 
 /// The built-in region table: tags for cloud endpoints whose
@@ -367,6 +349,9 @@ pub struct Destinations {
     pub platform_hosts: Option<Vec<String>>,
     /// `sink.platform_identity` allows the link-local metadata address.
     pub metadata_allowed: bool,
+    /// `sink.internal_destinations` (operator only): the internal
+    /// addresses an allowlist entry may open.
+    pub internal: InternalAllow,
 }
 
 impl std::fmt::Debug for Destinations {
@@ -388,7 +373,9 @@ pub struct Checked {
 }
 
 impl Destinations {
-    /// Rules allowing every listed host, with no residency (tests).
+    /// Rules allowing every listed host, with no residency and with every
+    /// internal address open to a literal entry (tests, which serve on
+    /// loopback).
     #[must_use]
     pub fn allow_list(hosts: &[&str]) -> Self {
         Self {
@@ -402,6 +389,7 @@ impl Destinations {
             residency: Box::new(Unpinned),
             platform_hosts: None,
             metadata_allowed: false,
+            internal: InternalAllow::everything(),
         }
     }
 
@@ -479,8 +467,9 @@ impl Destinations {
     /// connects to the returned address, never to the name again.
     ///
     /// # Errors
-    /// 39213 for an internal address not listed literally, or one that
-    /// doesn't resolve; 39228 for the metadata address.
+    /// 39213 for an internal address not listed literally or not covered
+    /// by the operator's list, or one that doesn't resolve; 39228 for a
+    /// metadata address.
     pub async fn resolve(
         &self,
         host: &str,
@@ -513,21 +502,36 @@ impl Destinations {
         };
         for a in &addrs {
             let ip = a.ip();
-            if ip == IpAddr::from([169, 254, 169, 254]) && !self.metadata_allowed {
+            if is_metadata(ip) && !self.metadata_allowed {
                 metrics::counter!("sprig_sink_destination_refused_total", "reason" => "identity")
                     .increment(1);
                 return Err(err(
                     SprigCode::SinkPlatformIdentityDenied,
-                    "instance metadata (169.254.169.254) needs sink.platform_identity = full",
+                    format!("instance metadata ({ip}) needs sink.platform_identity = full"),
                 ));
             }
-            if is_internal(ip) && !c.literal {
+            if !is_internal(ip) {
+                continue;
+            }
+            if !c.literal {
                 metrics::counter!("sprig_sink_destination_refused_total", "reason" => "allowlist")
                     .increment(1);
                 return Err(err(
                     SprigCode::SinkDestinationNotAllowed,
                     format!(
                         "{host} resolves to the internal address {ip}; list the address itself to allow it"
+                    ),
+                ));
+            }
+            // A platform connection's hosts are the operator's own list.
+            if self.platform_hosts.is_none() && !self.internal.covers(ip, port) {
+                metrics::counter!("sprig_sink_destination_refused_total", "reason" => "internal")
+                    .increment(1);
+                return Err(err(
+                    SprigCode::SinkDestinationNotAllowed,
+                    format!(
+                        "{host}:{port} is the internal address {ip}: an operator must list it in \
+                         sink.internal_destinations"
                     ),
                 ));
             }
@@ -629,6 +633,79 @@ mod tests {
         fn admits(&self, t: &Map<String, Value>) -> bool {
             t.get("jurisdiction").and_then(Value::as_str) == Some("EU")
         }
+    }
+
+    #[tokio::test]
+    async fn a_tenants_allowlist_alone_never_opens_an_internal_address() {
+        // What a sink task gets for a tenant whose administrator listed
+        // internal addresses, with no operator setting.
+        let tenant = |metadata_allowed: bool, internal: &str| Destinations {
+            allow: parse_allowlist(
+                r#"["127.0.0.1:7480", "10.0.0.5:5432", "192.168.0.1", "169.254.169.254",
+                    "[fd00:ec2::254]", "[::ffff:169.254.169.254]", "[::ffff:127.0.0.1]:7480",
+                    "169.254.170.2", "[fe80::1]"]"#,
+            )
+            .unwrap(),
+            residency: Box::new(Unpinned),
+            platform_hosts: None,
+            metadata_allowed,
+            internal: InternalAllow::parse(internal).unwrap(),
+        };
+        let refused = sprig_common::ErrorKind::Sprig(SprigCode::SinkDestinationNotAllowed);
+        let identity = sprig_common::ErrorKind::Sprig(SprigCode::SinkPlatformIdentityDenied);
+        let d = tenant(false, "[]");
+        for (host, port) in [
+            ("127.0.0.1", 7480),
+            ("::ffff:127.0.0.1", 7480),
+            ("10.0.0.5", 5432),
+            ("192.168.0.1", 443),
+            ("fe80::1", 443),
+        ] {
+            let e = d.resolve(host, port, None, None).await.unwrap_err();
+            assert_eq!(e.kind, refused, "{host}: {e}");
+            assert!(e.message.contains("sink.internal_destinations"), "{e}");
+        }
+        // Instance metadata in every spelling, not only 169.254.169.254.
+        for host in [
+            "169.254.169.254",
+            "fd00:ec2::254",
+            "::ffff:169.254.169.254",
+            "169.254.170.2",
+        ] {
+            let e = d.resolve(host, 80, None, None).await.unwrap_err();
+            assert_eq!(e.kind, identity, "{host}: {e}");
+        }
+        // The operator lists the database: that address and port only.
+        let d = tenant(false, "10.0.0.0/24:5432");
+        assert!(d.resolve("10.0.0.5", 5432, None, None).await.is_ok());
+        let e = d.resolve("127.0.0.1", 7480, None, None).await.unwrap_err();
+        assert_eq!(e.kind, refused, "{e}");
+        // The operator's ranges don't open metadata: that is
+        // sink.platform_identity, and then the range must cover it too.
+        let d = tenant(false, "169.254.0.0/16, fd00::/8");
+        let e = d
+            .resolve("169.254.169.254", 80, None, None)
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind, identity, "{e}");
+        let d = tenant(true, "[]");
+        let e = d
+            .resolve("169.254.169.254", 80, None, None)
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind, refused, "{e}");
+        let d = tenant(true, "169.254.169.254");
+        assert!(d.resolve("169.254.169.254", 80, None, None).await.is_ok());
+        // A platform connection's hosts are the operator's: no second list.
+        let p = Destinations {
+            allow: Vec::new(),
+            residency: Box::new(Unpinned),
+            platform_hosts: Some(vec!["10.0.0.9:9092".into()]),
+            metadata_allowed: false,
+            internal: InternalAllow::none(),
+        };
+        assert!(p.resolve("10.0.0.9", 9092, None, None).await.is_ok());
+        assert!(p.resolve("10.0.0.5", 5432, None, None).await.is_err());
     }
 
     #[tokio::test]

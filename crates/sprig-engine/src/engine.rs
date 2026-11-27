@@ -565,13 +565,22 @@ impl Engine {
     /// highest version applied to the unit (within a unit, commit
     /// timestamps follow log order, so every commit at or below it is
     /// applied). `None` where the unit is led here or not replicated:
-    /// reads use the node's own view.
+    /// reads use the node's own view. A replica that leads the unit first
+    /// makes sure it still may answer from its own state: its leader lease
+    /// holds, or a majority confirms it (a leader cut off from the others
+    /// must not serve what a newer leader may have replaced).
     ///
     /// # Errors
-    /// No leader confirmed in time, or replication hasn't started
-    /// (retryable).
+    /// No leader confirmed in time, this node could not confirm that it
+    /// still leads the unit, or replication hasn't started (retryable).
     pub fn follower_read(&self, unit: UnitId) -> Result<Option<keys::Ts>> {
-        if !self.is_replicated_unit(unit) || self.leader_epoch(unit) > 0 {
+        if !self.is_replicated_unit(unit) {
+            return Ok(None);
+        }
+        if self.leader_epoch(unit) > 0 {
+            if let Some(r) = self.replicated_log() {
+                r.leader_barrier(unit)?;
+            }
             return Ok(None);
         }
         let Some(r) = self.replicated_log() else {

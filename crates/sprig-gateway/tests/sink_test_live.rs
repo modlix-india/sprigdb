@@ -18,7 +18,9 @@
 //! per target with `TEST CONNECTION ... WRITE`: into the `MinIO` bucket `qcr`
 //! (deleted again), a Kafka topic named after the run, and the webhook.
 //!
-//! Every address must be on the tenant's `sink.destination_allowlist`.
+//! Every address must be on the tenant's `sink.destination_allowlist`, and
+//! the ones on this machine or a private network also on the operator's
+//! `sink.internal_destinations`.
 //! Each test works in a database of its own (`st_<time>`) and drops it.
 
 #![allow(

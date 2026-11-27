@@ -516,6 +516,7 @@ impl TxnShared {
                 .collect();
             let done = self.commit_across(path, txn, shares, durability, first, dep)?;
             self.wait_visible(done.cts);
+            crate::reads::note_commit(done.cts.0);
             let n = self.stats.commits.fetch_add(1, Ordering::Relaxed) + 1;
             self.prune(path);
             if n.is_multiple_of(WATERMARK_EVERY) {
@@ -610,6 +611,7 @@ impl TxnShared {
         if n.is_multiple_of(WATERMARK_EVERY) {
             path.set_gc_watermark(self.gc_watermark(self.hlc.physical_ms()));
         }
+        crate::reads::note_commit(cts.0);
         Ok(Committed {
             cts,
             ticket,

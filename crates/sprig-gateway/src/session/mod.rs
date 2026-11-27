@@ -509,6 +509,8 @@ pub struct Session {
     /// A reader session's read rules and token ([`crate::reader`]);
     /// `None` for a session on its tenant's leader.
     pub reader: Option<Arc<crate::reader::Reader>>,
+    /// Reads a session on the leader sends to a copy ([`crate::ship`]).
+    pub ship: crate::ship::SessionShip,
     state: SessionState,
     handle: Arc<SessionHandle>,
     registration: Arc<Registration>,

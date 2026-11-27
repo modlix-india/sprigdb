@@ -62,6 +62,8 @@ struct Cluster {
     dir: PathBuf,
     net: Arc<MemNetwork>,
     replicas: BTreeMap<u64, Replica>,
+    /// Each node's Raft settings.
+    config: fn(u64) -> RaftConfig,
 }
 
 fn until<T>(what: &str, mut f: impl FnMut() -> Option<T>) -> T {
@@ -77,12 +79,18 @@ fn until<T>(what: &str, mut f: impl FnMut() -> Option<T>) -> T {
 
 impl Cluster {
     fn new(name: &str) -> Self {
+        Self::with_config(name, |_| fast())
+    }
+
+    /// [`Cluster::new`] with Raft settings chosen per node.
+    fn with_config(name: &str, config: fn(u64) -> RaftConfig) -> Self {
         let dir = std::env::temp_dir().join(format!("sprig-repl-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut c = Cluster {
             dir,
             net: MemNetwork::new(),
             replicas: BTreeMap::new(),
+            config,
         };
         for id in VOTERS {
             c.start(id);
@@ -103,7 +111,7 @@ impl Cluster {
             &engine,
             EngineNodeOptions {
                 id,
-                config: fast(),
+                config: (self.config)(id),
                 store,
                 transport: self.net.transport(id),
                 clock: Arc::new(SystemClock),
@@ -761,4 +769,76 @@ fn an_isolated_followers_reads_fail_fast_and_leave_the_runtime_free() {
         .flatten()
     });
     rt.shutdown_background();
+}
+
+/// A leader cut off from the other replicas must not answer reads from its
+/// own state once its lease has run out. The others elect a leader and
+/// commit a new value; the old leader, which hasn't noticed anything yet
+/// (it checks for a lost quorum on its own, long, election timeout), still
+/// leads the unit for its engine. Its read fails as retryable; it never
+/// returns the value the new leader replaced.
+#[test]
+fn an_isolated_leader_does_not_serve_stale_reads() {
+    let c = Cluster::with_config("stale-leader", |id| RaftConfig {
+        election_ticks: if id == 1 { 300 } else { 10 },
+        ..fast()
+    });
+    let unit = Engine::unit_of_tenant(TENANT + 9);
+    c.replicas[&1].node.start_unit(unit, &VOTERS).unwrap();
+    let k = key(TENANT + 9, 1);
+    c.put(unit, &k, b"v0");
+    until("node 1 to lead", || {
+        let l = c.leader(unit);
+        if l != 1 {
+            let _ = c.replicas[&l].node.node().transfer_leader(unit.0, 1);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        (c.replicas[&1].engine.leader_epoch(unit) > 0).then_some(())
+    });
+    c.put(unit, &k, b"v0");
+    // In touch with a majority, the leader reads from its own state.
+    assert_eq!(c.get(1, &k).as_deref(), Some(&b"v0"[..]));
+
+    c.net.isolate(1, true);
+    let new = until("a new leader", || {
+        c.replicas
+            .iter()
+            .find(|(id, r)| **id != 1 && r.engine.leader_epoch(unit) > 0)
+            .map(|(id, _)| *id)
+    });
+    let mut t = c.replicas[&new]
+        .engine
+        .begin(TxnOptions::default())
+        .unwrap();
+    t.put(k.clone(), Bytes::from_static(b"v1")).unwrap();
+    t.commit().unwrap().wait().unwrap();
+
+    // The write is acknowledged; the old leader still believes it leads.
+    let old = &c.replicas[&1].engine;
+    assert!(
+        old.leader_epoch(unit) > 0,
+        "the test needs an old leader that hasn't noticed yet"
+    );
+    let mut r = old.begin(TxnOptions::default()).unwrap();
+    match r.get_snapshot(&k) {
+        Ok(v) => panic!(
+            "the isolated leader answered a read with {v:?} after the new leader acknowledged v1"
+        ),
+        Err(e) => assert_eq!(
+            e.code(),
+            Some(sprig_common::SprigCode::ShardMoved),
+            "retryable: {e}"
+        ),
+    }
+    drop(r);
+
+    // Back in touch, it follows the new leader and reads the new value.
+    c.net.isolate(1, false);
+    until("the old leader to follow", || {
+        (old.leader_epoch(unit) == 0).then_some(())
+    });
+    until("the new value on the old leader", || {
+        let mut t = old.begin(TxnOptions::default()).ok()?;
+        (t.get_snapshot(&k).ok()?.as_deref() == Some(&b"v1"[..])).then_some(())
+    });
 }

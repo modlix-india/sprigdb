@@ -2062,6 +2062,7 @@ mod fk;
 mod hidden;
 mod online;
 mod stats;
+mod tenant_wall;
 mod types;
 
 #[tokio::test]

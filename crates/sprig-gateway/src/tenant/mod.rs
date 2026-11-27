@@ -163,6 +163,8 @@ impl TenantServices {
         let registry: &'static Registry = live.registry();
         // Tenants' `backup.*` settings for the node's backup service.
         crate::backup::set_settings(live);
+        // `reads.*` and `sprig.read_from` for reads from copies.
+        crate::reader::set_settings(live);
         let stores = live.stores();
         let dc = stores.dc_id().clone();
         let global = Arc::clone(&stores.global);

@@ -23,6 +23,15 @@ pub(crate) struct MongoResume {
     dc: Option<String>,
     restore: bool,
     hello_done: bool,
+    /// A reader connection ([`crate::reader`]): served on a node holding a
+    /// replica.
+    #[serde(default)]
+    reader: bool,
+    /// A leader connection's shadow ([`crate::ship`]): it starts logged in
+    /// as this principal, taken from the mutually authenticated peer as a
+    /// login hand-off's principal is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    shadow: Option<sprig_auth::handoff::PrincipalWire>,
 }
 
 /// The resume of `st`.
@@ -36,6 +45,23 @@ pub(crate) fn resume_json(st: &Conn) -> String {
         dc: st.dc.clone(),
         restore: st.restore,
         hello_done: st.hello_done,
+        reader: false,
+        shadow: None,
+    };
+    serde_json::to_string(&r).unwrap_or_default()
+}
+
+/// The resume of `st`'s shadow connection to a copy: logged in as `p`,
+/// reading from the copy, uncompressed.
+pub(crate) fn shadow_json(st: &Conn, p: &crate::session::Principal) -> String {
+    let r = MongoResume {
+        compressors: Vec::new(),
+        client_meta: None,
+        dc: st.dc.clone(),
+        restore: false,
+        hello_done: true,
+        reader: true,
+        shadow: Some(sprig_auth::handoff::PrincipalWire::of(p)),
     };
     serde_json::to_string(&r).unwrap_or_default()
 }
@@ -64,6 +90,12 @@ pub(crate) fn resume(conn: &ClientConn, st: &mut Conn) {
     st.dc = r.dc;
     st.restore = r.restore;
     st.hello_done = r.hello_done;
+    if r.reader
+        && let Some(p) = r.shadow.and_then(|w| w.principal().ok())
+    {
+        st.follow.reader = Some(super::follow::shadow_reader(p.tenant.map_or(0, |t| t.0)));
+        st.principal = Some(p);
+    }
 }
 
 /// The user a SASL payload names: SCRAM's client-first (`n,,n=user,r=…`),

@@ -481,6 +481,94 @@ fn idle_groups_quiesce_wake_and_fail_over() {
     assert!(t.elapsed() < WAIT);
 }
 
+/// The lease a leader publishes for its own reads ([`Node::leader_barrier`])
+/// holds only while a quorum keeps accepting its frames: cut off, it runs
+/// out (the leader hasn't even noticed it lost anything yet), and from then
+/// on a read gets no answer until the replica stops leading. A transfer
+/// gives the lease up at once.
+#[test]
+fn a_leader_cut_off_from_its_followers_loses_its_lease() {
+    // The leader notices a lost quorum late (its own election timeout is
+    // long); the lease is as short as everyone's.
+    let late = RaftConfig {
+        election_ticks: 200,
+        ..fast()
+    };
+    let mut c = Cluster::new(&[2, 3], fast());
+    c.cfg = late;
+    c.start(1, MemLogStore::new());
+    c.cfg = fast();
+    c.create(1, &[1, 2, 3]);
+    c.put(1, 1, 1);
+    until("node 1 to lead", || {
+        let l = c.leader(1);
+        if l != 1 {
+            let _ = c.node(l).transfer_leader(1, 1);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        c.node(1).status(1).filter(|s| s.is_leader).map(|_| ())
+    });
+    c.put(1, 1, 1);
+    // The lease holds and is published: reads check it without the lock.
+    until("the lease", || {
+        matches!(c.node(1).leader_barrier(1), Ok(None)).then_some(())
+    });
+    assert!(c.node(1).lease_holds(1));
+    // A follower holds no lease, and its barrier is refused.
+    assert!(!c.node(2).lease_holds(1));
+    assert!(matches!(
+        c.node(2).leader_barrier(1),
+        Err(RaftError::NotLeader { .. })
+    ));
+    c.net.isolate(1, true);
+    until("the lease to run out", || {
+        (!c.node(1).lease_holds(1)).then_some(())
+    });
+    assert!(
+        c.node(1).status(1).is_some_and(|s| s.is_leader),
+        "the cut-off leader hasn't noticed yet"
+    );
+    // The others elect a leader and commit.
+    let new = until("a new leader", || {
+        [2, 3]
+            .into_iter()
+            .find(|id| c.node(*id).status(1).is_some_and(|s| s.is_leader))
+    });
+    let s = c
+        .node(new)
+        .propose(1, toy::put(1, 2), Durability::Strict)
+        .expect("propose");
+    assert!(matches!(s.wait_timeout(WAIT), Some(Ok(_))));
+    // The old leader still believes it leads, but its read gets no answer:
+    // no lease, and no quorum confirms it.
+    assert!(c.node(1).status(1).is_some_and(|s| s.is_leader));
+    let slot = c
+        .node(1)
+        .leader_barrier(1)
+        .expect("still a leader")
+        .expect("no lease: it must ask a quorum");
+    assert_eq!(slot.wait_timeout(Duration::from_millis(300)), None);
+    assert!(!c.node(1).lease_holds(1));
+    // Back in touch it follows the new leader, and the read fails.
+    c.net.isolate(1, false);
+    assert!(matches!(
+        slot.wait_timeout(WAIT),
+        Some(Err(RaftError::NotLeader { .. }))
+    ));
+    assert!(matches!(
+        c.node(1).leader_barrier(1),
+        Err(RaftError::NotLeader { .. })
+    ));
+    // The new leader's lease is given up the moment a transfer starts.
+    until("the new leader's lease", || {
+        matches!(c.node(new).leader_barrier(1), Ok(None)).then_some(())
+    });
+    assert!(c.node(new).lease_holds(1));
+    let to = if new == 2 { 3 } else { 2 };
+    c.node(new).transfer_leader(1, to).expect("transfer");
+    assert!(!c.node(new).lease_holds(1));
+}
+
 #[test]
 fn leadership_moves_by_transfer() {
     let c = Cluster::new(&[1, 2, 3], fast());

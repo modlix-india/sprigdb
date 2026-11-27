@@ -9,7 +9,7 @@ source: the metric macros in the source tree, and docs/metrics-help.toml
 
 Every metric SprigDB records, as exported on each process's telemetry port (`/metrics`, Prometheus text) and through OTLP. Counters end in `_total`; durations are histograms in seconds.
 
-477 metrics in 56 groups.
+491 metrics in 56 groups.
 
 ## `sprig_advisor_*`
 
@@ -238,6 +238,7 @@ Every metric SprigDB records, as exported on each process's telemetry port (`/me
 | `sprig_controller_migration_phase_seconds` | histogram | `phase` | sprig-controller | Duration of tenant moves between data centres; `phase` is the phase, `total` for the whole move. Unit: seconds. |
 | `sprig_controller_migration_write_pause_seconds` | histogram | - | sprig-controller | Write pause of each tenant move between data centres (target `migration.write_pause_target_ms`). Unit: seconds. |
 | `sprig_controller_migrations_total` | counter | `cause`, `result` | sprig-controller | Tenant moves between data centres started; `cause` is what triggered it (operator, traffic, residency), `result` is `started` or `auto_started`. Unit: count. |
+| `sprig_controller_nodes_declared_dead_total` | counter | - | sprig-controller | Engine nodes the controller declared dead: their gateway was not ready for replication.dead_node_minutes, so each unit with a copy there gets a new copy on another node. Unit: count. |
 | `sprig_controller_observed_writer_changes_total` | counter | - | sprig-controller | Writer changes made outside SprigDB that the controller observed and published after `failover.observe_settle_ms`. Unit: count. |
 | `sprig_controller_queue_depth` | gauge | `loop` | sprig-controller | Work items queued for a controller loop; `loop` names the loop. Unit: count. |
 | `sprig_controller_reconcile_duration_seconds` | histogram | `loop` | sprig-controller | Time of one reconcile step of a controller loop; `loop` names the loop. Unit: seconds. |
@@ -522,9 +523,21 @@ Every metric SprigDB records, as exported on each process's telemetry port (`/me
 
 | Metric | Type | Labels | Recorded by | Description |
 |---|---|---|---|---|
+| `sprig_node_apply_queue_entries` | gauge | - | sprig-gateway | Committed log entries this node has not applied yet, summed over the units it holds. Unit: entries. |
+| `sprig_node_clock_offset_seconds` | gauge | - | sprig-gateway | How far this node's clock is from the other nodes' (the median of what each other node measures, absolute). Above half of replication.max_offset_ms it warns; above 80% it leads no units. Unit: seconds. |
 | `sprig_node_direct_connections_total` | counter | `protocol` | sprig-gateway | Client connections whose tenant this node served itself after their login named it (no hand-off); `protocol` is the listener's protocol. With `sprig_node_forwarded_connections_total` it gives the forwarded ratio. Unit: count. |
 | `sprig_node_forwarded_connections_total` | counter | `protocol`, `result` | sprig-gateway | Client connections this node handed to the node leading their tenant's unit at the login message (`NodeForward.Splice` on the peer listener); `protocol` is the listener's protocol, `result` is `ok`, `unreachable`, `refused` or `redirect_loop`. Unit: count. |
+| `sprig_node_leader_transfers_total` | counter | `reason` | sprig-gateway | Unit leaderships this node handed to another voter because it is draining, stopping or its clock is out of bounds; `reason` is `drain` or `clock`. Unit: count. |
+| `sprig_node_leaders` | gauge | - | sprig-gateway | Engine units this node leads. Unit: units. |
+| `sprig_node_replication_lag_entries` | gauge | - | sprig-gateway | The largest gap, over the units this node leads, between the commit index and a voter's matched index. Unit: entries. |
+| `sprig_node_rereplication_seconds` | histogram | - | sprig-gateway | How long one re-replication took on the unit's leader: the new copy added as a learner, sent a snapshot and the log, and made a voter in place of the lost one. Unit: seconds. |
+| `sprig_node_rereplications_total` | counter | `result` | sprig-gateway | Units whose copy on a dead or removed node this node (their leader) replaced on another node; `result` is `ok` or `failed` (retried). Unit: count. |
 | `sprig_node_sessions_moved_total` | counter | - | sprig-gateway | Sessions marked to close at their next safe point because another node now leads their tenant's unit (39502 ER_SPRIG_SESSION_MOVED; clients reconnect). Unit: count. |
+| `sprig_node_stale_replicas_dropped_total` | counter | - | sprig-gateway | Copies this node dropped because their unit's descriptor no longer lists it (its units were re-replicated while it was dead or removed). Unit: count. |
+| `sprig_node_state` | gauge | `state` | sprig-gateway | 1 for this node's registry state (`state`: active, draining, dead, removed). Unit: none. |
+| `sprig_node_units` | gauge | - | sprig-gateway | Engine units this node holds a copy of. Unit: units. |
+| `sprig_node_units_leaderless` | gauge | - | sprig-gateway | Units this node holds a copy of with no leader known. Unit: units. |
+| `sprig_node_units_under_replicated` | gauge | - | sprig-gateway | Units this node leads that are short of copies: a voter on a dead or removed node, or fewer than three voters. Unit: units. |
 
 ## `sprig_operator_*`
 
@@ -738,6 +751,7 @@ Every metric SprigDB records, as exported on each process's telemetry port (`/me
 | Metric | Type | Labels | Recorded by | Description |
 |---|---|---|---|---|
 | `sprig_unit_follower_reads_total` | counter | `served` | sprig-gateway | Reads served on this node's copies of tenant units (reader sessions), by how they were let through: `served` is `local` (at once: the copy held the session's token and was fresh within the bound), `waited` (after a short wait for the copy to catch up) or `barrier` (after the leader confirmed its commits). Unit: count. |
+| `sprig_unit_shipped_reads_total` | counter | `protocol`, `result` | sprig-gateway | Reads a session on a tenant's leader sent to a copy (`READ_FROM(follower)`, `SET sprig.read_from = follower`, `reads.read_from`, MongoDB `secondary` read preferences), by protocol and `result`: `ok` (the copy answered), `fallback` (the copy couldn't, so the leader answered) or `unavailable` (no copy reachable; the leader answered). Unit: count. |
 
 ## `sprig_vector_*`
 

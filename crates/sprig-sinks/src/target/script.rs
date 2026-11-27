@@ -1162,6 +1162,7 @@ impl ScriptTarget {
                         residency: Box::new(Unpinned),
                         platform_hosts: None,
                         metadata_allowed: false,
+                        internal: sprig_common::outbound::InternalAllow::none(),
                     })
                 },
                 |c| Arc::clone(&c.dest),

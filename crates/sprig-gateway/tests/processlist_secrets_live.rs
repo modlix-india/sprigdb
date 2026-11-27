@@ -13,6 +13,7 @@
 //! export SPRIG_TEST_PROCESSLIST_USER=acme.app SPRIG_TEST_PROCESSLIST_PASSWORD=sprig-dev-app
 //! # the login needs CREATE USER and SPRIG_SINK_ADMIN, and the tenant
 //! # sink.destination_allowlist = ["127.0.0.1:9"] for the connection case
+//! # (and the operator's sink.internal_destinations covering 127.0.0.1:9)
 //! cargo test -p sprig-gateway --test processlist_secrets_live -- --nocapture --test-threads 1
 //! ```
 

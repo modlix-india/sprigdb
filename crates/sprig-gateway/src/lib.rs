@@ -112,6 +112,8 @@ pub mod registry;
 // Full-text search.
 pub mod search;
 pub mod session;
+// Reads a session on the leader sends to a copy.
+pub mod ship;
 pub mod sink_peer;
 pub(crate) mod table_changes;
 pub mod tenant;
@@ -425,6 +427,10 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
             let cache = t.cache.clone();
             let lookup: limits::TenantSettingsLookup =
                 Arc::new(move |id| cache.cached(id).map(|c| Arc::clone(&c.settings)));
+            // Reads from copies read tenants' `reads.*` and
+            // `placement.read_copies` the same way.
+            reader::set_tenant_settings(Arc::clone(&lookup));
+            reader::set_tenant_cache(t.cache.clone());
             lookup
         }),
     });

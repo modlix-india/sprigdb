@@ -58,8 +58,12 @@
 //!   (`node.pem`, `node-key.pem`); the certificate names the node
 //!   (subjectAltName `node-<raft id>`). Set, Raft traffic uses mutual TLS
 //!   with node identity: a node dials only the node it means and accepts
-//!   frames only from the node a peer's certificate names. Unset: plain
-//!   TCP (development).
+//!   frames only from the node a peer's certificate names. Unset, a node
+//!   that replicates refuses to start: without it Raft is plain TCP, and
+//!   whoever reaches the port can send votes, appends and snapshots for
+//!   any tenant's group.
+//! - `SPRIGDB_ENGINE_INSECURE_CLUSTER=true`: development and test clusters
+//!   only: lets a node replicate over that plain, unauthenticated TCP.
 //! - `SPRIGDB_ENGINE_RAFT_TRANSPORT=peer`: Raft traffic arrives on the
 //!   peer listener instead of a listener of its own; then
 //!   `SPRIGDB_ENGINE_RAFT_PEERS` names every node's peer listener. A Raft
@@ -138,6 +142,48 @@ pub const RAFT_TLS_DIR_VAR: &str = "SPRIGDB_ENGINE_RAFT_TLS_DIR";
 /// The variable choosing where Raft traffic arrives: `tcp` (the default,
 /// its own listener) or `peer` (the peer listener).
 pub const RAFT_TRANSPORT_VAR: &str = "SPRIGDB_ENGINE_RAFT_TRANSPORT";
+
+/// `true` lets a replicated node run without mutual TLS on its Raft
+/// traffic (development and test clusters).
+pub const INSECURE_CLUSTER_VAR: &str = "SPRIGDB_ENGINE_INSECURE_CLUSTER";
+
+/// Why a node with replication settings `r` may not start: it would take
+/// Raft traffic over plain TCP from anyone who reaches its port (`tls`:
+/// [`RAFT_TLS_DIR_VAR`] is set), and nobody asked for that by name.
+/// `None` with mutual TLS, with [`INSECURE_CLUSTER_VAR`] set to `true`,
+/// and for one node alone that listens on a loopback address.
+fn plain_raft_refused(
+    r: &RaftSetup,
+    tls: bool,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<Option<String>> {
+    let insecure = match lookup(INSECURE_CLUSTER_VAR)
+        .map(|v| v.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        None | Some("" | "false" | "0" | "no" | "off") => false,
+        Some("true" | "1" | "yes" | "on") => true,
+        Some(other) => {
+            return Err(SprigError::internal(format!(
+                "{INSECURE_CLUSTER_VAR} must be true or false, not '{other}'"
+            )));
+        }
+    };
+    if tls || insecure {
+        return Ok(None);
+    }
+    let others = r.peers.iter().filter(|(p, _)| *p != r.id).count();
+    if others == 0 && !r.join && r.listen.ip().is_loopback() {
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "this node would replicate with {others} other node(s), listening on {}, over plain \
+         TCP that nothing authenticates: set {RAFT_TLS_DIR_VAR} (mutual TLS with node \
+         certificates; SPRIGDB_ENGINE_RAFT_TLS_ISSUED=on has the controller's internal CA issue \
+         them), or, on a development or test cluster only, {INSECURE_CLUSTER_VAR}=true",
+        r.listen
+    )))
+}
 
 /// Whether Raft traffic arrives on the peer listener ([`RAFT_TRANSPORT_VAR`]).
 fn raft_on_peer_from(lookup: impl Fn(&str) -> Option<String>) -> Result<bool> {
@@ -316,7 +362,11 @@ pub fn start_placement(
         ));
         // Extra read copies: the leader keeps its units' learners equal to
         // their descriptors'.
-        tokio::spawn(crate::read_copies::follow(Arc::clone(&dir), stop.clone()));
+        tokio::spawn(crate::read_copies::follow(
+            Arc::clone(&dir),
+            Arc::clone(&dc),
+            stop.clone(),
+        ));
         tokio::spawn(dir.follow(dc, stop));
     }
 }
@@ -882,6 +932,18 @@ fn start_raft(engine: &Engine, r: &RaftSetup, dir: PathBuf) -> Result<()> {
     ));
     let tls = raft_tls(r.id)?;
     let mtls = tls.is_some();
+    // Before anything listens: plain Raft is asked for by name, or not run.
+    if let Some(why) = plain_raft_refused(r, mtls, |k| std::env::var(k).ok())? {
+        return Err(raft_err(why));
+    }
+    if !mtls {
+        tracing::warn!(
+            node = r.id,
+            listen = %r.listen,
+            "engine replication: Raft traffic is plain TCP that nothing authenticates \
+             (development and test clusters only)"
+        );
+    }
     let on_peer = raft_on_peer_from(|k| std::env::var(k).ok())?;
     let transport = sprig_raft::tcp::TcpTransport::new(r.id, rt.handle().clone(), tls);
     transport.set_preface(on_peer);
@@ -1372,6 +1434,85 @@ mod tests {
                 .find(|(n, _)| *n == k)
                 .map(|(_, v)| (*v).to_owned())
         })
+    }
+
+    /// A node that replicates never takes Raft traffic over plain TCP
+    /// unless its operator asked for that by name.
+    #[test]
+    fn plain_raft_needs_the_insecure_switch() {
+        let three = "1=10.0.0.1:26171,2=10.0.0.2:26171,3=10.0.0.3:26171";
+        let local = "1=127.0.0.1:26171,2=127.0.0.1:26172,3=127.0.0.1:26173";
+        let setup = |vars: &[(&str, &str)]| {
+            raft(vars)
+                .unwrap_or_else(|e| panic!("{e}"))
+                .unwrap_or_else(|| panic!("replicated"))
+        };
+        let check = |r: &RaftSetup, tls: bool, switch: Option<&str>| {
+            plain_raft_refused(r, tls, |k| {
+                (k == INSECURE_CLUSTER_VAR)
+                    .then(|| switch.map(str::to_owned))
+                    .flatten()
+            })
+        };
+        for peers in [three, local] {
+            let r = setup(&[(RAFT_ID_VAR, "2"), (RAFT_PEERS_VAR, peers)]);
+            // No TLS, nothing said: refused, and the message names both
+            // ways out.
+            let why = check(&r, false, None)
+                .unwrap_or_else(|e| panic!("{e}"))
+                .unwrap_or_else(|| panic!("{peers}: a plain cluster started"));
+            assert!(
+                why.contains(RAFT_TLS_DIR_VAR) && why.contains(INSECURE_CLUSTER_VAR),
+                "{why}"
+            );
+            for off in ["false", "0", "no", "off", "", " "] {
+                assert!(
+                    check(&r, false, Some(off))
+                        .unwrap_or_else(|e| panic!("{e}"))
+                        .is_some()
+                );
+            }
+            // Mutual TLS, or the switch by name.
+            assert_eq!(
+                check(&r, true, None).unwrap_or_else(|e| panic!("{e}")),
+                None
+            );
+            for on in ["true", "TRUE", "1", "yes", "on", " true "] {
+                assert_eq!(
+                    check(&r, false, Some(on)).unwrap_or_else(|e| panic!("{e}")),
+                    None
+                );
+            }
+            // A value that is neither isn't read as yes.
+            assert!(check(&r, false, Some("maybe")).is_err());
+        }
+        // One node alone on loopback has nobody to listen to; on another
+        // address, or joining a cluster, it does.
+        let alone = setup(&[(RAFT_ID_VAR, "1"), (RAFT_PEERS_VAR, "1=127.0.0.1:26171")]);
+        assert_eq!(
+            check(&alone, false, None).unwrap_or_else(|e| panic!("{e}")),
+            None
+        );
+        let open = setup(&[
+            (RAFT_ID_VAR, "1"),
+            (RAFT_PEERS_VAR, "1=127.0.0.1:26171"),
+            (RAFT_LISTEN_VAR, "0.0.0.0:26171"),
+        ]);
+        assert!(
+            check(&open, false, None)
+                .unwrap_or_else(|e| panic!("{e}"))
+                .is_some()
+        );
+        let joining = setup(&[
+            (RAFT_ID_VAR, "1"),
+            (RAFT_PEERS_VAR, "1=127.0.0.1:26171"),
+            (RAFT_JOIN_VAR, "true"),
+        ]);
+        assert!(
+            check(&joining, false, None)
+                .unwrap_or_else(|e| panic!("{e}"))
+                .is_some()
+        );
     }
 
     #[test]

@@ -57,9 +57,42 @@ impl std::fmt::Display for SqlError {
     }
 }
 
+/// A right on one logical database, as [`SqlRunner::holds_on_database`]
+/// asks for it: the SQL privilege of the same name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DbRight {
+    /// `SELECT`: reading keys.
+    Select,
+    /// `INSERT`: creating keys.
+    Insert,
+    /// `UPDATE`: changing keys.
+    Update,
+    /// `DELETE`: removing keys.
+    Delete,
+    /// `DROP`: emptying every database at once.
+    Drop,
+    /// `EXECUTE`: running scripts and functions.
+    Execute,
+    /// `CREATE ROUTINE`: loading function libraries.
+    CreateRoutine,
+    /// `ALTER ROUTINE`: replacing and deleting function libraries.
+    AlterRoutine,
+}
+
 /// Runs SQL for a front end.
 #[async_trait]
 pub trait SqlRunner: Send {
+    /// Whether the session's user holds every one of `rights` on the
+    /// logical database `database`, through a grant on the whole tenant or
+    /// on that database. The Redis front end asks before it runs a command
+    /// on the storage engine, where no SQL statement would check for it.
+    /// `None`: this runner authorizes nothing (a test's or an internal
+    /// task's connection), and the caller goes ahead; a runner that serves
+    /// clients always answers. By default `None`.
+    fn holds_on_database(&self, _rights: &[DbRight], _database: &str) -> Option<bool> {
+        None
+    }
+
     /// A statement returning rows.
     async fn query(&mut self, sql: &str) -> Result<Vec<Row>, SqlError>;
     /// A statement returning an affected-row count.

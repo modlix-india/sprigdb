@@ -54,6 +54,14 @@ key!(
     HardBounds::one_of(&["off", "assume_role", "full"]), true, "Whether sinks may use the worker's cloud identity"
 );
 key!(
+    /// `sink.internal_destinations`: the internal addresses (private,
+    /// loopback, link-local and the like) an entry of
+    /// `sink.destination_allowlist` may open, as addresses or CIDR ranges
+    /// with an optional port. Operators only; empty: none.
+    INTERNAL_DESTINATIONS: Text = "sink.internal_destinations", Cow::Borrowed("[]"), TENANT_DC_GLOBAL,
+    HardBounds::NONE, true, "Internal addresses sinks may reach when the allowlist names them"
+);
+key!(
     /// `sink.max_per_tenant`.
     MAX_PER_TENANT: u64 = "sink.max_per_tenant", 50, TENANT_GLOBAL,
     HardBounds::range(0, 100_000), false, "Sinks per tenant"
@@ -257,6 +265,23 @@ key!(
     SCRIPT_DB_BUDGET_MS: u64 = "sink.script_db_budget_ms", 5000, Scopes::DATA,
     HardBounds::range(1, 3_600_000), false, "Time one script batch may spend in reads"
 );
+
+/// Whether a sink's `WITH (...)` may set `name` (a key without `sink.`):
+/// a target's own option (not a setting) always; a `sink.*` setting only
+/// when it can be set for one object and isn't the operator's. The
+/// destination rules (`destination_allowlist`, `internal_destinations`,
+/// `platform_identity`, `enabled`, `allowed_kinds`) and the per-tenant and
+/// per-process limits are therefore never a sink's own choice.
+#[must_use]
+pub fn with_may_set(name: &str) -> bool {
+    let k = format!("sink.{}", name.strip_prefix("sink.").unwrap_or(name));
+    let Ok(reg) = sprig_settings::Registry::global() else {
+        return false;
+    };
+    reg.get(&k).is_none_or(|def| {
+        !def.operator_only() && def.scopes().contains(sprig_settings::ScopeKind::Object)
+    })
+}
 
 /// The `u64` keys a sink's `WITH (...)` may set, by name without `sink.`.
 #[must_use]

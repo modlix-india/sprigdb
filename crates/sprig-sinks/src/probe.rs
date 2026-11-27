@@ -239,6 +239,9 @@ pub async fn test_definition(
             residency: env.residency_of(tenant).await?,
             platform_hosts: None,
             metadata_allowed: opts.get("platform_identity") == Some("full"),
+            internal: sprig_common::outbound::InternalAllow::parse_or_none(
+                opts.get("internal_destinations").unwrap_or("[]"),
+            ),
         }),
     };
     let ms = || u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX);

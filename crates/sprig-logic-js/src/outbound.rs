@@ -5,8 +5,12 @@
 //! fetch(url):
 //!   scheme http or https, else 39867
 //!   host (and port) on the allowlist, else 39867
-//!   resolve; any address private, loopback, link-local, CGNAT, unspecified
-//!     or multicast → 39867, unless the allowlist names that address literally
+//!   resolve (a literal address is its own result); for every address:
+//!     instance metadata (169.254.169.254, fd00:ec2::254, ...) → 39867, always
+//!     internal (private, loopback, link-local, shared, unspecified,
+//!       multicast, reserved) → 39867, unless the allowlist names that
+//!       address literally AND the operator's
+//!       logic.outbound_internal_allowlist covers it
 //!   connect to the resolved address (no second lookup, so DNS rebinding
 //!     can't swap it), TLS for https with the host's name and webpki roots
 //!   logic.outbound_timeout_ms for the whole call, logic.outbound_max_bytes
@@ -16,6 +20,12 @@
 //! Allowlist entries are `host`, `host:port`, `*.domain` (any subdomain,
 //! not the domain itself) or an IP address, optionally with a port.
 //! Without a port an entry allows 80 and 443 only.
+//!
+//! The allowlist is the tenant's own setting, so it can't open the
+//! platform's network: an internal address needs the operator-only
+//! `logic.outbound_internal_allowlist` as well
+//! ([`sprig_common::outbound`]), and nothing lets tenant code reach a
+//! cloud's instance metadata.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, LazyLock};
@@ -26,6 +36,8 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::Uri;
 use hyper_util::rt::TokioIo;
+use sprig_common::outbound::InternalAllow;
+pub use sprig_common::outbound::{is_internal, is_metadata};
 use sprig_common::{Result, SprigCode, SprigError};
 
 /// The outbound settings of one invocation.
@@ -37,6 +49,9 @@ pub struct OutboundPolicy {
     pub timeout: Duration,
     /// `logic.outbound_max_bytes`.
     pub max_bytes: u64,
+    /// `logic.outbound_internal_allowlist` (operator only): the internal
+    /// addresses an allowlist entry may open.
+    pub internal: InternalAllow,
 }
 
 impl Default for OutboundPolicy {
@@ -45,6 +60,7 @@ impl Default for OutboundPolicy {
             allow: Vec::new(),
             timeout: Duration::from_millis(2000),
             max_bytes: 1 << 20,
+            internal: InternalAllow::none(),
         }
     }
 }
@@ -117,9 +133,10 @@ fn host_of(url: &str) -> String {
 pub enum Allowed {
     /// Not listed.
     No,
-    /// Listed by name (private addresses still refused).
+    /// Listed by name (internal addresses still refused).
     ByName,
-    /// Listed as this literal address: private addresses allowed.
+    /// Listed as this literal address: an internal address is allowed
+    /// when the operator's list covers it too.
     Literal,
 }
 
@@ -173,34 +190,38 @@ fn split_port(entry: &str) -> (&str, Option<u16>) {
     (entry, None)
 }
 
-/// Whether `ip` is private, loopback, link-local, shared (CGNAT),
-/// unspecified, broadcast or multicast: never reached by name.
-#[must_use]
-pub fn is_internal(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v) => {
-            let o = v.octets();
-            v.is_private()
-                || v.is_loopback()
-                || v.is_link_local()
-                || v.is_unspecified()
-                || v.is_broadcast()
-                || v.is_multicast()
-                || o[0] == 0
-                || (o[0] == 100 && (64..128).contains(&o[1]))
-        }
-        IpAddr::V6(v) => {
-            if let Some(v4) = v.to_ipv4_mapped() {
-                return is_internal(IpAddr::V4(v4));
-            }
-            let s = v.segments();
-            v.is_loopback()
-                || v.is_unspecified()
-                || v.is_multicast()
-                || (s[0] & 0xfe00) == 0xfc00
-                || (s[0] & 0xffc0) == 0xfe80
-        }
+/// Whether tenant code may connect to `ip:port`, which an allowlist entry
+/// matched as `how` led to (module notes).
+///
+/// # Errors
+/// Why not, for the 39867 message.
+pub fn address_allowed(
+    how: Allowed,
+    internal: &InternalAllow,
+    ip: IpAddr,
+    port: u16,
+) -> std::result::Result<(), String> {
+    if is_metadata(ip) {
+        return Err(format!(
+            "{ip} is a cloud instance-metadata address, which code never reaches"
+        ));
     }
+    if !is_internal(ip) {
+        return Ok(());
+    }
+    if how != Allowed::Literal {
+        return Err(format!(
+            "the internal address {ip} is reached only when logic.outbound_allowlist names \
+             the address itself"
+        ));
+    }
+    if !internal.covers(ip, port) {
+        return Err(format!(
+            "{ip}:{port} is an internal address: an operator must list it in \
+             logic.outbound_internal_allowlist"
+        ));
+    }
+    Ok(())
 }
 
 /// The HTTP/1.1 client behind `Sprig.Http.Fetch`.
@@ -298,13 +319,10 @@ impl HttpOutbound {
                 .map_err(|e| failed(format!("can't resolve {bare}: {e}")))?
                 .collect(),
         };
-        if how != Allowed::Literal
-            && let Some(a) = addrs.iter().find(|a| is_internal(a.ip()))
-        {
-            return Err(denied(&format!(
-                "{bare} resolves to the internal address {}",
-                a.ip()
-            )));
+        // Every address the name stands for, and a literal one the same.
+        for a in &addrs {
+            address_allowed(how, &p.internal, a.ip(), port)
+                .map_err(|why| denied(&format!("{bare}: {why}")))?;
         }
         let addr = *addrs
             .first()
@@ -467,6 +485,7 @@ mod tests {
         let port = server("hello").await;
         let o = HttpOutbound::new(OutboundPolicy {
             allow: vec![format!("127.0.0.1:{port}")],
+            internal: InternalAllow::parse(&format!("127.0.0.1:{port}")).unwrap(),
             ..OutboundPolicy::default()
         });
         let r = o
@@ -483,6 +502,7 @@ mod tests {
         // literally.
         let o = HttpOutbound::new(OutboundPolicy {
             allow: vec![format!("localhost:{port}")],
+            internal: InternalAllow::everything(),
             ..OutboundPolicy::default()
         });
         let e = o
@@ -499,6 +519,7 @@ mod tests {
         let port = server("0123456789").await;
         let o = HttpOutbound::new(OutboundPolicy {
             allow: vec![format!("127.0.0.1:{port}")],
+            internal: InternalAllow::everything(),
             max_bytes: 4,
             ..OutboundPolicy::default()
         });
@@ -535,5 +556,104 @@ mod tests {
             let e = o.fetch(get(url)).await.unwrap_err();
             assert_eq!(e.code(), Some(SprigCode::LogicOutboundDenied), "{url}: {e}");
         }
+    }
+
+    #[test]
+    fn an_internal_address_needs_the_operators_list_as_well() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let none = InternalAllow::none();
+        let ops = InternalAllow::parse("10.0.5.0/24:5432, 169.254.0.0/16, fd00::/8").unwrap();
+        // A public address: the tenant's allowlist is enough.
+        assert!(address_allowed(Allowed::ByName, &none, ip("93.184.216.34"), 443).is_ok());
+        assert!(address_allowed(Allowed::Literal, &none, ip("93.184.216.34"), 443).is_ok());
+        // An internal one listed literally by the tenant: not without the
+        // operator.
+        for a in [
+            "127.0.0.1",
+            "10.0.5.7",
+            "192.168.1.1",
+            "::1",
+            "::ffff:10.0.5.7",
+            "fe80::1",
+        ] {
+            let e = address_allowed(Allowed::Literal, &none, ip(a), 5432).unwrap_err();
+            assert!(e.contains("logic.outbound_internal_allowlist"), "{a}: {e}");
+        }
+        // With the operator's range: that port only, and still only when
+        // the tenant names the address itself.
+        assert!(address_allowed(Allowed::Literal, &ops, ip("10.0.5.7"), 5432).is_ok());
+        assert!(address_allowed(Allowed::Literal, &ops, ip("10.0.5.7"), 22).is_err());
+        assert!(address_allowed(Allowed::Literal, &ops, ip("10.0.6.7"), 5432).is_err());
+        assert!(address_allowed(Allowed::ByName, &ops, ip("10.0.5.7"), 5432).is_err());
+        // Instance metadata: never, even inside a range the operator listed.
+        for a in [
+            "169.254.169.254",
+            "169.254.170.2",
+            "fd00:ec2::254",
+            "::ffff:169.254.169.254",
+            "64:ff9b::a9fe:a9fe",
+        ] {
+            for how in [Allowed::Literal, Allowed::ByName] {
+                let e = address_allowed(how, &ops, ip(a), 80).unwrap_err();
+                assert!(e.contains("metadata"), "{a}: {e}");
+                let e = address_allowed(how, &InternalAllow::everything(), ip(a), 80).unwrap_err();
+                assert!(e.contains("metadata"), "{a}: {e}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tenants_allowlist_alone_never_opens_an_internal_address() {
+        // A service on this machine (the Admin API's place), and everything
+        // a tenant administrator can put on logic.outbound_allowlist.
+        let port = server("the node's secrets").await;
+        let allow = vec![
+            format!("127.0.0.1:{port}"),
+            format!("[::ffff:127.0.0.1]:{port}"),
+            "169.254.169.254".to_owned(),
+            "[fd00:ec2::254]".to_owned(),
+            "[::ffff:169.254.169.254]".to_owned(),
+            "10.0.0.1".to_owned(),
+            "192.168.0.1".to_owned(),
+            "[fe80::1]".to_owned(),
+        ];
+        let get = |url: String| Request {
+            method: "GET".into(),
+            url,
+            headers: Vec::new(),
+            body: None,
+        };
+        let urls = [
+            format!("http://127.0.0.1:{port}/admin/v1/tenants"),
+            format!("http://[::ffff:127.0.0.1]:{port}/"),
+            "http://169.254.169.254/latest/meta-data/iam/security-credentials/".to_owned(),
+            "http://[fd00:ec2::254]/latest/meta-data/".to_owned(),
+            "http://[::ffff:169.254.169.254]/".to_owned(),
+            "http://10.0.0.1/".to_owned(),
+            "http://192.168.0.1/".to_owned(),
+            "http://[fe80::1]/".to_owned(),
+        ];
+        let tenant_only = HttpOutbound::new(OutboundPolicy {
+            allow: allow.clone(),
+            ..OutboundPolicy::default()
+        });
+        for url in &urls {
+            let e = tenant_only.fetch(get(url.clone())).await.unwrap_err();
+            assert_eq!(e.code(), Some(SprigCode::LogicOutboundDenied), "{url}: {e}");
+        }
+        // The operator lists the local service: it is reached, and metadata
+        // still is not, whatever the operator's ranges say.
+        let with_operator = HttpOutbound::new(OutboundPolicy {
+            allow,
+            internal: InternalAllow::parse(&format!("127.0.0.1:{port}, 169.254.0.0/16, fd00::/8"))
+                .unwrap(),
+            ..OutboundPolicy::default()
+        });
+        for url in &urls[2..5] {
+            let e = with_operator.fetch(get(url.clone())).await.unwrap_err();
+            assert_eq!(e.code(), Some(SprigCode::LogicOutboundDenied), "{url}: {e}");
+        }
+        let r = with_operator.fetch(get(urls[0].clone())).await.unwrap();
+        assert_eq!((r.status, r.body.as_str()), (200, "the node's secrets"));
     }
 }

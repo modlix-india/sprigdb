@@ -351,7 +351,12 @@ pub async fn resolve_opts<Q: Queryable + Send>(
     }
     let mut m: BTreeMap<String, String> = best.into_iter().map(|(k, (_, v))| (k, v)).collect();
     for (k, v) in &def.options {
-        m.insert(k.clone(), v.clone());
+        // A sink's own `WITH` decides only what one sink may decide: never
+        // the destination rules or another key that is the operator's or
+        // the tenant's as a whole.
+        if crate::settings::with_may_set(k) {
+            m.insert(k.clone(), v.clone());
+        }
     }
     Ok(Opts(m))
 }
@@ -826,6 +831,9 @@ pub async fn open_conn(
 ) -> Result<Conn> {
     let allow = parse_allowlist(opts.get("destination_allowlist").unwrap_or("[]"))?;
     let metadata_allowed = opts.get("platform_identity") == Some("full");
+    let internal = sprig_common::outbound::InternalAllow::parse_or_none(
+        opts.get("internal_destinations").unwrap_or("[]"),
+    );
     match r {
         ConnRef::Tenant { id, name } => {
             let def = store.connection(*id).await?.ok_or_else(|| {
@@ -864,6 +872,7 @@ pub async fn open_conn(
                     residency: env.residency_of(tenant).await?,
                     platform_hosts: None,
                     metadata_allowed,
+                    internal,
                 }),
             })
         }
@@ -922,6 +931,7 @@ pub async fn open_conn(
                     residency: env.residency_of(tenant).await?,
                     platform_hosts: Some(p.hosts.clone()),
                     metadata_allowed,
+                    internal,
                 }),
             })
         }

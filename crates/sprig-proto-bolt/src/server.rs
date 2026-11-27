@@ -51,6 +51,9 @@ pub struct ConnInfo {
     pub connection_id: String,
     /// `user_agent` from `HELLO`.
     pub user_agent: String,
+    /// `HELLO` carried a routing context: a `neo4j://` driver, which sends
+    /// each transaction where its routing table names (reads to readers).
+    pub routing: bool,
 }
 
 /// A failure sent to the client: a Neo4j status code and a message.
@@ -200,6 +203,8 @@ pub struct Resume {
     pub user_agent: String,
     /// 5.1+: `HELLO` was answered; `LOGON` comes next.
     pub hello_done: bool,
+    /// `HELLO` carried a routing context ([`ConnInfo::routing`]).
+    pub routing: bool,
 }
 
 /// A connection to hand to the node that serves its tenant.
@@ -583,6 +588,7 @@ impl Conn {
                     .and_then(PackValue::as_str)
                     .unwrap_or_default()
                     .clone_into(&mut self.info.user_agent);
+                self.info.routing = has_routing(&extra);
                 if self.info.version < BoltVersion::new(5, 1) {
                     // 5.0: credentials ride in HELLO.
                     if self.logon(svc, &extra).await {
@@ -826,6 +832,7 @@ where
                 version: r.version,
                 connection_id: r.connection_id,
                 user_agent: r.user_agent,
+                routing: r.routing,
             },
             session: None,
             results: Vec::new(),
@@ -867,6 +874,7 @@ where
             version,
             connection_id: format!("{}{id}", cfg.id_prefix),
             user_agent: String::new(),
+            routing: false,
         },
         session: None,
         results: Vec::new(),
@@ -918,6 +926,7 @@ fn chunked(msg: &[u8], out: &mut Vec<u8>) {
 /// The connection's write half, shared with the keep-alive task.
 type Writer<S> = Arc<tokio::sync::Mutex<WriteHalf<S>>>;
 
+#[allow(clippy::too_many_lines)] // the read loop and the hand-off check, in order
 async fn run_loop<S>(
     rd: &mut ReadHalf<S>,
     wr: &Writer<S>,
@@ -941,6 +950,9 @@ where
             match dechunk.next(&mut inbuf) {
                 Ok(Some(msg)) => match Request::decode(&msg) {
                     Ok(req) => {
+                        if let Request::Hello(m) = &req {
+                            conn.info.routing = has_routing(m);
+                        }
                         // Credentials for a tenant served by another node:
                         // the connection goes there from this message on.
                         let creds = match (&conn.state, &req) {
@@ -982,6 +994,7 @@ where
                                     connection_id: conn.info.connection_id.clone(),
                                     user_agent: conn.info.user_agent.clone(),
                                     hello_done: conn.state == State::Authentication,
+                                    routing: conn.info.routing,
                                 },
                             }));
                         }
@@ -1154,4 +1167,11 @@ fn gql_error(code: &str) -> (&'static str, &'static str, Option<PackValue>) {
         "error: general processing exception - unexpected error. Unexpected error has occurred. See debug log for details.",
         None,
     )
+}
+
+/// Whether `HELLO`'s extra carries a routing context.
+fn has_routing(extra: &PackValue) -> bool {
+    extra
+        .get("routing")
+        .is_some_and(|r| !matches!(r, PackValue::Null))
 }

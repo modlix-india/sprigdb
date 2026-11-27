@@ -337,23 +337,37 @@ async fn the_sandbox_has_no_way_out() {
     )
     .await;
     assert_eq!(class(&r), Some(39867));
-    // ... through the real client too.
-    let p = JsProgram::new(
-        "f",
-        "return fetch('http://169.254.169.254/latest/meta-data/').status;",
-        sig(&[], false),
-    )
-    .unwrap();
-    let mut h = host(Arc::new(Script::default()));
-    h.outbound = Arc::new(crate::outbound::HttpOutbound::new(
-        crate::outbound::OutboundPolicy {
-            allow: vec!["*.example.com".into()],
-            timeout: Duration::from_millis(500),
-            max_bytes: 1 << 20,
-        },
-    ));
-    let e = run(&p, vec![], h, Limits::default()).await.unwrap_err();
-    assert_eq!(e.code(), Some(SprigCode::LogicOutboundDenied));
+    // ... through the real client too, and also when the tenant's own
+    // allowlist names the metadata address or this machine: the allowlist
+    // alone opens no internal address.
+    for url in [
+        "http://169.254.169.254/latest/meta-data/",
+        "http://127.0.0.1:7480/admin/v1/tenants",
+        "http://[fd00:ec2::254]/latest/meta-data/",
+    ] {
+        let p = JsProgram::new(
+            "f",
+            &format!("return fetch('{url}').status;"),
+            sig(&[], false),
+        )
+        .unwrap();
+        let mut h = host(Arc::new(Script::default()));
+        h.outbound = Arc::new(crate::outbound::HttpOutbound::new(
+            crate::outbound::OutboundPolicy {
+                allow: vec![
+                    "*.example.com".into(),
+                    "169.254.169.254".into(),
+                    "127.0.0.1:7480".into(),
+                    "[fd00:ec2::254]".into(),
+                ],
+                timeout: Duration::from_millis(500),
+                max_bytes: 1 << 20,
+                ..crate::outbound::OutboundPolicy::default()
+            },
+        ));
+        let e = run(&p, vec![], h, Limits::default()).await.unwrap_err();
+        assert_eq!(e.code(), Some(SprigCode::LogicOutboundDenied), "{url}: {e}");
+    }
 }
 
 #[tokio::test]

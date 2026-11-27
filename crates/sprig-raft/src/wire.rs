@@ -183,6 +183,80 @@ mod tests {
     use super::*;
     use raft::prelude::{Entry, MessageType};
 
+    /// A frame holding one Raft item whose message bytes are `message`.
+    fn frame_with(message: &[u8]) -> Vec<u8> {
+        let mut b = Frame {
+            from: 1,
+            to: 2,
+            ..Frame::default()
+        }
+        .encode();
+        // The item count, then the item by hand.
+        let at = b.len() - 4;
+        b[at..].copy_from_slice(&1u32.to_le_bytes());
+        b.push(0);
+        put_u64(&mut b, 42);
+        b.extend_from_slice(&u32::try_from(message.len() + 8).unwrap_or(0).to_le_bytes());
+        put_u64(&mut b, 0);
+        b.extend_from_slice(message);
+        b
+    }
+
+    /// A peer's bytes can't take the node down through the message parser:
+    /// groups nested as deep as a frame allows are refused (the parser
+    /// skips an unknown group with a loop and takes no group inside it),
+    /// and so is every truncation of a real frame and plain noise.
+    #[test]
+    fn hostile_messages_are_refused_not_crashed_on() {
+        // A well-formed message still decodes through the helper.
+        let mut msg = Message::default();
+        msg.set_msg_type(MessageType::MsgHeartbeat);
+        msg.term = 3;
+        let good = frame_with(&msg.write_to_bytes().unwrap_or_default());
+        assert!(Frame::decode(&good).is_some());
+        // Field 100 as a group (tag 803), opened again and again, in an
+        // unknown field and inside a known nested message (the snapshot,
+        // field 9) alike.
+        let open_group = [0xa3u8, 0x06];
+        let mut deep = Vec::new();
+        for _ in 0..2_000_000 {
+            deep.extend_from_slice(&open_group);
+        }
+        assert!(Frame::decode(&frame_with(&deep)).is_none());
+        let mut inside = vec![0x4a]; // field 9, length-delimited
+        let mut len = deep.len();
+        while len >= 0x80 {
+            inside.push(u8::try_from(len & 0x7f).unwrap_or(0) | 0x80);
+            len >>= 7;
+        }
+        inside.push(u8::try_from(len).unwrap_or(0));
+        inside.extend_from_slice(&deep);
+        assert!(Frame::decode(&frame_with(&inside)).is_none());
+        // One unknown group that closes is skipped; the message stands.
+        let mut closed = msg.write_to_bytes().unwrap_or_default();
+        closed.extend_from_slice(&[0xa3, 0x06, 0xa4, 0x06]);
+        assert!(Frame::decode(&frame_with(&closed)).is_some());
+        // Every prefix of a real frame, and noise after a valid header.
+        for cut in 0..good.len() {
+            assert!(Frame::decode(&good[..cut]).is_none(), "prefix {cut}");
+        }
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        for round in 0..2000 {
+            let mut noise = Vec::new();
+            for _ in 0..(round % 97) {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                noise.push(x.to_le_bytes()[0]);
+            }
+            // Refused or decoded, never a panic.
+            let _ = Frame::decode(&frame_with(&noise));
+            let mut raw = vec![MAGIC, VERSION];
+            raw.extend_from_slice(&noise);
+            let _ = Frame::decode(&raw);
+        }
+    }
+
     #[test]
     fn frames_round_trip() {
         let mut msg = Message::default();

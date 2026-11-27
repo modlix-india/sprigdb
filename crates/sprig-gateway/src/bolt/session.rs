@@ -49,6 +49,8 @@ struct Tx {
     /// Its engine transaction, once a statement used a graph stored in the
     /// storage engine.
     engine: Option<EngineTx>,
+    /// `BEGIN`'s `mode: "r"`.
+    read: bool,
 }
 
 /// The session's last bookmark.
@@ -67,6 +69,8 @@ pub(crate) struct GwSession {
     causal: Arc<Mutex<Causal>>,
     advertise: String,
     ttl: u64,
+    /// A routing session's reads from copies ([`super::follow`]).
+    follow: Option<Arc<crate::reader::Reader>>,
 }
 
 /// A statement ready to run.
@@ -355,7 +359,13 @@ impl GwSession {
             causal: Arc::new(Mutex::new(Causal::default())),
             advertise,
             ttl,
+            follow: None,
         }
+    }
+
+    /// Makes this a routing session ([`super::follow`]).
+    pub(crate) fn set_follow(&mut self) {
+        self.follow = Some(super::follow::reader(self.tenant().0));
     }
 
     /// The logged-in principal.
@@ -414,7 +424,12 @@ impl GwSession {
         let tenant = self.tenant();
         let key = self.graphs.bookmark_key(tenant).await?;
         for b in list {
-            bookmark::decode(b, tenant.0, &key)?;
+            let b = bookmark::decode(b, tenant.0, &key)?;
+            // A routing session's reads from copies are at least as fresh
+            // as the commit a bookmark names.
+            if let Some(r) = &self.follow {
+                r.raise(b.hlc);
+            }
         }
         Ok(())
     }
@@ -423,9 +438,13 @@ impl GwSession {
     async fn after_commit(&self) -> Result<String> {
         let key = self.graphs.bookmark_key(self.tenant()).await?;
         let mut c = self.causal();
+        // The session's last commit timestamp (on the storage engine), so
+        // a reader handed the bookmark reads at least that fresh.
         let b = Bookmark {
             tenant: self.tenant().0,
-            hlc: now_us(),
+            hlc: sprig_engine::reads::session_token()
+                .filter(|t| *t > 0)
+                .unwrap_or_else(now_us),
             gtids: BTreeMap::new(),
         };
         let text = bookmark::encode(&b, &key);
@@ -863,6 +882,21 @@ impl BoltSession for GwSession {
         params: &PackValue,
         extra: &PackValue,
     ) -> std::result::Result<QueryResult, BoltFailure> {
+        // A routing session's read transaction on a node that doesn't lead
+        // reads the copy here; its write transaction goes to the leader.
+        let read = self
+            .tx
+            .as_ref()
+            .map_or_else(|| super::follow::read_mode(extra), |t| t.read);
+        if let Some(p) = super::follow::policy(self.follow.as_ref(), self.tenant().0, read)?
+            && sprig_engine::reads::current().is_none()
+        {
+            return Box::pin(sprig_engine::reads::scope(
+                p,
+                self.run(query, params, extra),
+            ))
+            .await;
+        }
         let handle = self.reg.as_ref().map(|s| {
             s.begin_command("Query", Some(query.chars().take(1024).collect()));
             s.set_db(
@@ -913,9 +947,12 @@ impl BoltSession for GwSession {
                 "impersonation (imp_user) is not supported",
             ));
         }
+        let read = super::follow::read_mode(extra);
+        super::follow::policy(self.follow.as_ref(), self.tenant().0, read)?;
         let r: Result<Tx> = async {
             self.take_bookmarks(extra).await?;
             Ok(Tx {
+                read,
                 db: extra
                     .get("db")
                     .and_then(PackValue::as_str)
@@ -977,11 +1014,26 @@ impl BoltSession for GwSession {
             .and_then(PackValue::as_str)
             .unwrap_or("neo4j")
             .to_owned();
+        // Each node's own Bolt address when none is advertised: the leader
+        // writes, the other replicas read.
+        let servers = if self.advertise.is_empty() {
+            super::follow::route_servers(self.tenant().0, &addr).await
+        } else {
+            vec![
+                ("ROUTE", vec![addr.clone()]),
+                ("READ", vec![addr.clone()]),
+                ("WRITE", vec![addr.clone()]),
+            ]
+        };
         let server = |role: &str| {
+            let addresses = servers
+                .iter()
+                .find(|(r, _)| *r == role)
+                .map_or_else(|| vec![addr.clone()], |(_, a)| a.clone());
             PackValue::map([
                 (
                     "addresses",
-                    PackValue::List(vec![PackValue::str(addr.clone())]),
+                    PackValue::List(addresses.into_iter().map(PackValue::String).collect()),
                 ),
                 ("role", PackValue::str(role)),
             ])

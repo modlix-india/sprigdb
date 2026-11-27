@@ -337,6 +337,13 @@ pub struct RaftConsensus {
     barrier_failed: Mutex<HashMap<UnitId, Instant>>,
     /// Read barriers per unit (coalesced) and each unit's freshness.
     reads: Arc<Barriers>,
+    /// Units this node leads (or believed it led) whose last check with a
+    /// majority got no answer in time, and when it gave up.
+    leader_unconfirmed: Mutex<HashMap<UnitId, Instant>>,
+}
+
+fn lock_map(m: &Mutex<HashMap<UnitId, Instant>>) -> MutexGuard<'_, HashMap<UnitId, Instant>> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl std::fmt::Debug for RaftConsensus {
@@ -375,6 +382,7 @@ impl RaftConsensus {
             barriers: true,
             barrier_failed: Mutex::new(HashMap::new()),
             reads,
+            leader_unconfirmed: Mutex::new(HashMap::new()),
         }
     }
 
@@ -406,6 +414,44 @@ impl RaftConsensus {
             failed.insert(unit, Instant::now());
         } else {
             failed.remove(&unit);
+        }
+    }
+
+    /// The slow side of [`ReplicatedLog::leader_barrier`]: the lease isn't
+    /// known to hold, so the driver checks it under the group's lock and,
+    /// failing that, asks a majority (`ReadIndex`), again every short while
+    /// until it answers or the wait runs out. Stops at once when this
+    /// replica no longer leads.
+    fn confirm_leading(&self, unit: UnitId) -> Result<()> {
+        let deadline = Instant::now() + READ_BARRIER_WAIT;
+        loop {
+            let slot = match self.node.leader_barrier(unit.0) {
+                Ok(None) => return Ok(()),
+                Ok(Some(slot)) => slot,
+                Err(RaftError::NoGroup(_)) => {
+                    return Err(sprig_common::SprigError::new(
+                        sprig_common::SprigCode::ShardMoved,
+                        "this node no longer holds the unit; retry",
+                    ));
+                }
+                Err(e) => return Err(e.into()),
+            };
+            let left = deadline.saturating_duration_since(Instant::now());
+            match slot.wait_timeout(left.min(READ_BARRIER_TRY)) {
+                Some(Ok(_)) => return Ok(()),
+                // A request raft-rs dropped (a leader that hasn't committed
+                // in its term yet) is asked again.
+                Some(Err(RaftError::Dropped)) | None => {}
+                Some(Err(e)) => return Err(e.into()),
+            }
+            if Instant::now() >= deadline {
+                tracing::debug!(
+                    unit = unit.0,
+                    "raft: a leader's read could not confirm its leadership"
+                );
+                lock_map(&self.leader_unconfirmed).insert(unit, Instant::now());
+                return Err(unconfirmed_leader());
+            }
         }
     }
 
@@ -591,6 +637,21 @@ impl ReplicatedLog for RaftConsensus {
         r
     }
 
+    fn leader_barrier(&self, unit: UnitId) -> Result<()> {
+        if !self.barriers || self.node.lease_holds(unit.0) {
+            return Ok(());
+        }
+        // A leader that reached no majority a moment ago: fail at once
+        // rather than make every read wait again.
+        if lock_map(&self.leader_unconfirmed)
+            .get(&unit)
+            .is_some_and(|at| at.elapsed() < READ_BARRIER_BACKOFF)
+        {
+            return Err(unconfirmed_leader());
+        }
+        blocking(|| self.confirm_leading(unit))
+    }
+
     fn bounded_barrier(
         &self,
         unit: UnitId,
@@ -679,6 +740,14 @@ impl ReplicatedLog for RaftConsensus {
             tracing::debug!(unit = unit.0, error = %e, "raft: could not start a unit");
         }
     }
+}
+
+fn unconfirmed_leader() -> sprig_common::SprigError {
+    sprig_common::SprigError::new(
+        sprig_common::SprigCode::ShardMoved,
+        "this node could not confirm that it still leads the unit (it reaches no majority of the \
+         unit's replicas); retry",
+    )
 }
 
 fn backing_off() -> sprig_common::SprigError {

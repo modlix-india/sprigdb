@@ -64,7 +64,7 @@
 //! export SPRIG_TEST_FLD_SQL=127.0.0.1:46306        # the gateway's MySQL port
 //! export SPRIG_TEST_FLD_TENANT=fft                # a tenant on the Galera cluster
 //! export SPRIG_TEST_FLD_NODES=mysql://root:...@127.0.0.1:46311,...  # its nodes
-//! export SPRIG_TEST_FLD_HOOK_PORT=46881            # on sink.destination_allowlist
+//! export SPRIG_TEST_FLD_HOOK_PORT=46881            # on sink.destination_allowlist and sink.internal_destinations
 //! export SPRIG_TEST_FLD_STOP='deploy.sh stop worker'
 //! export SPRIG_TEST_FLD_START='deploy.sh start worker'
 //! export SPRIG_TEST_FLD_METRICS=127.0.0.1:46185    # optional

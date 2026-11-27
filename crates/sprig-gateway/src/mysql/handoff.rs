@@ -36,6 +36,10 @@ pub(crate) struct MysqlResume {
     /// replica, not only on the leader.
     #[serde(default)]
     pub(crate) reader: bool,
+    /// A leader's session's shadow connection ([`crate::ship`]): it starts
+    /// logged in as this principal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) shadow: Option<sprig_auth::handoff::PrincipalWire>,
 }
 
 impl MysqlResume {
@@ -53,6 +57,7 @@ impl MysqlResume {
             tls: false,
             conn_id: 0,
             reader: false,
+            shadow: None,
         }
     }
 

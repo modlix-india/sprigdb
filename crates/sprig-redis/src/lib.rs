@@ -51,6 +51,7 @@
     clippy::similar_names
 )]
 
+pub mod authz;
 pub mod batch;
 pub mod cmd;
 pub mod conn;

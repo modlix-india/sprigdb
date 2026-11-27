@@ -229,6 +229,7 @@ impl Webhooks {
                 residency: Box::new(Unpinned),
                 platform_hosts: Some(vec![format!("{bare}:{port}")]),
                 metadata_allowed: false,
+                internal: sprig_common::outbound::InternalAllow::none(),
             }),
         };
         WebhookTarget::for_events(conn, Opts::default(), "sprig_approvals")

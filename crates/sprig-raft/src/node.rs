@@ -251,8 +251,12 @@ struct Pending {
     waiter: Box<dyn Waiter>,
 }
 
+/// Where a read's answer arrives ([`Node::read`], [`Node::read_barrier`],
+/// [`Node::leader_barrier`]).
+pub type ReadSlot = Slot<Result<Vec<u8>, RaftError>>;
+
 struct ReadReq {
-    slot: Slot<Result<Vec<u8>, RaftError>>,
+    slot: ReadSlot,
     query: Vec<u8>,
 }
 
@@ -272,6 +276,8 @@ struct Group {
     /// Reads with a confirmed index, waiting for it to be applied.
     waiting: Vec<(u64, ReadReq)>,
     lease: Lease,
+    /// The cell's [`Cell::lease_until`].
+    lease_until: Arc<AtomicU64>,
     quiesced: bool,
     idle: u32,
     role: (u64, StateRole),
@@ -279,9 +285,24 @@ struct Group {
     snap_wait: BTreeMap<NodeId, u32>,
 }
 
+impl Group {
+    /// The lease is given up (a leader transfer) or gone (the role or the
+    /// membership changed): nobody may read under what was published.
+    fn unpublish_lease(&self) {
+        self.lease_until.store(0, Ordering::Release);
+    }
+}
+
 struct Cell {
     g: Mutex<Group>,
     progress: Arc<Progress>,
+    /// Until when this replica may answer reads as the group's leader
+    /// without asking anyone ([`Node::leader_barrier`]), as nanoseconds on
+    /// the node's clock after the node started; 0: not known to. Written
+    /// under `g`: set when the lease is found to hold with an entry of the
+    /// leader's own term applied, cleared when the lease is given up.
+    /// Readers check it without taking `g`.
+    lease_until: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Default)]
@@ -599,7 +620,9 @@ impl Node {
         self.reseed_timeout(&mut raw);
         let role = (raw.raft.term, raw.raft.state);
         self.note_peers(&applied_conf);
+        let lease_until = Arc::new(AtomicU64::new(0));
         let cell = Arc::new(Cell {
+            lease_until: Arc::clone(&lease_until),
             g: Mutex::new(Group {
                 id,
                 raw,
@@ -612,6 +635,7 @@ impl Node {
                 reads: BTreeMap::new(),
                 waiting: Vec::new(),
                 lease: Lease::default(),
+                lease_until,
                 quiesced: false,
                 idle: 0,
                 role,
@@ -811,28 +835,22 @@ impl Node {
         let mut g = self.leading(&cell)?;
         let slot = Slot::new();
         let now = self.inner.clock.now();
-        if !g.quiesced && g.raw.raft.commit_to_current_term() && g.lease.term() == g.raw.raft.term {
-            let usable = self.inner.cfg.usable_lease();
-            if let Some((start, _)) =
-                g.lease
-                    .valid_until(&g.applied_conf, self.inner.id, now, usable)
-            {
-                let index = g.raw.raft.raft_log.committed;
-                self.inner
-                    .observer
-                    .on_lease_read(group, g.raw.raft.term, start, now);
-                bump(&self.inner.counters.lease_reads, 1);
-                let req = ReadReq {
-                    slot: slot.clone(),
-                    query,
-                };
-                if g.applied >= index {
-                    req.slot.set(Ok(g.sm.query(&req.query)));
-                } else {
-                    g.waiting.push((index, req));
-                }
-                return Ok(slot);
+        if let Some((start, _)) = self.lease_at(&g, now) {
+            let index = g.raw.raft.raft_log.committed;
+            self.inner
+                .observer
+                .on_lease_read(group, g.raw.raft.term, start, now);
+            bump(&self.inner.counters.lease_reads, 1);
+            let req = ReadReq {
+                slot: slot.clone(),
+                query,
+            };
+            if g.applied >= index {
+                req.slot.set(Ok(g.sm.query(&req.query)));
+            } else {
+                g.waiting.push((index, req));
             }
+            return Ok(slot);
         }
         bump(&self.inner.counters.index_reads, 1);
         let ctx = self.inner.next_ctx.fetch_add(1, Ordering::Relaxed);
@@ -848,6 +866,87 @@ impl Node {
         drop(g);
         self.mark_dirty(group);
         Ok(slot)
+    }
+
+    /// The leader's lease at `now`, if it holds: when it started and when
+    /// it ends. It holds on a leader that isn't quiesced, has committed an
+    /// entry of its own term, and whose frames a quorum accepted recently
+    /// enough ([`Lease::valid_until`]).
+    fn lease_at(&self, g: &Group, now: Instant) -> Option<(Instant, Instant)> {
+        if g.quiesced
+            || g.raw.raft.state != StateRole::Leader
+            || !g.raw.raft.commit_to_current_term()
+            || g.lease.term() != g.raw.raft.term
+        {
+            return None;
+        }
+        g.lease.valid_until(
+            &g.applied_conf,
+            self.inner.id,
+            now,
+            self.inner.cfg.usable_lease(),
+        )
+    }
+
+    /// `t` on the scale of [`Cell::lease_until`] (never 0).
+    fn lease_stamp(&self, t: Instant) -> u64 {
+        u64::try_from(t.saturating_duration_since(self.inner.started).as_nanos())
+            .unwrap_or(u64::MAX)
+            .max(1)
+    }
+
+    /// Whether this replica is known to hold `group`'s leader lease right
+    /// now, without taking the group's lock: a lease published by an
+    /// earlier [`Node::leader_barrier`] that hasn't run out or been given
+    /// up.
+    #[must_use]
+    pub fn lease_holds(&self, group: GroupId) -> bool {
+        let Some(cell) = self.cell(group) else {
+            return false;
+        };
+        let until = cell.lease_until.load(Ordering::Acquire);
+        until != 0 && self.lease_stamp(self.inner.clock.now()) < until
+    }
+
+    /// Before this replica answers a read from its own state as `group`'s
+    /// leader: `None` when its lease holds (no other replica can have
+    /// committed as leader, and this one has applied an entry of its own
+    /// term, so its state holds every acknowledged write); otherwise a slot
+    /// that is set once a quorum has confirmed this leader (`ReadIndex`)
+    /// and the confirmed index is applied here, or fails when this replica
+    /// stops leading. A leader cut off from its followers gets no answer:
+    /// the caller gives up after a wait and reports a retryable error.
+    ///
+    /// A lease found to hold is published until its end, so the reads that
+    /// follow check it without the group's lock ([`Node::lease_holds`]),
+    /// and the group counts as busy (it doesn't quiesce under reads).
+    ///
+    /// # Errors
+    /// [`RaftError::NotLeader`], [`RaftError::NoGroup`], [`RaftError::Closed`].
+    pub fn leader_barrier(&self, group: GroupId) -> Result<Option<ReadSlot>, RaftError> {
+        let cell = self.cell(group).ok_or(RaftError::NoGroup(group))?;
+        let now = self.inner.clock.now();
+        let until = cell.lease_until.load(Ordering::Acquire);
+        if until != 0 && self.lease_stamp(now) < until {
+            bump(&self.inner.counters.lease_reads, 1);
+            return Ok(None);
+        }
+        {
+            let mut g = self.leading(&cell)?;
+            if let Some((start, end)) = self.lease_at(&g, now)
+                && g.applied >= g.raw.raft.raft_log.committed
+            {
+                g.lease_until
+                    .store(self.lease_stamp(end), Ordering::Release);
+                g.idle = 0;
+                self.inner
+                    .observer
+                    .on_lease_read(group, g.raw.raft.term, start, now);
+                bump(&self.inner.counters.lease_reads, 1);
+                return Ok(None);
+            }
+        }
+        self.read(group, Vec::new()).map(Some)
     }
 
     /// A read barrier on any replica: the slot is set once this replica
@@ -955,6 +1054,7 @@ impl Node {
         let cell = self.cell(group).ok_or(RaftError::NoGroup(group))?;
         let mut g = self.leading(&cell)?;
         g.lease.disable();
+        g.unpublish_lease();
         let term = g.raw.raft.term;
         self.inner
             .observer
@@ -1412,10 +1512,12 @@ impl Node {
     /// [`Node::write_loop`] with syncs overlapped: this thread only writes
     /// ([`LogStore::write_unsynced`]), and up to `depth` sync workers each
     /// sync everything written before they begin
-    /// ([`LogStore::sync_written`]). A write group counts as persisted once
-    /// a sync that began after it was written has returned and every group
-    /// before it counts too, so the persisted mark only moves over a
-    /// durable prefix. While syncs run, the next writes go to the file.
+    /// ([`LogStore::sync_written`], which returns only once everything
+    /// written before the call is durable). A write group counts as
+    /// persisted once a sync call that began after it was written has
+    /// returned and every group before it counts too, so the persisted
+    /// mark moves in order over a durable prefix. While syncs run, the
+    /// next writes go to the file.
     fn write_loop_pipelined(&self, rx: &std::sync::mpsc::Receiver<LogJob>, depth: usize) {
         let q = (Mutex::new(SyncQueue::default()), Condvar::new());
         std::thread::scope(|s| {
@@ -1881,6 +1983,7 @@ impl Node {
                         // `transfer_leader`, the lease ends first, so no
                         // lease read here overlaps the next leader's writes.
                         g.lease.disable();
+                        g.unpublish_lease();
                         let term = g.raw.raft.term;
                         self.inner.observer.on_lease_end(gid, term, now);
                     }
@@ -2047,6 +2150,7 @@ impl Node {
                 .on_lease_end(g.id, g.role.0, self.inner.clock.now());
         }
         g.role = role;
+        g.unpublish_lease();
         self.reseed_timeout(&mut g.raw);
         let leader = role.1 == StateRole::Leader;
         if leader {
@@ -2163,9 +2267,12 @@ impl Node {
         // A large snapshot takes longer to send and install: allow a tick
         // per 2 MiB on top (at 100 ms ticks, 20 MiB/s), so it isn't
         // declared lost and sent again while it is still arriving.
-        let size_ticks =
-            u32::try_from(g.raw.store().cached_len() / (2 << 20)).unwrap_or(u32::MAX);
-        let limit = self.inner.cfg.snapshot_retry_ticks.saturating_add(size_ticks);
+        let size_ticks = u32::try_from(g.raw.store().cached_len() / (2 << 20)).unwrap_or(u32::MAX);
+        let limit = self
+            .inner
+            .cfg
+            .snapshot_retry_ticks
+            .saturating_add(size_ticks);
         for id in waiting {
             let w = g.snap_wait.entry(id).or_insert(0);
             *w += ticks;
@@ -2397,6 +2504,8 @@ impl Node {
                         removed = (!cs.voters.is_empty() && !in_conf(&cs, self.inner.id))
                             .then_some(e.index);
                         g.applied_conf = cs;
+                        // The next lease is judged on the new members.
+                        g.unpublish_lease();
                     }
                     Err(x) => {
                         tracing::warn!(group = gid, error = %x, "raft: membership change not applied");

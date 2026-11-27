@@ -65,6 +65,22 @@ pub trait ReplicatedLog: Consensus {
         Ok(())
     }
 
+    /// Before a read of `unit` on the replica that leads it: returns once
+    /// it is known that no other replica can have committed to the unit as
+    /// its leader, so this replica's own state holds every acknowledged
+    /// write: its leader lease holds, or a majority of the unit's replicas
+    /// has just confirmed it. A leader cut off from the others must not
+    /// answer from its own state: a newer leader may have committed since.
+    /// Nothing by default.
+    ///
+    /// # Errors
+    /// This replica no longer leads the unit, or could not confirm in time
+    /// that it does (retryable).
+    fn leader_barrier(&self, unit: UnitId) -> Result<()> {
+        let _ = unit;
+        Ok(())
+    }
+
     /// Before a bounded read of `unit` on a replica that doesn't lead it
     /// ([`crate::reads::ReadMode::Bounded`]): returns once the read may be
     /// served here, that is when `holds_token()` and this replica is known

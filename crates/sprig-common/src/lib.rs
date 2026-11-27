@@ -24,6 +24,7 @@ pub mod ids;
 pub mod incidents;
 pub mod names;
 pub mod net;
+pub mod outbound;
 pub mod secret_file;
 pub mod telemetry;
 pub mod time;

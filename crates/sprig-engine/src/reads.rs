@@ -91,6 +91,36 @@ pub fn current() -> Option<ReadPolicy> {
     POLICY.try_with(Clone::clone).ok()
 }
 
+tokio::task_local! {
+    static SESSION: Arc<AtomicU64>;
+}
+
+/// Runs `f` (a whole client connection) with `token` as its session's
+/// causal token: every commit `f` makes raises it to the commit's
+/// timestamp, so it is the session's own last commit, not every commit the
+/// node made since.
+pub async fn session_scope<F: Future>(token: Arc<AtomicU64>, f: F) -> F::Output {
+    SESSION.scope(token, f).await
+}
+
+/// The running session's token, if it has a [`session_scope`].
+#[must_use]
+pub fn session_token() -> Option<u64> {
+    SESSION.try_with(|t| t.load(Ordering::Acquire)).ok()
+}
+
+/// The running session's token cell, if it has a [`session_scope`].
+#[must_use]
+pub fn session_cell() -> Option<Arc<AtomicU64>> {
+    SESSION.try_with(Arc::clone).ok()
+}
+
+/// Raises the running session's token to `ts` (a commit timestamp; called
+/// by every commit). Nothing outside a [`session_scope`].
+pub fn note_commit(ts: u64) {
+    let _ = SESSION.try_with(|t| t.fetch_max(ts, Ordering::AcqRel));
+}
+
 /// How a read on a copy was let through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Served {
@@ -162,5 +192,22 @@ mod tests {
         });
         assert!(current().is_none());
         assert_eq!(token.load(Ordering::Acquire), 9);
+    }
+
+    #[tokio::test]
+    async fn commits_raise_only_their_own_sessions_token() {
+        note_commit(50);
+        assert_eq!(session_token(), None);
+        let a = Arc::new(AtomicU64::new(0));
+        let b = Arc::new(AtomicU64::new(0));
+        session_scope(Arc::clone(&a), async {
+            note_commit(10);
+            note_commit(7);
+            assert_eq!(session_token(), Some(10));
+        })
+        .await;
+        session_scope(Arc::clone(&b), async { note_commit(3) }).await;
+        assert_eq!(a.load(Ordering::Acquire), 10);
+        assert_eq!(b.load(Ordering::Acquire), 3);
     }
 }

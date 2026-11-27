@@ -525,6 +525,7 @@ sprig_txn_rollbacks_total = "Distributed transactions rolled back; `reason` is `
 sprig_txn_unknown_outcomes_total = "Distributed commits whose outcome is unknown because a connection was lost (`ER_SPRIG_COMMIT_OUTCOME_UNKNOWN`). Unit: count."
 sprig_types_statements_total = "Statements on typed and hierarchical tables; `kind` is `insert`, `update`, `delete` or `select`, `plan` how it ran (such as `hierarchy`). Unit: count."
 sprig_unit_follower_reads_total = "Reads served on this node's copies of tenant units (reader sessions), by how they were let through: `served` is `local` (at once: the copy held the session's token and was fresh within the bound), `waited` (after a short wait for the copy to catch up) or `barrier` (after the leader confirmed its commits). Unit: count."
+sprig_unit_shipped_reads_total = "Reads a session on a tenant's leader sent to a copy (`READ_FROM(follower)`, `SET sprig.read_from = follower`, `reads.read_from`, MongoDB `secondary` read preferences), by protocol and `result`: `ok` (the copy answered), `fallback` (the copy couldn't, so the leader answered) or `unavailable` (no copy reachable; the leader answered). Unit: count."
 sprig_vector_overfetch_retries_total = "Extra queries vector searches ran to fill `k` results after filtering (limit `vector.max_overfetch`). Unit: count."
 sprig_vector_search_duration_seconds = "Duration of vector searches; `plan` is the search plan, such as exact or approximate. Unit: seconds."
 sprig_vector_searches_total = "Vector searches; `plan` is the search plan. Unit: count."

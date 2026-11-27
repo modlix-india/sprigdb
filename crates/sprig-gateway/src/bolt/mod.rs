@@ -21,6 +21,7 @@
 //! - **Streaming** ([`stream`]): reads whose rows don't depend on each
 //!   other stream to `PULL` with back-pressure; others are buffered.
 
+mod follow;
 pub(crate) mod session;
 mod stream;
 
@@ -499,6 +500,15 @@ impl BoltService for ConnService {
             .login
             .tenant_of(principal, info.sni.as_deref(), sprig_auth::admin::MAX_NAME)
             .await?;
+        // A routing driver's connection is served on any replica: its
+        // read transactions read there ([`follow`]).
+        if info.routing
+            && crate::forward::holds_replica(tenant.0)
+            && crate::reader::replica_ready(tenant.0)
+        {
+            crate::forward::count_direct(Protocol::Bolt);
+            return None;
+        }
         match crate::forward::route(tenant.0, Protocol::Bolt).await {
             crate::forward::Route::Node(n) => Some((n, tenant.0)),
             crate::forward::Route::Here => {
@@ -525,6 +535,12 @@ impl BoltService for ConnService {
         if let Some(mut s) = reg {
             s.set_principal(gw.principal().clone());
             s.set_state(crate::session::SessionState::Ready);
+            // A routing session stays when leadership moves: the driver
+            // sends its writes to the new leader on `NotALeader`.
+            if info.routing && crate::forward::enabled() {
+                s.handle().set_reader();
+                gw.set_follow();
+            }
             gw.attach(s);
         }
         Ok(Box::new(gw))
@@ -711,6 +727,10 @@ impl Frontend for BoltFrontend {
                     connection_id: v.get("connection_id")?.as_str()?.to_owned(),
                     user_agent: v.get("user_agent")?.as_str()?.to_owned(),
                     hello_done: v.get("hello_done")?.as_bool()?,
+                    routing: v
+                        .get("routing")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
                 })
             }),
             _ => None,
@@ -753,6 +773,7 @@ impl Frontend for BoltFrontend {
                         "connection_id": h.resume.connection_id,
                         "user_agent": h.resume.user_agent,
                         "hello_done": h.resume.hello_done,
+                        "routing": h.resume.routing,
                     })
                     .to_string(),
                     prelude: h.prelude.into(),

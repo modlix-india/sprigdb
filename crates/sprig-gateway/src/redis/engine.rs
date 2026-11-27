@@ -109,6 +109,17 @@ impl NodeEngine {
 }
 
 impl EngineBackend for NodeEngine {
+    fn read_token(&self, raise: Option<u64>) -> u64 {
+        match raise {
+            Some(t) => crate::reader::raise_session_token(t),
+            // Writes commit in rounds shared by connections (one commit per
+            // batch, led by whichever connection's task runs the round), so
+            // the connection's own cell may miss its last commit: what this
+            // node made visible covers it.
+            None => crate::reader::session_token().max(crate::reader::node_token()),
+        }
+    }
+
     fn database(&self, scope: &str, db: u32, placed: bool) -> Option<Arc<dyn EngineDatabase>> {
         let tenant: u64 = scope.parse().ok()?;
         if !placed && !self.tenants.has(tenant) {

@@ -9,7 +9,7 @@ source: the settings registry (sprig-settings)
 
 Every setting SprigDB declares, with its default, the scopes that may set it, hard bounds and when a change applies. Settings resolve from the most specific scope: object, database, tenant and its ancestors, cluster, data center, global, then the built-in default. Read them with `SHOW SPRIG SETTINGS`, change them with `ALTER TENANT|DATABASE|TABLE … SPRIG SET (key = value)` or `sprigctl settings`.
 
-702 settings in 59 groups.
+714 settings in 60 groups.
 
 ## `advisor`
 
@@ -379,6 +379,7 @@ Every setting SprigDB declares, with its default, the scopes that may set it, ha
 | `doc.spill_dir` | text | `` | dc, global | - | live | Directory for spill files |
 | `doc.spill_max_bytes` | int | `10737418240` | dc, global | 0 to 17592186044416 | live | Spill bytes on disk per gateway |
 | `doc.spill_tenant_max_bytes` | int | `4294967296` | dc, global | 0 to 17592186044416 | live | Spill bytes on disk per tenant |
+| `doc.sql_writes` | text | `on` | object, database, tenant, global | on, off | live | SQL writes to MongoDB collections: off makes them read-only to SQL (39661) |
 | `doc.ttl_interval_seconds` | int | `60` | dc, global | 1 to 86400 | live | TTL pass interval: how often expired documents of TTL indexes are deleted |
 | `doc.ttl_tenant_deletes_per_second` | int | `5000` | tenant, dc, global | 0 to 10000000 | live | Most TTL deletes per second for one tenant; 0 for no limit |
 
@@ -477,6 +478,7 @@ Every setting SprigDB declares, with its default, the scopes that may set it, ha
 | `inherit.broadcasts_per_hour` | int | `60` | object, tenant, global | 1 to 100000 | live | Broadcasts one definition may take per hour |
 | `inherit.copy_wait_ms` | int | `100` | object, database, tenant, global | 0 to 10000 | live | Milliseconds a statement waits for a lagging materialized copy before reading through |
 | `inherit.drop_grace_hours` | int | `168` | object, tenant, global | 0 to 87600 | live | How long instances of a dropped definition drain before removal |
+| `inherit.fan_in_sql_max_tenants` | int | `100` | tenant, global | 1 to 100000 | live | Members one fan-in SELECT may read |
 | `inherit.instance_create_wait_ms` | int | `5000` | tenant, global | 100 to 600000 | live | How long a publish or consumer waits for an instance being created (39899 after) |
 | `inherit.max_definitions_per_tenant` | int | `200` | tenant, global | 1 to 100000 | live | FOR EACH TENANT definitions one tenant may declare |
 | `inherit.max_depth` | int | `16` | tenant, global | 1 to 64 | live | Longest share chain of one object |
@@ -590,6 +592,7 @@ Every setting SprigDB declares, with its default, the scopes that may set it, ha
 | `logic.max_rows_read` | int | `100000` | object, database, tenant, global | 1 to 1000000000 | live | Rows read per invocation |
 | `logic.memory_limit_mb` | int | `64` | tenant, global | 1 to 4096 | live | Engine heap per invocation |
 | `logic.outbound_allowlist` | text | `[]` | tenant, global | - | live | Hosts fetch may reach |
+| `logic.outbound_internal_allowlist` | text | `[]` | tenant, dc, global (operator only) | - | live | Internal addresses fetch may reach when the allowlist names them |
 | `logic.outbound_max_bytes` | int | `1048576` | tenant, global | 1 to 1073741824 | live | Response cap |
 | `logic.outbound_timeout_ms` | int | `2000` | tenant, global | 1 to 600000 | live | Per outbound call |
 | `logic.trigger_budget_ms` | int | `30000` | object, database, tenant, global | 1 to 3600000 | live | One trigger invocation |
@@ -708,6 +711,7 @@ Every setting SprigDB declares, with its default, the scopes that may set it, ha
 | `placement.max_schema_creates_per_minute` | int | `300` | cluster, dc, global (operator only) | 1 to 1000000 | live | New shard schemas created on one cluster per minute |
 | `placement.max_shard_schemas_per_cluster` | int | `15000` | cluster, dc, global (operator only) | 1 to 10000000 | live | Shard schemas per cluster, a backstop to the table cap |
 | `placement.max_tables_per_cluster` | int | `75000` | cluster, dc, global (operator only) | 1 to 100000000 | live | Tables per cluster, side tables included: the cap new shards respect |
+| `placement.read_copies` | int | `0` | tenant, dc, global | 0 to 16 | live | Extra read-only copies (non-voting learners) of each of the tenant's units, serving reads from copies |
 
 ## `queue`
 
@@ -732,11 +736,14 @@ Every setting SprigDB declares, with its default, the scopes that may set it, ha
 | Key | Type | Default | Scopes | Bounds | Applies | Description |
 |---|---|---|---|---|---|---|
 | `reads.causal_scope` | text | `tenant_gateway` | cluster, dc, global | session, tenant_gateway | live | session or tenant_gateway |
+| `reads.follower_wait_ms` | int | `100` | object, database, tenant, cluster, dc, global | 0 to 60000 | live | How long a bounded read on a copy waits for the copy to catch up before it asks the leader |
 | `reads.galera_sync_wait_timeout_ms` | int | `300` | cluster, dc, global | 1 to 60000 | live | Galera sync-wait check before reading from the writer |
 | `reads.galera_unconfirmed` | text | `check` | cluster, dc, global | check, writer | live | check or writer: a Galera read whose write no polled position shows yet |
 | `reads.gtid_wait_timeout_ms` | int | `100` | object, database, tenant, cluster, dc, global | 0 to 60000 | live | Replica catch-up wait before reading from the writer |
 | `reads.max_galera_lag_ms` | int | `1000` | cluster, dc, global | 0 to 86400000 | live | A Galera node further behind gets no reads until it catches up |
 | `reads.max_replica_lag_ms` | int | `1000` | cluster, dc, global | 0 to 86400000 | live | Never read from a replica further behind |
+| `reads.nearest_max_lag_ms` | int | `5000` | object, database, tenant, cluster, dc, global | 0 to 86400000 | live | Default bound for nearest reads (and MongoDB secondary reads without maxStalenessSeconds) |
+| `reads.read_from` | text | `leader` | tenant, dc, global | leader, follower, nearest | live | leader, follower or nearest: where the tenant's SQL sessions read unless they ask otherwise (SET sprig.read_from for one session) |
 | `reads.replica_position_poll_ms` | int | `250` | cluster, dc, global | 10 to 60000 | live | Position polling |
 | `reads.routing` | text | `auto` | object, database, tenant, global | auto, writer | live | auto or writer |
 
@@ -773,6 +780,13 @@ Every setting SprigDB declares, with its default, the scopes that may set it, ha
 | `redis.server_version` | text | `7.2.0` | dc, global | - | live | HELLO and INFO version |
 | `redis.sharded_pubsub_hubs` | int | `8` | dc, global | 1 to 1024 | restart | Hubs for sharded channels |
 | `redis.write_retries` | int | `10` | dc, global | 0 to 100 | live | Internal retries on conflicts |
+
+## `replication`
+
+| Key | Type | Default | Scopes | Bounds | Applies | Description |
+|---|---|---|---|---|---|---|
+| `replication.dead_node_minutes` | float | `5` | dc, global (operator only) | 0 to 10080 | live | Minutes a node may be gone before its units are re-replicated elsewhere |
+| `replication.max_offset_ms` | int | `250` | dc, global (operator only) | 10 to 10000 | live | Largest clock offset between nodes; above half a node warns, above 80% it leads nothing |
 
 ## `residency`
 
@@ -850,6 +864,7 @@ Every setting SprigDB declares, with its default, the scopes that may set it, ha
 | `sink.fanin_refresh_seconds` | int | `30` | object, database, tenant, global | 1 to 3600 | live | How often a fan-in sink looks for new member instances |
 | `sink.http_connect_timeout_ms` | int | `5000` | object, tenant, global | 1 to 600000 | live | Connect timeout of webhooks and script fetches |
 | `sink.http_timeout_ms` | int | `30000` | object, tenant, global | 1 to 3600000 | live | Request timeout |
+| `sink.internal_destinations` | text | `[]` | tenant, dc, global (operator only) | - | live | Internal addresses sinks may reach when the allowlist names them |
 | `sink.kafka.offsets_topic` | text | `__sprig_sink_offsets` | object, tenant, global | - | live | Positions topic of exactly-once Kafka sinks |
 | `sink.kafka.transaction_timeout_ms` | int | `60000` | object, tenant, global | 1000 to 900000 | live | Kafka transaction timeout |
 | `sink.lag_alert_seconds` | int | `300` | object, tenant, global | 1 to 8640000 | live | Lag that raises SprigSinkLagHigh |
@@ -889,6 +904,8 @@ Every setting SprigDB declares, with its default, the scopes that may set it, ha
 
 | Key | Type | Default | Scopes | Bounds | Applies | Description |
 |---|---|---|---|---|---|---|
+| `stream.descendant_key` | text | `origin` | object, database, tenant, global | origin, any | live | origin: a descendant's record is keyed by its own tenant name (39957 otherwise); any: its own key |
+| `stream.descendant_publish` | text | `off` | object, database, tenant, global | on, off | live | on: descendants' own sessions may publish into this stream (IN TENANT); the owner's consent |
 | `stream.partitions_default` | int | `12` | database, tenant, global | 1 to 10000 | live | Partitions of a new stream |
 | `stream.produce_wait_ms` | int | `2000` | tenant, global | 0 to 600000 | live | How long a Kafka produce waits for its records' offsets |
 

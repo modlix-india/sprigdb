@@ -45,6 +45,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 use super::SyncMode;
+use super::fs::SyncGate;
 use super::payload::{self, BLOB, FORMAT, NOTE};
 
 /// Which notes go to blob files (the stream log's appends).
@@ -120,8 +121,8 @@ struct Active {
     len: u64,
     /// Records taken out since the last write, to go at `len`.
     pending: Vec<u8>,
-    /// Written since the last sync.
-    dirty: bool,
+    /// Which of its writes finished syncs cover.
+    gate: Arc<SyncGate>,
 }
 
 /// What a file holds: per unit, its highest entry index.
@@ -154,6 +155,9 @@ pub struct NoteBlobs {
     /// The newest file found at open and where its whole, checked records
     /// end: past that, a crash cut its unsynced tail.
     tail: Option<(u64, u64)>,
+    /// Tests: called at the start of every sync of a blob file.
+    #[cfg(test)]
+    sync_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl std::fmt::Debug for NoteBlobs {
@@ -330,6 +334,8 @@ impl NoteBlobs {
             next_collect: Mutex::new(None),
             grace: Mutex::new(SEALED_GRACE),
             tail,
+            #[cfg(test)]
+            sync_hook: Mutex::new(None),
         }))
     }
 
@@ -402,8 +408,25 @@ impl NoteBlobs {
             file,
             len: 0,
             pending: Vec::new(),
-            dirty: false,
+            gate: Arc::default(),
         })
+    }
+
+    /// One sync of `file`. `whole`: the file's own full sync (a file that
+    /// rolls); otherwise the sync that runs alongside the log's, which on
+    /// macOS is the log's (module docs).
+    fn sync_file(&self, file: &BlobFile, whole: bool) -> io::Result<()> {
+        #[cfg(test)]
+        if let Some(hook) = lock(&self.sync_hook).clone() {
+            hook();
+        }
+        if self.sync == SyncMode::Full
+            && !super::simulated_sync()
+            && (whole || !cfg!(target_os = "macos"))
+        {
+            file.file.sync_data()?;
+        }
+        Ok(())
     }
 
     /// Writes `a`'s pending records, synced when asked.
@@ -413,13 +436,10 @@ impl NoteBlobs {
             super::fs::note_write();
             a.len += a.pending.len() as u64;
             a.pending.clear();
-            a.dirty = true;
+            a.gate.note_write();
         }
-        if sync && a.dirty {
-            if self.sync == SyncMode::Full && !super::simulated_sync() {
-                a.file.file.sync_data()?;
-            }
-            a.dirty = false;
+        if sync {
+            a.gate.sync_with(|| self.sync_file(&a.file, true))?;
         }
         Ok(())
     }
@@ -544,36 +564,24 @@ impl NoteBlobs {
         }
     }
 
-    /// Syncs what was written (alongside the log's own sync). The file is
+    /// Syncs what was written (alongside the log's own sync): everything
+    /// written before the call is durable when it returns. The file is
     /// synced outside the lock, so writes go on meanwhile; several syncs
-    /// may run at once (a log that overlaps its syncs). One that finds
-    /// nothing written since the last sync began returns at once: whoever
-    /// counts on it must also wait for the syncs that began before it.
-    /// A file that rolled was synced when it rolled.
+    /// may run at once (a log that overlaps its syncs). A call with nothing
+    /// new to sync returns at once only when a finished sync covers the
+    /// file's last write; while the sync covering it still runs, the call
+    /// waits for it. A file that rolled was synced when it rolled.
     ///
     /// # Errors
     /// The sync failed.
     pub fn sync(&self) -> io::Result<()> {
-        let file = match lock(&self.active).as_mut() {
-            Some(a) if a.dirty => {
-                a.dirty = false;
-                Arc::clone(&a.file)
-            }
-            _ => return Ok(()),
+        let (file, gate) = match lock(&self.active).as_ref() {
+            Some(a) => (Arc::clone(&a.file), Arc::clone(&a.gate)),
+            None => return Ok(()),
         };
         // macOS: written with O_DSYNC; the log's full sync flushes the
         // drive (module docs).
-        if self.sync == SyncMode::Full
-            && !super::simulated_sync()
-            && !cfg!(target_os = "macos")
-            && let Err(e) = file.file.sync_data()
-        {
-            if let Some(a) = lock(&self.active).as_mut() {
-                a.dirty = true;
-            }
-            return Err(e);
-        }
-        Ok(())
+        gate.sync_with(|| self.sync_file(&file, false))
     }
 
     /// Whether `loc` lies where a crash cut the newest file's unsynced
@@ -868,6 +876,54 @@ mod tests {
             b.put_back(5, 9, 2, &stored).unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// Two overlapped syncs of the blob file (a log that overlaps its
+    /// syncs runs one beside each of the log's): the second finds nothing
+    /// new to sync while the first, which covers the note, still runs. It
+    /// waits for the first instead of reporting the note durable.
+    #[test]
+    fn a_sync_waits_for_the_running_sync_that_covers_its_note() {
+        use std::sync::mpsc;
+        let d = dir("overlap");
+        let b = NoteBlobs::open(&d, SyncMode::Off, pick, true).unwrap();
+        b.take_out(5, 9, 2, &entry(&[&[b'K'; 1000]]))
+            .unwrap()
+            .unwrap();
+        b.write_out().unwrap();
+        let (began_tx, began) = mpsc::channel::<()>();
+        let (finish, finish_rx) = mpsc::channel::<()>();
+        let finish_rx = Mutex::new(finish_rx);
+        let first = AtomicBool::new(true);
+        *lock(&b.sync_hook) = Some(Arc::new(move || {
+            // The first sync is the slow one.
+            if first.swap(false, Ordering::AcqRel) {
+                began_tx.send(()).unwrap();
+                lock(&finish_rx).recv().unwrap();
+            }
+        }));
+        let returned = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            s.spawn(|| b.sync().unwrap());
+            began.recv().unwrap();
+            s.spawn(|| {
+                b.sync().unwrap();
+                returned.store(true, Ordering::Release);
+            });
+            std::thread::sleep(Duration::from_millis(150));
+            assert!(
+                !returned.load(Ordering::Acquire),
+                "a sync returned while the sync covering the note was still running"
+            );
+            finish.send(()).unwrap();
+        });
+        assert!(returned.load(Ordering::Acquire));
+        // A later note needs a sync of its own, which doesn't wait.
+        b.take_out(5, 10, 2, &entry(&[&[b'K'; 1000]]))
+            .unwrap()
+            .unwrap();
+        b.persist(true).unwrap();
         let _ = fs::remove_dir_all(&d);
     }
 

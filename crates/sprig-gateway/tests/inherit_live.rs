@@ -32,6 +32,13 @@
 //! sprigctl settings set sink.destination_allowlist '["127.0.0.1:<SPRIG_TEST_INHERIT_HOOK_PORT>"]' --scope global ...
 //! ```
 //!
+//! The hook is on this machine, an internal address, which the allowlist
+//! alone doesn't open: an operator's setting has to cover it as well:
+//!
+//! ```sh
+//! sprigctl settings set sink.internal_destinations '["127.0.0.1:<SPRIG_TEST_INHERIT_HOOK_PORT>"]' --scope global ...
+//! ```
+//!
 //! Clean-up: each test first drops what an earlier run left
 //! in its declaring tenant's databases (every `FOR EACH TENANT` definition
 //! there, by the exact names `SHOW INHERITED DEFINITIONS` lists, then the

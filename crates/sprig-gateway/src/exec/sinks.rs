@@ -92,6 +92,7 @@ pub(crate) fn setting_of(
         "destination_allowlist" => text(&s::DESTINATION_ALLOWLIST),
         "allowed_kinds" => text(&s::ALLOWED_KINDS),
         "platform_identity" => text(&s::PLATFORM_IDENTITY),
+        "internal_destinations" => text(&s::INTERNAL_DESTINATIONS),
         "enabled" => {
             if svc.settings.get(&s::ENABLED, &ctx, Some(&cat.settings)) {
                 "on".into()
@@ -345,6 +346,7 @@ impl Host for GwHost<'_> {
             "destination_allowlist" => text(&s::DESTINATION_ALLOWLIST),
             "allowed_kinds" => text(&s::ALLOWED_KINDS),
             "platform_identity" => text(&s::PLATFORM_IDENTITY),
+            "internal_destinations" => text(&s::INTERNAL_DESTINATIONS),
             "enabled" => {
                 if svc
                     .settings

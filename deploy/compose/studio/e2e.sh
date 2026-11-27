@@ -163,6 +163,9 @@ setup() {
     ctl settings set --scope global workload.watch_p95_ms 5 --reason "Studio e2e" --actor studio-e2e
     ctl settings set --scope tenant:acme sink.destination_allowlist \
         "[\"127.0.0.1:$hook_port\", \"127.0.0.1:$closed_port\", \"hooks.example.com\"]" --reason "Studio e2e" --actor studio-e2e
+    # The two local ports are internal addresses: the operator's list too.
+    ctl settings set --scope tenant:acme sink.internal_destinations \
+        "[\"127.0.0.1:$hook_port\", \"127.0.0.1:$closed_port\"]" --reason "Studio e2e" --actor studio-e2e
     ctl settings set --scope tenant:acme logic.outbound_allowlist '["rates.example.com"]' --reason "Studio e2e" --actor studio-e2e
     sql "ALTER TENANT acme SPRIG SET (studio.cursor_idle_seconds = 3)"
     sql "GRANT SPRIG_SINK_ADMIN ON *.* TO app"

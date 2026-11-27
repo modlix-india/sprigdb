@@ -121,6 +121,24 @@ pub static OUTBOUND_ALLOWLIST: Setting<Cow<'static, str>> = Setting {
 };
 sprig_settings::register!(OUTBOUND_ALLOWLIST);
 
+/// `logic.outbound_internal_allowlist`: the internal addresses (private,
+/// loopback, link-local and the like) an entry of
+/// `logic.outbound_allowlist` may open, as addresses or CIDR ranges with
+/// an optional port (`["10.0.5.0/24:5432", "127.0.0.1:9000"]` or
+/// comma-separated). Operators only: a tenant's own allowlist never opens
+/// the platform's network by itself. Empty: no internal address.
+pub static OUTBOUND_INTERNAL_ALLOWLIST: Setting<Cow<'static, str>> = Setting {
+    key: "logic.outbound_internal_allowlist",
+    default: Cow::Borrowed("[]"),
+    scopes: Scopes::TREE,
+    hard: HardBounds::NONE,
+    apply: Apply::Live,
+    operator_only: true,
+    owner: 41,
+    doc: "Internal addresses fetch may reach when the allowlist names them",
+};
+sprig_settings::register!(OUTBOUND_INTERNAL_ALLOWLIST);
+
 /// The allowlist's entries.
 #[must_use]
 pub fn allowlist(text: &str) -> Vec<String> {
@@ -158,6 +176,11 @@ pub fn limits(
         allow: allowlist(&s.get(&OUTBOUND_ALLOWLIST, ctx, t)),
         timeout: Duration::from_millis(s.get(&OUTBOUND_TIMEOUT_MS, ctx, t)),
         max_bytes: s.get(&OUTBOUND_MAX_BYTES, ctx, t),
+        internal: sprig_common::outbound::InternalAllow::parse_or_none(&s.get(
+            &OUTBOUND_INTERNAL_ALLOWLIST,
+            ctx,
+            t,
+        )),
     };
     (limits, outbound)
 }

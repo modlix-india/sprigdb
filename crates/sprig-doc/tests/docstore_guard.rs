@@ -155,6 +155,69 @@ async fn reads_see_only_what_the_policies_let_through() {
     assert_eq!(ids(&first(&r)), [1, 5]);
 }
 
+/// A read of the protected collection nested anywhere in a pipeline (a
+/// pipeline inside a `$lookup`'s pipeline, `$unionWith` and `$graphLookup`
+/// inside one, a `$unionWith`'s own pipeline) goes through the guard like
+/// a top-level one: the documents the policies hide never come back.
+#[tokio::test]
+async fn nested_pipelines_read_through_the_guard() {
+    let b = Bed::mem();
+    seed(&b).await;
+    let g = guard_for(&b);
+    // What the policies hide from `a`: owners b and A, and n = 300.
+    let hidden = |r: &Document| {
+        let t = format!("{r:?}");
+        t.contains("String(\"b\")") || t.contains("String(\"A\")") || t.contains("300")
+    };
+    let pipelines = [
+        // A pipeline inside a $lookup's pipeline.
+        doc! {"aggregate": "o", "cursor": {}, "pipeline": [
+            {"$lookup": {"from": "o", "as": "x", "pipeline": [
+                {"$lookup": {"from": "c", "as": "j", "pipeline": [{"$match": {}}]}},
+            ]}},
+        ]},
+        // $unionWith inside a $lookup's pipeline.
+        doc! {"aggregate": "o", "cursor": {}, "pipeline": [
+            {"$lookup": {"from": "o", "as": "x", "pipeline": [{"$unionWith": "c"}]}},
+        ]},
+        // A $lookup inside a $unionWith's pipeline, `from` as a document.
+        doc! {"aggregate": "o", "cursor": {}, "pipeline": [
+            {"$unionWith": {"coll": "o", "pipeline": [
+                {"$lookup": {"from": {"coll": "c"}, "as": "j", "pipeline": []}},
+            ]}},
+        ]},
+        // $graphLookup inside a $lookup's pipeline.
+        doc! {"aggregate": "o", "cursor": {}, "pipeline": [
+            {"$lookup": {"from": "o", "as": "x", "pipeline": [
+                {"$graphLookup": {"from": "c", "startWith": "$ref",
+                    "connectFromField": "_id", "connectToField": "n", "as": "g"}},
+            ]}},
+        ]},
+        // Three levels down.
+        doc! {"aggregate": "o", "cursor": {}, "pipeline": [
+            {"$unionWith": {"coll": "o", "pipeline": [
+                {"$lookup": {"from": "o", "as": "x", "pipeline": [
+                    {"$unionWith": {"coll": "c", "pipeline": [{"$match": {"n": {"$gte": 0}}}]}},
+                ]}},
+            ]}},
+        ]},
+    ];
+    for p in pipelines {
+        // Unguarded, the nested read does reach the hidden documents.
+        let open = b.run("d", p.clone()).await;
+        assert!(open.get_document("cursor").is_ok(), "{p}: {open}");
+        assert!(
+            hidden(&open),
+            "{p} reads nothing hidden even unguarded: {open}"
+        );
+        let r = as_a(&b, &g, "d", p.clone()).await;
+        assert!(r.get_document("cursor").is_ok(), "{p}: {r}");
+        assert!(!hidden(&r), "{p} leaked a hidden document: {r}");
+        // And it still reads what `a` may see.
+        assert!(format!("{r:?}").contains("String(\"a\")"), "{p}: {r}");
+    }
+}
+
 #[tokio::test]
 async fn writes_touch_only_what_they_may_and_check_new_documents() {
     let b = Bed::mem();

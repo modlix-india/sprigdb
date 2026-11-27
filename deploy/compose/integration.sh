@@ -92,6 +92,9 @@ up() {
 
     ctl settings set sink.destination_allowlist '["127.0.0.1:9"]' --scope tenant:acme \
         --reason "deploy/compose/integration.sh" >/dev/null
+    # 127.0.0.1 is an internal address: the operator's list covers it too.
+    ctl settings set sink.internal_destinations '["127.0.0.1:9"]' --scope tenant:acme \
+        --reason "deploy/compose/integration.sh" >/dev/null
     # The process-list test also makes connections: acme.app needs
     # SPRIG_SINK_ADMIN, which the tenant's administrator may grant.
     sql_as acme.app "GRANT SPRIG_SINK_ADMIN ON *.* TO app"

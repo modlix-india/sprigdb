@@ -364,7 +364,7 @@ impl Frontend for RedisFrontend {
         self.env.set_config(cfg);
         let moved = sprig_common::CancellationToken::new();
         let done = sprig_common::CancellationToken::new();
-        let auth: Arc<dyn Auth> = Arc::new(GatewayAuth {
+        let auth = Arc::new(GatewayAuth {
             d: Arc::clone(&self.d),
             peer: conn.peer,
             listener: conn.listener.name,
@@ -372,22 +372,61 @@ impl Frontend for RedisFrontend {
             tls: conn.tls_info(),
             moved: moved.clone(),
             done: done.clone(),
+            reader: std::sync::atomic::AtomicBool::new(false),
         });
         let peer = conn.peer;
-        let sess = sprig_redis::Session::new(Arc::clone(&self.env), auth, &peer.to_string());
+        // A reader connection handed here: its `READONLY` came before the
+        // login, on the node that handed it over.
+        let reader = match &conn.stream {
+            crate::frontend::MaybeTls::Forwarded(f) => f
+                .take_resume()
+                .and_then(|j| serde_json::from_str::<serde_json::Value>(&j).ok())
+                .and_then(|v| v.get("reader").and_then(serde_json::Value::as_bool))
+                .unwrap_or(false),
+            _ => false,
+        };
+        if reader {
+            auth.reader
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        let mut sess = sprig_redis::Session::new(
+            Arc::clone(&self.env) as Arc<sprig_redis::Env>,
+            Arc::clone(&auth) as Arc<dyn Auth>,
+            &peer.to_string(),
+        );
+        if reader {
+            sess.set_reader();
+        }
         let stop = conn.close_soon.clone();
         metrics::gauge!("sprig_redis_connections", "dc" => self.d.dc.to_string()).increment(1.0);
         let mut conn = conn;
         // Closes between commands on a drain or a listener change, or when
         // another node leads the tenant's unit now (the client reconnects).
-        let r =
+        let served =
             sprig_redis::conn::serve_until_handoff(&mut conn.stream, sess, limits, async move {
                 tokio::select! {
                     () = stop.cancelled() => {}
                     () = moved.cancelled() => {}
                 }
-            })
-            .await;
+            });
+        // A reader connection (`READONLY` before its login) reads the copy
+        // here at most `reads.nearest_max_lag_ms` old and never older than
+        // its token (`SPRIG.TOKEN`); on the leader the rules never apply.
+        let r = match (
+            crate::forward::enabled(),
+            sprig_engine::reads::session_cell(),
+        ) {
+            (true, Some(token)) => {
+                let k = crate::reader::knobs(0);
+                let policy = sprig_engine::reads::ReadPolicy {
+                    mode: sprig_engine::reads::ReadMode::Bounded { max_lag: k.nearest },
+                    wait: k.wait,
+                    token,
+                };
+                sprig_engine::reads::scope(policy, served).await
+            }
+            _ => served.await,
+        };
         done.cancel();
         metrics::gauge!("sprig_redis_connections", "dc" => self.d.dc.to_string()).decrement(1.0);
         match r {
@@ -398,7 +437,12 @@ impl Frontend for RedisFrontend {
                     peer,
                     tls: conn.tls_info(),
                     tenant: h.tenant,
-                    resume: String::new(),
+                    // A reader connection is accepted on any replica.
+                    resume: if h.reader {
+                        r#"{"reader":true}"#.to_owned()
+                    } else {
+                        String::new()
+                    },
                     prelude: rest.freeze(),
                     to: h.node,
                 };
@@ -430,6 +474,9 @@ struct GatewayAuth {
     moved: sprig_common::CancellationToken,
     /// Cancelled when the connection ends.
     done: sprig_common::CancellationToken,
+    /// A reader connection ([`Auth::serve_reader_elsewhere`]): it doesn't
+    /// follow its tenant's leader.
+    reader: std::sync::atomic::AtomicBool,
 }
 
 impl GatewayAuth {
@@ -491,6 +538,35 @@ impl Auth for GatewayAuth {
             crate::forward::Route::Node(node) => Some(sprig_redis::HandOff {
                 node,
                 tenant: tenant.0,
+                reader: false,
+            }),
+            crate::forward::Route::Here => {
+                crate::forward::count_direct(Protocol::Redis);
+                None
+            }
+        }
+    }
+
+    async fn serve_reader_elsewhere(&self, user: Option<&[u8]>) -> Option<sprig_redis::HandOff> {
+        if !crate::forward::enabled() {
+            return None;
+        }
+        self.reader
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let name = self.named(user)?;
+        let sni = self.tls.as_ref().and_then(|t| t.sni.as_deref());
+        let tenant = self
+            .d
+            .login
+            .tenant_of(&name, sni, sprig_auth::admin::MAX_NAME)
+            .await?;
+        match crate::forward::route_reader(tenant.0, Protocol::Redis, u64::from(self.peer.port()))
+            .await
+        {
+            crate::forward::Route::Node(node) => Some(sprig_redis::HandOff {
+                node,
+                tenant: tenant.0,
+                reader: true,
             }),
             crate::forward::Route::Here => {
                 crate::forward::count_direct(Protocol::Redis);
@@ -556,6 +632,7 @@ impl Auth for GatewayAuth {
         metrics::counter!("sprig_redis_auth_total", "result" => "ok").increment(1);
         if let Some(t) = principal.tenant
             && crate::forward::enabled()
+            && !self.reader.load(std::sync::atomic::Ordering::Relaxed)
         {
             let (moved, done) = (self.moved.clone(), self.done.clone());
             tokio::spawn(async move {
@@ -1008,6 +1085,25 @@ impl SqlRunner for SqlSession {
 
     fn engine_placed(&self, database: &str) -> bool {
         self.exec.engine_database(database)
+    }
+
+    fn holds_on_database(&self, rights: &[sprig_kv::sql::DbRight], database: &str) -> Option<bool> {
+        use sprig_auth::authz::Action;
+        use sprig_kv::sql::DbRight;
+        // A client's session: always an answer, and "can't tell" is no.
+        Some(rights.iter().all(|r| {
+            let action = match r {
+                DbRight::Select => Action::Select,
+                DbRight::Insert => Action::Insert,
+                DbRight::Update => Action::Update,
+                DbRight::Delete => Action::Delete,
+                DbRight::Drop => Action::Drop,
+                DbRight::Execute => Action::Execute,
+                DbRight::CreateRoutine => Action::CreateRoutine,
+                DbRight::AlterRoutine => Action::AlterRoutine,
+            };
+            self.exec.holds_privilege_on(action, database, None) == Some(true)
+        }))
     }
 
     fn multi_results(&self) -> bool {

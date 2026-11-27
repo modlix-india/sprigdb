@@ -1179,15 +1179,30 @@ impl SessionExec for PassSession {
         if let Some(reader) = cx.session.reader.clone()
             && sprig_engine::reads::current().is_none()
         {
-            let hint = match &req {
-                Request::Query { sql, .. } => crate::reader::hint(sql),
-                _ => None,
+            let (hint, req) = match req {
+                // A statement a leader's session shipped here carries the
+                // session's token in a leading comment.
+                Request::Query { sql, attrs } => {
+                    let sql = match crate::ship::take_token(&sql) {
+                        Some((t, rest)) => {
+                            reader.raise(t);
+                            sql.slice_ref(rest)
+                        }
+                        None => sql,
+                    };
+                    (crate::reader::hint(&sql), Request::Query { sql, attrs })
+                }
+                r => (None, r),
             };
             return Box::pin(sprig_engine::reads::scope(
                 reader.policy(hint),
                 <Self as SessionExec>::execute(self, cx, req, out),
             ))
             .await;
+        }
+        // A read a session on the leader asked a copy for goes there.
+        if let Some(r) = self.ship_read(cx, &req, out).await {
+            return r;
         }
         // Queue acknowledgements held for this transaction learn how
         // it ended (the commit hook, after the request).

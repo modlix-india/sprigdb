@@ -519,7 +519,8 @@ impl ListenerManager {
             tokio::select! {
                 biased;
                 () = close.cancelled() => {}
-                r = fe.serve(conn, ctx) => {
+                // The connection's causal token: its own commits.
+                r = sprig_engine::reads::session_scope(Arc::default(), fe.serve(conn, ctx)) => {
                     if let Err(e) = r {
                         tracing::debug!(listener, %peer, error = %e, "forwarded connection ended with an error");
                     }

@@ -90,6 +90,11 @@ impl OidcState {
             claims: Some(claims),
         }
     }
+
+    /// Whether the connection logged in with a token's claims.
+    pub(crate) fn has_claims(&self) -> bool {
+        self.claims.is_some()
+    }
 }
 
 /// One connection's state.
@@ -121,6 +126,8 @@ pub struct Conn {
     /// before `ok`; the handler returned an empty document, and
     /// [`Conn::dispatch`] answers with these bytes.
     pub(crate) raw: Option<RawDocumentBuf>,
+    /// Reads from copies ([`super::follow`]).
+    pub(crate) follow: crate::ship::MongoFollow,
 }
 
 /// A command's reply: a document, or BSON bytes built directly.
@@ -193,6 +200,7 @@ pub async fn serve(shared: Arc<Shared>, mut conn: ClientConn) -> Result<()> {
         hello_done: false,
         close_now: false,
         raw: None,
+        follow: crate::ship::MongoFollow::default(),
     };
     // A connection another node accepted and handed here: what its
     // `hello`s settled there.
@@ -211,8 +219,11 @@ pub async fn serve(shared: Arc<Shared>, mut conn: ClientConn) -> Result<()> {
     let mut stream = tokio::io::BufReader::with_capacity(8 * 1024, &mut conn.stream);
     let r: Result<Option<(u64, u64, Vec<u8>)>> = async {
         loop {
+            // A leader's shadow connection on a copy reads here whoever
+            // leads.
             if moved.is_none()
                 && crate::forward::enabled()
+                && st.follow.reader.is_none()
                 && let Some(t) = st.principal.as_ref().and_then(|p| p.tenant)
             {
                 moved = Some(crate::forward::watch::Watched::new(t.0));
@@ -1124,6 +1135,9 @@ impl Conn {
                 close_after = i.close;
             }
         }
+        // The connection's token before the command: a command that commits
+        // answers with its own commit timestamp as `operationTime`.
+        let token_before = sprig_engine::reads::session_token();
         let r = match name.as_str() {
             // Boxed, as `run` is: this future stays small, and
             // creating it (once per command) copies little.
@@ -1138,7 +1152,21 @@ impl Conn {
                 }
                 Ok(doc! {"ok": 1.0})
             }
-            _ => Box::pin(super::commands::run(self, &name, &body)).await,
+            _ => {
+                // A read for a copy runs there; a shadow connection's
+                // command reads under its read preference's rules.
+                if let Some(d) = Box::pin(self.ship_read(&name, &body)).await {
+                    Ok(d)
+                } else if let Some(p) = self.follow_policy(&body) {
+                    Box::pin(sprig_engine::reads::scope(
+                        p,
+                        super::commands::run(self, &name, &body),
+                    ))
+                    .await
+                } else {
+                    Box::pin(super::commands::run(self, &name, &body)).await
+                }
+            }
         };
         if close_after {
             // The write committed; the client never hears.
@@ -1156,7 +1184,10 @@ impl Conn {
                 use bson::RawBson;
                 raw.append("ok", RawBson::Double(1.0));
                 let ts = cluster_time();
-                raw.append("operationTime", RawBson::Timestamp(ts));
+                raw.append(
+                    "operationTime",
+                    RawBson::Timestamp(super::follow::operation_time(token_before, ts)),
+                );
                 let mut sig = RawDocumentBuf::new();
                 sig.append(
                     "hash",
@@ -1190,7 +1221,10 @@ impl Conn {
                     "hello" | "isMaster" | "ismaster" | "saslStart" | "saslContinue"
                 ) {
                     let ts = cluster_time();
-                    d.insert("operationTime", ts);
+                    d.insert(
+                        "operationTime",
+                        super::follow::operation_time(token_before, ts),
+                    );
                     d.insert(
                         "$clusterTime",
                         doc! {"clusterTime": ts, "signature": {"hash": bson::Binary { subtype: bson::spec::BinarySubtype::Generic, bytes: vec![0; 20] }, "keyId": 0i64}},
@@ -1274,6 +1308,12 @@ static CLUSTER_TIME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 /// going backwards (a hybrid logical clock, without gossip between
 /// gateways yet).
 pub(crate) fn cluster_time() -> bson::Timestamp {
+    // Never below what this node has made visible (a hybrid logical clock
+    // timestamp in MongoDB's form), so an operation time taken from it
+    // covers every commit the client could have seen here.
+    if let Some(v) = super::follow::visible_packed() {
+        CLUSTER_TIME.fetch_max(v, Ordering::SeqCst);
+    }
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());

@@ -555,6 +555,7 @@ impl SqlEngine {
             hello_done: true,
             close_now: false,
             raw: None,
+            follow: crate::ship::MongoFollow::default(),
         };
         // The executor session now, so a client that leaves can stop the
         // first command too.

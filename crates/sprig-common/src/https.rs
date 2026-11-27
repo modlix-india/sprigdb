@@ -39,9 +39,20 @@ use crate::{Result, SprigCode, SprigError};
 pub use rustls::{ClientConfig, ServerConfig};
 
 /// The header in which a gateway relaying an Admin API call passes the
-/// address its client connected from. The controller believes it only
-/// with [`RELAY_AUTH_HEADER`].
+/// address its client connected from. The controller records it as the
+/// caller's address only with [`RELAY_AUTH_HEADER`]; without that it still
+/// tells a controller that has no admin token that the call isn't local.
 pub const CLIENT_ADDR_HEADER: &str = "x-sprig-client-addr";
+
+/// Headers a reverse proxy adds to the requests it passes on. A request
+/// that carries one came through a proxy, so a loopback peer says nothing
+/// about where its sender is.
+pub const PROXY_HEADERS: [&str; 4] = [
+    "forwarded",
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-real-ip",
+];
 
 /// The header in which a relaying gateway presents its service identity's
 /// secret (`[gateway] controller_token_file`), vouching for

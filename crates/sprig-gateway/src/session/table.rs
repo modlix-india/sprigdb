@@ -199,6 +199,7 @@ impl SessionTable {
             local_selects: 0,
             connect_attrs: Vec::new(),
             reader: None,
+            ship: crate::ship::SessionShip::default(),
             backend: None,
             mem: None,
             state: SessionState::Handshake,

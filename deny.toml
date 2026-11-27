@@ -19,12 +19,21 @@ ignore = [
     { id = "RUSTSEC-2026-0543", reason = "chrono: unmaintained, not vulnerable; replacement pending Kiran's decision" },
     { id = "RUSTSEC-2026-0555", reason = "chrono-tz: unmaintained, not vulnerable; replacement pending Kiran's decision" },
     { id = "RUSTSEC-2026-0542", reason = "humantime: unmaintained, not vulnerable; replacement pending Kiran's decision" },
-    # protobuf 2.x (MIT) comes in through raft-engine 0.4.2 (approved by Kiran,
+    # protobuf 2.28.0 (MIT) comes in through raft-engine 0.4.2 (approved by Kiran,
     # 18 Nov 2026), whose newest release still uses it for log entries and
-    # metrics. The advisory is a stack overflow when parsing deeply nested
-    # untrusted messages; the engine's log only ever parses entries it wrote
-    # itself, which hold no nested messages.
-    { id = "RUSTSEC-2024-0437", reason = "protobuf 2: raft-engine's log parses only the engine's own flat entries" },
+    # metrics, and through raft 0.7.0's protobuf codec. It parses two things:
+    # the engine's own log entries, and Raft messages from other nodes
+    # (crates/sprig-raft/src/wire.rs), so the input is NOT only our own.
+    # The advisory is unbounded recursion on unknown fields. It was reported
+    # against 3.x and is listed for every release below 3.7.2; in 2.28.0 an
+    # unknown group is skipped by a loop that refuses a group inside it
+    # (rt::skip_group), and known nested messages stop at depth 100. The test
+    # wire::tests::hostile_messages_are_refused_not_crashed_on holds that
+    # (2,000,000 nested groups are refused, not recursed into), and must keep
+    # passing if protobuf moves. Peers are also authenticated: Raft needs
+    # mutual TLS unless SPRIGDB_ENGINE_INSECURE_CLUSTER is set. Remove this
+    # entry when raft-engine and raft no longer need protobuf 2.
+    { id = "RUSTSEC-2024-0437", reason = "protobuf 2.28.0 also parses peers' Raft messages; its unknown-group skip is a loop, not the recursion the advisory describes (test in sprig-raft wire.rs), and peers are behind mutual TLS" },
     # pin-utils (MIT OR Apache-2.0) was archived in October 2026: unmaintained, not
     # vulnerable. It comes in through nix 0.26, which raft-engine 0.4.2 (approved by
     # Kiran, 18 Nov 2026) uses for file locking; no raft-engine release drops it yet.

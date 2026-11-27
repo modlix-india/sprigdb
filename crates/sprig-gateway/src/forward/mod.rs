@@ -221,7 +221,12 @@ pub fn holds_replica(tenant: u64) -> bool {
 /// `pick` (the client's port, so connections spread over the copies), or
 /// the leader when it is the only replica known.
 pub async fn route_reader(tenant: u64, protocol: Protocol, pick: u64) -> Route {
-    if !enabled() || tenant == 0 || holds_replica(tenant) {
+    if !enabled() || tenant == 0 {
+        return Route::Here;
+    }
+    // A copy still catching up (a learner that just joined) sends reader
+    // logins on.
+    if holds_replica(tenant) && crate::reader::replica_ready(tenant) {
         return Route::Here;
     }
     match reader_target(tenant, pick) {

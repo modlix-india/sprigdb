@@ -593,6 +593,15 @@ async fn read_frames<S: AsyncRead + Unpin>(
         }
         let n = u32::from_le_bytes(len) as usize;
         if n > MAX_FRAME {
+            // A frame this large (a snapshot of a big unit) can't be taken:
+            // the sender's retries end the same way, so say so.
+            tracing::warn!(
+                node = node.id(),
+                ?peer,
+                bytes = n,
+                max = MAX_FRAME,
+                "raft tcp: a frame over the size limit; connection closed"
+            );
             return;
         }
         let mut buf = vec![0u8; n];

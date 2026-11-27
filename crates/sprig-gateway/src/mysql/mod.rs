@@ -466,8 +466,30 @@ async fn login_phase(
             .increment(dropped as u64);
     }
 
-    // A login asking to read from copies (a reader session).
-    let reader = crate::reader::mysql_login(resp.database.as_deref(), &attrs);
+    // A login asking to read from copies (a reader session), or a
+    // leader's session's shadow connection ([`crate::ship`]).
+    let reader = crate::reader::mysql_login(resp.database.as_deref(), &attrs).or_else(|| {
+        resumed.as_ref().filter(|r| r.reader).map(|_| {
+            (
+                crate::reader::ReadFrom::Follower(None),
+                resp.database
+                    .as_ref()
+                    .map(|d| String::from_utf8_lossy(d).into_owned()),
+            )
+        })
+    });
+    // What a shadow connection to a copy replays: the greeting and this
+    // login packet.
+    let ship_login = crate::forward::enabled().then(|| {
+        let mut r = handoff::MysqlResume::new(nonce, server, seq, policy);
+        r.tls = conn.tls_info().is_some();
+        crate::ship::MysqlLogin {
+            listener: conn.listener.name,
+            protocol: protocol_of(persona),
+            resume: r,
+            packet: resp_raw.clone(),
+        }
+    });
     // Served by another node (the one leading the tenant's unit; for a
     // reader session, one holding a replica): the connection goes there
     // from its login packet on, before any of the tenant's credentials are
@@ -498,57 +520,76 @@ async fn login_phase(
     if tls && session.tls.is_none() {
         session.tls = conn.tls_info();
     }
-    let mut login = shared
-        .cfg
-        .login
-        .begin(login::request(
-            persona,
-            &resp.user,
-            conn.peer,
-            session.tls.as_ref(),
-            resp.caps,
-        ))
-        .await;
-    let (verdict, nonce, seq) = {
-        // The RSA key only matters without TLS (the full path's
-        // encrypted password).
-        let rsa = if tls {
-            None
-        } else {
-            // The first login after a start waits for the generated key:
-            // the gateway's wait, not the client's.
-            let _wait = sprig_auth::login_waits::begin_wait();
-            rsa::key_for(&settings.rsa_key_path).await
+    // A leader's shadow connection to this copy ([`crate::ship`]) starts
+    // logged in as the leader's session's principal, taken from the
+    // mutually authenticated peer as a login hand-off's principal is.
+    let shadow = resumed
+        .as_ref()
+        .filter(|r| r.reader)
+        .and_then(|r| r.shadow.clone());
+    let (principal, claims, nonce, mut seq) = if let Some(w) = shadow {
+        let p = w.principal()?;
+        let claims = w
+            .verified_token()
+            .ok()
+            .flatten()
+            .map(|t| std::sync::Arc::clone(&t.claims));
+        (p, claims, nonce, seq)
+    } else {
+        let mut login = shared
+            .cfg
+            .login
+            .begin(login::request(
+                persona,
+                &resp.user,
+                conn.peer,
+                session.tls.as_ref(),
+                resp.caps,
+            ))
+            .await;
+        let (verdict, nonce, seq) = {
+            // The RSA key only matters without TLS (the full path's
+            // encrypted password).
+            let rsa = if tls {
+                None
+            } else {
+                // The first login after a start waits for the generated key:
+                // the gateway's wait, not the client's.
+                let _wait = sprig_auth::login_waits::begin_wait();
+                rsa::key_for(&settings.rsa_key_path).await
+            };
+            let mut raw = RawIo::new(&mut conn.stream, seq);
+            let mut io = AuthIo {
+                io: &mut raw,
+                persona,
+                tls,
+                nonce,
+                rsa,
+            };
+            let v = authenticate(
+                &mut io,
+                resp.plugin.as_deref(),
+                resp.auth_response.clone(),
+                false,
+                &mut login,
+            )
+            .await?;
+            let nonce = io.nonce;
+            (v, nonce, raw.seq)
         };
-        let mut raw = RawIo::new(&mut conn.stream, seq);
-        let mut io = AuthIo {
-            io: &mut raw,
-            persona,
-            tls,
-            nonce,
-            rsa,
+        let mut seq = seq;
+        let principal = match verdict {
+            AuthVerdict::Refuse(e) => {
+                let _ = write_packet(&mut conn.stream, &mut seq, &e.encode(caps)).await;
+                return Ok(None);
+            }
+            AuthVerdict::Accept => match login.principal() {
+                Some(p) => p.clone(),
+                None => return Err(SprigError::internal("login accepted without a principal")),
+            },
         };
-        let v = authenticate(
-            &mut io,
-            resp.plugin.as_deref(),
-            resp.auth_response.clone(),
-            false,
-            &mut login,
-        )
-        .await?;
-        let nonce = io.nonce;
-        (v, nonce, raw.seq)
-    };
-    let mut seq = seq;
-    let principal = match verdict {
-        AuthVerdict::Refuse(e) => {
-            let _ = write_packet(&mut conn.stream, &mut seq, &e.encode(caps)).await;
-            return Ok(None);
-        }
-        AuthVerdict::Accept => match login.principal() {
-            Some(p) => p.clone(),
-            None => return Err(SprigError::internal("login accepted without a principal")),
-        },
+        let claims = login.token().map(|t| std::sync::Arc::clone(&t.claims));
+        (principal, claims, nonce, seq)
     };
     session.set_principal(principal.clone());
     // The client's DC, from the connection attribute.
@@ -597,19 +638,21 @@ async fn login_phase(
     });
     // SPRIG_CLAIM() and token roles: the claims of the issuer's token the
     // login used, here or in the DC it was handed to.
-    exec.set_claims(login.token().map(|t| std::sync::Arc::clone(&t.claims)));
-    let db = match &reader {
+    exec.set_claims(claims);
+    let db = if let Some((from, db)) = &reader {
         // `<db>@replica`: the database without its suffix.
-        Some((from, db)) => {
-            let r = std::sync::Arc::new(crate::reader::Reader::new(*from));
-            session.handle().set_reader();
-            session.reader = Some(r);
-            db.clone()
-        }
-        None => resp
-            .database
+        let r = std::sync::Arc::new(crate::reader::Reader::new(
+            *from,
+            principal.tenant.map_or(0, |t| t.0),
+        ));
+        session.handle().set_reader();
+        session.reader = Some(r);
+        db.clone()
+    } else {
+        session.ship.mysql_login = ship_login.map(std::sync::Arc::new);
+        resp.database
             .as_ref()
-            .map(|d| String::from_utf8_lossy(d).into_owned()),
+            .map(|d| String::from_utf8_lossy(d).into_owned())
     };
     if let Some(schema) = &db {
         let mut cx = ExecCtx {

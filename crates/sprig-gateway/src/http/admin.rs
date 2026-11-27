@@ -72,11 +72,46 @@ pub fn set_controller_tls(
     Ok(())
 }
 
+/// The client an admin call is relayed for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RelayClient {
+    /// The address the client connected to this gateway from.
+    pub ip: std::net::IpAddr,
+    /// Its request carried a reverse proxy's headers
+    /// ([`sprig_common::https::PROXY_HEADERS`]): the real client is
+    /// somewhere behind `ip`.
+    pub proxied: bool,
+}
+
+impl RelayClient {
+    /// A client that connected directly from `ip`.
+    #[must_use]
+    pub fn direct(ip: std::net::IpAddr) -> Self {
+        Self { ip, proxied: false }
+    }
+
+    /// The client of a request from `peer`; `has_header` says whether the
+    /// request carries a header. With no known peer the client is taken to
+    /// be elsewhere (the unspecified address), never this machine.
+    #[must_use]
+    pub fn of(peer: Option<std::net::IpAddr>, has_header: impl Fn(&str) -> bool) -> Self {
+        Self {
+            ip: peer.unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+            proxied: sprig_common::https::PROXY_HEADERS
+                .iter()
+                .any(|h| has_header(h)),
+        }
+    }
+}
+
 /// The request a relayed admin call becomes: only the caller's
 /// `authorization` is carried over (whatever else the client sent,
-/// including its own `x-sprig-client-addr`, stays behind). With the
-/// client's address and this gateway's service secret, both go along so
-/// the controller can record the person's address.
+/// including its own `x-sprig-client-addr`, stays behind). A call relayed
+/// for a client names the client's address, and says so when a reverse
+/// proxy stood in front of this gateway: a controller that has no admin
+/// token answers anonymous calls only for clients on its own machine. With
+/// this gateway's service secret as well, the controller records that
+/// address as the caller's.
 ///
 /// # Errors
 /// Internal for a URI that doesn't parse.
@@ -84,7 +119,7 @@ pub fn relay_request(
     url: &str,
     method: &Method,
     authorization: Option<&str>,
-    client: Option<std::net::IpAddr>,
+    client: Option<RelayClient>,
     relay_secret: Option<&str>,
     body: Bytes,
 ) -> Result<Request<Full<Bytes>>> {
@@ -96,10 +131,17 @@ pub fn relay_request(
     if let Some(a) = authorization {
         b = b.header("authorization", a);
     }
-    if let (Some(ip), Some(secret)) = (client, relay_secret) {
-        b = b
-            .header(sprig_common::https::CLIENT_ADDR_HEADER, ip.to_string())
-            .header(sprig_common::https::RELAY_AUTH_HEADER, secret);
+    if let Some(c) = client {
+        // Always: a controller without an admin token answers anonymous
+        // calls only for clients on its own machine, and the gateway looks
+        // like one to it.
+        b = b.header(sprig_common::https::CLIENT_ADDR_HEADER, c.ip.to_string());
+        if c.proxied {
+            b = b.header("x-forwarded-for", c.ip.to_string());
+        }
+        if let Some(secret) = relay_secret {
+            b = b.header(sprig_common::https::RELAY_AUTH_HEADER, secret);
+        }
     }
     b.body(Full::new(body))
         .map_err(|e| SprigError::internal("admin request").with_source(e))
@@ -267,6 +309,30 @@ impl AdminApi {
         body: Bytes,
         client: Option<std::net::IpAddr>,
     ) -> Result<Reply> {
+        self.forward_for(
+            method,
+            path_and_query,
+            authorization,
+            body,
+            client.map(RelayClient::direct),
+        )
+        .await
+    }
+
+    /// As [`Self::forward_from`], for a client that may have come through
+    /// a reverse proxy ([`RelayClient`]); `None` is this gateway's own
+    /// call.
+    ///
+    /// # Errors
+    /// As [`Self::forward`].
+    pub async fn forward_for(
+        &self,
+        method: &Method,
+        path_and_query: &str,
+        authorization: Option<&str>,
+        body: Bytes,
+        client: Option<RelayClient>,
+    ) -> Result<Reply> {
         let (addr, https) = self.controller().await?;
         let scheme = if https { "https" } else { "http" };
         let req = relay_request(
@@ -309,10 +375,21 @@ impl AdminApi {
         Ok(Reply { status, body })
     }
 
-    /// Whether the controller accepts `authorization` for admin calls.
-    pub(crate) async fn authorized(&self, authorization: Option<&str>) -> Result<()> {
+    /// Whether the controller accepts `authorization`, presented by
+    /// `client`, for admin calls.
+    pub(crate) async fn authorized(
+        &self,
+        authorization: Option<&str>,
+        client: RelayClient,
+    ) -> Result<()> {
         let r = self
-            .forward(&Method::GET, "/admin/v1/dcs", authorization, Bytes::new())
+            .forward_for(
+                &Method::GET,
+                "/admin/v1/dcs",
+                authorization,
+                Bytes::new(),
+                Some(client),
+            )
             .await?;
         if r.status == StatusCode::UNAUTHORIZED.as_u16() {
             return Err(SprigError::new(
@@ -333,8 +410,9 @@ impl AdminApi {
         rpc: &str,
         name: Option<&str>,
         authorization: Option<&str>,
+        client: RelayClient,
     ) -> Result<serde_json::Value> {
-        self.authorized(authorization).await?;
+        self.authorized(authorization, client).await?;
         match (rpc, name) {
             ("ListGateways", _) => {
                 let all = registry::list(self.store.as_ref()).await?;
@@ -386,7 +464,7 @@ mod tests {
             "https://ctl:7480/admin/v1/operators:login",
             &Method::POST,
             None,
-            Some(ip),
+            Some(RelayClient::direct(ip)),
             Some("gw-secret"),
             Bytes::from_static(b"{}"),
         )
@@ -397,19 +475,21 @@ mod tests {
         assert_eq!(header(&r, "authorization"), None);
         assert_eq!(header(&r, "x-sprig-forwarded"), Some("1"));
 
-        // Without the gateway's service secret the address isn't sent:
-        // the controller would ignore it anyway.
+        // Without the gateway's service secret the address still goes (a
+        // controller with no admin token needs it to tell a client on
+        // another machine from a local one), but nothing vouches for it.
         let r = relay_request(
             "http://ctl:7480/admin/v1/clusters",
             &Method::GET,
             Some("Bearer sprigop_x"),
-            Some(ip),
+            Some(RelayClient::direct(ip)),
             None,
             Bytes::new(),
         )
         .unwrap();
-        assert_eq!(header(&r, CLIENT_ADDR_HEADER), None);
+        assert_eq!(header(&r, CLIENT_ADDR_HEADER), Some("203.0.113.7"));
         assert_eq!(header(&r, RELAY_AUTH_HEADER), None);
+        assert_eq!(header(&r, "x-forwarded-for"), None);
         assert_eq!(header(&r, "authorization"), Some("Bearer sprigop_x"));
 
         // The gateway's own calls name no client.
@@ -431,6 +511,46 @@ mod tests {
             .map(hyper::header::HeaderName::as_str)
             .collect();
         assert_eq!(names, ["content-type", "x-sprig-forwarded"]);
+    }
+
+    #[test]
+    fn a_relayed_call_says_when_its_client_came_through_a_proxy() {
+        use sprig_common::https::CLIENT_ADDR_HEADER;
+        let lo: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        // A client on this machine, directly: only its address.
+        let c = RelayClient::of(Some(lo), |_| false);
+        assert_eq!(c, RelayClient::direct(lo));
+        let r = relay_request(
+            "http://ctl:7480/admin/v1/dcs",
+            &Method::GET,
+            None,
+            Some(c),
+            None,
+            Bytes::new(),
+        )
+        .unwrap();
+        assert_eq!(header(&r, CLIENT_ADDR_HEADER), Some("127.0.0.1"));
+        assert_eq!(header(&r, "x-forwarded-for"), None);
+        // The same peer, but a reverse proxy's header came along: the
+        // controller is told, so it doesn't take the client for local.
+        for h in sprig_common::https::PROXY_HEADERS {
+            let c = RelayClient::of(Some(lo), |name| name == h);
+            assert!(c.proxied, "{h}");
+            let r = relay_request(
+                "http://ctl:7480/admin/v1/dcs",
+                &Method::GET,
+                None,
+                Some(c),
+                None,
+                Bytes::new(),
+            )
+            .unwrap();
+            assert_eq!(header(&r, CLIENT_ADDR_HEADER), Some("127.0.0.1"));
+            assert_eq!(header(&r, "x-forwarded-for"), Some("127.0.0.1"));
+        }
+        // No peer known: never this machine.
+        let c = RelayClient::of(None, |_| false);
+        assert!(!c.ip.is_loopback());
     }
 
     #[test]

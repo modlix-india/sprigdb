@@ -59,6 +59,13 @@ pub trait Auth: Send + Sync {
     async fn serve_elsewhere(&self, _user: Option<&[u8]>) -> Option<HandOff> {
         None
     }
+
+    /// [`Self::serve_elsewhere`] for a reader connection (`READONLY` before
+    /// the login): it may be served on any node holding a copy of the
+    /// tenant's data (the default: served here).
+    async fn serve_reader_elsewhere(&self, _user: Option<&[u8]>) -> Option<HandOff> {
+        None
+    }
 }
 
 /// A connection to hand to the node that serves its tenant.
@@ -68,6 +75,8 @@ pub struct HandOff {
     pub node: u64,
     /// The tenant.
     pub tenant: u64,
+    /// A reader connection, served there from a copy.
+    pub reader: bool,
 }
 
 /// The `WRONGPASS` reply.
@@ -88,6 +97,9 @@ pub struct Session {
     /// `CLIENT ID`.
     pub id: u64,
     login: Option<Login>,
+    /// A reader connection: `READONLY` came before the login, so it reads
+    /// from a copy of the tenant's data and refuses writes.
+    reader: bool,
     /// RESP2 or RESP3.
     pub proto: Proto,
     db: u32,
@@ -172,6 +184,7 @@ impl Session {
             rx: Some(rx),
             closing: false,
             handoff: None,
+            reader: false,
             peer: peer.to_owned(),
             created: Instant::now(),
             dc_hint: None,
@@ -285,16 +298,38 @@ impl Session {
             }
             return vec![reply::arity(&name)];
         }
+        // `READONLY` before the login asks for a reader connection (as a
+        // Redis Cluster client does on a replica's connection).
+        if self.login.is_none() && name == "readonly" {
+            self.reader = true;
+            return vec![Frame::ok()];
+        }
         if self.login.is_none() && !spec.has('n') {
             if self.multi.is_some() {
                 self.multi_err = true;
             }
             return vec![Frame::error("NOAUTH Authentication required.")];
         }
+        if self.reader && spec.has('w') {
+            if self.multi.is_some() {
+                self.multi_err = true;
+            }
+            return vec![Frame::error(
+                "READONLY You can't write against a read only replica.",
+            )];
+        }
         if self.subscribed() && self.proto == Proto::Resp2 && !spec.has('S') {
             return vec![Frame::err(&format!(
                 "Can't execute '{name}': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context"
             ))];
+        }
+        // What the user may do on the engine's databases, where no SQL
+        // statement would check for it.
+        if let Some(f) = self.noperm(&name, spec, &c.args) {
+            if self.multi.is_some() {
+                self.multi_err = true;
+            }
+            return vec![f];
         }
         // A database on the storage engine: the engine runs its data
         // commands, the session only connection, server and pub/sub ones.
@@ -389,6 +424,30 @@ impl Session {
         frames
     }
 
+    /// Whether the logged-in user lacks a right command `name` needs on a
+    /// database stored on the engine ([`crate::authz`]).
+    fn lacks(&self, name: &str, spec: &spec::Spec, args: &[Bytes]) -> bool {
+        let (Some(e), Some(l)) = (&self.engine, &self.login) else {
+            return false;
+        };
+        let rights = crate::authz::need(name, args, spec, e.runs(name)).rights();
+        !rights.is_empty()
+            && l.sql
+                .holds_on_database(rights, &self.env.config().logical_database)
+                == Some(false)
+    }
+
+    /// The `-NOPERM` reply when the user may not run command `name`.
+    fn noperm(&self, name: &str, spec: &spec::Spec, args: &[Bytes]) -> Option<Frame> {
+        if !self.lacks(name, spec, args) {
+            return None;
+        }
+        Some(crate::authz::noperm(
+            self.login.as_ref().map_or("", |l| l.user.as_str()),
+            name,
+        ))
+    }
+
     /// How many commands at the head of `cmds` the storage engine runs as
     /// one batch ([`Session::handle_engine`]); 0 when the first doesn't go
     /// to the engine.
@@ -409,7 +468,11 @@ impl Session {
                 c.args.first().is_some_and(|first| {
                     let name = String::from_utf8_lossy(first).to_ascii_lowercase();
                     e.runs(&name)
-                        && crate::engine::lookup(&name).is_some_and(|s| s.arity_ok(c.args.len()))
+                        && crate::engine::lookup(&name).is_some_and(|s| {
+                            // A reader connection's writes are refused one
+                            // by one (`handle`).
+                            s.arity_ok(c.args.len()) && !(self.reader && s.has('w'))
+                        })
                 })
             })
             .count()
@@ -424,11 +487,30 @@ impl Session {
                 .map(|_| vec![Frame::err("no engine database")])
                 .collect();
         };
-        let args: Vec<&[Bytes]> = cmds.iter().map(|c| &c.args[..]).collect();
-        e.run(&args, self.resp3())
-            .await
+        // The commands the user may not run answer NOPERM; the rest run as
+        // the batch.
+        let refused: Vec<Option<Frame>> = cmds
+            .iter()
+            .map(|c| {
+                let name = String::from_utf8_lossy(&c.args[0]).to_ascii_lowercase();
+                crate::engine::lookup(&name).and_then(|s| self.noperm(&name, s, &c.args))
+            })
+            .collect();
+        let args: Vec<&[Bytes]> = cmds
+            .iter()
+            .zip(&refused)
+            .filter(|(_, r)| r.is_none())
+            .map(|(c, _)| &c.args[..])
+            .collect();
+        let mut ran = if args.is_empty() {
+            Vec::new()
+        } else {
+            e.run(&args, self.resp3()).await
+        }
+        .into_iter();
+        refused
             .into_iter()
-            .map(|f| vec![f])
+            .map(|r| vec![r.or_else(|| ran.next()).unwrap_or_else(Frame::null)])
             .collect()
     }
 
@@ -811,6 +893,7 @@ impl Session {
             }
             "fcall" | "fcall_ro" => Box::pin(self.fcall(name, a, in_txn)).await,
             "sprig.query" => Ok(vec![Box::pin(self.sprig_query(a, in_txn)).await]),
+            "sprig.token" => one(self.sprig_token(a)),
             _ if name.starts_with("ft.") && !spec.has('x') => {
                 Ok(vec![Box::pin(self.ft(name, a, in_txn)).await])
             }
@@ -1094,7 +1177,9 @@ impl Session {
             match upper(&a[i]).as_str() {
                 "AUTH" if i + 2 < a.len() => {
                     if self.login.is_none()
-                        && let Some(h) = self.auth.serve_elsewhere(Some(&a[i + 1])).await
+                        && let Some(h) =
+                            Self::elsewhere(Arc::clone(&self.auth), self.reader, Some(&a[i + 1]))
+                                .await
                     {
                         self.handoff = Some(h);
                         return Frame::ok();
@@ -1174,6 +1259,40 @@ impl Session {
         self.refresh_engine();
     }
 
+    /// Makes this a reader connection (one handed here by a node that saw
+    /// its `READONLY` before the login).
+    pub fn set_reader(&mut self) {
+        self.reader = true;
+    }
+
+    /// Where the login of `user` is served, when another node serves it
+    /// (`reader`: a reader connection's).
+    async fn elsewhere(auth: Arc<dyn Auth>, reader: bool, user: Option<&[u8]>) -> Option<HandOff> {
+        if reader {
+            auth.serve_reader_elsewhere(user).await
+        } else {
+            auth.serve_elsewhere(user).await
+        }
+    }
+
+    /// `SPRIG.TOKEN [token]`: the connection's causal token (its last
+    /// commit, or a token it was given); with a token, raises it first, so
+    /// a reader connection's later reads are at least that fresh.
+    fn sprig_token(&self, a: &[Bytes]) -> Frame {
+        let raise = match a.get(1) {
+            Some(v) => match std::str::from_utf8(v)
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+            {
+                Some(t) => Some(t),
+                None => return Frame::err("SPRIG.TOKEN takes a token (a non-negative integer)"),
+            },
+            None => None,
+        };
+        let t = self.env.engine().map_or(0, |e| e.read_token(raise));
+        Frame::bulk(t.to_string())
+    }
+
     async fn auth_cmd(&mut self, a: &[Bytes]) -> Frame {
         let user = match a.len() {
             3 => Some(&a[1][..]),
@@ -1181,7 +1300,7 @@ impl Session {
         };
         if self.login.is_none()
             && (2..=3).contains(&a.len())
-            && let Some(h) = self.auth.serve_elsewhere(user).await
+            && let Some(h) = Self::elsewhere(Arc::clone(&self.auth), self.reader, user).await
         {
             self.handoff = Some(h);
             return Frame::ok();

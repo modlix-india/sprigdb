@@ -116,6 +116,12 @@ fn b(v: &Value, k: &str) -> bool {
     v.get(k).and_then(Value::as_bool).unwrap_or(false)
 }
 
+/// Who an admin call is relayed for: the peer, and whether a reverse
+/// proxy's headers came with the request.
+fn relay_client(info: &ConnInfo, req: &Request<Incoming>) -> super::admin::RelayClient {
+    super::admin::RelayClient::of(Some(info.peer.ip()), |h| req.headers().contains_key(h))
+}
+
 /// Handles one REST request.
 pub async fn handle(core: &Arc<Core>, info: &ConnInfo, req: Request<Incoming>) -> Response<Body> {
     let path = req.uri().path().to_owned();
@@ -128,7 +134,8 @@ pub async fn handle(core: &Arc<Core>, info: &ConnInfo, req: Request<Incoming>) -
     }
     if method == Method::GET && path == crate::node_engine::UNITS_PATH {
         let auth = header(&req, "authorization");
-        return match core.admin.authorized(auth.as_deref()).await {
+        let client = relay_client(info, &req);
+        return match core.admin.authorized(auth.as_deref(), client).await {
             Ok(()) => json_response(200, &crate::node_engine::units_report()),
             Err(e) => error_response(&e),
         };
@@ -140,17 +147,17 @@ pub async fn handle(core: &Arc<Core>, info: &ConnInfo, req: Request<Incoming>) -
     if method == Method::POST
         && (path == crate::ops::drain::DRAIN_PATH || path == crate::ops::drain::UNDRAIN_PATH)
     {
-        return node_drain(core, req, path == crate::ops::drain::DRAIN_PATH)
+        return node_drain(core, info, req, path == crate::ops::drain::DRAIN_PATH)
             .await
             .unwrap_or_else(|e| error_response(&e));
     }
     if method == Method::POST && path == crate::node_engine::REPLACE_PATH {
-        return replace_replica(core, req)
+        return replace_replica(core, info, req)
             .await
             .unwrap_or_else(|e| error_response(&e));
     }
     if method == Method::POST && path.starts_with(crate::backup::ROUTE) {
-        return backups(core, req, path)
+        return backups(core, info, req, path)
             .await
             .unwrap_or_else(|e| error_response(&e));
     }
@@ -190,11 +197,14 @@ pub async fn handle(core: &Arc<Core>, info: &ConnInfo, req: Request<Incoming>) -
 /// [`crate::ops::drain`].
 async fn node_drain(
     core: &Arc<Core>,
+    info: &ConnInfo,
     req: Request<Incoming>,
     drain: bool,
 ) -> Result<Response<Body>, SprigError> {
     let auth = header(&req, "authorization");
-    core.admin.authorized(auth.as_deref()).await?;
+    core.admin
+        .authorized(auth.as_deref(), relay_client(info, &req))
+        .await?;
     let body = parse_json(&read_body(req, 64 << 10).await?)?;
     let dc = crate::ops::dc().ok_or_else(|| {
         SprigError::new(
@@ -221,10 +231,13 @@ async fn node_drain(
 
 async fn replace_replica(
     core: &Arc<Core>,
+    info: &ConnInfo,
     req: Request<Incoming>,
 ) -> Result<Response<Body>, SprigError> {
     let auth = header(&req, "authorization");
-    core.admin.authorized(auth.as_deref()).await?;
+    core.admin
+        .authorized(auth.as_deref(), relay_client(info, &req))
+        .await?;
     let body = parse_json(&read_body(req, 64 << 10).await?)?;
     let bad = |m: String| SprigError::new(SprigCode::AdminRequestInvalid, m);
     let id = |k: &str| {
@@ -260,11 +273,14 @@ async fn replace_replica(
 /// not a controller route): see [`crate::backup`].
 async fn backups(
     core: &Arc<Core>,
+    info: &ConnInfo,
     req: Request<Incoming>,
     path: String,
 ) -> Result<Response<Body>, SprigError> {
     let auth = header(&req, "authorization");
-    core.admin.authorized(auth.as_deref()).await?;
+    core.admin
+        .authorized(auth.as_deref(), relay_client(info, &req))
+        .await?;
     let body = read_body(req, 64 << 10).await?;
     let v = tokio::task::spawn_blocking(move || crate::backup::handle(&path, &body))
         .await
@@ -288,6 +304,7 @@ async fn admin(
                 m.route.rpc,
                 m.vars.get("name").map(String::as_str),
                 auth.as_deref(),
+                relay_client(info, &req),
             )
             .await?;
         return Ok(json_response(200, &v));
@@ -298,11 +315,13 @@ async fn admin(
         .path_and_query()
         .map_or_else(|| req.uri().path().to_owned(), |p| p.as_str().to_owned());
     let max = core.engine.settings().max_request;
+    let client = relay_client(info, &req);
     let body = read_body(req, max).await?;
-    // The controller records the client's address.
+    // The controller records the client's address, and without an admin
+    // token answers an anonymous call only for a client on its machine.
     let r = core
         .admin
-        .forward_from(&method, &pq, auth.as_deref(), body, Some(info.peer.ip()))
+        .forward_for(&method, &pq, auth.as_deref(), body, Some(client))
         .await?;
     Ok(bytes_response(r.status, r.body))
 }

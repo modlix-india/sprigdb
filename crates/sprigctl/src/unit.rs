@@ -4,9 +4,16 @@
 //! term, committed and applied indexes, and with units placed per tenant
 //! its descriptor's home node. A gateway whose engine doesn't replicate
 //! answers with no node and no units.
+//!
+//! `sprigctl unit read-copies <tenant> <n>`: the tenant's extra read-only
+//! copies, its `placement.read_copies` setting, written through the
+//! controller's Admin API (`--endpoint`); each unit's leader then lists that
+//! many learners in the unit's descriptor and adds them to its group.
 
 use clap::{Arg, ArgMatches, Command};
 use serde_json::Value;
+
+use sprig_controller::admin::types::{ScopeRef, SetSettingRequest, SettingWriteResponse};
 
 use crate::client::AdminClient;
 use crate::render::table;
@@ -26,6 +33,24 @@ pub(crate) fn group() -> Command {
                         .long("leading")
                         .action(clap::ArgAction::SetTrue)
                         .help("Only the units this gateway leads"),
+                ),
+        )
+        .subcommand(
+            Command::new("read-copies")
+                .about(
+                    "Set a tenant's extra read-only copies (placement.read_copies) through the controller at --endpoint",
+                )
+                .arg(Arg::new("tenant").required(true).help("The tenant's name"))
+                .arg(
+                    Arg::new("n")
+                        .required(true)
+                        .value_parser(clap::value_parser!(u64).range(0..=16))
+                        .help("How many non-voting copies each of its units keeps (0 to 16)"),
+                )
+                .arg(
+                    Arg::new("reason")
+                        .long("reason")
+                        .help("Why, for the settings audit"),
                 ),
         )
 }
@@ -116,6 +141,25 @@ pub(crate) async fn run(c: &AdminClient, group: &ArgMatches, out: Output) -> Res
                 a.retain(|u| u["leading"].as_bool().unwrap_or(false));
             }
             print(out, &v, |v| render(v, leading));
+        }
+        "read-copies" => {
+            let tenant = sub.get_one::<String>("tenant").cloned().unwrap_or_default();
+            let n = sub.get_one::<u64>("n").copied().unwrap_or(0);
+            let scope: ScopeRef = format!("tenant:{tenant}").parse().map_err(Failed)?;
+            let req = SetSettingRequest {
+                scope: Some(scope),
+                value: None,
+                value_text: Some(n.to_string()),
+                reason: sub
+                    .get_one::<String>("reason")
+                    .cloned()
+                    .unwrap_or_else(|| format!("{n} extra read copies")),
+                actor: std::env::var("USER").ok().filter(|a| !a.trim().is_empty()),
+            };
+            let r: SettingWriteResponse = c
+                .put("/admin/v1/settings/placement.read_copies", &req)
+                .await?;
+            print(out, &r, crate::render::settings_write);
         }
         other => return Err(Failed(format!("unknown subcommand {other}"))),
     }

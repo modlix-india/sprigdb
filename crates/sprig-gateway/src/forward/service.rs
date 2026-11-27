@@ -96,10 +96,22 @@ fn redirect_to(tenant: u64, hops: u32, reader: bool) -> Option<u64> {
         return None;
     }
     if reader {
-        if super::holds_replica(tenant) {
+        if super::holds_replica(tenant) && crate::reader::replica_ready(tenant) {
             return None;
         }
-        return super::reader_target(tenant, u64::from(hops));
+        // No replica here, or one still catching up: another copy, else
+        // the leader.
+        if let Some(n) = super::reader_target(tenant, u64::from(hops)) {
+            return Some(n);
+        }
+        if super::holds_replica(tenant) {
+            let me = node_engine::raft_id_from_env()?;
+            return match node_engine::tenant_leader(tenant) {
+                UnitLeader::Node(n) if n != me => Some(n),
+                _ => None,
+            };
+        }
+        return None;
     }
     let me = node_engine::raft_id_from_env()?;
     match node_engine::tenant_leader(tenant) {

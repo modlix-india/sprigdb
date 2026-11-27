@@ -34,6 +34,13 @@ pub trait EngineBackend: Send + Sync + std::fmt::Debug {
     fn set_keyspace_flags(&self, scope: &str, flags: u16) {
         let _ = (scope, flags);
     }
+
+    /// The running connection's causal token (`SPRIG.TOKEN`), raised to
+    /// `raise` first when given; 0 where the engine keeps none.
+    fn read_token(&self, raise: Option<u64>) -> u64 {
+        let _ = raise;
+        0
+    }
 }
 
 /// A key a transaction watches on the engine (`WATCH`).
@@ -190,6 +197,7 @@ pub fn session_command(name: &str) -> bool {
             | "role"
             | "lastsave"
             | "readonly"
+            | "sprig.token"
             | "readwrite"
             | "asking"
             | "multi"

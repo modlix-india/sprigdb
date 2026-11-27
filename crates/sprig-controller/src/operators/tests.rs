@@ -988,3 +988,171 @@ async fn the_layer_hands_routes_the_client_address() {
     stop.cancel();
     let _ = server.await;
 }
+
+/// A guard with no admin token: the default of an install that sets none.
+fn tokenless_guard(e: &Env) -> Guard {
+    Guard::new(Arc::clone(&e.ops), None, None, Vec::new(), false)
+}
+
+#[test]
+fn a_call_is_local_only_from_this_machine_and_unrelayed() {
+    use super::guard::{CLIENT_ADDR_HEADER, is_local};
+    let lo: std::net::SocketAddr = "127.0.0.1:50000".parse().unwrap();
+    let lo6: std::net::SocketAddr = "[::1]:50000".parse().unwrap();
+    let mapped: std::net::SocketAddr = "[::ffff:127.0.0.1]:50000".parse().unwrap();
+    let lan: std::net::SocketAddr = "192.168.0.101:50000".parse().unwrap();
+    let none = axum::http::HeaderMap::new();
+    assert!(is_local(&none, Some(lo)));
+    assert!(is_local(&none, Some(lo6)));
+    assert!(is_local(&none, Some(mapped)));
+    assert!(!is_local(&none, Some(lan)));
+    // No peer known: not local.
+    assert!(!is_local(&none, None));
+    // A gateway on this machine relaying for a client elsewhere.
+    for (client, local) in [
+        ("203.0.113.7", false),
+        ("192.168.0.50", false),
+        ("169.254.169.254", false),
+        ("2001:db8::1", false),
+        ("127.0.0.1", true),
+        ("::1", true),
+        ("not an address", false),
+        ("127.0.0.1, 203.0.113.7", false),
+        ("", false),
+    ] {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(CLIENT_ADDR_HEADER, client.parse().unwrap());
+        assert_eq!(is_local(&h, Some(lo)), local, "{client}");
+        // Never local from another machine, whatever the header says.
+        assert!(!is_local(&h, Some(lan)), "{client}");
+    }
+    // Two copies of the header: every one must be local.
+    let mut h = axum::http::HeaderMap::new();
+    h.append(CLIENT_ADDR_HEADER, "127.0.0.1".parse().unwrap());
+    h.append(CLIENT_ADDR_HEADER, "203.0.113.7".parse().unwrap());
+    assert!(!is_local(&h, Some(lo)));
+    // A reverse proxy on this machine.
+    for proxy in [
+        "forwarded",
+        "x-forwarded-for",
+        "x-forwarded-host",
+        "x-real-ip",
+    ] {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(proxy, "127.0.0.1".parse().unwrap());
+        assert!(!is_local(&h, Some(lo)), "{proxy}");
+    }
+}
+
+#[tokio::test]
+async fn without_an_admin_token_only_a_local_call_is_the_bootstrap_principal() {
+    let e = env();
+    let g = tokenless_guard(&e);
+    let none = HeaderMapT::new();
+    assert_eq!(
+        g.authenticate_from(&none, true).await.unwrap().kind,
+        PrincipalKind::Bootstrap
+    );
+    // From anywhere else: refused, with or without some bearer.
+    for h in [none.clone(), headers("anything"), headers("")] {
+        let err = g.authenticate_from(&h, false).await.unwrap_err();
+        assert_eq!(code_of(&err), SprigCode::AdminUnauthenticated);
+        assert!(err.to_string().contains("admin_token_file"), "{err}");
+        let err = g.authenticate(&h).await.unwrap_err();
+        assert_eq!(code_of(&err), SprigCode::AdminUnauthenticated);
+    }
+    // With a token configured, being local earns nothing.
+    let with = guard(&e);
+    let err = with.authenticate_from(&none, true).await.unwrap_err();
+    assert_eq!(code_of(&err), SprigCode::AdminUnauthenticated);
+    let err = with
+        .authenticate_from(&headers("nope"), true)
+        .await
+        .unwrap_err();
+    assert_eq!(code_of(&err), SprigCode::AdminUnauthenticated);
+}
+
+#[tokio::test]
+async fn a_tokenless_controller_refuses_calls_a_gateway_relays_from_other_machines() {
+    use super::guard::{CLIENT_ADDR_HEADER, RELAY_AUTH_HEADER};
+    let e = env();
+    let g = Arc::new(tokenless_guard(&e));
+    let app = Router::new()
+        .route("/admin/v1/clusters", get(echo).post(echo))
+        .route("/admin/v1/ca:init", post(echo))
+        .layer(axum::middleware::from_fn_with_state(g, guard::layer));
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    let stop = sprig_common::CancellationToken::new();
+    let server = tokio::spawn(crate::admin::http::serve(l, app, stop.clone()));
+    let call = |m: &str, path: &str, extra: String| {
+        let req = format!(
+            "{m} {path} HTTP/1.1\r\nhost: x\r\ncontent-type: application/json\r\n{extra}\
+             content-length: 2\r\nconnection: close\r\n\r\n{{}}"
+        );
+        async move {
+            let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+            s.write_all(req.as_bytes()).await.unwrap();
+            let mut out = String::new();
+            s.read_to_string(&mut out).await.unwrap();
+            let status: u16 = out[9..12].parse().unwrap();
+            let body = out.split_once("\r\n\r\n").unwrap().1;
+            (
+                status,
+                serde_json::from_str::<Value>(body).unwrap_or(Value::Null),
+            )
+        }
+    };
+    // On the controller's machine, directly: the bootstrap principal.
+    let (s, v) = call("GET", "/admin/v1/clusters", String::new()).await;
+    assert_eq!(s, 200, "{v}");
+    let authn: Principal = serde_json::from_str(v["authn"].as_str().unwrap()).unwrap();
+    assert_eq!(authn.kind, PrincipalKind::Bootstrap);
+    // A gateway's own call (marked relayed, naming no client), and one it
+    // relays for a client on this machine.
+    let (s, v) = call(
+        "GET",
+        "/admin/v1/clusters",
+        "x-sprig-forwarded: 1\r\n".into(),
+    )
+    .await;
+    assert_eq!(s, 200, "{v}");
+    let (s, v) = call(
+        "POST",
+        "/admin/v1/clusters",
+        format!("x-sprig-forwarded: 1\r\n{CLIENT_ADDR_HEADER}: 127.0.0.1\r\n"),
+    )
+    .await;
+    assert_eq!(s, 200, "{v}");
+    // The same gateway relaying for anyone who reached its HTTP port from
+    // another machine: no credential, an invented one, a guessed relay
+    // secret; reads and changes alike.
+    for (m, path) in [
+        ("GET", "/admin/v1/clusters"),
+        ("POST", "/admin/v1/clusters"),
+        ("POST", "/admin/v1/ca:init"),
+    ] {
+        for extra in [
+            String::new(),
+            "authorization: Bearer anything\r\n".to_owned(),
+            format!("{RELAY_AUTH_HEADER}: guess\r\n"),
+        ] {
+            let relayed =
+                format!("x-sprig-forwarded: 1\r\n{CLIENT_ADDR_HEADER}: 203.0.113.7\r\n{extra}");
+            let (s, v) = call(m, path, relayed).await;
+            assert_eq!(s, 401, "{m} {path} {extra:?}: {v}");
+            assert_eq!(v["code"], 39793, "{m} {path}: {v}");
+        }
+    }
+    // Through a reverse proxy on this machine.
+    let (s, v) = call(
+        "GET",
+        "/admin/v1/clusters",
+        "x-forwarded-for: 203.0.113.7\r\n".into(),
+    )
+    .await;
+    assert_eq!(s, 401, "{v}");
+    assert_eq!(v["code"], 39793);
+    stop.cancel();
+    let _ = server.await;
+}

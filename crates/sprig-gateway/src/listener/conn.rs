@@ -103,7 +103,8 @@ pub(super) async fn run(
         () = close.cancelled() => {
             tracing::debug!(listener = name, %peer, "connection closed: listener retired");
         }
-        r = fe.serve(conn, ctx) => {
+        // The connection's causal token: its own commits (reads from copies).
+        r = sprig_engine::reads::session_scope(Arc::default(), fe.serve(conn, ctx)) => {
             if let Err(e) = r {
                 tracing::debug!(listener = name, %peer, error = %e, "connection ended with an error");
             }

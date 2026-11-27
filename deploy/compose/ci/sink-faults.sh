@@ -79,6 +79,10 @@ up() {
     # minutes, and pausing after 1 minute for the long faults.
     target/release/sprigctl --endpoint http://127.0.0.1:7480 settings set sink.destination_allowlist \
         '["127.0.0.1:29093","127.0.0.1:25433","127.0.0.1:29001"]' --scope global --reason ci-sink-faults
+    # The proxies are on this machine: internal addresses, which the
+    # allowlist opens only together with the operator's own list.
+    target/release/sprigctl --endpoint http://127.0.0.1:7480 settings set sink.internal_destinations \
+        '["127.0.0.1:29093","127.0.0.1:25433","127.0.0.1:29001"]' --scope global --reason ci-sink-faults
     target/release/sprigctl --endpoint http://127.0.0.1:7480 settings set sink.pause_after_minutes 1 \
         --scope tenant:acme --reason ci-sink-faults
     sql "CREATE DATABASE IF NOT EXISTS qcr"

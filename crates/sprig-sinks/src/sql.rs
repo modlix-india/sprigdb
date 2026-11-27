@@ -355,6 +355,11 @@ fn destinations(h: &dyn Host, db: u32) -> Result<Destinations> {
         residency: h.residency(),
         platform_hosts: None,
         metadata_allowed: h.setting("platform_identity", db).as_deref() == Some("full"),
+        internal: sprig_common::outbound::InternalAllow::parse_or_none(
+            h.setting("internal_destinations", db)
+                .as_deref()
+                .unwrap_or("[]"),
+        ),
     })
 }
 
@@ -1062,6 +1067,13 @@ async fn dry_run_rows(
 }
 
 fn check_option(k: &str, v: &str) -> Result<()> {
+    if !crate::settings::with_may_set(k) {
+        let k = k.strip_prefix("sink.").unwrap_or(k);
+        return Err(bad_option(format!(
+            "{k} isn't a sink's own option: sink.{k} is set for the tenant or by an operator, \
+             not in WITH"
+        )));
+    }
     if crate::settings::u64_key(k).is_some() && v.trim().parse::<u64>().is_err() {
         return Err(bad_option(format!("{k} must be a whole number, not '{v}'")));
     }

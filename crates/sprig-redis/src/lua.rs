@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use mlua::chunk::ChunkMode;
 use mlua::{Lua, MultiValue, Table, Value as LuaValue, Variadic};
 use sha1::{Digest, Sha1};
 use sprig_logic_js::budget::{Limits, RunState};
@@ -1239,14 +1240,22 @@ fn lua_frame(e: &mlua::Error) -> Frame {
     Frame::err(&format!("Error compiling script (new function): {msg}"))
 }
 
+/// A client's script or library as a chunk to compile: text only. Lua
+/// would otherwise take a precompiled chunk here (one that starts with its
+/// signature byte) and run it unchecked, and the interpreter trusts
+/// bytecode: a crafted chunk reads and writes outside the sandbox's
+/// memory. Every load of client code goes through this.
+fn user_chunk<'a>(lua: &'a Lua, source: &'a str, name: &str) -> mlua::chunk::Chunk<'a> {
+    lua.load(source).set_name(name).set_mode(ChunkMode::Text)
+}
+
 /// Compiles a script without running it (`SCRIPT LOAD`).
 ///
 /// # Errors
 /// The compile error as Redis words it.
 pub fn check(body: &str) -> Result<(), Frame> {
     let lua = Lua::new();
-    lua.load(body)
-        .set_name("@user_script")
+    user_chunk(&lua, body, "@user_script")
         .into_function()
         .map(|_| ())
         .map_err(|e| lua_frame(&e))
@@ -1288,10 +1297,7 @@ pub fn load_library(code: &str, cfg: &crate::env::Config) -> Result<LibraryInfo,
             .exec();
     }
     protect(&sb)?;
-    let f = sb
-        .lua()
-        .load(&body)
-        .set_name("@user_function")
+    let f = user_chunk(sb.lua(), &body, "@user_function")
         .into_function()
         .map_err(|e| {
             let msg = match &e {
@@ -1517,7 +1523,7 @@ fn run_blocking(
         Body::Script { source, name } => (source, "@user_script", name.clone()),
         Body::Function { source, name } => (source, "@user_function", name.clone()),
     };
-    let f = match lua.load(source.as_str()).set_name(chunk).into_function() {
+    let f = match user_chunk(lua, source.as_str(), chunk).into_function() {
         Ok(f) => f,
         Err(e) => return Outcome::Reply(lua_frame(&e)),
     };
@@ -1678,6 +1684,115 @@ mod tests {
             .expect("the cancelled loop never stopped")
             .unwrap();
         assert!(matches!(out, Outcome::Abort(_)), "{out:?}");
+    }
+
+    /// `return 42` as a precompiled Lua 5.1 chunk whose bytes are all
+    /// ASCII, so it reaches the loader unchanged the way a script does
+    /// (bytes to text). The compiler's closing `RETURN 0 1` has a byte
+    /// over 127; it is swapped for a second `RETURN 0 2`, never reached.
+    fn precompiled() -> String {
+        let lua = Lua::new();
+        let mut code = lua.load("return 42").into_function().unwrap().dump(true);
+        let at = code
+            .windows(4)
+            .rposition(|w| w == [0x1e, 0x00, 0x80, 0x00])
+            .expect("the closing RETURN");
+        code[at..at + 4].copy_from_slice(&[0x1e, 0x00, 0x00, 0x01]);
+        assert_eq!(code[0], 27, "a precompiled chunk starts with ESC");
+        assert!(code.is_ascii(), "{code:?}");
+        // What it does when something loads it as a chunk: runs.
+        let f = lua
+            .load(&code[..])
+            .set_mode(ChunkMode::Binary)
+            .into_function()
+            .unwrap();
+        assert_eq!(f.call::<i64>(()).unwrap(), 42);
+        String::from_utf8_lossy(&code).into_owned()
+    }
+
+    async fn outcome(body: Body, args: Vec<Bytes>) -> String {
+        let cfg = crate::env::Config::default();
+        let s = start(body, Vec::new(), args, false, &cfg);
+        let out = tokio::time::timeout(Duration::from_secs(20), s.done)
+            .await
+            .expect("the script never ended")
+            .unwrap();
+        match out {
+            Outcome::Reply(f) | Outcome::Abort(f) => match f {
+                Frame::Error(e) => format!("error: {}", String::from_utf8_lossy(&e)),
+                other => format!("{other:?}"),
+            },
+        }
+    }
+
+    /// A precompiled chunk is refused wherever client code is loaded:
+    /// `SCRIPT LOAD`, `EVAL` and `EVALSHA`, `FUNCTION LOAD` and `FCALL`,
+    /// and `loadstring` inside a script.
+    #[tokio::test]
+    async fn precompiled_chunks_are_never_loaded() {
+        let code = precompiled();
+        // SCRIPT LOAD.
+        let Err(Frame::Error(e)) = check(&code) else {
+            panic!("SCRIPT LOAD took a precompiled chunk");
+        };
+        let e = String::from_utf8_lossy(&e).into_owned();
+        assert!(e.contains("binary chunk"), "{e}");
+        assert!(check("return 42").is_ok());
+        // EVAL, and EVALSHA of a script that got into the cache.
+        let out = outcome(
+            Body::Script {
+                source: code.clone(),
+                name: "f".into(),
+            },
+            Vec::new(),
+        )
+        .await;
+        assert!(
+            out.starts_with("error: ") && out.contains("binary chunk"),
+            "{out}"
+        );
+        // FCALL of a library whose stored code is a precompiled chunk.
+        let out = outcome(
+            Body::Function {
+                source: code.clone(),
+                name: "f".into(),
+            },
+            Vec::new(),
+        )
+        .await;
+        assert!(
+            out.starts_with("error: ") && out.contains("binary chunk"),
+            "{out}"
+        );
+        // FUNCTION LOAD: after the shebang line, and with no shebang.
+        let cfg = crate::env::Config::default();
+        for lib in [format!("#!lua name=evil\n{code}"), code.clone()] {
+            assert!(load_library(&lib, &cfg).is_err(), "FUNCTION LOAD took it");
+        }
+        // Inside a script: no loadstring of a chunk, no string.dump to make one.
+        let out = outcome(
+            Body::Script {
+                source: "local f, e = loadstring(ARGV[1]) \
+                         return {type(f), tostring(e), type(string.dump)}"
+                    .into(),
+                name: "f".into(),
+            },
+            vec![Bytes::from(code.into_bytes())],
+        )
+        .await;
+        assert!(!out.starts_with("error: "), "{out}");
+        assert!(out.contains("binary chunks are not allowed"), "{out}");
+        assert!(!out.contains("function"), "{out}");
+        // Text still runs.
+        let out = outcome(
+            Body::Script {
+                source: "return 42".into(),
+                name: "f".into(),
+            },
+            Vec::new(),
+        )
+        .await;
+        assert!(out.contains("42") && !out.starts_with("error: "), "{out}");
     }
 
     #[test]

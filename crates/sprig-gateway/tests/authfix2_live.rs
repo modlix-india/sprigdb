@@ -24,7 +24,8 @@
 //! export AF2_KAFKA=33092 AF2_AMQPS=33671 AF2_BOLT=33687
 //! export AF2_SET=<dir>/setting.sh   # <cmd> <key> <json>: a dc setting
 //! export AF2_LOG=<the gateway's log file>  AF2_HOOK_PORT=33881
-//! # sink.destination_allowlist must include 127.0.0.1:$AF2_HOOK_PORT
+//! # sink.destination_allowlist must include 127.0.0.1:$AF2_HOOK_PORT, and
+//! # the operator's sink.internal_destinations must cover it
 //! cargo test -p sprig-gateway --test authfix2_live -- --nocapture --test-threads 1
 //! ```
 //!

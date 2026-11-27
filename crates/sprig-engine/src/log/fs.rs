@@ -20,10 +20,16 @@
 //! **Syncs outside raft-engine.** raft-engine syncs only inside a write
 //! (its own `sync()` writes an empty batch, which it skips). A log that
 //! overlaps its syncs writes without syncing and then calls
-//! [`LogFs::sync_written`], from any thread, while later writes go on: it
-//! syncs every append file written since its last sync, so everything
-//! written before the call is durable when it returns. Files raft-engine
-//! rotates away are synced by raft-engine itself when it closes them.
+//! [`LogFs::sync_written`], from any thread, while later writes go on:
+//! everything written before the call is durable when it returns. Each
+//! file counts its writes ([`SyncGate`]): a sync covers the writes made
+//! before it began, so a caller returns only once a sync that began after
+//! the file's last write before the call has finished, whether it ran that
+//! sync itself or waited for another caller's. (A flag saying "written
+//! since the last sync began" is not enough: a second caller would find it
+//! clear and return while the first caller's sync, the one covering the
+//! bytes, was still running.) Files raft-engine rotates away are synced by
+//! raft-engine itself when it closes them, through the same gate.
 //!
 //! **Simulated syncs** ([`simulate_syncs`], benchmarks only): every sync of
 //! a log in the process sleeps instead of reaching the disk, either all
@@ -156,6 +162,10 @@ pub struct SimDisk {
     synced: Mutex<HashMap<PathBuf, u64>>,
     /// The power is off: syncs no longer make anything durable.
     cut: AtomicBool,
+    /// How long each sync takes, in microseconds ([`SimDisk::set_sync_delay`]).
+    delay_micros: AtomicU64,
+    /// Syncs begun ([`SimDisk::syncs_begun`]).
+    begun: AtomicU64,
 }
 
 impl SimDisk {
@@ -163,6 +173,31 @@ impl SimDisk {
     #[must_use]
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    /// Every sync under this simulation takes `d` from now on (a slow
+    /// disk): what it covers counts as synced only once that time has
+    /// passed, so a power cut meanwhile loses it.
+    pub fn set_sync_delay(&self, d: Duration) {
+        self.delay_micros.store(
+            u64::try_from(d.as_micros()).unwrap_or(u64::MAX),
+            Ordering::Release,
+        );
+    }
+
+    /// How many syncs have begun under this simulation.
+    #[must_use]
+    pub fn syncs_begun(&self) -> u64 {
+        self.begun.load(Ordering::Acquire)
+    }
+
+    /// A sync begins: counted, then it takes the sync delay.
+    fn begin_sync(&self) {
+        self.begun.fetch_add(1, Ordering::AcqRel);
+        let d = self.delay_micros.load(Ordering::Acquire);
+        if d > 0 {
+            std::thread::sleep(Duration::from_micros(d));
+        }
     }
 
     fn note_sync(&self, path: &Path, len: u64) {
@@ -202,13 +237,28 @@ impl SimDisk {
     /// # Errors
     /// A file could not be truncated.
     pub fn crash(&self, dir: &Path, seed: u64) -> IoResult<u64> {
+        self.crash_keeping(dir, Some(seed))
+    }
+
+    /// [`SimDisk::crash`] at its worst: every file keeps its synced bytes
+    /// and nothing of its unsynced tail.
+    ///
+    /// # Errors
+    /// A file could not be truncated.
+    pub fn crash_losing_unsynced(&self, dir: &Path) -> IoResult<u64> {
+        self.crash_keeping(dir, None)
+    }
+
+    /// The crash: with a seed, a seed-chosen prefix of each unsynced tail
+    /// survives; without one, none of it.
+    fn crash_keeping(&self, dir: &Path, seed: Option<u64>) -> IoResult<u64> {
         let synced = self
             .synced
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
         let mut lost = 0;
-        let mut rng = seed | 1;
+        let mut rng = seed.unwrap_or(0) | 1;
         // What survives the power loss is on the disk: a later crash (the
         // same log reopened on this simulation) keeps it.
         let mut survived = HashMap::new();
@@ -228,7 +278,10 @@ impl SimDisk {
             rng ^= rng << 13;
             rng ^= rng >> 7;
             rng ^= rng << 17;
-            let keep = rng % (tail + 1);
+            let keep = match seed {
+                Some(_) => rng % (tail + 1),
+                None => 0,
+            };
             let new_len = keep_synced + keep;
             lost += len - new_len;
             OpenOptions::new()
@@ -240,6 +293,79 @@ impl SimDisk {
         *self.synced.lock().unwrap_or_else(PoisonError::into_inner) = survived;
         self.cut.store(false, Ordering::Release);
         Ok(lost)
+    }
+}
+
+/// Which writes of one file finished syncs cover.
+///
+/// Writes are counted after they reach the file ([`SyncGate::note_write`]).
+/// A sync covers every write counted before it began, so
+/// [`SyncGate::sync_with`] returns only once a sync that began at or after
+/// the count it saw on entry has finished: it runs one, or waits for one
+/// that is already running if that one began late enough. Syncs that began
+/// earlier may still be running beside it; they don't cover the newest
+/// writes, so they are not waited for and another sync starts at once.
+#[derive(Debug, Default)]
+pub(super) struct SyncGate {
+    /// Writes to the file so far.
+    written: AtomicU64,
+    /// Every write up to this count is covered by a sync that finished
+    /// (kept beside `state` so a caller with nothing to sync takes no lock).
+    durable: AtomicU64,
+    /// `written` when each running sync began.
+    state: Mutex<Vec<u64>>,
+    done: Condvar,
+}
+
+impl SyncGate {
+    /// A write (or another change a sync must cover) reached the file.
+    /// Call it after the write returns: a sync that then reads the count
+    /// began after the write.
+    pub(super) fn note_write(&self) {
+        self.written.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Returns once everything written before the call is covered by a
+    /// finished `sync`. Safe alongside writes and other calls.
+    ///
+    /// # Errors
+    /// The sync this call ran failed; what it would have covered stays
+    /// uncovered, and whoever waited for it runs its own.
+    pub(super) fn sync_with(&self, sync: impl Fn() -> IoResult<()>) -> IoResult<()> {
+        let target = self.written.load(Ordering::Acquire);
+        if self.durable.load(Ordering::Acquire) >= target {
+            return Ok(());
+        }
+        let mut running = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        loop {
+            if self.durable.load(Ordering::Acquire) >= target {
+                return Ok(());
+            }
+            // A running sync that began after the last write this call must
+            // cover: wait for it rather than start another.
+            if running.iter().any(|began| *began >= target) {
+                running = self
+                    .done
+                    .wait(running)
+                    .unwrap_or_else(PoisonError::into_inner);
+                continue;
+            }
+            // Read under the lock, before the sync starts: every write
+            // counted by now is in the file.
+            let began = self.written.load(Ordering::Acquire);
+            running.push(began);
+            drop(running);
+            let res = sync();
+            running = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(i) = running.iter().position(|b| *b == began) {
+                running.swap_remove(i);
+            }
+            if res.is_ok() {
+                self.durable.fetch_max(began, Ordering::AcqRel);
+            }
+            self.done.notify_all();
+            res?;
+        }
     }
 }
 
@@ -265,12 +391,14 @@ impl LogFs {
         }
     }
 
-    /// Syncs every append file written since its last sync: everything
-    /// written to the log before the call is durable when it returns (see
-    /// the module docs). Safe alongside writes and other syncs.
+    /// Makes every append file's writes durable: everything written to the
+    /// log before the call is durable when it returns (see the module
+    /// docs). A file with nothing new is skipped only when a finished sync
+    /// covers its last write; while the sync covering it still runs, the
+    /// call waits for that sync. Safe alongside writes and other syncs.
     ///
     /// # Errors
-    /// A sync failed; the file counts as unsynced again.
+    /// A sync failed; what it would have covered counts as unsynced.
     pub fn sync_written(&self) -> IoResult<()> {
         let files: Vec<Arc<FileCore>> = {
             let mut a = self.append.lock().unwrap_or_else(PoisonError::into_inner);
@@ -278,12 +406,7 @@ impl LogFs {
             a.iter().filter_map(Weak::upgrade).collect()
         };
         for f in files {
-            if f.dirty.swap(false, Ordering::AcqRel)
-                && let Err(e) = f.sync()
-            {
-                f.dirty.store(true, Ordering::Release);
-                return Err(e);
-            }
+            f.sync_covering()?;
         }
         Ok(())
     }
@@ -296,11 +419,17 @@ struct FileCore {
     path: PathBuf,
     mode: SyncMode,
     sim: Option<Arc<SimDisk>>,
-    /// Written since the last sync began.
-    dirty: AtomicBool,
+    /// Which of its writes finished syncs cover.
+    gate: SyncGate,
 }
 
 impl FileCore {
+    /// Returns once everything written to the file before the call is
+    /// durable ([`SyncGate::sync_with`]).
+    fn sync_covering(&self) -> IoResult<()> {
+        self.gate.sync_with(|| self.sync())
+    }
+
     fn sync(&self) -> IoResult<()> {
         // What the simulation counts as synced is what was there before
         // the sync began: writes alongside it may not be covered.
@@ -308,6 +437,9 @@ impl FileCore {
             Some(_) => self.file.metadata()?.len(),
             None => 0,
         };
+        if let Some(sim) = &self.sim {
+            sim.begin_sync();
+        }
         if self.mode == SyncMode::Full && !simulated_sync() {
             self.file.sync_data()?;
         }
@@ -326,7 +458,9 @@ pub struct LogHandle {
 
 impl Handle for LogHandle {
     fn truncate(&self, offset: usize) -> IoResult<()> {
-        self.core.file.set_len(offset as u64)
+        self.core.file.set_len(offset as u64)?;
+        self.core.gate.note_write();
+        Ok(())
     }
 
     fn file_size(&self) -> IoResult<usize> {
@@ -334,10 +468,13 @@ impl Handle for LogHandle {
     }
 
     fn sync(&self) -> IoResult<()> {
-        self.core.dirty.store(false, Ordering::Release);
-        self.core.sync().inspect_err(|_| {
-            self.core.dirty.store(true, Ordering::Release);
-        })
+        // raft-engine's own syncs (a write it was asked to sync, a file it
+        // closes or has just created) go through the gate too: a
+        // `sync_written` beside one must not take the file for durable
+        // before it has finished. They always sync, as raft-engine expects,
+        // even with no write counted since the last sync.
+        self.core.gate.note_write();
+        self.core.sync_covering()
     }
 }
 
@@ -360,7 +497,7 @@ impl Write for LogIo {
     fn write(&mut self, buf: &[u8]) -> IoResult<usize> {
         let n = self.h.core.file.write_at(buf, self.offset)?;
         self.offset += n as u64;
-        self.h.core.dirty.store(true, Ordering::Release);
+        self.h.core.gate.note_write();
         note_write();
         Ok(n)
     }
@@ -385,6 +522,7 @@ impl Seek for LogIo {
 impl WriteExt for LogIo {
     fn truncate(&mut self, offset: usize) -> IoResult<()> {
         self.h.core.file.set_len(offset as u64)?;
+        self.h.core.gate.note_write();
         self.offset = offset as u64;
         Ok(())
     }
@@ -405,7 +543,7 @@ impl LogFs {
             path: path.to_path_buf(),
             mode: self.mode,
             sim: self.sim.clone(),
-            dirty: AtomicBool::new(false),
+            gate: SyncGate::default(),
         });
         if writable && path.to_string_lossy().ends_with(APPEND_SUFFIX) {
             self.append
@@ -456,5 +594,196 @@ impl FileSystem for LogFs {
 
     fn new_writer(&self, h: Arc<LogHandle>) -> IoResult<LogIo> {
         Ok(LogIo { h, offset: 0 })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::mpsc;
+
+    use super::*;
+
+    /// A sync that blocks until told to finish, and says when it began.
+    struct Slow {
+        began: mpsc::Sender<()>,
+        finish: Mutex<mpsc::Receiver<()>>,
+    }
+
+    impl Slow {
+        fn new() -> (Slow, mpsc::Receiver<()>, mpsc::Sender<()>) {
+            let (began, began_rx) = mpsc::channel();
+            let (finish_tx, finish) = mpsc::channel();
+            (
+                Slow {
+                    began,
+                    finish: Mutex::new(finish),
+                },
+                began_rx,
+                finish_tx,
+            )
+        }
+
+        fn run(&self) {
+            self.began.send(()).unwrap();
+            self.finish.lock().unwrap().recv().unwrap();
+        }
+    }
+
+    /// The interleaving of two overlapped sync workers: the write a caller
+    /// must cover is covered by another caller's sync that is still
+    /// running. The caller waits for it; it neither returns early nor
+    /// starts a sync of its own.
+    #[test]
+    fn a_sync_waits_for_the_running_sync_that_covers_its_writes() {
+        let gate = SyncGate::default();
+        let (slow, began, finish) = Slow::new();
+        let own = AtomicUsize::new(0);
+        let returned = AtomicBool::new(false);
+        gate.note_write();
+        gate.note_write();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                gate.sync_with(|| {
+                    slow.run();
+                    Ok(())
+                })
+                .unwrap();
+            });
+            began.recv().unwrap();
+            s.spawn(|| {
+                gate.sync_with(|| {
+                    own.fetch_add(1, Ordering::AcqRel);
+                    Ok(())
+                })
+                .unwrap();
+                returned.store(true, Ordering::Release);
+            });
+            std::thread::sleep(Duration::from_millis(150));
+            assert!(
+                !returned.load(Ordering::Acquire),
+                "returned while the sync covering its writes was still running"
+            );
+            finish.send(()).unwrap();
+        });
+        assert!(returned.load(Ordering::Acquire));
+        assert_eq!(
+            own.load(Ordering::Acquire),
+            0,
+            "the running sync covered it"
+        );
+        // Nothing new: no sync at all.
+        gate.sync_with(|| panic!("nothing to sync")).unwrap();
+    }
+
+    /// Syncs still overlap: a running sync that began before a write does
+    /// not cover it, so the next caller starts its own beside it and does
+    /// not wait for the first.
+    #[test]
+    fn a_sync_runs_beside_one_that_began_before_its_write() {
+        let gate = SyncGate::default();
+        let (slow, began, finish) = Slow::new();
+        gate.note_write();
+        std::thread::scope(|s| {
+            let first = s.spawn(|| {
+                gate.sync_with(|| {
+                    slow.run();
+                    Ok(())
+                })
+                .unwrap();
+            });
+            began.recv().unwrap();
+            gate.note_write();
+            let own = AtomicUsize::new(0);
+            gate.sync_with(|| {
+                own.fetch_add(1, Ordering::AcqRel);
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(own.load(Ordering::Acquire), 1);
+            assert!(!first.is_finished(), "the earlier sync is still running");
+            finish.send(()).unwrap();
+        });
+        gate.sync_with(|| panic!("nothing to sync")).unwrap();
+    }
+
+    /// A failed sync covers nothing: its caller gets the error, and the
+    /// next call (or whoever waited for it) syncs again.
+    #[test]
+    fn a_failed_sync_covers_nothing() {
+        let gate = SyncGate::default();
+        gate.note_write();
+        let err = gate
+            .sync_with(|| Err(std::io::Error::other("disk")))
+            .unwrap_err();
+        assert_eq!(err.to_string(), "disk");
+        let ran = AtomicUsize::new(0);
+        gate.sync_with(|| {
+            ran.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(ran.load(Ordering::Acquire), 1);
+
+        // A waiter of a sync that fails runs its own.
+        let (slow, began, finish) = Slow::new();
+        gate.note_write();
+        std::thread::scope(|s| {
+            let first = s.spawn(|| {
+                gate.sync_with(|| {
+                    slow.run();
+                    Err(std::io::Error::other("disk"))
+                })
+            });
+            began.recv().unwrap();
+            let waiter = s.spawn(|| {
+                gate.sync_with(|| {
+                    ran.fetch_add(1, Ordering::AcqRel);
+                    Ok(())
+                })
+            });
+            std::thread::sleep(Duration::from_millis(50));
+            finish.send(()).unwrap();
+            assert!(first.join().unwrap().is_err());
+            waiter.join().unwrap().unwrap();
+        });
+        assert_eq!(ran.load(Ordering::Acquire), 2);
+    }
+
+    /// Many writers and syncers: whenever a sync call returns, a sync that
+    /// began after every write counted before the call has finished.
+    #[test]
+    fn every_returned_sync_covers_what_was_written_before_it() {
+        let gate = SyncGate::default();
+        // The write count the latest finished sync began at, as the "disk"
+        // sees it.
+        let disk = AtomicU64::new(0);
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            for t in 0..4u64 {
+                let (gate, disk, stop) = (&gate, &disk, &stop);
+                s.spawn(move || {
+                    while !stop.load(Ordering::Acquire) {
+                        let before = gate.written.load(Ordering::Acquire);
+                        gate.sync_with(|| {
+                            let at = gate.written.load(Ordering::Acquire);
+                            std::thread::sleep(Duration::from_micros(200 + 100 * t));
+                            disk.fetch_max(at, Ordering::AcqRel);
+                            Ok(())
+                        })
+                        .unwrap();
+                        assert!(
+                            disk.load(Ordering::Acquire) >= before,
+                            "a sync returned before its writes were covered"
+                        );
+                    }
+                });
+            }
+            for _ in 0..2000 {
+                gate.note_write();
+                std::thread::yield_now();
+            }
+            stop.store(true, Ordering::Release);
+        });
     }
 }

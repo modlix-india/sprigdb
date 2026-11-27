@@ -688,6 +688,10 @@ impl Session {
                 "Write commands are not allowed from read-only scripts.",
             ));
         }
+        // Each call is authorized like a client's command.
+        if self.lacks(&name, spec, a) {
+            return Ok(crate::authz::noperm_in_script());
+        }
         if e.runs(&name) || name == "select" {
             return txn.call(a, call.resp3).await;
         }

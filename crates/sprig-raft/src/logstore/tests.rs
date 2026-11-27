@@ -287,6 +287,135 @@ fn raft_engine_syncs_beside_writes_keep_what_came_before_them() {
     }
 }
 
+fn one_entry(i: u64) -> WriteBatch {
+    batch(vec![GroupWrite {
+        group: 1,
+        entries: vec![ent(i, 1)],
+        hard_state: Some(hs(1, i)),
+        ..GroupWrite::default()
+    }])
+}
+
+/// The entry indexes of group 1 a log reopened after a crash holds.
+fn recovered_indexes(dir: &std::path::Path) -> Vec<u64> {
+    let s = EngineLogStore::open(dir, SyncMode::Full, None).unwrap();
+    let r = s.recover().unwrap();
+    r.first()
+        .map(|g| g.entries.iter().map(|e| e.index).collect())
+        .unwrap_or_default()
+}
+
+/// Two overlapped syncs on a slow disk, as two sync workers of the log
+/// writer run them: write 1 goes out, then write 2, and the second worker's
+/// sync (the one that covers both writes) is still running when the first
+/// worker asks for its own. That one must not return before write 1 is
+/// durable: the power goes the moment it returns, and only what completed
+/// syncs covered survives.
+#[test]
+fn raft_engine_a_sync_waits_for_the_running_sync_that_covers_its_write() {
+    let dir = std::env::temp_dir().join(format!(
+        "sprig-raft-logstore-overlap-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let sim = SimDisk::new();
+    {
+        let s = EngineLogStore::open(&dir, SyncMode::Full, Some(Arc::clone(&sim))).unwrap();
+        // Opening syncs nothing slowly; from here every sync takes a while.
+        sim.set_sync_delay(Duration::from_millis(400));
+        // Worker A's group.
+        s.write_unsynced(&[&one_entry(1)], true).unwrap();
+        // Worker B's group, and B's sync begins: it covers both writes.
+        s.write_unsynced(&[&one_entry(2)], true).unwrap();
+        let before = sim.syncs_begun();
+        std::thread::scope(|sc| {
+            let b = sc.spawn(|| s.sync_written().unwrap());
+            while sim.syncs_begun() == before {
+                std::thread::yield_now();
+            }
+            // Worker A's sync, for write 1. When it returns the node counts
+            // write 1 as persisted, so the power may go at once.
+            s.sync_written().unwrap();
+            sim.power_cut();
+            b.join().unwrap();
+        });
+    }
+    sim.crash_losing_unsynced(&dir).unwrap();
+    let idx = recovered_indexes(&dir);
+    assert!(
+        idx.contains(&1),
+        "a sync returned while the sync covering its write was still running: write 1 was \
+         reported persisted and the power cut lost it (recovered {idx:?})"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Writes and overlapped syncs on a slow disk, with the power cut while
+/// syncs are in flight: everything written before a sync that returned
+/// before the cut is there, even when the crash keeps nothing unsynced.
+#[test]
+fn raft_engine_a_power_cut_between_overlapped_syncs_keeps_what_they_reported() {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    for round in 0..12u64 {
+        let dir = std::env::temp_dir().join(format!(
+            "sprig-raft-logstore-cutpipe-{}-{round}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let sim = SimDisk::new();
+        let durable = AtomicU64::new(0);
+        {
+            let s = EngineLogStore::open(&dir, SyncMode::Full, Some(Arc::clone(&sim))).unwrap();
+            sim.set_sync_delay(Duration::from_millis(2));
+            let written = AtomicU64::new(0);
+            let done = AtomicBool::new(false);
+            std::thread::scope(|sc| {
+                for _ in 0..3 {
+                    sc.spawn(|| {
+                        while !done.load(Ordering::Acquire) {
+                            let upto = written.load(Ordering::Acquire);
+                            s.sync_written().unwrap();
+                            // Reported only by a sync that returned before
+                            // the power went.
+                            if !sim.is_cut() {
+                                durable.fetch_max(upto, Ordering::AcqRel);
+                            }
+                        }
+                    });
+                }
+                sc.spawn(|| {
+                    let mut i = 0;
+                    while !done.load(Ordering::Acquire) {
+                        i += 1;
+                        s.write_unsynced(&[&one_entry(i)], true).unwrap();
+                        written.store(i, Ordering::Release);
+                        std::thread::sleep(Duration::from_micros(300));
+                    }
+                });
+                // Some sync has reported (the machine may be slow), then
+                // the power goes at a moment that differs per round.
+                while durable.load(Ordering::Acquire) == 0 {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                std::thread::sleep(Duration::from_micros(500 + round * 700));
+                sim.power_cut();
+                done.store(true, Ordering::Release);
+            });
+        }
+        sim.crash_losing_unsynced(&dir).unwrap();
+        let idx = recovered_indexes(&dir);
+        let last = idx.last().copied().unwrap_or(0);
+        let durable = durable.load(Ordering::Acquire);
+        assert!(durable > 0, "round {round}: no sync covered anything");
+        assert!(
+            last >= durable,
+            "round {round}: lost entries a sync reported durable: last {last} < {durable}"
+        );
+        assert_eq!(idx, (1..=last).collect::<Vec<_>>(), "round {round}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// With note blobs, synced writes keep large notes in blob files and the
 /// log reads them back whole; unsynced writes keep them inline. A crash
 /// that cut the newest blob file's tail cuts the log at the first entry

@@ -16,6 +16,12 @@
 //! session's `@sprig_read_token` to a reader connection on another node,
 //! which must then read the value just written (never an older one), and
 //! checks every reader connection's values never go back.
+//!
+//! With `RL_SHIP=1`, `ryw`'s readers are sessions on the leader (endpoints
+//! without `@replica`) whose reads ask for a copy with
+//! `/*+ READ_FROM(follower[, MAX_LAG = 5s]) */` as text statements (shipped
+//! to a copy with the session's token), and each writer also reads its own
+//! write back the same way on its own session.
 
 #![allow(
     clippy::unwrap_used,
@@ -327,6 +333,26 @@ async fn ryw(secs: u64, writers: usize, write_ep: Endpoint, read_eps: Vec<Endpoi
                 }
                 // The write is acknowledged; the value is now v.
                 val.insert(k, v);
+                let ship = env("RL_SHIP", "0") == "1";
+                if ship {
+                    // The writer's own session, its read shipped to a copy.
+                    let own: mysql_async::Result<Option<i64>> = c
+                        .query_first(format!(
+                            "SELECT /*+ READ_FROM(follower, MAX_LAG = 5s) */ v FROM kv WHERE k = {k}"
+                        ))
+                        .await;
+                    match own {
+                        Ok(Some(g)) => {
+                            checked.fetch_add(1, Ordering::Relaxed);
+                            if g < v {
+                                violations.fetch_add(1, Ordering::Relaxed);
+                                eprintln!("VIOLATION: own session key {k} read {g} after write {v}");
+                            }
+                        }
+                        Ok(None) => note("own read missing".into()),
+                        Err(e) => note(format!("own read {}", code(&e))),
+                    }
+                }
                 let token: Option<String> = match c.query_first("SELECT @sprig_read_token").await {
                     Ok(t) => t,
                     Err(e) => {
@@ -365,7 +391,19 @@ async fn ryw(secs: u64, writers: usize, write_ep: Endpoint, read_eps: Vec<Endpoi
                 } else {
                     "SELECT v FROM kv WHERE k = ?"
                 };
-                let got: mysql_async::Result<Option<i64>> = r.exec_first(sql, (k,)).await;
+                let got: mysql_async::Result<Option<i64>> = if ship {
+                    let hint = if exact {
+                        "follower"
+                    } else {
+                        "follower, MAX_LAG = 5s"
+                    };
+                    r.query_first(format!(
+                        "SELECT /*+ READ_FROM({hint}) */ v FROM kv WHERE k = {k}"
+                    ))
+                    .await
+                } else {
+                    r.exec_first(sql, (k,)).await
+                };
                 match got {
                     Ok(Some(g)) => {
                         checked.fetch_add(1, Ordering::Relaxed);
