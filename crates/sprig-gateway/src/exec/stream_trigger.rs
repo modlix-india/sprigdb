@@ -42,6 +42,16 @@
 //! start with a warning. A dropped stream stops the trigger: its binding
 //! becomes `orphaned` (the job ends within seconds) and a run-log line says
 //! why; `CREATE OR REPLACE TRIGGER` on a stream made since starts it again.
+//!
+//! **Fan-in.** `CREATE TRIGGER g ON STREAM s FAN IN ...` in the declarer
+//! of a `FOR EACH TENANT` stream `s` (with `SPRIG_FAN_IN` and `SELECT` on
+//! it) runs once, in the declarer, over every member's instance: the
+//! instances it reads are listed under `logic-fanin/<tenant>/<binding>/`
+//! (existing ones when it is made, each new one when it is made), its
+//! positions are the group's records on each member (`instance`), and the
+//! lanes split the (member, partition) pairs. `ctx.record.tenant` is the
+//! member's name; a dead letter's event key starts `t<member>`. An existing
+//! instance starts at its end; a new one at its first record.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
@@ -74,8 +84,9 @@ const CHECK_EVERY: Duration = Duration::from_secs(30);
 /// The most lanes a trigger runs (`logic.trigger_lanes`' maximum).
 const MAX_LANES: u32 = 1024;
 
-/// A partition of a trigger: tenant, binding id and partition.
-type Key = (u64, u64, u32);
+/// A partition of a trigger: tenant, binding id, instance (the member a
+/// fan-in trigger reads, else 0) and partition.
+type Key = (u64, u64, u64, u32);
 
 /// A binding: tenant and binding id.
 type Binding = (u64, u64);
@@ -105,6 +116,50 @@ static CHECKED: LazyLock<Mutex<HashMap<Binding, Instant>>> = LazyLock::new(Mutex
 /// writes the record).
 static ORPHANED: LazyLock<Mutex<std::collections::HashSet<Binding>>> =
     LazyLock::new(Mutex::default);
+/// The instances each fan-in trigger reads (its `logic-fanin` list and the
+/// members' names), read again every [`FANIN_REFRESH`].
+static FANIN: LazyLock<Mutex<HashMap<Binding, Listed>>> = LazyLock::new(Mutex::default);
+
+/// When a fan-in trigger's parts were listed, and the parts.
+type Listed = (Instant, Arc<Vec<Part>>);
+
+/// How often a fan-in trigger's instances are listed again (new members'
+/// instances join within it).
+const FANIN_REFRESH: Duration = Duration::from_secs(5);
+
+/// A partition a trigger reads: its own stream's, or (a fan-in trigger)
+/// a member's instance's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Part {
+    /// The tenant whose log holds it.
+    log_tenant: u64,
+    /// The position's instance: the member for a fan-in trigger, else 0.
+    instance: u64,
+    /// The stream (the instance's id in the member).
+    stream: u64,
+    /// The partition.
+    partition: u32,
+    /// The member's name (a fan-in trigger's `ctx.record.tenant`).
+    member: Option<Arc<str>>,
+}
+
+impl Part {
+    fn key(&self) -> sprig_streams::seg::Key {
+        sprig_streams::seg::Key {
+            tenant: self.log_tenant,
+            stream: self.stream,
+            partition: self.partition,
+        }
+    }
+
+    fn event_key(&self, offset: i64) -> String {
+        if self.instance == 0 {
+            event_key(self.partition, offset)
+        } else {
+            format!("t{}{}", self.instance, event_key(self.partition, offset))
+        }
+    }
+}
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
@@ -201,12 +256,7 @@ impl PassSession {
             .clone()
             .ok_or_else(|| SprigError::internal("no source"))?;
         if src.fan_in {
-            return Err(SprigError::standard(
-                1235,
-                *b"42000",
-                "This version of SprigDB doesn't yet support 'FAN IN triggers': they read a FOR \
-                 EACH TENANT stream, and inherited streams aren't built on the SprigDB engine yet",
-            ));
+            return Box::pin(self.deploy_fan_in_trigger(decl)).await;
         }
         let Some(streams) = crate::kafka::engine::streams() else {
             return Err(SprigError::new(
@@ -385,6 +435,287 @@ impl PassSession {
         Ok(notes)
     }
 
+    /// `CREATE TRIGGER g ON STREAM s FAN IN ...` in the declarer of
+    /// inherited stream `s`: one trigger here reading every member's
+    /// instance, each with its own positions (see the module docs).
+    #[allow(clippy::too_many_lines)]
+    async fn deploy_fan_in_trigger(&mut self, decl: Declaration) -> Result<Vec<String>> {
+        let src = decl
+            .source
+            .clone()
+            .ok_or_else(|| SprigError::internal("no source"))?;
+        let Some(streams) = crate::kafka::engine::streams() else {
+            return Err(SprigError::new(
+                SprigCode::NotOnEngine,
+                "a trigger on a stream reads the engine's stream log, which this node doesn't \
+                 serve",
+            ));
+        };
+        let current = self.current_logical();
+        let ts = self
+            .tenant
+            .as_deref_mut()
+            .ok_or_else(|| SprigError::internal("no tenant"))?;
+        let db = decl
+            .db
+            .clone()
+            .or(current)
+            .ok_or_else(|| SprigError::standard(1046, *b"3D000", "No database selected"))?;
+        if decl.tier == TierPref::Mariadb {
+            return Err(SprigError::new(
+                SprigCode::LogicTierUnavailable,
+                format!(
+                    "SPRIG_TIER = 'mariadb': a trigger on a stream runs on the engine tier \
+                     (database {db})"
+                ),
+            ));
+        }
+        let cat = match ts.catalog() {
+            Some(c) => Arc::clone(c),
+            None => ts.refresh().await?,
+        };
+        let lctn = ts.lower_case_table_names();
+        let unknown =
+            |d: &str| SprigError::standard(1049, *b"42000", format!("Unknown database '{d}'"));
+        let row = cat
+            .database(&database_key(&db, lctn))
+            .cloned()
+            .ok_or_else(|| unknown(&db))?;
+        let source_db = src.db.clone().unwrap_or_else(|| db.clone());
+        let own = crate::inherited::state_of(&cat);
+        let def = own
+            .def(&source_db, sprig_inherit::msg::DefKind::Stream, &src.name)
+            .cloned()
+            .ok_or_else(|| {
+                SprigError::new(
+                    SprigCode::StreamNotFound,
+                    format!(
+                        "ER_SPRIG_STREAM_NOT_FOUND: a FAN IN trigger reads a FOR EACH TENANT \
+                         stream this tenant declares; {source_db}.{} isn't one",
+                        src.name
+                    ),
+                )
+            })?;
+        let srow = cat
+            .database(&database_key(&def.db_name, lctn))
+            .cloned()
+            .ok_or_else(|| unknown(&def.db_name))?;
+        let user = ts
+            .principal
+            .user_id
+            .ok_or_else(|| SprigError::internal("a logic deploy without a user"))?;
+        let tenant_name = ts.principal.tenant_name.clone().unwrap_or_default();
+        let tenant = ts.tenant;
+        let grants = crate::tenant::authz::privileges(ts, &cat);
+        let db_key = database_key(&db, lctn);
+        if !grants.unrestricted()
+            && !grants.allows(
+                Action::CreateRoutine,
+                AuthzTarget::Database { db_key: &db_key },
+            )
+        {
+            return Err(SprigError::standard(
+                1044,
+                *b"42000",
+                format!(
+                    "Access denied for user '{}' to database '{db}'",
+                    ts.principal.user
+                ),
+            ));
+        }
+        if !grants.unrestricted() && !grants.allows(Action::FanIn, AuthzTarget::Tenant) {
+            return Err(SprigError::standard(
+                1227,
+                *b"42000",
+                "Access denied; you need (at least one of) the SPRIG_FAN_IN privilege(s) for \
+                 this operation",
+            ));
+        }
+        let src_key = database_key(&def.db_name, lctn);
+        let name_key = object_key(ObjectKind::Table, &def.name, lctn);
+        if !grants.unrestricted()
+            && !grants.allows(
+                Action::Select,
+                AuthzTarget::Named {
+                    db_key: &src_key,
+                    name_key: &name_key,
+                },
+            )
+            && !grants.allows(Action::Select, AuthzTarget::Database { db_key: &src_key })
+        {
+            return Err(SprigError::standard(
+                1142,
+                *b"42000",
+                format!(
+                    "SELECT command denied to user '{}'@'{}' for table '{}'",
+                    ts.principal.user, ts.principal.client_ip, def.name
+                ),
+            ));
+        }
+        let object_id = messages::fanin_source_id(def.object_id)
+            .ok_or_else(|| SprigError::internal("a definition's object id out of range"))?;
+        let mut d = decl.clone();
+        d.tier = TierPref::Engine;
+        d.source = Some(MessageSource {
+            name: def.name.clone(),
+            db: Some(srow.name.clone()),
+            ..src
+        });
+        let svc = Arc::clone(ts.services());
+        let ep = svc.locator.writer(tenant).await?;
+        let mut conn = svc.records.begin(tenant).await?;
+        let deployed = messages::deploy(
+            &d,
+            messages::MsgTarget {
+                catalog: &mut *conn,
+                catalog_schema: ep.store.schema(),
+                catalog_version: cat.version,
+                db_id: row.db_id.0,
+                user_id: user.0,
+                tenant_name: &tenant_name,
+                source_db: (srow.db_id.0, &srow.name),
+                object_id,
+                fanin_declarer: tenant.0,
+                compile: None,
+            },
+        )
+        .await?;
+        conn.commit().await?;
+        let dc = svc.locator.dc_store();
+        let binding = deployed.binding_id;
+        messages::put_fanin_trigger(
+            dc.as_ref(),
+            (def.declarer.0, def.object_id),
+            &messages::FanInTrigger { tenant, binding },
+        )
+        .await?;
+        // Every existing instance, from its end now (a replaced trigger
+        // keeps its positions).
+        let group = messages::sprig_streams_group(binding);
+        let have: std::collections::HashSet<u64> = streams
+            .records()
+            .offsets_on(tenant.0, &group)?
+            .into_iter()
+            .map(|(i, _)| i)
+            .collect();
+        let mut n = 0usize;
+        for e in crate::inherited::instances_of(&svc, def.key()).await? {
+            if e.tenant == tenant && !def.scope.including_self {
+                continue;
+            }
+            messages::put_fanin_member(
+                dc.as_ref(),
+                &messages::FanInMember {
+                    tenant,
+                    binding,
+                    member: e.tenant,
+                    stream: e.instance_id,
+                },
+            )
+            .await?;
+            n += 1;
+            if have.contains(&e.tenant.0) {
+                continue;
+            }
+            let Some(topic) = streams.topic_by_id(e.tenant.0, e.instance_id)? else {
+                continue;
+            };
+            let at: Vec<(u64, sprig_proto_kafka::group::CommittedOffset)> =
+                (0..topic.partitions.max(0))
+                    .map(|p| {
+                        (
+                            e.tenant.0,
+                            sprig_proto_kafka::group::CommittedOffset {
+                                stream_id: e.instance_id,
+                                partition: p,
+                                offset: streams
+                                    .log()
+                                    .bounds(sprig_streams::seg::Key {
+                                        tenant: e.tenant.0,
+                                        stream: e.instance_id,
+                                        partition: u32::try_from(p).unwrap_or(0),
+                                    })
+                                    .high_watermark,
+                                leader_epoch: None,
+                                metadata: None,
+                            },
+                        )
+                    })
+                    .collect();
+            streams
+                .records()
+                .commit_offsets_on(tenant.0, &group, &at, sprig_streams::seg::now_ms())
+                .await?;
+        }
+        forget_binding(tenant.0, binding);
+        messages::put_index(
+            dc.as_ref(),
+            &MsgIndex {
+                tenant,
+                binding,
+                kind: sprig_logic::declare::SourceKind::Stream,
+            },
+        )
+        .await?;
+        let mut notes = deployed.notes();
+        notes.push(format!(
+            "FAN IN trigger on stream {}.{}: reads {n} member instance(s) now, and each new one \
+             from its first record; each instance's partitions in offset order",
+            def.db_name, def.name
+        ));
+        tracing::info!(%tenant, binding, def = %def.key(), name = %decl.name, instances = n, "fan-in trigger on an inherited stream deployed");
+        Ok(notes)
+    }
+
+    /// The partitions a fan-in trigger reads: every listed member
+    /// instance's (kept for [`FANIN_REFRESH`]).
+    async fn fanin_parts(
+        &self,
+        streams: &EngineStreams,
+        tenant: u64,
+        binding: u64,
+    ) -> Result<Arc<Vec<Part>>> {
+        if let Some((at, parts)) = lock(&FANIN).get(&(tenant, binding))
+            && at.elapsed() < FANIN_REFRESH
+        {
+            return Ok(Arc::clone(parts));
+        }
+        let ts = self
+            .tenant
+            .as_deref()
+            .ok_or_else(|| SprigError::internal("no tenant"))?;
+        let svc = Arc::clone(ts.services());
+        let members = messages::fanin_members(
+            svc.locator.dc_store().as_ref(),
+            sprig_common::ids::TenantId(tenant),
+            binding,
+        )
+        .await?;
+        let mut parts = Vec::new();
+        for m in members {
+            let Some(topic) = streams.topic_by_id(m.member.0, m.stream)? else {
+                continue;
+            };
+            let name: Arc<str> = match crate::inherited::tenant_name(&svc, m.member).await {
+                Ok(n) => Arc::from(n),
+                Err(_) => continue,
+            };
+            for p in 0..u32::try_from(topic.partitions.max(0)).unwrap_or(0) {
+                parts.push(Part {
+                    log_tenant: m.member.0,
+                    instance: m.member.0,
+                    stream: m.stream,
+                    partition: p,
+                    member: Some(Arc::clone(&name)),
+                });
+            }
+        }
+        parts.sort_by_key(|q| (q.instance, q.partition));
+        let parts = Arc::new(parts);
+        lock(&FANIN).insert((tenant, binding), (Instant::now(), Arc::clone(&parts)));
+        Ok(parts)
+    }
+
     /// One run of a trigger on an engine stream (see the module docs).
     pub(super) async fn run_stream_trigger(
         &mut self,
@@ -403,22 +734,35 @@ impl PassSession {
         cx: &mut ExecCtx<'_>,
         req: &RunRequest,
     ) -> Result<RunReply> {
-        if req.source.fanin_definition().is_some() {
-            return Ok(RunReply::failed(&SprigError::internal(
-                "FAN IN triggers aren't served: inherited streams aren't built on the engine",
-            )));
-        }
         let streams = crate::kafka::engine::streams()
             .ok_or_else(|| unavailable("the engine's stream log isn't served on this gateway"))?;
         let tenant = req.tenant;
         let binding = req.source.binding_id;
-        let stream = req.source.object_id;
-        let Some(topic) = streams.topic_by_id(tenant, stream)? else {
-            self.stream_gone(req).await?;
-            return Ok(RunReply::of(RunOutcome::Empty));
-        };
+        let fan_in = req.source.fanin_definition().is_some();
         let db = req.source.db_name.clone();
         let stream_name = format!("{db}.{}", req.source.name);
+        // What it reads: its stream's partitions, or every member
+        // instance's (a fan-in trigger).
+        let all: Arc<Vec<Part>> = if fan_in {
+            self.fanin_parts(&streams, tenant, binding).await?
+        } else {
+            let stream = req.source.object_id;
+            let Some(topic) = streams.topic_by_id(tenant, stream)? else {
+                self.stream_gone(req).await?;
+                return Ok(RunReply::of(RunOutcome::Empty));
+            };
+            Arc::new(
+                (0..u32::try_from(topic.partitions.max(0)).unwrap_or(0))
+                    .map(|p| Part {
+                        log_tenant: tenant,
+                        instance: 0,
+                        stream,
+                        partition: p,
+                        member: None,
+                    })
+                    .collect(),
+            )
+        };
         // The definer still reads the stream.
         let due = lock(&CHECKED)
             .get(&(tenant, binding))
@@ -429,10 +773,13 @@ impl PassSession {
             }
             lock(&CHECKED).insert((tenant, binding), Instant::now());
         }
-        let partitions = u32::try_from(topic.partitions.max(0)).unwrap_or(0);
         let n = req.lanes.clamp(1, MAX_LANES);
         let lane = req.lane.min(n - 1);
-        let mine = lane_partitions(partitions, n, lane);
+        let mine: Vec<&Part> =
+            lane_partitions(u32::try_from(all.len()).unwrap_or(u32::MAX), n, lane)
+                .into_iter()
+                .filter_map(|i| all.get(i as usize))
+                .collect();
         if mine.is_empty() {
             // More lanes than partitions: this one has none.
             tokio::time::sleep(WAIT).await;
@@ -440,24 +787,22 @@ impl PassSession {
         }
         let group = messages::sprig_streams_group(binding);
         let log = streams.log();
-        let key = |p: u32| sprig_streams::seg::Key {
-            tenant,
-            stream,
-            partition: p,
-        };
         let mut waited = false;
-        let (p, cur) = loop {
-            let at: HashMap<i32, i64> = streams
+        let (part, cur) = loop {
+            let at: HashMap<(u64, u64, i32), i64> = streams
                 .records()
-                .offsets(tenant, &group, None)?
+                .offsets_on(tenant, &group)?
                 .into_iter()
-                .filter(|o| o.stream_id == stream)
-                .map(|o| (o.partition, o.offset))
+                .map(|(i, o)| ((i, o.stream_id, o.partition), o.offset))
                 .collect();
-            let pos = |p: u32| {
-                at.get(&i32::try_from(p).unwrap_or(i32::MAX))
-                    .copied()
-                    .unwrap_or(0)
+            let pos = |q: &Part| {
+                at.get(&(
+                    q.instance,
+                    q.stream,
+                    i32::try_from(q.partition).unwrap_or(i32::MAX),
+                ))
+                .copied()
+                .unwrap_or(0)
             };
             let start = {
                 let mut t = lock(&TURN);
@@ -467,34 +812,36 @@ impl PassSession {
             };
             let mut found = None;
             for i in 0..mine.len() {
-                let p = mine[(start + i) % mine.len()];
-                let b = log.bounds(key(p));
-                let cur = pos(p);
+                let q = mine[(start + i) % mine.len()];
+                let b = log.bounds(q.key());
+                let cur = pos(q);
                 if cur < b.log_start {
                     // Retention removed records the trigger hadn't run.
-                    lock(&PENDING).remove(&(tenant, binding, p));
-                    let moved = self.stream_skip(cx, &db, req, p, cur, b.log_start).await?;
+                    lock(&PENDING).remove(&(tenant, binding, q.instance, q.partition));
+                    let moved = self.stream_skip(cx, &db, req, q, cur, b.log_start).await?;
                     let mut rep = RunReply::of(RunOutcome::Moved);
                     if moved {
                         tracing::warn!(
                             tenant,
                             binding,
-                            partition = p,
+                            instance = q.instance,
+                            partition = q.partition,
                             from = cur,
                             to = b.log_start,
                             "stream trigger: records expired from the stream before they ran"
                         );
                         rep.message = format!(
-                            "{}: records {cur} to {} of partition {p} left stream {stream_name} \
+                            "{}: records {cur} to {} of partition {} left stream {stream_name} \
                              before the trigger ran them; it goes on from the oldest record kept",
                             SprigCode::FeedHistoryLost.name(),
-                            b.log_start
+                            b.log_start,
+                            q.partition
                         );
                     }
                     return Ok(rep);
                 }
                 if cur < b.high_watermark {
-                    found = Some((p, cur));
+                    found = Some((q.clone(), cur));
                     break;
                 }
             }
@@ -506,17 +853,18 @@ impl PassSession {
             }
             waited = true;
             let beyond: Vec<(sprig_streams::seg::Key, i64)> =
-                mine.iter().map(|&p| (key(p), pos(p))).collect();
+                mine.iter().map(|q| (q.key(), pos(q))).collect();
             log.wait(&beyond, tokio::time::Instant::now() + WAIT).await;
         };
-        let k: Key = (tenant, binding, p);
+        let p = part.partition;
+        let k: Key = (tenant, binding, part.instance, p);
         // The records at `cur`: kept from the partition's last run, or read
         // now.
         let kept = lock(&PENDING).remove(&k).filter(|pend| pend.from == cur);
         let mut pend = if let Some(pend) = kept {
             pend
         } else {
-            let bytes = match log.read(key(p), cur, PAGE_BYTES) {
+            let bytes = match log.read(part.key(), cur, PAGE_BYTES) {
                 Ok((_, b)) => b,
                 // Trimmed meanwhile: the next run moves past it.
                 Err(Ok(_)) => return Ok(RunReply::of(RunOutcome::Moved)),
@@ -538,15 +886,18 @@ impl PassSession {
         let Some(r) = r else {
             // Only control batches or a compacted stretch: past it.
             if pend.end > cur {
-                self.stream_skip(cx, &db, req, p, cur, pend.end).await?;
+                self.stream_skip(cx, &db, req, &part, cur, pend.end).await?;
                 return Ok(RunReply::of(RunOutcome::Moved));
             }
             return Ok(RunReply::of(RunOutcome::Empty));
         };
         let at = r.offset;
         let next = at + 1;
-        let event = record_event(&stream_name, p, &r);
-        let ekey = event_key(p, at);
+        let mut event = record_event(&stream_name, p, &r);
+        if let (Some(m), Some(o)) = (&part.member, event.as_object_mut()) {
+            o.insert("tenant".into(), Value::String(m.to_string()));
+        }
+        let ekey = part.event_key(at);
         let attempts = match lock(&FAILS).get(&k) {
             Some((o, n)) if *o == at => *n,
             _ => 0,
@@ -566,7 +917,6 @@ impl PassSession {
             pend.from = from;
             lock(&PENDING).insert(k, pend);
         };
-        let part = i32::try_from(p).unwrap_or(i32::MAX);
         let failure = 'run: {
             if let Err(e) = self.trigger_stmt(cx, &format!("USE {}", bq(&db))).await {
                 break 'run e;
@@ -574,7 +924,7 @@ impl PassSession {
             if let Err(e) = self.trigger_stmt(cx, "START TRANSACTION").await {
                 break 'run e;
             }
-            match self.stream_move(req, part, cur, next).await {
+            match self.stream_move(req, &part, cur, next).await {
                 Ok(true) => {}
                 Ok(false) => {
                     self.rollback_quietly(cx).await;
@@ -633,7 +983,7 @@ impl PassSession {
                         return Ok(rep);
                     }
                     lock(&FAILS).remove(&k);
-                    match self.stream_skip(cx, &db, req, p, cur, next).await {
+                    match self.stream_skip(cx, &db, req, &part, cur, next).await {
                         Ok(_) => keep(pend, None, next),
                         Err(werr) => {
                             tracing::warn!(error = %werr, binding, "trigger position not moved past a dead letter");
@@ -687,18 +1037,25 @@ impl PassSession {
 
     /// Partition `p`'s position compare-and-set in the session's engine
     /// transaction; it locks the row.
-    async fn stream_move(&mut self, req: &RunRequest, p: i32, from: i64, to: i64) -> Result<bool> {
+    async fn stream_move(
+        &mut self,
+        req: &RunRequest,
+        q: &Part,
+        from: i64,
+        to: i64,
+    ) -> Result<bool> {
         let Some(tx) = self.eng.txn.open_tx() else {
             return Err(SprigError::internal(
                 "a stream trigger's run has no engine transaction",
             ));
         };
-        sprig_streams::seg::records::move_offset(
+        sprig_streams::seg::records::move_offset_on(
             tx.engine_txn(),
             req.tenant,
             &messages::sprig_streams_group(req.source.binding_id),
-            req.source.object_id,
-            p,
+            q.instance,
+            q.stream,
+            i32::try_from(q.partition).unwrap_or(i32::MAX),
             from,
             to,
             sprig_streams::seg::now_ms(),
@@ -713,14 +1070,13 @@ impl PassSession {
         cx: &mut ExecCtx<'_>,
         db: &str,
         req: &RunRequest,
-        p: u32,
+        q: &Part,
         from: i64,
         to: i64,
     ) -> Result<bool> {
-        let part = i32::try_from(p).unwrap_or(i32::MAX);
         self.trigger_stmt(cx, &format!("USE {}", bq(db))).await?;
         self.trigger_stmt(cx, "START TRANSACTION").await?;
-        match self.stream_move(req, part, from, to).await {
+        match self.stream_move(req, q, from, to).await {
             Ok(true) => {
                 self.trigger_stmt(cx, "COMMIT").await?;
                 Ok(true)
@@ -839,6 +1195,7 @@ impl PassSession {
 
 /// Forgets what this gateway keeps for binding `binding` of `tenant`.
 fn forget_binding(tenant: u64, binding: u64) {
+    lock(&FANIN).remove(&(tenant, binding));
     lock(&PENDING).retain(|k, _| !(k.0 == tenant && k.1 == binding));
     lock(&FAILS).retain(|k, _| !(k.0 == tenant && k.1 == binding));
     lock(&TURN).retain(|k, _| !(k.0 == tenant && k.1 == binding));

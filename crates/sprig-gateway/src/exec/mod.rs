@@ -40,6 +40,7 @@ mod embed_ddl;
 mod docs;
 // Retrieval indexes: their DDL and `RETRIEVE()`.
 mod retrieval;
+pub(crate) use inherit_msg::bcast::start as start_inherited_broadcasts;
 pub(crate) use retrieval::KEY_JSON_HINT as RETRIEVE_KEY_JSON_HINT;
 mod fence;
 // A mover's fence never reaches clients as 1146 or 1049.

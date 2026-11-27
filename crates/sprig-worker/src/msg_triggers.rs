@@ -578,8 +578,9 @@ impl MsgEnv {
             }
             // A trigger on an engine stream: the gateway's run finds a
             // dropped stream and orphans the binding, which ends the job.
-            // A FAN IN trigger's (inherited streams) isn't built.
-            SourceKind::Stream => source.fanin_definition().is_none(),
+            // A FAN IN trigger reads the members' instances the gateway
+            // lists for it.
+            SourceKind::Stream => true,
             SourceKind::Queue => {
                 // Durable queues are catalog records on the engine node.
                 let mut rec = crate::sinks::catalog_records().begin(tenant).await?;

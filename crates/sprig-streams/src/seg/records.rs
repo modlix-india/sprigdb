@@ -164,7 +164,30 @@ pub async fn move_offset(
     offset: i64,
     now_ms: i64,
 ) -> Result<bool> {
-    let k = Bytes::from(offset_key(tenant, group, 0, stream, partition));
+    move_offset_on(
+        txn, tenant, group, 0, stream, partition, expect, offset, now_ms,
+    )
+    .await
+}
+
+/// [`move_offset`] of a position on an instance (0 for the tenant's own
+/// streams, the member for a fan-in reader's position).
+///
+/// # Errors
+/// A lock, read or write error of the transaction.
+#[allow(clippy::too_many_arguments)] // the key's parts and the move
+pub async fn move_offset_on(
+    txn: &mut Txn,
+    tenant: u64,
+    group: &str,
+    instance: u64,
+    stream: u64,
+    partition: i32,
+    expect: i64,
+    offset: i64,
+    now_ms: i64,
+) -> Result<bool> {
+    let k = Bytes::from(offset_key(tenant, group, instance, stream, partition));
     txn.lock(&k, LockRequest::write()).await?;
     let have = match txn.read_current(&k)? {
         Some(b) => parse::<OffsetRow>(&b)?.offset,

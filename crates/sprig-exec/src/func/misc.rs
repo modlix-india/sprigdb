@@ -409,30 +409,94 @@ pub(crate) fn sec_to_time(a: Node) -> Node {
     )
 }
 
-/// `UUID()`: a version-1 layout over the clock and random bits.
-pub(crate) fn uuid(env: Env<'_>) -> Node {
+/// 64 bits that differ on every call (the process's random hasher keys
+/// over a counter).
+fn random_u64() -> u64 {
     use std::hash::{BuildHasher, Hasher};
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u64(SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    h.finish()
+}
+
+/// 16 bytes as a UUID's text.
+fn uuid_text(b: [u8; 16]) -> String {
+    let h = b.iter().fold(String::with_capacity(32), |mut h, x| {
+        let _ = write!(h, "{x:02x}");
+        h
+    });
+    format!(
+        "{}-{}-{}-{}-{}",
+        &h[0..8],
+        &h[8..12],
+        &h[12..16],
+        &h[16..20],
+        &h[20..32]
+    )
+}
+
+/// Which `UUID` function.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UuidKind {
+    /// `UUID()`: version 1 (time, clock sequence, node).
+    V1,
+    /// `UUID_V4()`: random.
+    V4,
+    /// `UUID_V7()`: Unix milliseconds, then random.
+    V7,
+}
+
+/// A new UUID of `kind`'s layout.
+fn new_uuid(kind: UuidKind) -> String {
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let (a, r) = (random_u64(), random_u64());
+    match kind {
+        UuidKind::V1 => {
+            // 100 ns intervals since 1582-10-15.
+            let ts = (t.as_nanos() / 100) as u64 + 0x01B2_1DD2_1381_4000;
+            format!(
+                "{:08x}-{:04x}-1{:03x}-{:04x}-{:012x}",
+                ts & 0xffff_ffff,
+                (ts >> 32) & 0xffff,
+                (ts >> 48) & 0x0fff,
+                ((r >> 48) & 0x3fff) | 0x8000,
+                r & 0xffff_ffff_ffff
+            )
+        }
+        UuidKind::V4 | UuidKind::V7 => {
+            let mut b = [0u8; 16];
+            b[..8].copy_from_slice(&a.to_be_bytes());
+            b[8..].copy_from_slice(&r.to_be_bytes());
+            if kind == UuidKind::V7 {
+                let ms = u64::try_from(t.as_millis()).unwrap_or(u64::MAX);
+                b[..6].copy_from_slice(&ms.to_be_bytes()[2..]);
+            }
+            b[6] = (b[6] & 0x0f) | if kind == UuidKind::V7 { 0x70 } else { 0x40 };
+            b[8] = (b[8] & 0x3f) | 0x80;
+            uuid_text(b)
+        }
+    }
+}
+
+/// `UUID()` (version 1), MariaDB's `UUID_V4()` and `UUID_V7()`. On
+/// MariaDB the result is a `UUID` value (so `UUID() + 1` is 4078); on
+/// MySQL `UUID()` is a string.
+pub(crate) fn uuid(env: Env<'_>, kind: UuidKind) -> Node {
+    let name = match kind {
+        UuidKind::V1 => "uuid()",
+        UuidKind::V4 => "uuid_v4()",
+        UuidKind::V7 => "uuid_v7()",
+    };
+    if env.maria() {
+        let ty = ExprType::fbt_of(sprig_engine::row::Fbt::Uuid);
+        return Node::new(ty, name, move |_, _| Ok(Value::str(&new_uuid(kind))));
+    }
     let ty = ExprType::string(36, env.conn(), Derivation::Coercible);
     let binary = env.conn() == Collation::Binary;
-    Node::new(ty, "uuid()", move |_, _| {
-        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let t = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default();
-        // 100 ns intervals since 1582-10-15.
-        let ts = (t.as_nanos() / 100) as u64 + 0x01B2_1DD2_1381_4000;
-        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
-        h.write_u64(SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
-        let r = h.finish();
-        let s = format!(
-            "{:08x}-{:04x}-1{:03x}-{:04x}-{:012x}",
-            ts & 0xffff_ffff,
-            (ts >> 32) & 0xffff,
-            (ts >> 48) & 0x0fff,
-            ((r >> 48) & 0x3fff) | 0x8000,
-            r & 0xffff_ffff_ffff
-        );
-        Ok(wrap(s.into_bytes(), binary))
+    Node::new(ty, name, move |_, _| {
+        Ok(wrap(new_uuid(kind).into_bytes(), binary))
     })
 }
 
@@ -950,4 +1014,28 @@ pub(crate) fn inet6_ntoa(a: Node, env: Env<'_>) -> Node {
         };
         Ok(wrap(out.into_bytes(), false))
     })
+}
+
+#[cfg(test)]
+mod uuid_tests {
+    use super::{UuidKind, new_uuid};
+
+    #[test]
+    fn uuids_carry_their_version_and_variant() {
+        for (k, v) in [
+            (UuidKind::V1, '1'),
+            (UuidKind::V4, '4'),
+            (UuidKind::V7, '7'),
+        ] {
+            let u = new_uuid(k);
+            assert_eq!(u.len(), 36, "{u}");
+            assert_eq!(u.as_bytes()[14] as char, v, "{u}");
+            assert!(matches!(u.as_bytes()[19], b'8' | b'9' | b'a' | b'b'), "{u}");
+            assert_ne!(new_uuid(k), u);
+        }
+        // Version 7 starts with the time: later ones sort after.
+        let a = new_uuid(UuidKind::V7);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        assert!(new_uuid(UuidKind::V7) > a);
+    }
 }

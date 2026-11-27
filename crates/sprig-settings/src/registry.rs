@@ -245,11 +245,6 @@ pub const MARKED: &[(&str, Mark, &str)] = &[
         "diverged-transaction extracts are kept until an operator removes them",
     ),
     (
-        "inherit.fan_in_sql_max_tenants",
-        Mark::Unbuilt,
-        "fan-in SELECTs over members' stream instances went with the MariaDB stream path; FOR EACH TENANT streams aren't built on the engine",
-    ),
-    (
         "inherit.instance_precreate",
         Mark::Unbuilt,
         "instances are created on first use; the background precreate job isn't built",
@@ -293,16 +288,6 @@ pub const MARKED: &[(&str, Mark, &str)] = &[
         "queue.descendant_publish",
         Mark::Unbuilt,
         "publishing into an ancestor's ordinary exchange isn't built",
-    ),
-    (
-        "stream.descendant_key",
-        Mark::Unbuilt,
-        "publishing into an ancestor's stream went with the MariaDB stream path; not built on the engine streams",
-    ),
-    (
-        "stream.descendant_publish",
-        Mark::Unbuilt,
-        "publishing into an ancestor's stream went with the MariaDB stream path; not built on the engine streams",
     ),
     (
         "recovery.max_latency_increase_pct",

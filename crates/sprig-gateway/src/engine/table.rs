@@ -989,6 +989,7 @@ fn exec_expr_with(
 ) -> std::result::Result<CExpr, String> {
     let table = super::general::names::plan_table(def, "");
     let mut out: Vec<(sprig_exec::Session, sprig_exec::Compiled)> = Vec::with_capacity(2);
+    let mut mysql_refused = None;
     for persona in [sprig_exec::Persona::MariaDb, sprig_exec::Persona::MySql] {
         let session = sprig_exec::Session::new(persona);
         let db = sprig_plan::mem::MemDb::new("");
@@ -1004,6 +1005,14 @@ fn exec_expr_with(
                 out.push(first);
                 continue;
             }
+            // A value only MariaDB has (`CAST(.. AS INET4)`, `UUID_V7()`):
+            // a MySQL session's statement gets the MySQL form's refusal.
+            Err(err) if value && matches!(err.code, 1064 | 1305) && !out.is_empty() => {
+                let first = out[0].clone();
+                out.push(first);
+                mysql_refused = Some(err);
+                continue;
+            }
             Err(err) => return Err(err.message),
         };
         if value && !read.is_empty() {
@@ -1016,7 +1025,17 @@ fn exec_expr_with(
         {
             return Err(format!("it reads a {t} column"));
         }
-        let c = sprig_exec::compile(&x, &session).map_err(|e| e.message)?;
+        let c = match sprig_exec::compile(&x, &session) {
+            Ok(c) => c,
+            // As above, for a function only MariaDB has.
+            Err(err) if value && matches!(err.code, 1064 | 1305) && !out.is_empty() => {
+                let first = out[0].clone();
+                out.push(first);
+                mysql_refused = Some(err);
+                continue;
+            }
+            Err(err) => return Err(err.message),
+        };
         out.push((session, c));
     }
     let mysql = out.pop().ok_or("no MySQL form")?;
@@ -1024,6 +1043,7 @@ fn exec_expr_with(
     Ok(CExpr::Exec(Arc::new(super::expr::ExecExpr {
         maria,
         mysql,
+        mysql_refused,
         session_clock: clock,
     })))
 }

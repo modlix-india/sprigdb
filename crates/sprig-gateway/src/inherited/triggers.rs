@@ -17,6 +17,10 @@
 //!     enabled again: the index entry comes back
 //! ```
 //!
+//! `ensure_for_stream` does the same for a stream instance (an engine
+//! stream of T); a trigger new to the instance starts at each partition's
+//! high watermark, and `sprig_inherited` also gets SELECT on the database.
+//!
 //! Every run is then an ordinary trigger run of T: in a gateway, as T's
 //! `sprig_inherited`, once per message, in the engine tier.
 
@@ -47,6 +51,12 @@ use crate::tenant::TenantServices;
 /// definition `queue`.
 #[must_use]
 pub fn on_queue(chain: &Chain, queue: &Definition) -> Vec<Arc<Definition>> {
+    on_source(chain, queue)
+}
+
+/// The trigger definitions reaching the member whose source is the stream
+/// or queue definition `source`.
+fn on_source(chain: &Chain, source: &Definition) -> Vec<Arc<Definition>> {
     chain
         .reaching(DefKind::Trigger)
         .into_iter()
@@ -55,12 +65,143 @@ pub fn on_queue(chain: &Chain, queue: &Definition) -> Vec<Arc<Definition>> {
             let Ok(spec) = serde_json::from_value::<TriggerSpec>(g.definition.clone()) else {
                 return false;
             };
-            spec.source_kind == "queue"
+            spec.source_kind == source.kind.as_str()
                 && chain
-                    .resolve(&spec.source_db, DefKind::Queue, &spec.source_name)
-                    .is_some_and(|q| q.key() == queue.key())
+                    .resolve(&spec.source_db, source.kind, &spec.source_name)
+                    .is_some_and(|q| q.key() == source.key())
         })
         .collect()
+}
+
+/// The inherited triggers of the member's stream instance
+/// (`stream_def`'s instance, stream `stream_id` of database `db`), as
+/// [`ensure_for_queue`] does for queues. A trigger new to the instance
+/// starts at each partition's high watermark (all of a new instance).
+///
+/// # Errors
+/// The catalog's and the deploy's.
+pub async fn ensure_for_stream(
+    svc: &Arc<TenantServices>,
+    chain: &Chain,
+    stream_def: &Definition,
+    db: (u32, &str),
+    stream_id: u64,
+) -> Result<bool> {
+    let triggers = on_source(chain, stream_def);
+    if triggers.is_empty() {
+        return Ok(true);
+    }
+    ensure_for(
+        svc,
+        chain,
+        triggers,
+        Source {
+            tenant: chain.member(),
+            db_id: db.0,
+            db_name: db.1,
+            object_id: stream_id,
+            name: &stream_def.name,
+            kind: SourceKind::Stream,
+        },
+    )
+    .await
+}
+
+/// Whether a trigger definition reaching the member reads `source` and
+/// isn't deployed on the member's instance yet (or is behind).
+#[must_use]
+pub fn pending_for(chain: &Chain, source: &Definition, st: &sprig_inherit::msg::MsgState) -> bool {
+    on_source(chain, source).iter().any(|g| {
+        if chain.disabled(g.key()) {
+            return false;
+        }
+        let (_, mark) = body_of(chain, g);
+        !st.instances.get(&g.key()).is_some_and(|i| {
+            i.state == InstanceState::Active
+                && i.physical
+                    .as_ref()
+                    .and_then(|p| p.get("applied"))
+                    .and_then(Value::as_str)
+                    == Some(mark.as_str())
+        })
+    })
+}
+
+/// [`ensure_for_stream`] for the chain's member's instance of `stream_def`,
+/// when it has one.
+///
+/// # Errors
+/// The catalog's, the stream log's and the deploy's.
+pub async fn ensure_for_stream_instance(
+    svc: &Arc<TenantServices>,
+    chain: &Chain,
+    stream_def: &Definition,
+) -> Result<bool> {
+    let t = chain.member();
+    let Some(streams) = crate::kafka::engine::streams() else {
+        return Ok(true);
+    };
+    let full = format!("{}.{}", stream_def.db_name, stream_def.name);
+    let Some(topic) = streams.topic(t.0, &full)? else {
+        return Ok(true);
+    };
+    let cat = catalog(svc, t).await?;
+    let Some(db) = cat
+        .databases
+        .iter()
+        .find(|d| d.name.eq_ignore_ascii_case(&stream_def.db_name))
+        .cloned()
+    else {
+        return Ok(true);
+    };
+    ensure_for_stream(
+        svc,
+        chain,
+        stream_def,
+        (db.db_id.0, &db.name),
+        topic.stream_id,
+    )
+    .await
+}
+
+/// A new stream trigger's positions: each partition's high watermark, in
+/// the trigger's own consumer group (kept when it has some already).
+async fn start_positions(t: TenantId, binding: u64, stream_id: u64) -> Result<()> {
+    let Some(streams) = crate::kafka::engine::streams() else {
+        return Ok(());
+    };
+    let Some(topic) = streams.topic_by_id(t.0, stream_id)? else {
+        return Ok(());
+    };
+    let group = messages::sprig_streams_group(binding);
+    if streams
+        .records()
+        .offsets(t.0, &group, None)?
+        .into_iter()
+        .any(|o| o.stream_id == stream_id)
+    {
+        return Ok(());
+    }
+    let at: Vec<sprig_proto_kafka::group::CommittedOffset> = (0..topic.partitions.max(0))
+        .map(|p| sprig_proto_kafka::group::CommittedOffset {
+            stream_id,
+            partition: p,
+            offset: streams
+                .log()
+                .bounds(sprig_streams::seg::Key {
+                    tenant: t.0,
+                    stream: stream_id,
+                    partition: u32::try_from(p).unwrap_or(0),
+                })
+                .high_watermark,
+            leader_epoch: None,
+            metadata: None,
+        })
+        .collect();
+    streams
+        .records()
+        .commit_offsets(t.0, &group, &at, sprig_streams::seg::now_ms())
+        .await
 }
 
 /// What an inherited trigger reads in the member: a queue instance (an
@@ -250,6 +391,16 @@ async fn ensure_for(
         } else {
             Vec::new()
         };
+        // A stream trigger reads the instance as sprig_inherited.
+        let extra: Vec<GrantItem> = if src.kind == SourceKind::Stream {
+            vec![GrantItem {
+                privileges: vec!["SELECT".into()],
+                db: src.db_name.to_owned(),
+                name: "*".to_owned(),
+            }]
+        } else {
+            extra
+        };
         let run_as = ensure_run_as(svc, t, &g, binding.is_none(), &extra).await?;
         let deployed = match deploy(svc, t, &g, &text, src, run_as).await {
             Ok(d) => d,
@@ -270,6 +421,9 @@ async fn ensure_for(
             "source": src.kind.as_str(),
             "stream": src.object_id,
         });
+        if src.kind == SourceKind::Stream {
+            start_positions(t, deployed.binding_id, src.object_id).await?;
+        }
         set_module_state(&svc.records, t, deployed.module_id, true).await?;
         mstore
             .set_instance(
@@ -326,6 +480,10 @@ async fn deploy(
 ) -> Result<messages::Deployed> {
     let mut decl = sprig_logic::declare::parse(text)?;
     decl.or_replace = true;
+    if src.kind == SourceKind::Stream {
+        // Stream triggers run on the engine tier.
+        decl.tier = sprig_logic::declare::TierPref::Engine;
+    }
     decl.db = Some(src.db_name.to_owned());
     if let Some(s) = decl.source.as_mut() {
         s.db = Some(src.db_name.to_owned());

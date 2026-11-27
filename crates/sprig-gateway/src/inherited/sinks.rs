@@ -1451,6 +1451,9 @@ pub async fn reapply_source(
     if d.kind == DefKind::Queue {
         ensure_for_queue(svc, &chain, &d, t).await;
     }
+    if d.kind == DefKind::Stream {
+        super::triggers::ensure_for_stream_instance(svc, &chain, &d).await?;
+    }
     Ok(true)
 }
 

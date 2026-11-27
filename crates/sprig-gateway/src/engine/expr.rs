@@ -232,6 +232,9 @@ pub(crate) enum CExpr {
 pub(crate) struct ExecExpr {
     pub maria: (sprig_exec::Session, sprig_exec::Compiled),
     pub mysql: (sprig_exec::Session, sprig_exec::Compiled),
+    /// The MySQL form's refusal, when only MariaDB has the expression (a
+    /// `CAST` to `INET4`): a MySQL session's statement answers it.
+    pub mysql_refused: Option<sprig_exec::SqlError>,
     /// Evaluated with the statement's time and the session's time zone and
     /// strictness (a value of `VALUES`); else as compiled (a table's own
     /// expressions, which read neither).
@@ -1512,6 +1515,11 @@ pub(crate) fn eval(e: &CExpr, row: &[Datum], a: &Args<'_>) -> Result<Datum> {
     Ok(match e {
         CExpr::Col(i) => row.get(*i).cloned().unwrap_or(Datum::Null),
         CExpr::Exec(x) => {
+            if a.env.mysql
+                && let Some(err) = &x.mysql_refused
+            {
+                return Err(super::general::sql_error(err.clone()));
+            }
             let (session, c) = if a.env.mysql { &x.mysql } else { &x.maria };
             if x.session_clock {
                 let mut s = session.clone();

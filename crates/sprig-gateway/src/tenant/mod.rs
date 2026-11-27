@@ -298,6 +298,7 @@ impl TenantServices {
         // left behind.
         crate::inherited::outbox::start_sweeper(&svc);
         crate::inherited::broadcast::start_fan_out(&svc);
+        crate::exec::start_inherited_broadcasts(&svc);
         crate::inherited::lifecycle::start_sweeper(&svc);
         // Members' failed inherited sink deploys, on a timer.
         crate::inherited::sinks::retry::start(&svc);

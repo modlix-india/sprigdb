@@ -15,7 +15,7 @@
 //!
 //! `CREATE STREAM ... FOR EACH TENANT` and publishes `FOR TENANT` or `FOR
 //! ALL TENANTS` are [`streams`]' (instances on the engine's stream log);
-//! `IN TENANT` publishes answer 1235.
+//! `IN TENANT` publishes into an ancestor's ordinary stream are [`streams`]' too.
 
 // Lexing options are passed by reference, as the lexer takes them.
 #![allow(clippy::trivially_copy_pass_by_ref)]
@@ -48,6 +48,8 @@ use crate::pipeline::{ExecCtx, ResultSink, RowFormat};
 use crate::tenant::TenantServices;
 use crate::tenant::session::{LocalWarning, TenantSession};
 
+pub(crate) mod bcast;
+mod fanin;
 mod streams;
 
 /// What a statement answers.
@@ -56,6 +58,8 @@ enum Reply {
     Ok(u64, Vec<String>),
     /// A result set.
     Rows(Vec<&'static str>, Vec<Vec<Option<String>>>),
+    /// A query's result (column definitions, text rows).
+    Query(super::streams::select::Answer),
 }
 
 /// Inherited streams: their instances, publishes and fan-in were built for
@@ -150,7 +154,7 @@ impl PassSession {
         };
         if !matches!(
             head.as_str(),
-            "insert" | "create" | "drop" | "alter" | "show" | "select" | "bind" | "unbind"
+            "insert" | "create" | "drop" | "alter" | "show" | "select" | "with" | "bind" | "unbind"
         ) {
             return Ok(None);
         }
@@ -177,7 +181,10 @@ impl PassSession {
         if !kw && !inherited::has_defs(&chain) && own.instances.is_empty() {
             return Ok(None);
         }
-        let r = Box::pin(self.inherit_msg(sql, &head, &lex_opts, &svc, &cat, &chain, &own)).await;
+        let charset = cx.proto.collation;
+        let r =
+            Box::pin(self.inherit_msg(sql, &head, &lex_opts, &svc, &cat, &chain, &own, charset))
+                .await;
         let mut status = self.status();
         if more {
             status |= StatusFlags::MORE_RESULTS_EXISTS;
@@ -214,6 +221,11 @@ impl PassSession {
                 out.ok(ok).await?;
                 Ok(Some(step))
             }
+            Ok(Some(Reply::Query((columns, rows)))) => {
+                let rows = sprig_types::Rows { columns, rows };
+                super::types::send_rows(out, &rows, format, status).await?;
+                Ok(Some(step))
+            }
             Ok(Some(Reply::Rows(columns, rows))) => {
                 let cols = columns
                     .iter()
@@ -242,6 +254,7 @@ impl PassSession {
         cat: &Arc<TenantCatalog>,
         chain: &Chain,
         own: &MsgState,
+        charset: u16,
     ) -> Result<Option<Reply>> {
         if let Some(s) = grammar::statement(sql, lex_opts)? {
             return match s {
@@ -290,6 +303,18 @@ impl PassSession {
                 None => Ok(None),
             },
             "unbind" => self.unbind_def(svc, cat, own, sql, lex_opts).await,
+            // `SELECT ... FROM s FAN IN`: the declarer reads every member's
+            // instance.
+            "select" | "with" => {
+                let current = self.current_logical();
+                match fanin::find(sql, lex_opts, own, current.as_deref()) {
+                    Some(f) => self
+                        .fan_in_select(svc, cat, f, charset)
+                        .await
+                        .map(|a| Some(Reply::Query(a))),
+                    None => Ok(None),
+                }
+            }
             "insert" => {
                 // `INSERT ... FOR TENANT | IN TENANT | FOR ALL TENANTS`
                 // publish into inherited streams.
@@ -374,13 +399,18 @@ impl PassSession {
                 "FOR EACH TENANT on an after-commit trigger (inherited triggers read streams)",
             ));
         };
-        if src.kind != sprig_logic::declare::SourceKind::Queue {
-            return Err(not_built(
-                "FOR EACH TENANT on a trigger on a stream: it reads a FOR EACH TENANT stream, \
-                 and inherited streams aren't built on the SprigDB engine yet",
+        if src.fan_in {
+            return Err(SprigError::standard(
+                1064,
+                *b"42000",
+                "a trigger is either FOR EACH TENANT (one in every member) or FAN IN (one in this \
+                 tenant reading every member), not both",
             ));
         }
-        let src_kind = DefKind::Queue;
+        let src_kind = match src.kind {
+            sprig_logic::declare::SourceKind::Queue => DefKind::Queue,
+            sprig_logic::declare::SourceKind::Stream => DefKind::Stream,
+        };
         let current = self.current_logical();
         let ts = self
             .tenant

@@ -373,7 +373,18 @@ pub(crate) fn build(name: &str, args: &[Expr], env: Env<'_>) -> Result<Node> {
         }
         "UUID" => {
             arity(name, &nodes, 0, 0)?;
-            Ok(misc::uuid(env))
+            Ok(misc::uuid(env, misc::UuidKind::V1))
+        }
+        "UUID_V4" | "UUID_V7" if env.maria() => {
+            arity(name, &nodes, 0, 0)?;
+            Ok(misc::uuid(
+                env,
+                if name == "UUID_V4" {
+                    misc::UuidKind::V4
+                } else {
+                    misc::UuidKind::V7
+                },
+            ))
         }
         "UUID_SHORT" => {
             arity(name, &nodes, 0, 0)?;

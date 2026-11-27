@@ -123,7 +123,7 @@ struct StreamTable {
 }
 
 /// The columns of a stream read as a table.
-fn stream_def(db: &str, name: &str) -> TableDef {
+pub(crate) fn stream_def(db: &str, name: &str) -> TableDef {
     TableDef {
         schema: db.to_owned(),
         name: name.to_owned(),
@@ -318,7 +318,7 @@ fn datetime_of(ms: i64) -> DateTime {
 }
 
 /// A record as a row of the stream's columns.
-fn row_of(partition: u32, r: &StoredRecord) -> Row {
+pub(crate) fn row_of(partition: u32, r: &StoredRecord) -> Row {
     let headers = if r.headers.is_empty() {
         Value::Null
     } else {
@@ -777,6 +777,22 @@ pub(crate) fn run(
         tenant,
         tables,
     });
+    plan_and_run(&catalog, storage, &stmt, persona, charset).map(Some)
+}
+
+/// Plans and runs a parsed query over `catalog` and `storage`, as the
+/// stream reads do: text results with the planner's column definitions.
+///
+/// # Errors
+/// The statement's (as the planner and the expression engine raise them)
+/// and the storage's.
+pub(crate) fn plan_and_run(
+    catalog: &dyn Catalog,
+    storage: Arc<dyn Storage>,
+    stmt: &Statement,
+    persona: Persona,
+    charset: u16,
+) -> Result<Answer> {
     let mut session = Session::new(persona);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -785,13 +801,13 @@ pub(crate) fn run(
     session.now_micros = now.subsec_micros();
     session.fold_constants = true;
     let ran = (|| -> std::result::Result<Answer, SqlError> {
-        let mut planner = Planner::new(&catalog, storage, &session);
+        let mut planner = Planner::new(catalog, storage, &session);
         planner.options = PlanOptions {
             keep_filters: true,
             memory_limit: Some(MEMORY_LIMIT),
             ..PlanOptions::for_persona(persona)
         };
-        let mut plan = planner.plan(&stmt, &[])?;
+        let mut plan = planner.plan(stmt, &[])?;
         let mut ctx = Ctx::new(&session);
         let defs: Vec<ColumnDef> = plan
             .columns
@@ -820,7 +836,7 @@ pub(crate) fn run(
         }
         Ok((defs, rows))
     })();
-    ran.map(Some).map_err(sql_error)
+    ran.map_err(sql_error)
 }
 
 #[cfg(test)]

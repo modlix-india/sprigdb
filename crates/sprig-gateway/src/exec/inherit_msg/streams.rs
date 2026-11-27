@@ -11,12 +11,16 @@
 //! INSERT INTO s FOR ALL TENANTS [WITH INSTANCE] [UNDER u] ...
 //!     into every member's instance in scope below the publisher (WITH
 //!     INSTANCE: only existing instances), one member after another
+//! INSERT INTO s IN TENANT a ...
+//!     into ancestor a's ordinary stream, with a's consent
+//!     (stream.descendant_publish), keyed by the publisher's name
 //! ```
 //!
-//! Each member's append is its own transaction on the member's unit: a
-//! publish from an ancestor isn't part of the ancestor's transaction, and
-//! a broadcast that fails part way leaves the members before the failure
-//! with the record.
+//! The server stamps `x-sprig-tenant` (the member) and
+//! `x-sprig-origin-tenant` (the publisher) on every record. A `FOR TENANT`
+//! or `IN TENANT` publish inside an engine transaction joins it (a
+//! transaction across units); outside one, and for each member of a
+//! broadcast, the append is its own transaction on the member's unit.
 
 use std::sync::Arc;
 
@@ -25,14 +29,17 @@ use sprig_auth::authz::Action;
 use sprig_catalog::TenantCatalog;
 use sprig_catalog::ddl::database_key;
 use sprig_common::ids::TenantId;
-use sprig_common::{Result, SprigError};
+use sprig_common::{Result, SprigCode, SprigError};
 use sprig_inherit::msg::grammar::{self, InsertTarget, Target};
+use sprig_inherit::msg::settings as s;
 use sprig_inherit::msg::{Chain, DefKind, DefState, Definition, MsgState};
+use sprig_proto_kafka::broker::data::ProduceRecord;
+use sprig_proto_kafka::records::Header;
 use sprig_sql::lex::LexOptions;
 use sprig_streams::seg::kafka::{EngineStreams, Need};
 use sprig_streams::seg::sql::{self as ssql, SqlHost};
 
-use super::{Reply, allows, check_quota, denied, next_object_id, not_built, scope_of};
+use super::{Reply, allows, check_quota, denied, next_object_id, scope_of};
 use crate::exec::PassSession;
 use crate::inherited::{self, InstanceIndex, MsgWrite};
 use crate::tenant::TenantServices;
@@ -89,6 +96,61 @@ fn no_definition(db: &str, name: &str) -> SprigError {
 /// # Errors
 /// The catalog's, the stream log's.
 pub(crate) async fn ensure_instance(
+    svc: &Arc<TenantServices>,
+    eng: &EngineStreams,
+    member: TenantId,
+    def: &Definition,
+    lex: &LexOptions,
+) -> Result<bool> {
+    let made = make_instance(svc, eng, member, def, lex).await?;
+    if made {
+        join_fan_ins(svc, eng, member, def).await?;
+    }
+    // Its inherited triggers, before a record goes in (they start at the
+    // instance's end).
+    let mcat = inherited::catalog(svc, member).await?;
+    let chain = inherited::chain(svc, &mcat).await?;
+    if made || inherited::triggers::pending_for(&chain, def, &inherited::state_of(&mcat)) {
+        inherited::triggers::ensure_for_stream_instance(svc, &chain, def).await?;
+    }
+    Ok(made)
+}
+
+/// A new instance joins its definition's `FAN IN` triggers, read from its
+/// first record.
+async fn join_fan_ins(
+    svc: &Arc<TenantServices>,
+    eng: &EngineStreams,
+    member: TenantId,
+    def: &Definition,
+) -> Result<()> {
+    use sprig_logic::messages;
+    let dc = svc.locator.dc_store();
+    let triggers = messages::fanin_triggers(dc.as_ref(), (def.declarer.0, def.object_id)).await?;
+    if triggers.is_empty() {
+        return Ok(());
+    }
+    let full = format!("{}.{}", def.db_name, def.name);
+    let Some(topic) = eng.topic(member.0, &full)? else {
+        return Ok(());
+    };
+    for t in triggers {
+        messages::put_fanin_member(
+            dc.as_ref(),
+            &messages::FanInMember {
+                tenant: t.tenant,
+                binding: t.binding,
+                member,
+                stream: topic.stream_id,
+            },
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// The instance itself: made from the template when missing.
+async fn make_instance(
     svc: &Arc<TenantServices>,
     eng: &EngineStreams,
     member: TenantId,
@@ -303,10 +365,8 @@ impl PassSession {
             .clone()
             .or_else(|| self.current_logical())
             .ok_or_else(|| SprigError::standard(1046, *b"3D000", "No database selected"))?;
-        if let Target::In(_) = it.target {
-            return Err(not_built(
-                "IN TENANT publishes into an ancestor's stream on the engine",
-            ));
+        if let Target::In(a) = &it.target {
+            return self.publish_up(svc, cat, sql, lex, it, a, db).await;
         }
         let def = own
             .def(&db, DefKind::Stream, &it.name)
@@ -359,27 +419,17 @@ impl PassSession {
                     with_instance: *with_instance,
                     under,
                 };
-                let all = inherited::broadcast::members(
-                    svc,
-                    &def,
-                    me,
-                    form,
-                    sprig_inherit::msg::store::now_ms(),
-                )
-                .await?;
-                let full = format!("{db}.{}", it.name);
-                let mut out = Vec::with_capacity(all.len());
-                for t in all {
-                    if *with_instance && eng.topic(t.0, &full)?.is_none() {
-                        continue;
-                    }
-                    out.push(t);
-                }
-                out
+                return self
+                    .broadcast(svc, &eng, &def, me, &it.strip(sql), lex, form)
+                    .await;
             }
             Target::In(_) => Vec::new(),
         };
         let body = it.strip(sql);
+        let origin = self.own_tenant_name(svc, me).await?;
+        // One member's publish joins the session's engine transaction; a
+        // broadcast's appends are each their own.
+        let join = matches!(it.target, Target::Tenant(_)) && self.eng.txn.is_open();
         let mut affected = 0u64;
         for t in &targets {
             ensure_instance(svc, &eng, *t, &def, lex).await?;
@@ -390,15 +440,287 @@ impl PassSession {
             let plan = ssql::plan(&eng, &body, lex, &host)?.ok_or_else(|| {
                 SprigError::internal("a publish into an inherited stream isn't a stream publish")
             })?;
-            if let ssql::Answer::Ok(n) = ssql::run(&eng, t.0, plan).await? {
+            let to = match &it.target {
+                Target::Tenant(n) => n.clone(),
+                _ => inherited::tenant_name(svc, *t).await?,
+            };
+            let plan = restamp(&eng, t.0, plan, |r| {
+                stamp(r, TENANT_HEADER, &to);
+                stamp(r, ORIGIN_HEADER, &origin);
+                Ok(())
+            })?;
+            if let ssql::Answer::Ok(n) = self.append(&eng, t.0, plan, join).await? {
                 affected += n;
             }
         }
-        let notes = if matches!(it.target, Target::All { .. }) {
-            vec![format!("published to {} member(s)", targets.len())]
-        } else {
-            Vec::new()
-        };
-        Ok(Reply::Ok(affected, notes))
+        Ok(Reply::Ok(affected, Vec::new()))
     }
+
+    /// `FOR ALL TENANTS`: the records go into the definition's broadcast
+    /// log (in the session's engine transaction when one is open), and the
+    /// fan-out task delivers them to every member ([`super::bcast`]).
+    #[allow(clippy::too_many_arguments)]
+    async fn broadcast(
+        &mut self,
+        svc: &Arc<TenantServices>,
+        eng: &Arc<EngineStreams>,
+        def: &Definition,
+        me: TenantId,
+        body: &str,
+        lex: &LexOptions,
+        form: inherited::broadcast::Form,
+    ) -> Result<Reply> {
+        let sql = def
+            .definition
+            .get("create")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                SprigError::internal("an inherited stream's definition has no CREATE STREAM text")
+            })?;
+        let host = MemberHost {
+            tenant: me.0,
+            db: def.db_name.clone(),
+        };
+        let Some(ssql::Plan::Create { rec, .. }) = ssql::plan(eng, sql, lex, &host)? else {
+            return Err(SprigError::internal(
+                "an inherited stream's template isn't a stream",
+            ));
+        };
+        let records = ssql::publish_records(eng, body, lex, &rec)?;
+        let origin = self.own_tenant_name(svc, me).await?;
+        let n = records.len() as u64;
+        let seq = if self.eng.txn.is_open() {
+            let tx = self.eng.txn.open_tx().ok_or_else(|| {
+                SprigError::internal("stream publish: the session's engine transaction ended")
+            })?;
+            super::bcast::publish(
+                svc,
+                eng,
+                def,
+                me,
+                &origin,
+                form,
+                &records,
+                Some(tx.engine_txn()),
+            )
+            .await?
+        } else {
+            super::bcast::publish(svc, eng, def, me, &origin, form, &records, None).await?
+        };
+        Ok(Reply::Ok(
+            n,
+            vec![format!(
+                "broadcast {}.{seq}: every member in scope gets it from the broadcast log, in \
+                 order, once",
+                def.object_id
+            )],
+        ))
+    }
+
+    /// The name of the session's own tenant.
+    async fn own_tenant_name(&self, svc: &TenantServices, me: TenantId) -> Result<String> {
+        match self
+            .tenant
+            .as_deref()
+            .and_then(|t| t.principal.tenant_name.clone())
+        {
+            Some(n) => Ok(n),
+            None => inherited::tenant_name(svc, me).await,
+        }
+    }
+
+    /// Appends a planned publish into `tenant`'s stream: inside the
+    /// session's engine transaction (`join`, a transaction across units
+    /// when `tenant` isn't the session's), else on its own.
+    async fn append(
+        &mut self,
+        eng: &EngineStreams,
+        tenant: u64,
+        plan: ssql::Plan,
+        join: bool,
+    ) -> Result<ssql::Answer> {
+        if join {
+            let tx = self.eng.txn.open_tx().ok_or_else(|| {
+                SprigError::internal("stream publish: the session's engine transaction ended")
+            })?;
+            return ssql::publish_in(eng, tenant, plan, tx.engine_txn()).await;
+        }
+        ssql::run(eng, tenant, plan).await
+    }
+
+    /// `INSERT INTO s IN TENANT a ...`: into ancestor `a`'s ordinary stream
+    /// (one platform stream for every client). Only with the owner's
+    /// consent (`stream.descendant_publish = on` where the stream is), and
+    /// under `stream.descendant_key = origin` keyed by the publisher's own
+    /// tenant name (its name when the record has no key; 39957 for another
+    /// key). Anything but an ancestor, or no consent, answers 1142 (never a
+    /// hint that a tenant exists). The record carries
+    /// `x-sprig-origin-tenant`; inside an engine transaction the append
+    /// joins it.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    async fn publish_up(
+        &mut self,
+        svc: &Arc<TenantServices>,
+        cat: &Arc<TenantCatalog>,
+        sql: &str,
+        lex: &LexOptions,
+        it: &InsertTarget,
+        anc_name: &str,
+        db: String,
+    ) -> Result<Reply> {
+        let me = cat.tenant;
+        let ts = self
+            .tenant
+            .as_deref()
+            .ok_or_else(|| SprigError::internal("no tenant"))?;
+        let refused = denied(ts, "INSERT", &it.name);
+        let anc = inherited::tenant_by_name(svc, anc_name).await?;
+        let eng = streams()?;
+        let body = it.strip(sql);
+        let host_db = db.clone();
+        let join = self.eng.txn.is_open();
+        // Its own stream: an ordinary publish.
+        if anc == Some(me) {
+            if !allows(ts, cat, Action::Insert, &db, &it.name) {
+                return Err(refused);
+            }
+            let plan = ssql::plan(
+                &eng,
+                &body,
+                lex,
+                &MemberHost {
+                    tenant: me.0,
+                    db: host_db,
+                },
+            )?
+            .ok_or_else(|| SprigError::internal("a publish isn't a stream publish"))?;
+            return match self.append(&eng, me.0, plan, join).await? {
+                ssql::Answer::Ok(n) => Ok(Reply::Ok(n, Vec::new())),
+                _ => Ok(Reply::Ok(0, Vec::new())),
+            };
+        }
+        let Some(anc) = anc else {
+            return Err(refused);
+        };
+        let ancestors = inherited::dir_entry(svc, me)
+            .await?
+            .map(|e| e.path_ids())
+            .unwrap_or_default();
+        if !ancestors
+            .split_last()
+            .is_some_and(|(_, up)| up.contains(&anc.0))
+        {
+            return Err(refused);
+        }
+        // The owner's consent, where the stream is.
+        let acat = inherited::catalog(svc, anc).await?;
+        let Some(adb) = acat
+            .databases
+            .iter()
+            .find(|d| d.name.eq_ignore_ascii_case(&db))
+        else {
+            return Err(refused);
+        };
+        let ctx = acat.setting_ctx(&svc.dc).with_db(adb.db_id);
+        let consent = svc
+            .settings
+            .get(&s::STREAM_DESCENDANT_PUBLISH, &ctx, Some(&acat.settings));
+        if !consent.eq_ignore_ascii_case("on") {
+            return Err(refused);
+        }
+        let any_key = svc
+            .settings
+            .get(&s::STREAM_DESCENDANT_KEY, &ctx, Some(&acat.settings))
+            .eq_ignore_ascii_case("any");
+        let origin = self.own_tenant_name(svc, me).await?;
+        let plan = ssql::plan(
+            &eng,
+            &body,
+            lex,
+            &MemberHost {
+                tenant: anc.0,
+                db: host_db,
+            },
+        )?
+        .ok_or_else(|| SprigError::internal("a publish isn't a stream publish"))?;
+        let plan = restamp(&eng, anc.0, plan, |r| {
+            if !any_key {
+                match r.key.as_deref() {
+                    None => r.key = Some(origin.clone().into_bytes()),
+                    Some(k) if k == origin.as_bytes() => {}
+                    Some(k) => {
+                        return Err(SprigError::new(
+                            SprigCode::StreamOriginKey,
+                            format!(
+                                "ER_SPRIG_STREAM_ORIGIN_KEY: a record tenant '{origin}' publishes \
+                                 into tenant '{anc_name}''s stream {db}.{} is keyed by its tenant \
+                                 name (stream.descendant_key = origin), not '{}'",
+                                it.name,
+                                String::from_utf8_lossy(k)
+                            ),
+                        ));
+                    }
+                }
+            }
+            stamp(r, ORIGIN_HEADER, &origin);
+            Ok(())
+        })?;
+        let n = match self.append(&eng, anc.0, plan, join).await? {
+            ssql::Answer::Ok(n) => n,
+            _ => 0,
+        };
+        tracing::debug!(tenant = %me, into = %anc, stream = %it.name, records = n, "published into an ancestor's stream");
+        Ok(Reply::Ok(n, Vec::new()))
+    }
+}
+
+/// The member a record was published for (server-stamped).
+pub(super) const TENANT_HEADER: &str = "x-sprig-tenant";
+/// The tenant that published it (server-stamped).
+pub(super) const ORIGIN_HEADER: &str = "x-sprig-origin-tenant";
+
+/// Sets header `key` of a record to `value`, replacing any the client sent.
+pub(super) fn stamp(r: &mut ProduceRecord, key: &str, value: &str) {
+    r.headers.retain(|h| !h.key.eq_ignore_ascii_case(key));
+    r.headers.push(Header {
+        key: key.to_owned(),
+        value: Some(value.as_bytes().to_vec()),
+    });
+}
+
+/// A publish plan with `f` applied to each record; a record given a key
+/// here goes to that key's partition.
+fn restamp(
+    eng: &EngineStreams,
+    tenant: u64,
+    plan: ssql::Plan,
+    mut f: impl FnMut(&mut ProduceRecord) -> Result<()>,
+) -> Result<ssql::Plan> {
+    let ssql::Plan::Publish { stream_id, batches } = plan else {
+        return Ok(plan);
+    };
+    let parts = eng
+        .topics(tenant)?
+        .into_iter()
+        .find(|t| t.stream_id == stream_id)
+        .map_or(1, |t| u32::try_from(t.partitions.max(1)).unwrap_or(1));
+    let mut by_part: std::collections::BTreeMap<i32, Vec<ProduceRecord>> =
+        std::collections::BTreeMap::new();
+    for (p, recs) in batches {
+        for mut r in recs {
+            let keyed = r.key.is_some();
+            f(&mut r)?;
+            let p = match r.key.as_deref() {
+                Some(k) if !keyed => {
+                    i32::try_from(sprig_streams::partition::for_key(k, parts).0).unwrap_or(0)
+                }
+                _ => p,
+            };
+            by_part.entry(p).or_default().push(r);
+        }
+    }
+    Ok(ssql::Plan::Publish {
+        stream_id,
+        batches: by_part.into_iter().collect(),
+    })
 }

@@ -341,6 +341,45 @@ pub fn plan(
     }
 }
 
+/// The records of `INSERT INTO <stream> ...` (`sql`) for a stream like
+/// `r`, which isn't looked up by name, in the statement's order: a
+/// broadcast's records, made before any member's instance is.
+///
+/// # Errors
+/// The statement isn't such an insert, or a record breaks `r`'s limits.
+pub fn publish_records(
+    eng: &EngineStreams,
+    sql: &str,
+    lex: &LexOptions,
+    r: &TopicRecord,
+) -> Result<Vec<ProduceRecord>> {
+    let Ok(Stmt::Insert(i)) = grammar::classify(sql.as_bytes(), lex) else {
+        return Err(unsupported(
+            "a publish that isn't INSERT INTO <stream> VALUES",
+        ));
+    };
+    if i.on_duplicate {
+        return Err(SprigError::new(
+            SprigCode::StreamAppendOnly,
+            "ER_SPRIG_STREAM_APPEND_ONLY: INSERT ... ON DUPLICATE KEY UPDATE on a stream",
+        ));
+    }
+    if i.set_form {
+        return Err(unsupported("INSERT ... SET"));
+    }
+    let rows = grammar::insert_values(sql.as_bytes(), lex)
+        .ok_or_else(|| unsupported("INSERT ... SELECT or values that aren't literals"))?;
+    // One partition keeps the statement's order.
+    let one = TopicRecord {
+        partitions: 1,
+        ..r.clone()
+    };
+    match publish_plan(eng, &one, &i, rows)? {
+        Plan::Publish { batches, .. } => Ok(batches.into_iter().flat_map(|(_, b)| b).collect()),
+        _ => Ok(Vec::new()),
+    }
+}
+
 /// The batches of a publish: records by partition (an explicit
 /// `partition_no`, else by key, else round robin over the statement).
 #[allow(clippy::too_many_lines)] // one check after another, per record
