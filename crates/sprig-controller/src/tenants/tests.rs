@@ -494,6 +494,7 @@ fn table(id: ObjectId, db: DbId, v: u64) -> ObjectRow {
     }
 }
 
+#[ignore = "live: needs SPRIG_TEST_MARIADB_SINGLE; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn live_bootstrap_tree_settings_and_delete() {
     let Some(url) = std::env::var(MARIADB_ENV)
@@ -501,7 +502,7 @@ async fn live_bootstrap_tree_settings_and_delete() {
         .filter(|v| !v.trim().is_empty())
     else {
         eprintln!("skipped live_bootstrap_tree_settings_and_delete: set {MARIADB_ENV} to run it");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let pools = StaticPools::new()
         .with_url(cid("lt-c1"), &url)
@@ -789,6 +790,7 @@ async fn live_bootstrap_tree_settings_and_delete() {
 /// raised past the catalogs on the clusters; a schema found anyway (the
 /// counter behind, a cluster unread) is refused unless it carries this
 /// tenant's mark, and deleting the refused tenant leaves it alone.
+#[ignore = "live: needs SPRIG_TEST_MARIADB_SINGLE; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_catalog_schemas_are_never_reused() {
     let Some(url) = std::env::var(MARIADB_ENV)
@@ -796,7 +798,7 @@ async fn live_catalog_schemas_are_never_reused() {
         .filter(|v| !v.trim().is_empty())
     else {
         eprintln!("skipped live_catalog_schemas_are_never_reused: set {MARIADB_ENV} to run it");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let pools = StaticPools::new().with_url(cid("lt-c1"), &url).unwrap();
     with_env(pools, Some(&url), |env| {
@@ -911,6 +913,7 @@ async fn live_catalog_schemas_are_never_reused() {
 /// schemas inside the range raise the id counter, so another deployment's
 /// schemas on the same servers no longer pull this one's ids into its
 /// range, and a used-up range refuses with 39080.
+#[ignore = "live: needs SPRIG_TEST_MARIADB_SINGLE; tools/live/README.md"]
 #[tokio::test]
 async fn live_tenant_ids_stay_in_the_deployments_range() {
     let Some(url) = std::env::var(MARIADB_ENV)
@@ -918,7 +921,7 @@ async fn live_tenant_ids_stay_in_the_deployments_range() {
         .filter(|v| !v.trim().is_empty())
     else {
         eprintln!("skipped live_tenant_ids_stay_in_the_deployments_range: set {MARIADB_ENV}");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let pools = StaticPools::new().with_url(cid("lt-c1"), &url).unwrap();
     with_env(pools, Some(&url), |env| {
@@ -1003,6 +1006,7 @@ async fn live_tenant_ids_stay_in_the_deployments_range() {
 ///    after making the schema; simulated here for 150 ms). The retry
 ///    adopts it once the mark shows, instead of refusing the tenant's own
 ///    catalog.
+#[ignore = "live: needs SPRIG_TEST_MARIADB_SINGLE; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn live_a_half_done_create_and_its_retry() {
     let Some(url) = std::env::var(MARIADB_ENV)
@@ -1010,7 +1014,7 @@ async fn live_a_half_done_create_and_its_retry() {
         .filter(|v| !v.trim().is_empty())
     else {
         eprintln!("skipped live_a_half_done_create_and_its_retry: set {MARIADB_ENV} to run it");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let pools = StaticPools::new().with_url(cid("lt-c1"), &url).unwrap();
     with_env(pools, Some(&url), |env| {

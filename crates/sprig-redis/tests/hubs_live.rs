@@ -141,6 +141,7 @@ fn texts(r: &R) -> Vec<String> {
     }
 }
 
+#[ignore = "live: needs SPRIG_TEST_REDIS_SPRIG, SPRIG_TEST_REDIS_SPRIG_B; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pubsub_and_wakeups_across_gateways() {
     let (Some(a), Some(b)) = (
@@ -148,7 +149,7 @@ async fn pubsub_and_wakeups_across_gateways() {
         var("SPRIG_TEST_REDIS_SPRIG_B"),
     ) else {
         eprintln!("SPRIG_TEST_REDIS_SPRIG(_B) not set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     // Subscribers: two on gateway B (a channel, a pattern), one on A.
     let mut sub_b1 = Raw::open(&b).await;

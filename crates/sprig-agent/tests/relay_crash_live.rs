@@ -254,11 +254,12 @@ async fn restart(e: &Env, target: &str) {
     }
 }
 
+#[ignore = "live: needs R3W_SCRIPT, R3W_GATEWAY, R3W_BACKENDS, ...; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn transfers_survive_kill_9_at_each_step() {
     let Some(e) = env() else {
         eprintln!("relay_crash_live: R3W_* not set; skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let e = Arc::new(e);
     std::fs::create_dir_all(&e.pause_dir).unwrap();
@@ -735,11 +736,12 @@ async fn client_victim() {
 /// and is killed with `kill -9` after a random 1–4 s, `n` times. Then,
 /// once no branch is in doubt, every child transfer must be in both rows
 /// or in neither, and the balances must sum to the start.
+#[ignore = "live: needs R3W_CLIENT_KILLS; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn client_kills() {
     let (Ok(n), Some(e)) = (std::env::var("R3W_CLIENT_KILLS"), env()) else {
         eprintln!("relay_crash_live: R3W_CLIENT_KILLS not set; skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let kills: usize = n.parse().unwrap();
     let sessions: usize = std::env::var("R3W_KILL_SESSIONS")
@@ -999,11 +1001,12 @@ fn list<T: std::str::FromStr>(var: &str, default: &str) -> Vec<T> {
 /// connections opened per transaction, and `R3W_TW_PORTS` the peak of
 /// `TIME_WAIT` sockets on those ports, sampled every half second. A run
 /// stops early when the laptop's `TIME_WAIT` sockets pass 8,000.
+#[ignore = "live: needs R3W_BENCH; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn cost_of_the_path() {
     let (Ok(label), Some(e)) = (std::env::var("R3W_BENCH"), env()) else {
         eprintln!("relay_crash_live: R3W_BENCH not set; skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let secs: u64 = std::env::var("R3W_BENCH_SECS")
         .ok()

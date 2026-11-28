@@ -238,10 +238,11 @@ async fn setup(c: &mut Conn) {
     }
 }
 
+#[ignore = "live: needs SPRIG_TEST_LOGIC_GATEWAY, SPRIG_TEST_LOGIC_USER, SPRIG_TEST_LOGIC_PASSWORD; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn javascript_bound_logic_matches_kirun() {
     let Some(mut c) = connect("javascript_bound_logic_matches_kirun").await else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let started = Instant::now();
     setup(&mut c).await;

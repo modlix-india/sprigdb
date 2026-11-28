@@ -1038,10 +1038,49 @@ impl PassSession {
                 puts.push(mk(What::Settings, Value::Object(m)));
                 what_done = "queue arguments".into();
             }
+            AlterOp::Set(kvs) if a.kind == DefKind::Stream => {
+                let mut m = existing(What::Settings)
+                    .and_then(|o| o.value.as_object().cloned())
+                    .unwrap_or_default();
+                for (k, v) in kvs {
+                    let k = k.to_ascii_lowercase();
+                    let k = if k.starts_with("stream.") {
+                        k
+                    } else {
+                        format!("stream.{k}")
+                    };
+                    if !streams::STREAM_OVERRIDABLE.contains(&k.as_str()) {
+                        return Err(inherited::not_overridable(format!(
+                            "{k} belongs to the definition; a member may set {}",
+                            streams::STREAM_OVERRIDABLE.join(", ")
+                        )));
+                    }
+                    let val =
+                        if v.eq_ignore_ascii_case("null") {
+                            Value::Null
+                        } else {
+                            let n = v.trim().parse::<i64>().ok().filter(|n| *n > 0).ok_or_else(
+                                || {
+                                    SprigError::standard(
+                                        1231,
+                                        *b"42000",
+                                        format!(
+                                            "Variable '{k}' can't be set to the value of '{v}'"
+                                        ),
+                                    )
+                                },
+                            )?;
+                            json!(n)
+                        };
+                    m.insert(k, val);
+                }
+                puts.push(mk(What::Settings, Value::Object(m)));
+                what_done = "stream settings".into();
+            }
             AlterOp::Set(_) => {
                 return Err(not_built(&format!(
-                    "SET on an inherited {} yet (queues take SET; DISABLE, ENABLE, REPLACE and \
-                     RESET are built)",
+                    "SET on an inherited {} yet (queues and streams take SET; DISABLE, ENABLE, \
+                     REPLACE and RESET are built)",
                     a.kind.as_str()
                 )));
             }
@@ -1055,6 +1094,8 @@ impl PassSession {
                     .unwrap_or_default();
                 for k in keys {
                     m.remove(k);
+                    // A stream setting named without its `stream.`.
+                    m.remove(&format!("stream.{}", k.to_ascii_lowercase()));
                 }
                 if m.is_empty() {
                     deletes.push(Some(What::Settings));
@@ -1148,6 +1189,10 @@ impl PassSession {
         // other DCs index.
         let mut reached =
             inherited::remote::apply_override_here(svc, chain, &def, target, applies).await?;
+        if def.kind == DefKind::Stream {
+            reached +=
+                streams::apply_override(svc, &def, target, applies == AppliesTo::Subtree).await?;
+        }
         reached += usize::try_from(
             inherited::remote::in_other_dcs(
                 svc,
@@ -1343,7 +1388,11 @@ impl PassSession {
                     .ok_or_else(|| {
                         target_err(format!("no definition {} {db}.{name}", kind.as_str()))
                     })?;
-                let rows = inherited::broadcast::show(svc, &def).await?;
+                let rows = if crate::amqp::queues::messages_on_engine(def.declarer.0) {
+                    bcast::show(svc, &def).await?
+                } else {
+                    inherited::broadcast::show(svc, &def).await?
+                };
                 Ok(Reply::Rows(
                     vec![
                         "Broadcast",
@@ -1816,7 +1865,26 @@ impl PassSession {
                     ts_ms: None,
                 };
                 let form = inherited::broadcast::Form::default();
-                if self.offsets_in_transaction() {
+                if crate::amqp::queues::messages_on_engine(me.0) {
+                    // The broadcast log on the engine, in the session's
+                    // engine transaction when one is open.
+                    let tx = if self.offsets_in_transaction() {
+                        Some(self.eng.txn.open_tx().ok_or_else(engine_txn_needed)?)
+                    } else {
+                        None
+                    };
+                    bcast::publish_message(
+                        &svc,
+                        &def,
+                        me,
+                        &my_name,
+                        form,
+                        m,
+                        &String::from_utf8_lossy(rec.key.as_deref().unwrap_or_default()),
+                        tx.map(crate::engine::store::Tx::engine_txn),
+                    )
+                    .await?;
+                } else if self.offsets_in_transaction() {
                     let bytes = rec.value.as_ref().map_or(0, Vec::len);
                     inherited::broadcast::check_limits(&svc, &def, me, bytes, form).await?;
                     let dest = inherited::outbox::Dest::Broadcast {
@@ -1852,9 +1920,6 @@ impl PassSession {
                     .await
                     .map(Some);
                 }
-                // Inside a transaction: through this tenant's cross-tenant
-                // outbox; forwarded into the member's queue outbox once
-                // the transaction commits.
                 let strict = svc.settings.get(
                     &sprig_inherit::msg::settings::CROSS_TENANT_MESSAGING_STRICT,
                     &cat.setting_ctx(&svc.dc),
@@ -1863,6 +1928,33 @@ impl PassSession {
                 if strict {
                     inherited::check_residency(&svc, tid, me, SprigCode::InheritResidency).await?;
                 }
+                if crate::amqp::queues::messages_on_engine(tid.0) {
+                    // Inside a transaction, on the engine: the member's
+                    // queue outbox row is a plain write of the session's
+                    // engine transaction (in the member's unit), so it
+                    // exists only if the transaction commits; the
+                    // member's forwarder routes it then.
+                    if self.eng.txn.open_tx().is_none() {
+                        return Err(engine_txn_needed());
+                    }
+                    let (v, store) =
+                        Box::pin(inherited::mq::engine_vhost(&svc, &tchain, &db)).await?;
+                    let row = inherited::mq::outbox_row(
+                        inherited::outbox::new_id(),
+                        &stamped.exchange,
+                        &stamped,
+                    );
+                    let tx = self.eng.txn.open_tx().ok_or_else(engine_txn_needed)?;
+                    inherited::mq::txn_put(tx.engine_txn(), store.txn_publish(&row))?;
+                    if let Some(q) = svc.mq.get() {
+                        let r = v.vhost();
+                        q.note_txn_publish(u64::from(cx.session.id.0), r.tenant, r.db_id);
+                    }
+                    return Ok(Some(1));
+                }
+                // Inside a transaction: through this tenant's cross-tenant
+                // outbox; forwarded into the member's queue outbox once
+                // the transaction commits.
                 let rec = Publish {
                     key: Some(stamped.routing_key.clone().into_bytes()),
                     value: Some(stamped.body.to_vec()),
@@ -1912,6 +2004,18 @@ impl PassSession {
             ))),
         }
     }
+}
+
+/// A publish into another tenant inside a transaction that has no engine
+/// transaction (its statements so far ran elsewhere).
+fn engine_txn_needed() -> SprigError {
+    SprigError::standard(
+        1235,
+        *b"42000",
+        "This version of SprigDB doesn't yet support a publish into another tenant's inherited \
+         exchange or queue inside a transaction that isn't on the engine; publish outside the \
+         transaction, or start it in an engine database",
+    )
 }
 
 /// Re-applies database `db`'s inherited exchanges, queues and bindings in

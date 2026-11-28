@@ -80,11 +80,12 @@ async fn run(db: &Database, c: &Document) -> Result<Vec<Document>, i32> {
     cur.try_collect().await.map_err(|e| code_of(&e))
 }
 
+#[ignore = "live: needs SPRIG_TEST_MONGO_URI; tools/live/README.md"]
 #[tokio::test]
 async fn stage_corpus_through_the_gateway() {
     let Some(u) = uri("SPRIG_TEST_MONGO_URI") else {
         eprintln!("SPRIG_TEST_MONGO_URI not set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let client = Client::with_uri_str(&u).await.unwrap();
     let db = client.database("m2_stage_live");
@@ -174,11 +175,12 @@ async fn first_keys(
         .unwrap_or_default())
 }
 
+#[ignore = "live: needs SPRIG_TEST_MONGO_URI; tools/live/README.md"]
 #[tokio::test]
 async fn diagnostic_stages_have_mongodb_shapes() {
     let Some(u) = uri("SPRIG_TEST_MONGO_URI") else {
         eprintln!("SPRIG_TEST_MONGO_URI not set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let mut targets = vec![("sprig", Client::with_uri_str(&u).await.unwrap())];
     if let Some(r) = uri("SPRIG_TEST_MONGO_REF_URI") {

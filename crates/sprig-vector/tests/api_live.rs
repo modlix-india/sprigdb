@@ -103,11 +103,12 @@ impl Rng {
     }
 }
 
+#[ignore = "live: needs SPRIG_TEST_KV_HTTP, SPRIG_TEST_REDIS_SPRIG; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn vectors_over_rest_and_grpc() {
     let (Some(addr), Some(url)) = (var("SPRIG_TEST_KV_HTTP"), var("SPRIG_TEST_REDIS_SPRIG")) else {
         eprintln!("SPRIG_TEST_KV_HTTP or SPRIG_TEST_REDIS_SPRIG not set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let auth = creds(&url);
     let base = "/v1/databases/r6vecapi/vectorIndexes";

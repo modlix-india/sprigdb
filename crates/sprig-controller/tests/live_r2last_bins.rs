@@ -948,6 +948,7 @@ async fn user_and_schema(sprigctl: &Path, dc: &str, t: &str) {
 
 static ONE_AT_A_TIME: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+#[ignore = "live: needs SPRIG_TEST_DOCKER; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn bins_r2last_readonly_standbys_tenant_scopes_and_traffic_following() {
     if !skip::flag(skip::DOCKER) {
@@ -955,7 +956,7 @@ async fn bins_r2last_readonly_standbys_tenant_scopes_and_traffic_following() {
             skip::DOCKER,
             "bins_r2last_readonly_standbys_tenant_scopes_and_traffic_following",
         );
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     }
     let _one = ONE_AT_A_TIME.lock().await;
     let Some((sprigdb, sprigctl)) = bins() else {
@@ -1912,6 +1913,7 @@ async fn dc_move_item(tenant: &str) -> Option<Value> {
     v["items"].as_array()?.first().cloned()
 }
 
+#[ignore = "live: needs SPRIG_TEST_DOCKER; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn bins_approvals_dc_move_escalates_tenant_ancestor_platform() {
     use sprig_api::proto::admin::recommendations_client::RecommendationsClient;
@@ -1921,7 +1923,7 @@ async fn bins_approvals_dc_move_escalates_tenant_ancestor_platform() {
             skip::DOCKER,
             "bins_approvals_dc_move_escalates_tenant_ancestor_platform",
         );
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     }
     let _one = ONE_AT_A_TIME.lock().await;
     let Some((sprigdb, sprigctl)) = bins() else {

@@ -1,0 +1,5 @@
+q:SELECT @@character_set_client, @@collation_connection
+q:SELECT @@sql_mode, @@time_zone
+q:SELECT @@character_set_server, @@collation_database
+q:SELECT @@version_comment
+q:SELECT @@session.character_set_results

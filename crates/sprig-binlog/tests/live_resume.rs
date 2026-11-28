@@ -115,10 +115,11 @@ async fn switch_nodes(writer: &str, nodes: &[String], domain: Option<u32>) {
 
 /// Primary, then replica 1, then replica 2 (and back): the replicas'
 /// binlogs (`log_slave_updates`) hold the same GTIDs.
+#[ignore = "live: needs SPRIG_TEST_BINLOG_SCRATCH_PAIRS; tools/live/README.md"]
 #[tokio::test]
 async fn resume_across_primary_and_replicas() {
     let Some(u) = urls(common::REPLICATION, module_path!()) else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let mut nodes = u.clone();
     switch_nodes(&u[0], &nodes, None).await;
@@ -127,10 +128,11 @@ async fn resume_across_primary_and_replicas() {
 }
 
 /// Galera: positions keep only `wsrep_gtid_domain_id`.
+#[ignore = "live: needs SPRIG_TEST_BINLOG_SCRATCH_PAIRS; tools/live/README.md"]
 #[tokio::test]
 async fn resume_across_galera_nodes() {
     let Some(u) = urls(common::GALERA, module_path!()) else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let mut c = sql(&u[0]).await;
     let domain: u32 = c
@@ -147,11 +149,12 @@ async fn resume_across_galera_nodes() {
 /// reader is mid-stream; the reader continues on it. A position holding a
 /// transaction the promoted node never received fails with 1236. The test
 /// writes in a fresh GTID domain and repairs replication afterwards.
+#[ignore = "live: needs SPRIG_TEST_BINLOG_SCRATCH_PAIRS; tools/live/README.md"]
 #[tokio::test]
 async fn follow_a_promoted_replica_and_refuse_a_lost_position() {
     let Some(pairs) = std::env::var(PAIRS).ok().filter(|v| !v.is_empty()) else {
         let _ = urls(PAIRS, module_path!());
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     for pair in pairs.split(';') {
         let (primary, replica) = pair.split_once(',').unwrap();

@@ -1,0 +1,26 @@
+# The TRIGGER right of a trigger's definer, checked when the trigger fires.
+x:DROP USER IF EXISTS 'rsp_tu'@'%'
+x:DROP TABLE IF EXISTS tp_t
+x:DROP TABLE IF EXISTS tp_u
+x:CREATE USER 'rsp_tu'@'%' IDENTIFIED BY 'rsp-tu-pw'
+q:CREATE TABLE tp_t (id INT PRIMARY KEY, v INT)
+q:CREATE TABLE tp_u (id INT PRIMARY KEY, w INT)
+x:GRANT SELECT, INSERT, UPDATE, DELETE ON rsp_a.tp_t TO 'rsp_tu'@'%'
+x:GRANT SELECT, INSERT, UPDATE ON rsp_a.tp_u TO 'rsp_tu'@'%'
+q:CREATE DEFINER='rsp_tu'@'%' TRIGGER tp_bi BEFORE INSERT ON tp_t FOR EACH ROW SET NEW.v = NEW.v + 1
+q:CREATE DEFINER='rsp_tu'@'%' TRIGGER tp_bu BEFORE UPDATE ON tp_u FOR EACH ROW SET NEW.w = NEW.w * 10
+q:INSERT INTO tp_t VALUES (1, 1)
+q:INSERT INTO tp_u VALUES (1, 1)
+q:UPDATE tp_u SET w = 2
+q:UPDATE tp_u JOIN tp_t ON tp_t.id = tp_u.id SET tp_u.w = 3
+q:SELECT * FROM tp_t
+x:GRANT TRIGGER ON rsp_a.tp_t TO 'rsp_tu'@'%'
+q:INSERT INTO tp_t VALUES (2, 1)
+q:UPDATE tp_u JOIN tp_t ON tp_t.id = tp_u.id SET tp_u.w = 3
+x:GRANT TRIGGER ON rsp_a.* TO 'rsp_tu'@'%'
+q:UPDATE tp_u JOIN tp_t ON tp_t.id = tp_u.id SET tp_u.w = 4
+q:SELECT * FROM tp_t ORDER BY id
+q:SELECT * FROM tp_u ORDER BY id
+x:DROP TABLE IF EXISTS tp_t
+x:DROP TABLE IF EXISTS tp_u
+x:DROP USER IF EXISTS 'rsp_tu'@'%'

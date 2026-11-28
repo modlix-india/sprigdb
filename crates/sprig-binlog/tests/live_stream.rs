@@ -20,10 +20,11 @@ use sprig_common::SprigCode;
 
 /// With a 300 ms period on an idle server, heartbeats arrive about every
 /// 300 ms: the period is taken in nanoseconds.
+#[ignore = "live: needs SPRIG_TEST_BINLOG_PAUSE; tools/live/README.md"]
 #[tokio::test]
 async fn heartbeats_arrive_at_the_requested_period() {
     let Some(us) = urls(common::SCRATCH, module_path!()) else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     for url in us {
         let mut c = sql(&url).await;
@@ -53,10 +54,11 @@ async fn heartbeats_arrive_at_the_requested_period() {
 
 /// `COM_REGISTER_SLAVE` is optional: a registered stream shows in `SHOW
 /// SLAVE HOSTS`; an unregistered one works without it (every other test).
+#[ignore = "live: needs SPRIG_TEST_BINLOG_PAUSE; tools/live/README.md"]
 #[tokio::test]
 async fn registration_is_optional_and_visible() {
     let Some(us) = urls(common::SCRATCH, module_path!()) else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     for url in us {
         let mut c = sql(&url).await;
@@ -80,11 +82,12 @@ async fn registration_is_optional_and_visible() {
 /// container while a stream with 200 ms heartbeats reads it; the stream
 /// ends with the retryable `ER_SPRIG_BINLOG_DISCONNECTED` after about three
 /// periods.
+#[ignore = "live: needs SPRIG_TEST_BINLOG_PAUSE; tools/live/README.md"]
 #[tokio::test]
 async fn silence_ends_the_stream() {
     let Some(spec) = std::env::var("SPRIG_TEST_BINLOG_PAUSE").ok() else {
         let _ = urls("SPRIG_TEST_BINLOG_PAUSE", module_path!());
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let (container, url) = spec.split_once('=').unwrap();
     let mut c = sql(url).await;
@@ -123,7 +126,7 @@ async fn silence_ends_the_stream() {
 #[ignore = "measurement, not a check"]
 async fn throughput() {
     let Some(us) = urls(common::SCRATCH, module_path!()) else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     for url in us {
         let schema = schema_name();
@@ -178,10 +181,11 @@ async fn throughput() {
 /// probe's dump check reads) sends the format description and the start position's
 /// `GTID_LIST`, then ends with [`Event::DumpEnd`] instead of waiting.
 /// Read-only, so it runs on the shared single node.
+#[ignore = "live: needs SPRIG_TEST_BINLOG_PAUSE; tools/live/README.md"]
 #[tokio::test]
 async fn non_blocking_dump_ends_at_the_end_of_the_binlog() {
     let Some(us) = urls(common::SINGLE, module_path!()) else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     for url in us {
         let mut c = sql(&url).await;

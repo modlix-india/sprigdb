@@ -337,7 +337,6 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
     // The AI assistants' exact payloads past `ai.audit_payload_days`.
     let ai_purge = ai_admin::AiPurgeLoop::new(
         Directory::new(Arc::clone(&stores.global)),
-        Arc::new(locator.clone()),
         dc.clone(),
         Some(settings.live.clone()),
     );
@@ -531,11 +530,6 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
             Arc::clone(&stores.dc),
             Arc::clone(&stores.global),
             cfg.controller.workload_key_file.as_deref(),
-            RegistryPools::new(
-                ClusterRegistry::new(Arc::clone(&stores.global), Arc::clone(&stores.dc))?,
-                Some(Arc::clone(&monitor)),
-            )
-            .budget("ai_incidents", 1),
             Some((settings.live.clone(), dc.clone())),
         )?);
     // The administration agent's metric history, health checks,
@@ -636,17 +630,10 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
             Some((settings.live.clone(), dc.clone())),
             docs_loader::PackSource::Settings,
         )))
-        // The administration assistant's conversations on the system
-        // cluster: the schema, and their payloads' retention.
+        // The administration assistant's conversations in the system
+        // catalog records: their payloads' retention.
         .with_loop(Loop::new(ai_system::AiSystemLoop::new(
-            Arc::new(ai_system::RegistrySystem::new(
-                ClusterRegistry::new(Arc::clone(&stores.global), Arc::clone(&stores.dc))?,
-                RegistryPools::new(
-                    ClusterRegistry::new(Arc::clone(&stores.global), Arc::clone(&stores.dc))?,
-                    Some(Arc::clone(&monitor)),
-                )
-                .budget("ai_system", 1),
-            )),
+            catalog_records(),
             Some((settings.live.clone(), dc.clone())),
         )))
         // The administration agent's health checks and write-ups.
@@ -654,15 +641,10 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
         // Tenant digests (ai.digest), from statistics only.
         .with_loop(Loop::new(ai_digest::DigestLoop::new(
             Directory::new(Arc::clone(&stores.global)),
-            Arc::new(locator.clone()),
+            catalog_records(),
             dc.clone(),
             Some(settings.live.clone()),
             Arc::clone(&incident_env),
-            RegistryPools::new(
-                ClusterRegistry::new(Arc::clone(&stores.global), Arc::clone(&stores.dc))?,
-                Some(Arc::clone(&monitor)),
-            )
-            .budget("ai_digest", 1),
             Some(Arc::clone(&notifier)),
         )))
         // The administration agent's incident intake: triage and advice.

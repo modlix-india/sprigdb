@@ -915,12 +915,13 @@ fn cases(a: &'static Table, b: &'static Table, rng: &mut Rng) -> Vec<Case> {
     out
 }
 
+#[ignore = "live: needs SPRIG_EXEC_ORACLE_SEED, SPRIG_EXEC_ORACLE_REPORT; tools/live/README.md"]
 #[test]
 fn operators_match_the_servers() {
     let oracles = Oracle::from_env();
     if oracles.is_empty() {
         eprintln!("no SPRIG_EXEC_ORACLE_* command set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     }
     let seed = std::env::var("SPRIG_EXEC_ORACLE_SEED")
         .ok()

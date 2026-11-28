@@ -291,9 +291,11 @@ fn times_print_as_mariadb_did() {
 async fn statements_set_state_and_drop_after_their_commit() {
     use crate::sql::{Change, after_commit};
     let m = MemRecords::new();
-    change(&m, async |r| SinksStore::insert_sink(r, &sink(30, "s")).await)
-        .await
-        .unwrap();
+    change(&m, async |r| {
+        SinksStore::insert_sink(r, &sink(30, "s")).await
+    })
+    .await
+    .unwrap();
     let store = SinksStore::new(Arc::new(m.clone()), T);
     store
         .claim_task(SinkId(30), TaskNo(0), &serde_json::json!({}), "w")
@@ -323,5 +325,11 @@ async fn statements_set_state_and_drop_after_their_commit() {
         .unwrap();
     assert!(store.tasks(SinkId(30)).await.unwrap().is_empty());
     let mut tx = m.begin(T).await.unwrap();
-    assert!(STATES.rows::<StateRow>(&mut *tx, &Pk::new()).await.unwrap().is_empty());
+    assert!(
+        STATES
+            .rows::<StateRow>(&mut *tx, &Pk::new())
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }

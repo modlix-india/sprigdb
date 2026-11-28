@@ -221,11 +221,13 @@ fn zstd_decode(b: &Bytes) -> Vec<u8> {
     zstd::decode_all(&b[..]).unwrap()
 }
 
+#[ignore = "live: needs SPRIG_SINKS_S3_LIVE; tools/live/README.md"]
 #[tokio::test]
 async fn every_format_and_compression_and_conditional_writes() {
-    if !live() {
-        return;
-    }
+    assert!(
+        live(),
+        "live test run without its environment: see tools/live/README.md"
+    );
     let c = setup().await;
     // Conditional writes on MinIO.
     let k = format!("{}probe.txt", unique("cond"));
@@ -306,11 +308,13 @@ fn o32(x: u64) -> u32 {
     u32::try_from(x).unwrap()
 }
 
+#[ignore = "live: needs SPRIG_SINKS_S3_LIVE; tools/live/README.md"]
 #[tokio::test]
 async fn multipart_and_failed_completion_and_sweep() {
-    if !live() {
-        return;
-    }
+    assert!(
+        live(),
+        "live test run without its environment: see tools/live/README.md"
+    );
     let c = setup().await;
     let prefix = unique("multipart");
     // ~12 MiB of JSON Lines, no compression, 5 MiB parts: 3 parts.
@@ -397,11 +401,13 @@ async fn multipart_and_failed_completion_and_sweep() {
     assert!(c.list_uploads(&key).await.unwrap().is_empty());
 }
 
+#[ignore = "live: needs SPRIG_SINKS_S3_LIVE; tools/live/README.md"]
 #[tokio::test]
 async fn refused_destinations_and_bad_credentials() {
-    if !live() {
-        return;
-    }
+    assert!(
+        live(),
+        "live test run without its environment: see tools/live/README.md"
+    );
     // Off the allowlist: 39213 at the first connection.
     let mut cx = ctx(&unique("refused"), Guarantee::AtLeastOnce, &[], 0);
     cx.conn = Some(conn(&["127.0.0.1:29001"]));
@@ -651,11 +657,13 @@ fn stream(n: u64, parts: u32) -> Arc<Stream> {
     })
 }
 
+#[ignore = "live: needs SPRIG_SINKS_S3_LIVE; tools/live/README.md"]
 #[tokio::test]
 async fn exactly_once_through_task_kills() {
-    if !live() {
-        return;
-    }
+    assert!(
+        live(),
+        "live test run without its environment: see tools/live/README.md"
+    );
     let c = setup().await;
     for (format, cols) in [
         ("jsonl", None),
@@ -709,11 +717,13 @@ async fn exactly_once_through_task_kills() {
     }
 }
 
+#[ignore = "live: needs SPRIG_SINKS_S3_LIVE; tools/live/README.md"]
 #[tokio::test]
 async fn minio_down_then_up() {
-    if !live() {
-        return;
-    }
+    assert!(
+        live(),
+        "live test run without its environment: see tools/live/README.md"
+    );
     let c = setup().await;
     let prefix = unique("outage");
     let s = stream(4000, 3);
@@ -759,11 +769,13 @@ async fn minio_down_then_up() {
     );
 }
 
+#[ignore = "live: needs SPRIG_SINKS_S3_LIVE; tools/live/README.md"]
 #[tokio::test]
 async fn at_least_once_throughput() {
-    if !live() {
-        return;
-    }
+    assert!(
+        live(),
+        "live test run without its environment: see tools/live/README.md"
+    );
     let c = setup().await;
     let prefix = unique("tput");
     let s = stream(50_000, 4);
@@ -789,11 +801,13 @@ async fn at_least_once_throughput() {
     );
 }
 
+#[ignore = "live: needs SPRIG_SINKS_S3_LIVE; tools/live/README.md"]
 #[tokio::test]
 async fn pending_is_finished_or_undone_at_open() {
-    if !live() {
-        return;
-    }
+    assert!(
+        live(),
+        "live test run without its environment: see tools/live/README.md"
+    );
     let c = setup().await;
     let prefix = unique("pending");
     let info = TaskInfo {

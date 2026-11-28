@@ -99,6 +99,8 @@ pub fn coll_counter(tenant: u64) -> Vec<u8> {
 
 /// The registry of tenants holding collections on this unit (the TTL
 /// sweeper's list after a restart): under tenant 0's catalog object.
+/// Written only where units have no leaders (one node): on a replicated
+/// engine the key would be in unit 0, another unit than the tenant's.
 const CAT_TENANTS: u16 = 9;
 
 /// The registry entry of `tenant`.

@@ -1,0 +1,24 @@
+# UPDATE OF triggers (MariaDB's; MySQL answers 1064). Lists with the listed column first in the SET list
+# (MariaDB 11.8 looks only at the first assignment: see the decision).
+both: CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT, c INT DEFAULT 0)
+both: CREATE TABLE s (id INT PRIMARY KEY, v INT)
+both: CREATE TABLE u (n INT AUTO_INCREMENT PRIMARY KEY, what VARCHAR(40))
+both: INSERT INTO s VALUES (1, 9), (2, 8)
+both: CREATE TRIGGER tu BEFORE UPDATE OF a, b ON t FOR EACH ROW SET NEW.c = NEW.c + 1
+both: CREATE TRIGGER tau AFTER UPDATE OF b ON t FOR EACH ROW INSERT INTO u (what) VALUES (CONCAT('b ', OLD.b, '->', NEW.b))
+@maria check: SELECT TRIGGER_NAME, EVENT_MANIPULATION, ACTION_TIMING, ACTION_STATEMENT FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = DATABASE() ORDER BY TRIGGER_NAME
+both: INSERT INTO t VALUES (1, 1, 1, 0), (2, 1, 1, 0)
+both: UPDATE t SET c = 5
+both: UPDATE t SET a = 2
+both: UPDATE t SET b = 3 WHERE id = 1
+both: UPDATE t SET A = 4, c = c
+both: UPDATE t SET a = a
+both: INSERT INTO t (id, c) VALUES (1, 0) ON DUPLICATE KEY UPDATE c = 9
+both: INSERT INTO t (id, c) VALUES (1, 0) ON DUPLICATE KEY UPDATE b = 7
+both: UPDATE t JOIN s ON s.id = t.id SET t.b = s.v
+both: UPDATE t JOIN s ON s.id = t.id SET t.c = s.v
+check: SELECT * FROM t ORDER BY id
+check: SELECT what FROM u ORDER BY n
+both: DROP TRIGGER tu
+both: UPDATE t SET a = 1
+check: SELECT * FROM t ORDER BY id

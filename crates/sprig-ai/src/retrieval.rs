@@ -38,10 +38,12 @@
 //! |---|---|---|
 //! | `ai.retrieval.candidates` | `40` | global |
 //! | `ai.retrieval.max_chunks_per_row` | `64` | global |
+//! | `ai.retrieval.max_scan_chunks` | `50000` | global |
 //!
 //! Throttles, batches and input cuts are the embedded columns'
 //! (`ai.embedding.*`), and so are the model aliases.
 
+pub mod rec;
 pub mod store;
 
 use serde::{Deserialize, Serialize};
@@ -94,6 +96,13 @@ key!(
     MAX_CHUNKS_PER_ROW: u64 = "ai.retrieval.max_chunks_per_row", 64, GLOBAL,
     HardBounds::range(1, 10_000), true,
     "Chunks a retrieval index keeps of one row at most; the rest of a longer text isn't indexed"
+);
+
+key!(
+    /// `ai.retrieval.max_scan_chunks`.
+    MAX_SCAN_CHUNKS: u64 = "ai.retrieval.max_scan_chunks", 50_000, GLOBAL,
+    HardBounds::range(1_000, 10_000_000), true,
+    "Chunks a search of an engine database's retrieval index compares with the query's vector at most (an exact scan); a larger index answers from its keyword list alone, with warning 39827"
 );
 
 /// The chunk table of index `id`.
@@ -235,6 +244,120 @@ pub fn create_table_sql(
         quote(&table_name(id)),
         cols.join(", ")
     )
+}
+
+/// `CREATE TABLE IF NOT EXISTS` of index `id`'s chunk table on an engine
+/// database `db`: as [`create_table_sql`]'s, but the embedding is a
+/// `LONGBLOB` of little-endian `f32` values ([`vector_bytes`]; the engine
+/// has no `VECTOR` type or vector index yet, so searches scan it), and
+/// there is no routing hash (engine databases have no shards). The
+/// `FULLTEXT` key is the engine's own, kept as rows commit.
+#[must_use]
+pub fn create_engine_table_sql(
+    db: &str,
+    id: u64,
+    keys: &[KeyColumn],
+    filters: &[FilterColumn],
+) -> String {
+    let mut cols: Vec<String> = keys
+        .iter()
+        .map(|k| {
+            format!(
+                "{} {} NOT NULL",
+                quote(&key_column(&k.name)),
+                engine_column_type(&k.column_type)
+            )
+        })
+        .collect();
+    cols.extend([
+        "`chunk_no` SMALLINT UNSIGNED NOT NULL".to_owned(),
+        "`title` TEXT NULL".to_owned(),
+        "`text` MEDIUMTEXT NOT NULL".to_owned(),
+    ]);
+    for f in filters {
+        cols.push(format!(
+            "{} {} NULL",
+            quote(&filter_column(&f.name)),
+            engine_column_type(&f.column_type)
+        ));
+    }
+    cols.push("`src_hash` BINARY(16) NOT NULL".to_owned());
+    cols.push("`embedding` LONGBLOB NOT NULL".to_owned());
+    let mut pk: Vec<String> = keys.iter().map(|k| quote(&key_column(&k.name))).collect();
+    pk.push("`chunk_no`".to_owned());
+    cols.push(format!("PRIMARY KEY ({})", pk.join(", ")));
+    cols.push("FULLTEXT KEY `ft` (`text`, `title`)".to_owned());
+    format!(
+        "CREATE TABLE IF NOT EXISTS {}.{} ({}) DEFAULT CHARSET=utf8mb4",
+        quote(db),
+        quote(&table_name(id)),
+        cols.join(", ")
+    )
+}
+
+/// A source column's `COLUMN_TYPE` as a plain column of the chunk table:
+/// without `auto_increment` or a generated column's expression.
+fn engine_column_type(t: &str) -> String {
+    let l = t.to_ascii_lowercase();
+    let cut = [" auto_increment", " generated", " invisible"]
+        .iter()
+        .filter_map(|w| l.find(w))
+        .min()
+        .unwrap_or(t.len());
+    t[..cut].trim().to_owned()
+}
+
+/// A vector as the bytes the chunk table stores: little-endian `f32`
+/// values, four bytes each (MariaDB's `VECTOR` layout, which the engine's
+/// `VEC_DISTANCE_*` functions read too).
+#[must_use]
+pub fn vector_bytes(v: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(v.len() * 4);
+    for x in v {
+        out.extend_from_slice(&x.to_le_bytes());
+    }
+    out
+}
+
+/// The vector [`vector_bytes`] wrote; `None` for a length that isn't a
+/// multiple of four.
+#[must_use]
+pub fn vector_of(b: &[u8]) -> Option<Vec<f32>> {
+    if !b.len().is_multiple_of(4) {
+        return None;
+    }
+    Some(
+        b.chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+    )
+}
+
+/// What a row's chunks were made from, hashed in process (engine
+/// databases): the first 16 bytes of SHA-256 over the text, the title and
+/// the filters' values (as text), each length-prefixed, `NULL` marked
+/// apart from empty.
+#[must_use]
+pub fn row_hash(text: Option<&str>, title: Option<&str>, filters: &[Option<String>]) -> [u8; 16] {
+    use sha2::{Digest as _, Sha256};
+    let mut h = Sha256::new();
+    let mut put = |v: Option<&str>| match v {
+        None => h.update([0u8]),
+        Some(s) => {
+            h.update([1u8]);
+            h.update((s.len() as u64).to_le_bytes());
+            h.update(s.as_bytes());
+        }
+    };
+    put(text);
+    put(title);
+    for f in filters {
+        put(f.as_deref());
+    }
+    let d = h.finalize();
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&d[..16]);
+    out
 }
 
 /// The routing hash column the chunk table shares with sharded tables.
@@ -494,6 +617,35 @@ mod tests {
                 numeric: true,
             },
         ]
+    }
+
+    #[test]
+    fn engine_chunk_tables_vectors_and_hashes() {
+        let mut kc = keys();
+        kc[2].column_type = "int(11) auto_increment".into();
+        let filters = vec![FilterColumn {
+            name: "lang".into(),
+            column_type: "varchar(8)".into(),
+        }];
+        let sql = create_engine_table_sql("shop", 4, &kc, &filters);
+        assert!(sql.starts_with("CREATE TABLE IF NOT EXISTS `shop`.`__sprig_rx_4` ("));
+        assert!(sql.contains("`k_n` int(11) NOT NULL"), "{sql}");
+        assert!(sql.contains("`f_lang` varchar(8) NULL"));
+        assert!(sql.contains("`embedding` LONGBLOB NOT NULL"));
+        assert!(sql.contains("PRIMARY KEY (`k_org`, `k_id`, `k_n`, `chunk_no`)"));
+        assert!(sql.contains("FULLTEXT KEY `ft` (`text`, `title`)"));
+        assert!(!sql.contains("VECTOR") && !sql.contains("_sprig_rk"));
+        let vals = [0.5f32, -1.25, 3.0];
+        let bytes = vector_bytes(&vals);
+        assert_eq!(bytes.len(), 12);
+        assert_eq!(&bytes[..4], &0.5f32.to_le_bytes());
+        assert_eq!(vector_of(&bytes).unwrap(), vals);
+        assert!(vector_of(&bytes[..5]).is_none());
+        let hash = row_hash(Some("a"), None, &[Some("en".into())]);
+        assert_eq!(hash, row_hash(Some("a"), None, &[Some("en".into())]));
+        assert_ne!(hash, row_hash(Some("a"), Some(""), &[Some("en".into())]));
+        assert_ne!(hash, row_hash(Some("a"), None, &[None]));
+        assert_ne!(hash, row_hash(Some("b"), None, &[Some("en".into())]));
     }
 
     #[test]

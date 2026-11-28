@@ -157,7 +157,10 @@ impl Conn {
                     .get_document("readConcern")
                     .is_ok_and(|c| c.get_str("level") == Ok("snapshot"))
                 || !self.follow.may_try()
-                || self.oidc.as_ref().is_some_and(super::conn::OidcState::has_claims)
+                || self
+                    .oidc
+                    .as_ref()
+                    .is_some_and(super::conn::OidcState::has_claims)
             {
                 return None;
             }

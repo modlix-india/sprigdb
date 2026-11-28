@@ -1,5 +1,5 @@
-//! The `docs.*` settings: loading the docs pack into every cluster (the
-//! controller) and searching it (the gateway). Every key is an operator's,
+//! The `docs.*` settings: the docs pack each gateway reads into memory and
+//! searches (and that a controller with MariaDB clusters loads into them). Every key is an operator's,
 //! at dc or global scope, and applies live.
 
 use std::borrow::Cow;
@@ -18,7 +18,7 @@ pub static ENABLED: Setting<bool> = Setting {
     apply: Apply::Live,
     operator_only: true,
     owner: OWNER,
-    doc: "Load the docs pack into every cluster and serve docs search (the REST call and the sprig_docs database)",
+    doc: "Serve docs search from the docs pack (the REST call, pages and the sprig_docs database); each node reads the pack into memory",
 };
 sprig_settings::register!(ENABLED);
 
@@ -31,7 +31,7 @@ pub static KEEP_VERSIONS: Setting<u64> = Setting {
     apply: Apply::Live,
     operator_only: true,
     owner: OWNER,
-    doc: "Releases of the docs kept on each cluster, the running one included (2: current and previous, for a rollback)",
+    doc: "Releases of the docs kept on each MariaDB cluster, the running one included (2: current and previous, for a rollback); engine nodes serve their own release from memory",
 };
 sprig_settings::register!(KEEP_VERSIONS);
 
@@ -44,7 +44,7 @@ pub static PACK_PATH: Setting<Cow<'static, str>> = Setting {
     apply: Apply::Live,
     operator_only: true,
     owner: OWNER,
-    doc: "The docs pack the controller loads; empty: sprig-docs-<version>.pack next to the sprigdb binary",
+    doc: "The docs pack each node reads (and a controller with MariaDB clusters loads); empty: sprig-docs-<version>.pack next to the sprigdb binary",
 };
 sprig_settings::register!(PACK_PATH);
 

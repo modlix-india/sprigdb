@@ -70,11 +70,12 @@ struct Acked {
     binds: AtomicUsize,
 }
 
+#[ignore = "live: needs SPRIG_AMQP_ADDR; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn declares_survive_kill_9() {
     if var("SPRIG_AMQP_ADDR").is_none() {
         eprintln!("skipped: set SPRIG_AMQP_ADDR");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     }
     let kill = var("SPRIG_GATEWAY_KILL").unwrap();
     let start = var("SPRIG_GATEWAY_START").unwrap();

@@ -127,11 +127,12 @@ fn parse(json: &str) -> Value {
     serde_json::from_str(json).unwrap()
 }
 
+#[ignore = "live: needs SPRIG_TEST_OPERATORS_GATEWAY, SPRIG_TEST_OPERATORS_TOKEN_FILE; tools/live/README.md"]
 #[tokio::test]
 async fn operators_through_the_gateway() {
     let Some(addr) = skip::var(GATEWAY) else {
         skip::report_missing(GATEWAY, "operators_through_the_gateway");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let Some(token_file) = skip::var(TOKEN_FILE) else {
         skip::report_missing(TOKEN_FILE, "operators_through_the_gateway");

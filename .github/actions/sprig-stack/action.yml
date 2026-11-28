@@ -24,7 +24,7 @@ runs:
       run: rustup toolchain install
     # etcd-client and tonic build scripts need protoc.
     - shell: bash
-      run: sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler
+      run: sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler libclang-dev
     - uses: Swatinem/rust-cache@v2
       with:
         key: heavy-release

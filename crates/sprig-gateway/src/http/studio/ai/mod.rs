@@ -16,11 +16,11 @@
 //!
 //! **Who.** Every route runs as the signed-in caller (a Studio session,
 //! Basic or an API key). `dba` and `data` turns need a tenant login and
-//! keep their conversations in the tenant's catalog, readable only by
+//! keep their conversations in the tenant's catalog records, readable only by
 //! their owner; `admin` turns need a platform operator (a login in
 //! `studio.operator_logins` with operator mode on) and keep their
-//! conversations in the system store, `__sprig_ai` on the DC's system
-//! cluster ([`system`]), readable only by that operator while they are one.
+//! conversations in the system store, the DC's system catalog records
+//! ([`system`]), readable only by that operator while they are one.
 //! Its ids carry an `a` prefix (`a12`). When the system store can't be
 //! reached, an `admin` turn still runs, unstored, with a warning. Tools
 //! run with the caller's rights ([`host`]).
@@ -57,9 +57,10 @@ use std::sync::{Arc, OnceLock};
 use hyper::body::Incoming;
 use hyper::{Request, Response};
 use serde_json::{Value, json};
-use sprig_ai::audit::{AuditStore, CatalogAudit, ConvId};
+use sprig_ai::audit::rec::RecAudit;
+use sprig_ai::audit::{AuditStore, ConvId};
 use sprig_ai::feedback::{self, FeedbackStore, Outcome};
-use sprig_ai::glossary::{self, CatalogGlossary, GlossaryStore, NewTerm, Status};
+use sprig_ai::glossary::{self, GlossaryStore, NewTerm, RecGlossary, Status};
 use sprig_ai::keys::AiKeyring;
 use sprig_ai::providers::ProviderStore;
 use sprig_ai::settings::{Lookup, TurnSettings};
@@ -251,9 +252,32 @@ pub(crate) fn ai_roles(
 
 // ---- tenant stores ----
 
+/// The catalog records the assistants' stores read and write: the
+/// services' leader-routed records (`TenantServices::writers`, a
+/// [`LeaderRecords`](crate::tenant::catalog_records::LeaderRecords)): a
+/// transaction runs on this node when it leads the tenant's unit (or the
+/// engine doesn't replicate), else on the unit's leader through its peer
+/// service, as auth changes do. A replica that doesn't lead the tenant can
+/// then still store a conversation, a vote or a glossary entry.
+pub(crate) fn records(svc: &crate::tenant::TenantServices) -> Arc<dyn sprig_catalog::RecordStore> {
+    Arc::clone(&svc.writers)
+}
+
+/// `local` (this node's records) behind the unit-leader routing, as
+/// `TenantServices::writers` is built (tests).
+#[cfg(test)]
+pub(crate) fn leader_routed(
+    local: Arc<dyn sprig_catalog::RecordStore>,
+    dc: Arc<dyn sprig_meta::MetaStore>,
+) -> Arc<crate::tenant::catalog_records::LeaderRecords> {
+    Arc::new(crate::tenant::catalog_records::LeaderRecords::new(
+        local, dc,
+    ))
+}
+
 struct Stores {
-    audit: Arc<CatalogAudit>,
-    glossary: Arc<CatalogGlossary>,
+    audit: Arc<RecAudit>,
+    glossary: Arc<RecGlossary>,
     tenant: TenantId,
     user: UserId,
 }
@@ -266,11 +290,10 @@ async fn stores(core: &Arc<Core>, caller: &Caller) -> Result<Stores, SprigError>
     ) else {
         return Err(invalid("the assistants' conversations need a tenant login"));
     };
-    let ep = sprig_catalog::CatalogLocator::writer(&*svc.locator, tid).await?;
-    let schema = ep.store.schema().to_owned();
+    // The tenant's catalog records on the engine.
     Ok(Stores {
-        audit: Arc::new(CatalogAudit::new(ep.pool.clone(), schema.clone())),
-        glossary: Arc::new(CatalogGlossary::new(ep.pool.clone(), schema)),
+        audit: Arc::new(RecAudit::tenant(records(svc), tid)),
+        glossary: Arc::new(RecGlossary::new(records(svc), tid)),
         tenant: tid,
         user,
     })
@@ -506,7 +529,7 @@ async fn chat_route(
     } else {
         // The administration assistant: its conversations in the system
         // store; unstored (as before it existed) when that can't be reached.
-        let sys = match system::store(core, &caller).await {
+        let sys = match system::store(core, &caller) {
             Ok(s) => {
                 let s = Arc::new(s);
                 match s.usage_today(user).await {
@@ -606,11 +629,7 @@ async fn views(core: &Arc<Core>, caller: &Caller) -> Result<Views, SprigError> {
     };
     let admin = if operator {
         let user = caller.principal.user_id.unwrap_or(UserId(0));
-        Some(
-            system::store(core, caller)
-                .await
-                .map(|s| (Arc::new(s) as Arc<dyn ConvStore>, user)),
-        )
+        Some(system::store(core, caller).map(|s| (Arc::new(s) as Arc<dyn ConvStore>, user)))
     } else {
         None
     };
@@ -874,7 +893,7 @@ async fn digests(
     id: Option<&str>,
     query: &str,
 ) -> Result<Response<Body>, SprigError> {
-    use sprig_ai::digest::{CatalogDigests, DigestStore};
+    use sprig_ai::digest::{DigestStore, RecDigests};
     let (Some(svc), Some(tid)) = (&core.studio.tenants, caller.principal.tenant) else {
         return Err(invalid("digests need a tenant login"));
     };
@@ -885,20 +904,13 @@ async fn digests(
             "Access denied; the tenant's digests need SPRIG_TENANT_ADMIN",
         ));
     }
-    let ep = sprig_catalog::CatalogLocator::writer(&*svc.locator, tid).await?;
-    let schema = ep.store.schema().to_owned();
-    let store = CatalogDigests::new(ep.pool.clone(), schema.clone());
-    let have = store.exists().await?;
+    let store = RecDigests::new(records(svc), tid);
     let Some(id) = id else {
         let limit = query_value(query, "limit")
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(20)
             .clamp(1, MAX_LIST);
-        let list = if have {
-            store.list(limit).await?
-        } else {
-            Vec::new()
-        };
+        let list = store.list(limit).await?;
         return Ok(json_response(
             200,
             &json!({"digests": list.iter().map(|d| digest_json(d, false)).collect::<Vec<_>>()}),
@@ -907,13 +919,15 @@ async fn digests(
     let n: u64 = id
         .parse()
         .map_err(|_| invalid("digests/{id} takes a digest id"))?;
-    let d = if have { store.get(n).await? } else { None }
+    let d = store
+        .get(n)
+        .await?
         .ok_or_else(|| invalid(format!("there is no digest {id}")))?;
     let mut v = digest_json(&d, true);
     // What was sent to word it: the stored turn's notes.
     if let Some(c) = d.conversation {
         let payloads = query_value(query, "payloads") == Some("true");
-        let audit = CatalogAudit::new(ep.pool.clone(), schema);
+        let audit = RecAudit::tenant(records(svc), tid);
         let sent: Vec<Value> = audit
             .messages(ConvId(c))
             .await

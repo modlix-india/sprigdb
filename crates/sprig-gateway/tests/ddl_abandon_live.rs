@@ -110,11 +110,12 @@ async fn abandon(e: &Env, col: &str) -> Conn {
     holder
 }
 
+#[ignore = "live: needs SPRIG_TEST_DDLABANDON_SQL, SPRIG_TEST_DDLABANDON_TENANT, SPRIG_TEST_DDLABANDON_TENANT_ID, ...; tools/live/README.md"]
 #[tokio::test]
 async fn a_ddl_whose_client_hangs_up_does_not_hold_its_table() {
     let Some(e) = env() else {
         eprintln!("skipped: set SPRIG_TEST_DDLABANDON_SQL, _TENANT, _TENANT_ID and _NODE");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let mut c = login(&e, None).await;
     c.query_drop(format!("DROP DATABASE IF EXISTS {DB}"))

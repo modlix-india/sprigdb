@@ -86,10 +86,11 @@ async fn strings(c: &mut Conn, sql: &str) -> Vec<String> {
         .collect()
 }
 
+#[ignore = "live: needs SPRIG_TEST_M03_GATEWAY; tools/live/README.md"]
 #[tokio::test]
 async fn two_tenants_same_names_own_rows() {
     let Some(eps) = endpoints("two_tenants_same_names_own_rows") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     for addr in &eps {
         let db = unique_ident("m03live");
@@ -152,10 +153,11 @@ async fn two_tenants_same_names_own_rows() {
     }
 }
 
+#[ignore = "live: needs SPRIG_TEST_M03_GATEWAY; tools/live/README.md"]
 #[tokio::test]
 async fn physical_and_foreign_names_are_unknown() {
     let Some(eps) = endpoints("physical_and_foreign_names_are_unknown") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let addr = &eps[0];
     let db = unique_ident("m03vault");
@@ -172,10 +174,11 @@ async fn physical_and_foreign_names_are_unknown() {
     a.query_drop(format!("DROP DATABASE {db}")).await.unwrap();
 }
 
+#[ignore = "live: needs SPRIG_TEST_M03_GATEWAY; tools/live/README.md"]
 #[tokio::test]
 async fn ddl_happy_paths_and_refusals() {
     let Some(eps) = endpoints("ddl_happy_paths_and_refusals") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let addr = &eps[0];
     let db = unique_ident("m03ddl");
@@ -244,10 +247,11 @@ async fn ddl_happy_paths_and_refusals() {
     assert_eq!(strings(&mut a, "SELECT DATABASE()").await, ["NULL"]);
 }
 
+#[ignore = "live: needs SPRIG_TEST_M03_GATEWAY; tools/live/README.md"]
 #[tokio::test]
 async fn settings_at_object_scope_apply_live_and_bounds_hold() {
     let Some(eps) = endpoints("settings_at_object_scope_apply_live_and_bounds_hold") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let addr = &eps[0];
     let db = unique_ident("m03set");

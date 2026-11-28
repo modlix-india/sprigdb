@@ -1311,18 +1311,28 @@ async fn scenario(fault: Fault) {
     let _ = std::fs::remove_dir_all(&work);
 }
 
+#[ignore = "live: needs SPRIG_TEST_DOCKER, SPRIG_TEST_TOXIPROXY; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dc_cut_from_the_global_tier() {
-    if env("R2FO_ROLE") == "dc" || !skip::flag(skip::DOCKER) {
+    if env("R2FO_ROLE") == "dc" {
         return;
     }
+    assert!(
+        skip::flag(skip::DOCKER),
+        "live test run without its environment: see tools/live/README.md"
+    );
     scenario(Fault::CutFromGlobal).await;
 }
 
+#[ignore = "live: needs SPRIG_TEST_DOCKER, SPRIG_TEST_TOXIPROXY; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dc_frozen_by_a_process_pause() {
-    if env("R2FO_ROLE") == "dc" || !skip::flag(skip::DOCKER) {
+    if env("R2FO_ROLE") == "dc" {
         return;
     }
+    assert!(
+        skip::flag(skip::DOCKER),
+        "live test run without its environment: see tools/live/README.md"
+    );
     scenario(Fault::Freeze).await;
 }

@@ -21,7 +21,6 @@
 //! Every address must be on the tenant's `sink.destination_allowlist`, and
 //! the ones on this machine or a private network also on the operator's
 //! `sink.internal_destinations`.
-//! Each test works in a database of its own (`st_<time>`) and drops it.
 
 #![allow(
     clippy::unwrap_used,
@@ -152,11 +151,12 @@ async fn hook(port: u16) -> Arc<Mutex<Vec<String>>> {
     seen
 }
 
+#[ignore = "live: needs SPRIG_TEST_SINKTEST_GATEWAY, SPRIG_TEST_SINKTEST_TENANT, SPRIG_TEST_SINKTEST_PG, ...; tools/live/README.md"]
 #[tokio::test]
 async fn test_connection_reports_each_step() {
     let Some(addr) = skip::var(GATEWAY) else {
         skip::report_missing(GATEWAY, "test_connection_reports_each_step");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let tenant = var("SPRIG_TEST_SINKTEST_TENANT").unwrap_or_else(|| "r9tqc".into());
     let mut c = conn(&addr, &format!("{tenant}.app"), "sprig-dev-app").await;
@@ -287,11 +287,12 @@ async fn test_connection_reports_each_step() {
     ok(&mut c, &format!("DROP DATABASE {db}")).await;
 }
 
+#[ignore = "live: needs SPRIG_TEST_SINKTEST_GATEWAY, SPRIG_TEST_SINKTEST_TENANT, SPRIG_TEST_SINKTEST_PG, ...; tools/live/README.md"]
 #[tokio::test]
 async fn test_sink_shows_records_and_delivers_nothing() {
     let Some(addr) = skip::var(GATEWAY) else {
         skip::report_missing(GATEWAY, "test_sink_shows_records_and_delivers_nothing");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let Some(port) = var("SPRIG_TEST_SINKTEST_HOOK_PORT").and_then(|p| p.parse::<u16>().ok())
     else {
@@ -485,11 +486,12 @@ async fn test_sink_shows_records_and_delivers_nothing() {
 /// `OPTIONS`; a Kafka topic named with `TO` gets a record (refused without
 /// `TO`); an S3 object is put and deleted again; a database table's
 /// `INSERT` right is checked without a row (a missing table fails).
+#[ignore = "live: needs SPRIG_TEST_SINKTEST_GATEWAY, SPRIG_TEST_SINKTEST_TENANT, SPRIG_TEST_SINKTEST_PG, ...; tools/live/README.md"]
 #[tokio::test]
 async fn test_connection_write() {
     let Some(addr) = skip::var(GATEWAY) else {
         skip::report_missing(GATEWAY, "test_connection_write");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let tenant = var("SPRIG_TEST_SINKTEST_TENANT").unwrap_or_else(|| "r9tqc".into());
     let mut c = conn(&addr, &format!("{tenant}.app"), "sprig-dev-app").await;
@@ -616,6 +618,7 @@ fn authed<T>(m: T, auth: &str) -> tonic::Request<T> {
 /// `sprig.v1.Connections.Test` answer the statements' rows, as the caller.
 /// Needs `SPRIG_TEST_SINKTEST_HTTP` (the gateway's HTTP listener, h2c) and
 /// `SPRIG_TEST_SINKTEST_CLOSED` (an allowed address nothing listens on).
+#[ignore = "live: needs SPRIG_TEST_SINKTEST_HTTP, SPRIG_TEST_SINKTEST_CLOSED; tools/live/README.md"]
 #[tokio::test]
 async fn grpc_test_calls_answer_the_statements_rows() {
     use base64::Engine as _;
@@ -630,7 +633,7 @@ async fn grpc_test_calls_answer_the_statements_rows() {
         eprintln!(
             "skipped: needs {GATEWAY}, SPRIG_TEST_SINKTEST_HTTP and SPRIG_TEST_SINKTEST_CLOSED"
         );
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let tenant = var("SPRIG_TEST_SINKTEST_TENANT").unwrap_or_else(|| "r9tqc".into());
     let user = format!("{tenant}.app");

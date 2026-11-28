@@ -760,7 +760,7 @@ fn engine_txn_refused(call: &str) -> SprigError {
 }
 
 /// The engine store of vhost (`tenant`, `db_id`).
-fn engine_msg_store(
+pub(super) fn engine_msg_store(
     tenant: u64,
     db_id: u32,
 ) -> Result<Arc<sprig_queues::enginestore::EngineMsgStore>> {
@@ -775,7 +775,10 @@ fn engine_msg_store(
 }
 
 /// Adds a queue store write to the session's engine transaction.
-fn plain_write(t: &mut sprig_engine::txn::Txn, op: sprig_queues::enginestore::TxnOp) -> Result<()> {
+pub(super) fn plain_write(
+    t: &mut sprig_engine::txn::Txn,
+    op: sprig_queues::enginestore::TxnOp,
+) -> Result<()> {
     use sprig_queues::enginestore::TxnOp;
     match op {
         TxnOp::Put(k, v) => t.add_plain_put(sprig_engine::Cf::Data, k, v),
@@ -846,7 +849,7 @@ impl PassSession {
 
 impl PassSession {
     /// Whether vhost database `db`'s messages are stored on the engine.
-    fn mq_on_engine(&self, db: &str) -> bool {
+    pub(super) fn mq_on_engine(&self, db: &str) -> bool {
         let tenant = self.tenant.as_deref().map_or(0, |t| t.tenant.0);
         crate::amqp::queues::messages_on_engine(tenant) || self.engine_database_named(db)
     }

@@ -1,0 +1,52 @@
+# E0 statements: sysbench's prepare and point select, then the subset's edges.
+q:CREATE TABLE sbtest1(id INTEGER NOT NULL AUTO_INCREMENT, k INTEGER DEFAULT '0' NOT NULL, c CHAR(120) DEFAULT '' NOT NULL, pad CHAR(60) DEFAULT '' NOT NULL, PRIMARY KEY (id)) /*! ENGINE = innodb */
+q:INSERT INTO sbtest1(k, c, pad) VALUES(5,'83868641912-28773972837-60736120486','67847967377-48000963322'),(2,'c2','p2'),(3,'c3','p3'),(3,'c4  ','p4')
+q:CREATE INDEX k_1 ON sbtest1(k)
+q:SELECT c FROM sbtest1 WHERE id=1
+q:SELECT c FROM sbtest1 WHERE id=99
+q:SELECT id, k, c, pad FROM sbtest1 WHERE id=2
+q:SELECT * FROM sbtest1 WHERE k=3
+q:SELECT id FROM sbtest1 WHERE id BETWEEN 1 AND 3
+q:SELECT c AS x FROM sbtest1 AS t WHERE t.id=1
+q:SELECT C FROM SBTEST1 WHERE ID=4
+q:SELECT c FROM sbtest1 WHERE pad='p2'
+q:SELECT c FROM sbtest1 ORDER BY id DESC LIMIT 2
+q:SELECT id FROM sbtest1 WHERE id IN (1,3) AND k > 2
+p:SELECT c FROM sbtest1 WHERE id=?
+e:1:i=1
+e:1:i=2
+e:1:i=99
+e:1:s=3
+p:SELECT id,k,c,pad FROM sbtest1 WHERE id=?
+e:2:i=3
+e:2:n=0
+p:SELECT id FROM sbtest1 WHERE k=? ORDER BY id
+e:3:i=3
+p:INSERT INTO sbtest1(k,c,pad) VALUES (?,?,?)
+e:4:i=9,s=new-c,s=new-pad
+p:UPDATE sbtest1 SET k=k+1 WHERE id=?
+e:5:i=1
+p:DELETE FROM sbtest1 WHERE id=?
+e:6:i=5
+q:INSERT INTO sbtest1(k,c,pad) VALUES (4,'c5','p5')
+q:UPDATE sbtest1 SET k=k+1 WHERE id=1
+q:UPDATE sbtest1 SET k=k WHERE id=1
+q:DELETE FROM sbtest1 WHERE id=6
+q:SELECT id,k FROM sbtest1
+q:INSERT INTO sbtest1(id,k,c,pad) VALUES (1,1,'x','y')
+q:SELECT c FROM nosuch
+q:SELECT zz FROM sbtest1
+q:SELECT c FROM sbtest1 WHERE zz=1
+q:INSERT INTO sbtest1(k,c,pad) VALUES ('abc','a','b')
+q:INSERT INTO sbtest1(k,c,pad) VALUES ('12x','a','b')
+q:INSERT INTO sbtest1(k,c,pad) VALUES (NULL,'a','b')
+q:INSERT INTO sbtest1(k,c,pad) VALUES (99999999999,'a','b')
+q:INSERT INTO sbtest1(zz) VALUES (1)
+q:INSERT INTO sbtest1(k,c,pad) VALUES (1,'a','b'),(2,'c')
+q:UPDATE sbtest1 SET zz=1 WHERE id=1
+q:SET NAMES utf8mb4 COLLATE utf8mb4_bin
+q:SELECT c FROM sbtest1 WHERE id=2
+e:1:i=2
+q:SET NAMES latin1
+q:SELECT c FROM sbtest1 WHERE id=2
+q:DROP TABLE sbtest1

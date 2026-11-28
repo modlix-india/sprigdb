@@ -263,7 +263,7 @@ async fn wait_for_flush(pool: &Pool, baseline: u64) {
 async fn ten_thousand_schemas_without_table_cache_thrashing() {
     let Ok(url) = std::env::var("SPRIG_TEST_MARIADB_SINGLE") else {
         eprintln!("skipped: set SPRIG_TEST_MARIADB_SINGLE");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let schemas = env_u64("SPRIG_SCALE_SCHEMAS", 10_000);
     let tables = env_u64("SPRIG_SCALE_TABLES", 1).max(1);

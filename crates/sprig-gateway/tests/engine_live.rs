@@ -70,11 +70,12 @@ async fn engine_of(c: &mut Conn, table: &str) -> Option<String> {
     .unwrap()
 }
 
+#[ignore = "live: needs SPRIG_TEST_ENGINE_PORTS; tools/live/README.md"]
 #[tokio::test]
 async fn engines_become_innodb_live() {
     let Some(ports) = std::env::var("SPRIG_TEST_ENGINE_PORTS").ok() else {
         eprintln!("SPRIG_TEST_ENGINE_PORTS not set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let ports: Vec<u16> = ports
         .split(',')

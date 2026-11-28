@@ -1,0 +1,20 @@
+# Prepared (binary-protocol) CALL with ? in OUT and INOUT positions: the output-parameters result set.
+x:DROP PROCEDURE IF EXISTS po_a
+x:DROP PROCEDURE IF EXISTS po_b
+x:DROP PROCEDURE IF EXISTS po_c
+q:CREATE PROCEDURE po_a(IN a INT, OUT b VARCHAR(10), INOUT c INT) BEGIN SET b = CONCAT('v', a); SET c = c + a; SELECT a AS one; END
+q:CREATE PROCEDURE po_b(OUT d DECIMAL(6,2), OUT t DATE, OUT n BIGINT) BEGIN SET d = 12.5; SET t = '2024-02-03'; END
+q:CREATE PROCEDURE po_c(INOUT s VARCHAR(20)) BEGIN SET s = UPPER(s); END
+p:CALL po_a(?, ?, ?)
+e:1:i=5,s=x,i=10
+e:1:i=7,s=,i=1
+p:CALL po_b(?, ?, ?)
+e:2:i=0,i=0,i=0
+p:CALL po_c(?)
+e:3:s=abc
+p:CALL po_a(?, @ob, ?)
+e:4:i=2,i=3
+q:SELECT @ob
+x:DROP PROCEDURE IF EXISTS po_a
+x:DROP PROCEDURE IF EXISTS po_b
+x:DROP PROCEDURE IF EXISTS po_c

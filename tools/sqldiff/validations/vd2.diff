@@ -1,0 +1,19 @@
+# A KIRun validation that reads only the new row against a CHECK constraint (no INSERT IGNORE: a CHECK there is a warning).
+both: CREATE TABLE t (id INT PRIMARY KEY, qty INT NOT NULL, note VARCHAR(16))
+sprig: CREATE VALIDATION qty_positive ON t FOR INSERT, UPDATE LANGUAGE kirun AS '{"namespace": "Test", "name": "QtyPositive", "parameters": {"qty": {"parameterName": "qty", "schema": {"type": ["INTEGER"]}}}, "events": {"output": {"name": "output", "parameters": {}}, "reject": {"name": "reject", "parameters": {"message": {"type": ["STRING"]}}}}, "steps": {"bad": {"statementName": "bad", "namespace": "System", "name": "If", "parameterMap": {"condition": {"c": {"type": "EXPRESSION", "expression": "Arguments.qty <= 0"}}}}, "no": {"statementName": "no", "namespace": "System", "name": "GenerateEvent", "executeIftrue": {"Steps.bad.true": true}, "parameterMap": {"eventName": {"e": {"type": "VALUE", "value": "reject"}}, "results": {"r": {"type": "VALUE", "value": {"name": "message", "value": {"isExpression": false, "value": "qty must be positive"}}}}}}}}'
+oracle: ALTER TABLE t ADD CONSTRAINT qty_positive CHECK (qty > 0)
+both: INSERT INTO t VALUES (1, 1, NULL), (2, 2, NULL)
+both: INSERT INTO t VALUES (3, 0, NULL)
+both: INSERT INTO t VALUES (4, 4, NULL), (5, -5, NULL)
+both: UPDATE t SET qty = qty - 1
+both: UPDATE t SET qty = qty + 10 WHERE id = 2
+both: UPDATE t SET note = 'n'
+both: INSERT INTO t VALUES (2, 1, NULL) ON DUPLICATE KEY UPDATE qty = 0
+both: INSERT INTO t VALUES (2, 1, NULL) ON DUPLICATE KEY UPDATE qty = qty + 1
+both: REPLACE INTO t VALUES (1, 0, 'r')
+both: REPLACE INTO t VALUES (1, 3, 'r')
+both: START TRANSACTION
+both: UPDATE t SET qty = 7 WHERE id = 1
+both: UPDATE t SET qty = -7 WHERE id = 2
+both: COMMIT
+check: SELECT * FROM t ORDER BY id

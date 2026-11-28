@@ -142,13 +142,14 @@ async fn writer(mut c: Conn, first: i64, stop: Arc<AtomicBool>) -> Vec<(i64, &'s
     out
 }
 
+#[ignore = "live: needs SPRIG_TEST_LCC_GATEWAY; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_column_change_and_its_recompile_are_one_job() {
     let Some(mut setup) = ({
         // The database first, from a session without it.
         let Ok(addr) = std::env::var("SPRIG_TEST_LCC_GATEWAY") else {
             eprintln!("skipped: set SPRIG_TEST_LCC_GATEWAY");
-            return;
+            panic!("live test run without its environment: see tools/live/README.md");
         };
         let (host, port) = addr.rsplit_once(':').unwrap();
         let opts = OptsBuilder::default()

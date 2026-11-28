@@ -1,0 +1,12 @@
+# SHOW and DESCRIBE of a table the engine database doesn't have: 1146.
+x:DROP TABLE IF EXISTS ns_x
+q:SHOW CREATE TABLE nosuch_t
+q:SHOW CREATE TABLE rg_a.nosuch_t
+q:SHOW COLUMNS FROM nosuch_t
+q:SHOW FULL COLUMNS FROM nosuch_t
+q:DESCRIBE nosuch_t
+q:SHOW INDEX FROM nosuch_t
+q:SHOW KEYS FROM nosuch_t
+q:SHOW CREATE VIEW nosuch_t
+q:CREATE TABLE ns_x LIKE nosuch_t
+x:DROP TABLE IF EXISTS ns_x

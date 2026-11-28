@@ -113,6 +113,50 @@ impl Bm25 {
     /// each; identifiers ([`query_terms`]) count [`IDENTIFIER_BOOST`] times.
     #[must_use]
     pub fn search(&self, query: &str, limit: usize) -> Vec<(usize, f64)> {
+        top(
+            self.scores(query)
+                .into_iter()
+                .enumerate()
+                .filter(|(_, s)| *s > 0.0),
+            limit,
+        )
+    }
+
+    /// The best `limit` documents for `query` among those `keep` accepts,
+    /// as [`Bm25::search`] ranks them (the statistics stay those of every
+    /// document).
+    #[must_use]
+    pub fn search_where(
+        &self,
+        query: &str,
+        limit: usize,
+        keep: impl Fn(usize) -> bool,
+    ) -> Vec<(usize, f64)> {
+        top(
+            self.scores(query)
+                .into_iter()
+                .enumerate()
+                .filter(|(i, s)| *s > 0.0 && keep(*i)),
+            limit,
+        )
+    }
+
+    /// The number of documents indexed.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.docs.len()
+    }
+
+    /// Whether no document is indexed.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.docs.is_empty()
+    }
+
+    /// Every document's score for `query` (0 when it matches nothing), in
+    /// document order.
+    #[must_use]
+    pub fn scores(&self, query: &str) -> Vec<f64> {
         let mut keys: Vec<(String, f64)> = Vec::new();
         for w in analyze(query) {
             if !keys.iter().any(|(k, _)| *k == w) {
@@ -141,10 +185,7 @@ impl Bm25 {
                 }
             }
         }
-        top(
-            scores.into_iter().enumerate().filter(|(_, s)| *s > 0.0),
-            limit,
-        )
+        scores
     }
 }
 

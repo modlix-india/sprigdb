@@ -57,6 +57,7 @@ fn server_code(e: &mysql_async::Error) -> Option<u16> {
     }
 }
 
+#[ignore = "live: needs SPRIG_TEST_DOCS_ETCD, SPRIG_TEST_DOCS_PACK, SPRIG_TEST_DOCS_DC; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn loads_verifies_reloads_and_reads_only() {
     let Some(etcd) = skip::var(ETCD) else {

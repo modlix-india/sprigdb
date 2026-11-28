@@ -98,12 +98,13 @@ impl Checks {
     }
 }
 
+#[ignore = "live: needs SPRIG_TEST_LOGIC_GATEWAY, SPRIG_TEST_LOGIC_ROOT, SPRIG_TEST_LOGIC_TENANT, ...; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failing_after_commit_candidate_rolls_back_by_itself() {
     let Some((mut c, mut root, t)) =
         connect("a_failing_after_commit_candidate_rolls_back_by_itself").await
     else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let cat = format!("t{t}_sprig");
     must(&mut c, &format!("DROP DATABASE IF EXISTS {DB}")).await;

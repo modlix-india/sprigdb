@@ -79,7 +79,7 @@ pub async fn remove_all(svc: &Arc<TenantServices>, def: &Definition) -> Result<u
             continue;
         }
         let found = {
-            let st = MsgStore::new(Arc::clone(&svc.records), t);
+            let st = MsgStore::new(Arc::clone(&svc.writers), t);
             st.instance(def.key()).await?
         };
         // The connection went back first: `remove_one` takes its own from
@@ -262,7 +262,7 @@ pub async fn database_dropped(
     // The chain may load an ancestor's catalog from the same pool: before
     // this function's catalog connection is taken.
     let chain = super::chain(svc, &cat).await?;
-    let st = MsgStore::new(Arc::clone(&svc.records), t);
+    let st = MsgStore::new(Arc::clone(&svc.writers), t);
     for i in &gone {
         let triggers = match chain.def(i.def) {
             Some(d) if d.kind == DefKind::Queue => super::triggers::on_queue(&chain, &d),
@@ -307,7 +307,7 @@ pub async fn detach(svc: &Arc<TenantServices>, t: TenantId, def: &Definition) ->
             "only a stream, exchange or queue instance can be detached",
         ));
     }
-    let st = MsgStore::new(Arc::clone(&svc.records), t);
+    let st = MsgStore::new(Arc::clone(&svc.writers), t);
     {
         let Some(i) = st.instance(def.key()).await? else {
             return Err(super::target_err(format!(

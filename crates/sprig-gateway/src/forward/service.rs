@@ -149,8 +149,21 @@ impl NodeForward for ForwardService {
                 "the node is still starting; retry".into(),
             );
         };
-        if let Some(n) = redirect_to(open.tenant_id, open.hops, is_reader(&open.resume_json)) {
+        let reader = is_reader(&open.resume_json);
+        if let Some(n) = redirect_to(open.tenant_id, open.hops, reader) {
             return Ok(tonic::Response::new(one(splice_down::Msg::Redirect(n))));
+        }
+        // A node cut off from the other replicas (or in an election) can't
+        // serve the tenant; the forwarding node may find the leader through
+        // another replica.
+        if !reader && open.hops + 1 < super::MAX_HOPS && super::leaderless_here(open.tenant_id) {
+            return refuse(
+                SprigCode::ShardMoved,
+                format!(
+                    "node {} holds a replica of the tenant's unit but knows no leader of it; try another replica",
+                    node_engine::raft_id_from_env().unwrap_or(0)
+                ),
+            );
         }
         let peer: SocketAddr = open
             .client_addr

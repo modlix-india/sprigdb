@@ -1,0 +1,22 @@
+# Checked against MariaDB 11.8: JSON values compared with strings (per row, constant, JSON column), booleans in documents.
+x:DROP TABLE IF EXISTS jc_a
+x:CREATE TABLE jc_a (id INT PRIMARY KEY, doc JSON, n INT, v VARCHAR(10))
+x:INSERT INTO jc_a VALUES (1,'{"name":"Ben","n":5,"f":1.50,"b":true,"z":null,"a":[1,2]}',5,'Ben'),(2,'"Ben"',2,'Ben'),(3,'5',3,NULL),(4,'{"name":"ben"}',4,'ben')
+q:SELECT id, JSON_EXTRACT(doc,'$.name')='Ben', JSON_EXTRACT(doc,'$.n')='5', JSON_EXTRACT(doc,'$.n')=5, JSON_EXTRACT(doc,'$.f')='1.50', JSON_EXTRACT(doc,'$.f')='1.5', JSON_EXTRACT(doc,'$.b')='true', JSON_EXTRACT(doc,'$.z')='null', JSON_EXTRACT(doc,'$.a')='[1, 2]', JSON_EXTRACT(doc,'$.a')='[1,2]' FROM jc_a ORDER BY id
+q:SELECT id, doc='Ben', doc='"Ben"', doc='5', doc=5, doc='{"name":"ben"}', doc='{"name": "ben"}' FROM jc_a ORDER BY id
+q:SELECT id, JSON_EXTRACT(doc,'$.name')='ben', 'Ben'=JSON_EXTRACT(doc,'$.name'), JSON_EXTRACT(doc,'$.name') < 'C', JSON_EXTRACT(doc,'$.name') IN ('Ben','x'), JSON_EXTRACT(doc,'$.name') LIKE 'B%' FROM jc_a ORDER BY id
+q:SELECT JSON_EXTRACT('{"name":"Ben"}','$.name')='Ben', JSON_EXTRACT('{"n":5}','$.n')='5', JSON_OBJECT('b',TRUE,'c',1=1,'d',2<1,'e',1), JSON_ARRAY(FALSE, 1=1, NULL IS NULL, 'a' LIKE 'a')
+q:SELECT JSON_EXTRACT('"b"','$')='b', JSON_EXTRACT('{"a":"b"}','$.a')='b', JSON_EXTRACT('["b"]','$[0]')='b', JSON_QUERY('{"a":[1]}','$.a')='[1]', JSON_OBJECT('a',1)='{"a": 1}', JSON_ARRAY('x')='["x"]', JSON_EXTRACT('{"a":"b"}','$.a') IN ('b'), JSON_EXTRACT('{"a":"b"}','$.a') LIKE 'b'
+q:SELECT id, JSON_EXTRACT(doc,'$.name') <=> 'Ben', JSON_EXTRACT(doc,'$.name') <> 'Ben', JSON_EXTRACT(doc,'$.name') BETWEEN 'A' AND 'C', STRCMP(JSON_EXTRACT(doc,'$.name'),'Ben'), JSON_EXTRACT(doc,'$.name') = n, CASE JSON_EXTRACT(doc,'$.name') WHEN 'Ben' THEN 1 ELSE 0 END, NULLIF(JSON_EXTRACT(doc,'$.name'),'Ben') FROM jc_a ORDER BY id
+q:SELECT id, JSON_EXTRACT(doc,'$') = '"Ben"', JSON_EXTRACT(doc,'$')='Ben', JSON_UNQUOTE(doc)='Ben', JSON_EXTRACT(doc,'$.n') > '10', JSON_EXTRACT(doc,'$.n') > 10, JSON_EXTRACT(doc,'$.n') = '5.0', JSON_EXTRACT(doc,'$.n') = 5.0 FROM jc_a ORDER BY id
+q:SELECT id FROM jc_a WHERE JSON_EXTRACT(doc,'$.name') = 'Ben'
+q:SELECT COUNT(*) FROM jc_a WHERE JSON_EXTRACT(doc,'$.name') IN ('Ben','x')
+q:SELECT id, JSON_VALUE(doc,'$.name')='Ben', JSON_COMPACT(doc)='{"name":"ben"}', JSON_SET(doc,'$.x',1) = '{"name": "ben", "x": 1}' FROM jc_a ORDER BY id
+q:SELECT id, JSON_EXTRACT(doc,'$.name') = v, v = JSON_EXTRACT(doc,'$.name'), JSON_EXTRACT(doc,'$.name') IN ('Ben'), JSON_EXTRACT(doc,'$.name') IN (v), JSON_EXTRACT(doc,'$.name') IN ('Ben', v), doc = v, JSON_EXTRACT(doc,'$.name') = CONCAT('B','en'), GREATEST(JSON_EXTRACT(doc,'$.name'),'A') FROM jc_a ORDER BY id
+q:SELECT JSON_EXTRACT('{"a":"b"}','$.a') IN ('b','x'), NULLIF(JSON_EXTRACT('{"a":"b"}','$.a'),'b'), JSON_EXTRACT('{"a":"b"}','$.a') = _utf8mb4'b' COLLATE utf8mb4_general_ci, JSON_EXTRACT('{"a":"B"}','$.a') = 'b', JSON_EXTRACT('{"a":"b"}','$.a') = JSON_EXTRACT('"b"','$'), JSON_EXTRACT('{"a":"b"}','$.a') = JSON_UNQUOTE('"b"'), JSON_EXTRACT('{"a":"b\\u0041"}','$.a') = 'bA', JSON_EXTRACT('{"a":"b\\"c"}','$.a')='b"c'
+q:SELECT JSON_EXTRACT('{"a":"b"}','$.a') = JSON_EXTRACT('{"a":"b"}','$.a'), JSON_EXTRACT('"b"','$') = JSON_EXTRACT('{"a":"b"}','$.a'), JSON_EXTRACT('{"a":"b"}','$.a') = JSON_EXTRACT('{"a":"\\"b\\""}','$.a'), JSON_EXTRACT('{"a":"\\"b\\""}','$.a') = JSON_EXTRACT('{"a":"b"}','$.a'), JSON_EXTRACT('[1]','$[0]') = JSON_EXTRACT('[1]','$[0]')
+q:SELECT id, JSON_EXTRACT(doc,'$.name') = JSON_EXTRACT(doc,'$.name'), doc = JSON_EXTRACT(doc,'$'), JSON_EXTRACT(doc,'$') = doc, JSON_EXTRACT(doc,'$.name') = JSON_UNQUOTE(JSON_EXTRACT(doc,'$.name')) FROM jc_a ORDER BY id
+q:SELECT JSON_EXTRACT(doc,'$.name') = 'BEN', JSON_EXTRACT(doc,'$.name') = 'Ben' COLLATE utf8mb4_general_ci, COLLATION(JSON_EXTRACT(doc,'$.name')), COLLATION(JSON_EXTRACT('{}','$')), COLLATION(doc) FROM jc_a WHERE id=1
+q:SELECT JSON_EXTRACT('12.5','$') < JSON_EXTRACT('100','$'), JSON_EXTRACT('"b"','$') < JSON_EXTRACT('{"a":1}','$'), JSON_EXTRACT('"b"','$') = 'b', 'b' = JSON_EXTRACT('"b"','$'), JSON_EXTRACT('"b"','$') = JSON_EXTRACT('"b"','$')
+q:SELECT COUNT(*) FROM jc_a WHERE JSON_EXTRACT(doc, '$.name') = 'Ben'
+x:DROP TABLE IF EXISTS jc_a

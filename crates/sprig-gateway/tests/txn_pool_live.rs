@@ -222,11 +222,12 @@ async fn transfer(
     threads
 }
 
+#[ignore = "live: needs SPRIG_TEST_TXN_POOL; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn branch_connections_return_to_the_pool_clean() {
     let Some(v) = skip::var("SPRIG_TEST_TXN_POOL") else {
         skip::report_missing("SPRIG_TEST_TXN_POOL", "txn_pool_live");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let urls = skip::urls(&v);
     assert!(urls.len() >= 2, "two servers");

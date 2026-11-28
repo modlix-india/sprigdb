@@ -77,11 +77,12 @@ async fn reader(dc: &Arc<dyn MetaStore>, role: &str, node: &str, format: u32) {
     put(dc, &key_of(role, node), Record::new(rec).encode().unwrap()).await;
 }
 
+#[ignore = "live: needs SPRIG_TEST_MARIADB_SINGLE; tools/live/README.md"]
 #[tokio::test]
 async fn contracts_wait_for_readers_and_the_delay_unless_overridden() {
     let Ok(url) = std::env::var("SPRIG_TEST_MARIADB_SINGLE") else {
         eprintln!("skipped: set SPRIG_TEST_MARIADB_SINGLE to run it");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     // One connection, kept while idle (connections are reused).
     let pool = Pool::new(

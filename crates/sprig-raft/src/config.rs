@@ -1,5 +1,6 @@
 //! Driver settings.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -65,6 +66,22 @@ pub struct RaftConfig {
     /// queued meanwhile share the next sync. Off: the loop writes itself
     /// (a driver run with [`crate::Node::run`] always does).
     pub log_writer_thread: bool,
+    /// Snapshots of state machines that can write them off the driver
+    /// ([`crate::StateMachine::exporter`]: the engine's units) are built
+    /// into a file on a thread of their own, and sent in chunks of 1 MiB
+    /// that a follower writes to a file before it restores from it, paced
+    /// by [`RaftConfig::snapshot_bytes_per_second`]. Off: built on the
+    /// driver and sent in one message (the simulator, which steps every
+    /// thread itself).
+    pub snapshot_off_driver: bool,
+    /// Where those snapshots' files are kept while they are built, sent or
+    /// received (cleared when the node opens). `None`: a folder of its own
+    /// under the system's temporary directory.
+    pub snapshot_dir: Option<PathBuf>,
+    /// The most snapshot bytes per second this node sends, over all its
+    /// transfers together (0: no limit). [`crate::Node::set_snapshot_rate`]
+    /// changes it while the node runs.
+    pub snapshot_bytes_per_second: u64,
 }
 
 impl Default for RaftConfig {
@@ -86,6 +103,9 @@ impl Default for RaftConfig {
             static_voters: Vec::new(),
             placement: None,
             log_writer_thread: false,
+            snapshot_off_driver: true,
+            snapshot_dir: None,
+            snapshot_bytes_per_second: 0,
         }
     }
 }

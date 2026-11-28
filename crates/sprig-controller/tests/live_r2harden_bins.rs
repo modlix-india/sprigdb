@@ -1096,6 +1096,7 @@ fn forbidden(t: &Tally) -> Vec<(String, u64)> {
 
 static ONE_AT_A_TIME: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+#[ignore = "live: needs SPRIG_TEST_DOCKER; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn bins_r2harden_holds_fences_and_stored_programs() {
     if !skip::flag(skip::DOCKER) {
@@ -1103,7 +1104,7 @@ async fn bins_r2harden_holds_fences_and_stored_programs() {
             skip::DOCKER,
             "bins_r2harden_holds_fences_and_stored_programs",
         );
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     }
     let _one = ONE_AT_A_TIME.lock().await;
     let Some((sprigdb, sprigctl)) = bins() else {

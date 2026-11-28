@@ -684,3 +684,38 @@ fn whoami_lists_the_roles_with_a_model() {
     // No provider store: nothing, whatever the settings say.
     assert!(super::ai_roles(false, true, &models("anthropic/m", "anthropic/m")).is_empty());
 }
+
+/// The assistants' stores are built on the unit-leader-routed records
+/// (`LeaderRecords`, as auth writes are), and their writes and reads go
+/// through it: here, an engine that doesn't replicate, so to this node's
+/// own records.
+#[tokio::test]
+async fn the_stores_write_through_the_leader_routed_records() {
+    use sprig_ai::audit::rec::RecAudit;
+    use sprig_catalog::records::RecordStore;
+    use sprig_catalog::records::mem::MemRecords;
+    use sprig_common::ids::DcId;
+    use sprig_meta::{MemStore, MetaStore, Tier};
+    let local = Arc::new(MemRecords::new());
+    let dc: Arc<dyn MetaStore> = Arc::new(MemStore::new(Tier::Dc(DcId::new("dc-a").unwrap())));
+    let routed = super::leader_routed(Arc::clone(&local) as Arc<dyn RecordStore>, dc);
+    assert!(
+        format!("{routed:?}").contains("LeaderRecords"),
+        "{routed:?}"
+    );
+    let routed: Arc<dyn RecordStore> = routed;
+    let a = RecAudit::tenant(Arc::clone(&routed), TenantId(9));
+    let c = a.create(UserId(1), Role::Data, "q").await.unwrap();
+    a.append(c, sprig_ai::MsgKind::User, &json!({"text": "hi"}), None)
+        .await
+        .unwrap();
+    a.add_usage(UserId(1), Role::Data, &usage()).await.unwrap();
+    assert!(
+        !local.dump(TenantId(9)).is_empty(),
+        "the writes reached the records"
+    );
+    assert_eq!(a.messages(c).await.unwrap().len(), 1);
+    let sys = RecAudit::system(routed, "acme.op");
+    sys.create(UserId(0), Role::Admin, "disk").await.unwrap();
+    assert!(!local.dump(TenantId(0)).is_empty(), "the system store too");
+}

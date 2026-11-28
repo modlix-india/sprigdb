@@ -43,10 +43,10 @@ macro_rules! topology_or_skip {
     ($var:literal) => {
         match endpoints($var) {
             Some(eps) => eps,
-            None => {
-                eprintln!("skipped: {} is not set", $var);
-                return;
-            }
+            None => panic!(
+                "{} is not set: a live test needs its environment (see tools/live/README.md)",
+                $var
+            ),
         }
     };
 }
@@ -82,18 +82,21 @@ async fn every_node_reads(eps: &[NodeEndpoint]) {
     }
 }
 
+#[ignore = "live: needs SPRIG_TEST_MARIADB_SINGLE; tools/live/README.md"]
 #[tokio::test]
 async fn single_node() {
     let eps = topology_or_skip!("SPRIG_TEST_MARIADB_SINGLE");
     every_node_reads(&eps).await;
 }
 
+#[ignore = "live: needs SPRIG_TEST_MARIADB_REPLICATION; tools/live/README.md"]
 #[tokio::test]
 async fn primary_and_replicas() {
     let eps = topology_or_skip!("SPRIG_TEST_MARIADB_REPLICATION");
     every_node_reads(&eps).await;
 }
 
+#[ignore = "live: needs SPRIG_TEST_MARIADB_GALERA; tools/live/README.md"]
 #[tokio::test]
 async fn galera_nodes() {
     let eps = topology_or_skip!("SPRIG_TEST_MARIADB_GALERA");
@@ -103,6 +106,7 @@ async fn galera_nodes() {
 /// An account without `REPLICATION SLAVE` logs in but can't dump: 1227,
 /// the feed and the mover are `unsupported`, and the report names the
 /// grant.
+#[ignore = "live: needs SPRIG_TEST_MARIADB_SINGLE; tools/live/README.md"]
 #[tokio::test]
 async fn an_account_without_replication_slave_makes_the_feed_unsupported() {
     let eps = topology_or_skip!("SPRIG_TEST_MARIADB_SINGLE");
@@ -182,6 +186,7 @@ async fn an_account_without_replication_slave_makes_the_feed_unsupported() {
 /// before a write, decodes the compressed events and passes, on a server
 /// with `encrypt_binlog = ON` too (the server decrypts the events; the
 /// reader skips the `START_ENCRYPTION` event it sends ahead of them).
+#[ignore = "live: needs SPRIG_TEST_BINLOG_SCRATCH; tools/live/README.md"]
 #[tokio::test]
 async fn compressed_binlog_on_a_scratch_server() {
     let eps = topology_or_skip!("SPRIG_TEST_BINLOG_SCRATCH");

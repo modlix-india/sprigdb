@@ -368,11 +368,7 @@ type ChangeBody<'a, T> =
 async fn auth_change<T, F>(cat: &AuthCatalog, tenant: TenantId, body: F) -> Result<(T, u64)>
 where
     T: Send,
-    F: for<'a> FnOnce(
-            &'a AuthStore,
-            &'a mut dyn RecordTx,
-        ) -> ChangeBody<'a, T>
-        + Send,
+    F: for<'a> FnOnce(&'a AuthStore, &'a mut dyn RecordTx) -> ChangeBody<'a, T> + Send,
 {
     let mut c = cat
         .change_with(tenant, VersionKind::Auth, ChangeOpts::default())

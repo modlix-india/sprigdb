@@ -441,11 +441,12 @@ async fn replicas_have(c: &Live, want: usize) {
 /// home committed, the primary's branch is prepared), and the resolver
 /// commits the prepared branch; then killed after the prepare (before the
 /// commit point), and the resolver rolls it back.
+#[ignore = "live: needs SPRIG_TEST_MARIADB_GALERA2, SPRIG_TEST_MARIADB_SINGLE, SPRIG_TEST_MARIADB_REPLICATION, ...; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread")]
 async fn xa_across_two_clusters_resolver_finishes_after_coordinator_kill() {
     let test = "xakill";
     let Some(cs) = clusters(test, &["single", "repl"]) else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     setup(&cs).await;
     let b = backend(&cs).await;
@@ -526,11 +527,12 @@ async fn xa_across_two_clusters_resolver_finishes_after_coordinator_kill() {
 /// cluster's write fails with 39440 before it runs; `check_writes` refuses
 /// an autocommit statement over both; `best_effort` commits both, and
 /// reports 39442 when the second commit fails after the first.
+#[ignore = "live: needs SPRIG_TEST_MARIADB_GALERA2, SPRIG_TEST_MARIADB_SINGLE, SPRIG_TEST_MARIADB_REPLICATION, ...; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread")]
 async fn reject_refuses_writes_spanning_two_galera_clusters() {
     let test = "reject";
     let Some(cs) = clusters(test, &["galera", "galera2"]) else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     setup(&cs).await;
     let b = Arc::new(backend(&cs).await);
@@ -611,12 +613,13 @@ async fn reject_refuses_writes_spanning_two_galera_clusters() {
 /// Galera commits): the resolver follows the pointer, records abort in the
 /// Galera schema and rolls back both XA branches. Then killed after the
 /// commit point: the resolver commits them.
+#[ignore = "live: needs SPRIG_TEST_MARIADB_GALERA2, SPRIG_TEST_MARIADB_SINGLE, SPRIG_TEST_MARIADB_REPLICATION, ...; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread")]
 async fn last_resource_commit_with_one_galera_participant() {
     let test = "lrc";
     let names = "single,galera,repl";
     let Some(cs) = clusters(test, &["single", "galera", "repl"]) else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     setup(&cs).await;
     let b = Arc::new(backend(&cs).await);
@@ -720,6 +723,7 @@ async fn last_resource_commit_with_one_galera_participant() {
 /// Lookup sessions on a distributed transaction: Pre on the
 /// Galera cluster commits first, Main on the single node and the primary
 /// commits atomically through the coordinator, Post runs after.
+#[ignore = "live: needs SPRIG_TEST_MARIADB_GALERA2, SPRIG_TEST_MARIADB_SINGLE, SPRIG_TEST_MARIADB_REPLICATION, ...; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread")]
 async fn lookup_sessions_commit_main_through_the_coordinator() {
     use sprig_shard::lookup::{LookupSessions, Target};
@@ -727,7 +731,7 @@ async fn lookup_sessions_commit_main_through_the_coordinator() {
 
     let test = "lookup";
     let Some(cs) = clusters(test, &["single", "repl", "galera"]) else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     setup(&cs).await;
     q(
@@ -799,13 +803,14 @@ async fn lookup_sessions_commit_main_through_the_coordinator() {
 /// a kill before the commit point, the list reports no decision, the
 /// operator's `resolve` rolls it back through the insert race, and the
 /// transaction is no longer in doubt (39447).
+#[ignore = "live: needs SPRIG_TEST_MARIADB_GALERA2, SPRIG_TEST_MARIADB_SINGLE, SPRIG_TEST_MARIADB_REPLICATION, ...; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread")]
 async fn operator_lists_and_resolves_and_the_mover_drains() {
     use sprig_common::SprigCode;
     use sprig_txn::indoubt;
     let test = "r1closeop";
     let Some(cs) = clusters(test, &["single", "repl"]) else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     setup(&cs).await;
     let b = backend(&cs).await;

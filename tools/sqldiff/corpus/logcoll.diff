@@ -1,0 +1,31 @@
+# The session's character sets after login (handshake collation 45 = utf8mb4_general_ci) and after SET NAMES, on each port.
+x:DROP TABLE IF EXISTS lc_a
+q:SELECT @@character_set_client, @@character_set_connection, @@character_set_results, @@collation_connection
+q:SELECT COLLATION('a'), CHARSET('a'), COERCIBILITY('a')
+q:CREATE TABLE lc_a (id INT PRIMARY KEY, s VARCHAR(10), g VARCHAR(10) COLLATE utf8mb4_general_ci)
+q:INSERT INTO lc_a VALUES (1,'a','a'),(2,'b','B')
+q:SELECT id FROM lc_a WHERE s = 'a'
+q:SELECT id FROM lc_a WHERE g = 'b'
+q:SET @t = 'b'
+q:SELECT COLLATION(@t)
+q:SELECT id FROM lc_a WHERE s = @t
+q:SELECT id FROM lc_a WHERE g = @t
+q:SELECT id FROM lc_a WHERE s = CONCAT(@t, '')
+q:SET NAMES utf8mb4
+q:SELECT @@character_set_client, @@character_set_connection, @@character_set_results, @@collation_connection
+q:SELECT COLLATION('a'), COLLATION(@t)
+q:SET @u = 'a'
+q:SELECT id FROM lc_a WHERE s = @u
+q:SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci
+q:SELECT @@collation_connection, COLLATION('a')
+q:SELECT id FROM lc_a WHERE s = 'a'
+q:SET NAMES default
+q:SELECT @@character_set_client, @@collation_connection, COLLATION('a')
+q:SET CHARACTER SET utf8mb4
+q:SELECT @@character_set_client, @@character_set_connection, @@collation_connection
+q:SET collation_connection = utf8mb4_bin
+q:SELECT @@character_set_connection, @@collation_connection, COLLATION('a')
+q:SET NAMES latin1
+q:SELECT @@character_set_client, @@collation_connection, COLLATION('a'), CHARSET('a')
+q:SET NAMES utf8mb4
+x:DROP TABLE IF EXISTS lc_a

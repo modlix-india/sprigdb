@@ -1,4 +1,6 @@
-//! Hybrid docs search.
+//! Hybrid docs search. From the local pack when this gateway has one
+//! ([`local_search`], [`DocsIndex::hybrid`]: the same lists and fusion in
+//! memory, the vector list an exact scan); else on a cluster:
 //!
 //! ```text
 //! q_vec := embed(query)                        -- none: keyword only
@@ -23,6 +25,7 @@ use mysql_async::{Conn, Value};
 use serde::Serialize;
 use sprig_common::ids::TenantId;
 use sprig_common::{Result, SprigCode, SprigError};
+use sprig_docs::index::DocsIndex;
 use sprig_docs::pack::hex;
 use sprig_docs::search::{
     CANDIDATES, MAX_PER_PAGE, RRF_K, cap_per_page, keyword_weight, rrf_weighted,
@@ -285,6 +288,40 @@ pub fn fuse<'a>(
         .collect()
 }
 
+/// A search of the local pack (pure, for tests).
+#[must_use]
+pub fn local_search(
+    ix: &DocsIndex,
+    query: &str,
+    q_vec: Option<&[f32]>,
+    audience: Option<&str>,
+    limit: usize,
+) -> SearchReply {
+    let hits = ix
+        .hybrid(query, q_vec, audience, limit)
+        .into_iter()
+        .map(|f| {
+            let c = &ix.chunks()[f.chunk];
+            Hit {
+                chunk_id: hex(&c.chunk_id),
+                page: c.page.clone(),
+                title: c.title.clone(),
+                heading_path: c.heading_path.clone(),
+                audience: c.audience.clone(),
+                text: c.text.clone(),
+                score: f.score,
+                bm25_rank: f.bm25_rank,
+                vector_rank: f.vector_rank,
+            }
+        })
+        .collect();
+    SearchReply {
+        version: ix.version().to_owned(),
+        mode: if q_vec.is_some() { "hybrid" } else { "keyword" },
+        hits,
+    }
+}
+
 impl DocsService {
     /// Runs a search for a caller of `tenant` (see the module docs).
     ///
@@ -321,6 +358,15 @@ impl DocsService {
         // The embedding first: the connection isn't held while the model
         // runs (or loads, the first time).
         let q_vec = self.embed_query(&query).await;
+        if let Some(ix) = self.local_for(req.version.as_deref()) {
+            return Ok(local_search(
+                &ix,
+                &query,
+                q_vec.as_deref(),
+                audience.as_deref(),
+                limit,
+            ));
+        }
         let mut t = self.target(tenant, req.version.as_deref()).await?;
         let keyword = keyword_ids(&mut t.conn, &t.version, &query, audience.as_deref()).await?;
         let vector = match &q_vec {
@@ -396,6 +442,58 @@ mod tests {
         x.limit = Some(0);
         assert!(validate(&x, 8).is_err());
         assert!(validate(&r(&"x".repeat(MAX_QUERY + 1)), 8).is_err());
+    }
+
+    #[test]
+    fn the_local_pack_answers_searches() {
+        use sprig_docs::pack::{DIM, Pack, chunk_pages};
+        use sprig_docs::page::parse_page;
+        let pages = [
+            parse_page(
+                "reference/errors.md",
+                "---\ntitle: Errors\naudience: [user, operator]\n---\n\n# Errors\n\nError 39420 means the plan scatters to every shard.\n",
+            )
+            .unwrap(),
+            parse_page(
+                "guides/fruit.md",
+                "---\ntitle: Fruit\naudience: [user]\n---\n\n# Fruit\n\nBananas grow in bunches.\n",
+            )
+            .unwrap(),
+        ];
+        let mut chunks = chunk_pages("1.0.0", &pages);
+        for (n, c) in chunks.iter_mut().enumerate() {
+            let mut v = vec![0.0f32; DIM];
+            v[n] = 1.0;
+            c.set_embedding(&v);
+        }
+        let pack = Pack {
+            version: "1.0.0".into(),
+            model_id: "test".into(),
+            model_sha256: [0; 32],
+            chunks,
+        };
+        let ix = DocsIndex::from_bytes(&pack.to_bytes().unwrap()).unwrap();
+        let r = local_search(&ix, "what does error 39420 mean", None, None, 5);
+        assert_eq!(r.version, "1.0.0");
+        assert_eq!(r.mode, "keyword");
+        assert_eq!(r.hits[0].page, "reference/errors.md");
+        assert_eq!(r.hits[0].bm25_rank, Some(1));
+        assert_eq!(r.hits[0].vector_rank, None);
+        let mut q = vec![0.0f32; DIM];
+        q[1] = 1.0;
+        let r = local_search(&ix, "bananas", Some(&q), Some("user"), 5);
+        assert_eq!(r.mode, "hybrid");
+        assert!(
+            r.hits
+                .iter()
+                .all(|h| h.audience.iter().any(|a| a == "user"))
+        );
+        assert!(r.hits.iter().any(|h| h.vector_rank.is_some()));
+        let r = local_search(&ix, "bananas", None, Some("operator"), 5);
+        assert!(r.hits.iter().all(|h| h.page != "guides/fruit.md"));
+        let page = super::super::page::local_page(&ix, "guides/fruit.md".into()).unwrap();
+        assert!(page.markdown.contains("Bananas"));
+        assert!(super::super::page::local_page(&ix, "nope.md".into()).is_err());
     }
 
     #[test]

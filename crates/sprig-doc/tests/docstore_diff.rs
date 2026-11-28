@@ -536,11 +536,12 @@ fn norm(cmd: &Document, r: &Document) -> Bson {
     }
 }
 
+#[ignore = "live: needs SPRIG_TEST_MONGO_REF; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn random_sequences_match_mongodb() {
     let Ok(addr) = std::env::var("SPRIG_TEST_MONGO_REF") else {
         eprintln!("SPRIG_TEST_MONGO_REF not set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let rounds: u64 = std::env::var("SPRIG_DIFF_ROUNDS")
         .ok()
@@ -654,11 +655,12 @@ async fn random_sequences_match_mongodb() {
 /// Multi-document transactions through the driver, on the reference and,
 /// with `SPRIG_TEST_MONGO_GW`, on the gateway: commit, abort, read your own
 /// writes, a write conflict between two sessions, and a retried commit.
+#[ignore = "live: needs SPRIG_TEST_MONGO_REF; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn transactions_match_mongodb() {
     let Ok(addr) = std::env::var("SPRIG_TEST_MONGO_REF") else {
         eprintln!("SPRIG_TEST_MONGO_REF not set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let mut uris = vec![format!("mongodb://{addr}/?directConnection=true")];
     if let Ok(gw) = std::env::var("SPRIG_TEST_MONGO_GW") {
@@ -741,11 +743,12 @@ fn code(e: &mongodb::error::Error) -> i32 {
 
 /// Views on the store against MongoDB: reads through the view, a view of
 /// a view, writes and index commands refused, listCollections.
+#[ignore = "live: needs SPRIG_TEST_MONGO_REF; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn views_match_mongodb() {
     let Ok(addr) = std::env::var("SPRIG_TEST_MONGO_REF") else {
         eprintln!("SPRIG_TEST_MONGO_REF not set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let client = mongodb::Client::with_uri_str(format!("mongodb://{addr}/?directConnection=true"))
         .await

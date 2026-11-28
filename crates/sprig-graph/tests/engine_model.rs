@@ -15,7 +15,11 @@
 //!
 //! `SPRIG_ENGINE_MODEL_OPS` sets the operations per run (default 600).
 
-#![allow(clippy::unwrap_used, clippy::too_many_lines, clippy::many_single_char_names)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::too_many_lines,
+    clippy::many_single_char_names
+)]
 
 use std::path::PathBuf;
 use std::sync::Arc;

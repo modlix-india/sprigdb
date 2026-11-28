@@ -113,11 +113,12 @@ fn show(label: &str, s: &Stats) {
     );
 }
 
+#[ignore = "live: needs SPRIG_TEST_LARGE_GATEWAY, SPRIG_TEST_LARGE_MB, SPRIG_TEST_LARGE_PARAM_MB, ...; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn large_statements_dont_stall_other_sessions() {
     let Some(url) = skip::var(VAR) else {
         skip::report_missing(VAR, "large_statements_dont_stall_other_sessions");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let big_mb = env_usize("SPRIG_TEST_LARGE_MB", 64);
     let param_mb = env_usize("SPRIG_TEST_LARGE_PARAM_MB", 16);

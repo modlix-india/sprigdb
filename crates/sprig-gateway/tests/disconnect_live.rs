@@ -228,10 +228,11 @@ async fn setup(e: &Env) -> Conn {
 
 /// HTTP/1.1: the client closes its socket while the response (NDJSON
 /// streamed, or buffered `sql:execute`) waits on the statement.
+#[ignore = "live: needs SPRIG_TEST_HTTP_DISCONNECT, SPRIG_TEST_MARIADB_SINGLE, SPRIG_TEST_HTTP_USER, ...; tools/live/README.md"]
 #[tokio::test]
 async fn http1_client_gone() {
     let Some(e) = env("http1_client_gone") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let mut wire = setup(&e).await;
     for (case, path, ndjson) in [
@@ -260,10 +261,11 @@ async fn http1_client_gone() {
 /// HTTP/2 (h2c): the client resets the stream and keeps the connection, as
 /// a browser or HTTP/2 client cancelling one request does; then the whole
 /// connection goes.
+#[ignore = "live: needs SPRIG_TEST_HTTP_DISCONNECT, SPRIG_TEST_MARIADB_SINGLE, SPRIG_TEST_HTTP_USER, ...; tools/live/README.md"]
 #[tokio::test]
 async fn http2_client_gone() {
     let Some(e) = env("http2_client_gone") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let mut wire = setup(&e).await;
     let tcp = tokio::net::TcpStream::connect(&e.http).await.unwrap();
@@ -303,10 +305,11 @@ async fn http2_client_gone() {
 
 /// gRPC: the caller drops a `Sql.Query` stream (`RST_STREAM`, channel kept)
 /// and a unary `Sql.Execute` call.
+#[ignore = "live: needs SPRIG_TEST_HTTP_DISCONNECT, SPRIG_TEST_MARIADB_SINGLE, SPRIG_TEST_HTTP_USER, ...; tools/live/README.md"]
 #[tokio::test]
 async fn grpc_client_gone() {
     let Some(e) = env("grpc_client_gone") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let mut wire = setup(&e).await;
     let ch = Endpoint::from_shared(format!("http://{}", e.http))
@@ -370,10 +373,11 @@ async fn rest_json(e: &Env, path: &str, body: &serde_json::Value) -> (u16, serde
 
 /// Inside a transaction handle: the statement stops when its client goes,
 /// and the transaction, with its earlier write, goes on.
+#[ignore = "live: needs SPRIG_TEST_HTTP_DISCONNECT, SPRIG_TEST_MARIADB_SINGLE, SPRIG_TEST_HTTP_USER, ...; tools/live/README.md"]
 #[tokio::test]
 async fn transaction_survives_a_gone_client() {
     let Some(e) = env("transaction_survives_a_gone_client") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let mut wire = setup(&e).await;
     wire.query_drop(format!("DELETE FROM {DB}.t"))

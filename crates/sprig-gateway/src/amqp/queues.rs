@@ -188,7 +188,9 @@ impl GatewayMq {
                 .await
                 .map_err(unavailable)?;
         }
-        let secret = MqStore::token_secret(&*self.svc.records, TenantId(tenant))
+        // Made on first use: on the unit's leader (connections stay on a
+        // node after the tenant's leadership moves).
+        let secret = MqStore::token_secret(&*self.svc.writers, TenantId(tenant))
             .await
             .map_err(unavailable)?;
         lock(&self.keys).insert(tenant, Arc::new(TokenKey::new(&secret)));

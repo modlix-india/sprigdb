@@ -73,11 +73,12 @@ async fn cmd(db: &Database, c: Document) -> Result<Document, i32> {
     db.run_command(c).await.map_err(|e| code_of(&e))
 }
 
+#[ignore = "live: needs SPRIG_TEST_MONGO_URI; tools/live/README.md"]
 #[tokio::test]
 async fn users_and_roles() {
     let Some(u) = uri("SPRIG_TEST_MONGO_URI") else {
         eprintln!("SPRIG_TEST_MONGO_URI not set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let admin_client = client(&u).await;
     let data = admin_client.database("r5mongo2_users");
@@ -265,11 +266,12 @@ async fn user_corpus(admin: &Database) -> Vec<(String, Bson)> {
     out
 }
 
+#[ignore = "live: needs SPRIG_TEST_MONGO_URI, SPRIG_TEST_MONGO_REF_URI; tools/live/README.md"]
 #[tokio::test]
 async fn user_commands_against_mongodb() {
     let (Some(g), Some(r)) = (uri("SPRIG_TEST_MONGO_URI"), uri("SPRIG_TEST_MONGO_REF_URI")) else {
         eprintln!("SPRIG_TEST_MONGO_URI or SPRIG_TEST_MONGO_REF_URI not set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let a = user_corpus(&client(&g).await.database("admin")).await;
     let b = user_corpus(&client(&r).await.database("admin")).await;

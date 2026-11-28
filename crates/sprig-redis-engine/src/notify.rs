@@ -464,7 +464,8 @@ pub fn after<B: Batch>(
     Ok(())
 }
 
-/// The per-command rules (Redis 7.4's `notifyKeyspaceEvent` calls).
+/// The per-command rules: which keyspace events each command sends, as a
+/// Redis 7.4 server sends them.
 #[allow(clippy::too_many_lines)] // one arm per command family
 fn rules(x: &mut Rules<'_>, name: &str, a: &[Bytes], r: &Frame) {
     let ok = is_ok(r);
@@ -879,9 +880,9 @@ fn numkeys(a: &[Bytes], at: usize) -> &[Bytes] {
     a.get(at + 1..(at + 1 + n).min(a.len())).unwrap_or_default()
 }
 
-/// The keys command `a` looks up for reading (Redis's `lookupKeyRead`,
-/// which sends "keymiss"): a read command's keys, and the sources of
-/// commands that write elsewhere.
+/// The keys command `a` reads, each of which sends "keymiss" when it is
+/// missing: a read command's keys, and the sources of commands that write
+/// elsewhere.
 fn read_keys<'a>(name: &str, a: &'a [Bytes]) -> Vec<&'a Bytes> {
     let from = |i: usize| a.get(i..).unwrap_or_default().iter().collect();
     match name {

@@ -203,18 +203,20 @@ async fn xa_and_alter(url: &str) {
     drop_schema(url, &schema).await;
 }
 
+#[ignore = "live: needs a running stack or reference server; tools/live/README.md"]
 #[tokio::test]
 async fn xa_groups_and_two_phase_alter_on_the_single_node() {
     let Some(u) = urls(common::SINGLE, module_path!()) else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     xa_and_alter(&u[0]).await;
 }
 
+#[ignore = "live: needs a running stack or reference server; tools/live/README.md"]
 #[tokio::test]
 async fn xa_groups_and_two_phase_alter_on_scratch_servers() {
     let Some(us) = urls(common::SCRATCH, module_path!()) else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     for u in us {
         xa_and_alter(&u).await;
@@ -224,10 +226,11 @@ async fn xa_groups_and_two_phase_alter_on_scratch_servers() {
 /// `log_bin_compress` (global) and, on 12.3+, a tiny
 /// `binlog_row_event_fragment_threshold`: every compressed rows-event type,
 /// a compressed query, and fragments, decoded to the written values.
+#[ignore = "live: needs a running stack or reference server; tools/live/README.md"]
 #[tokio::test]
 async fn compressed_and_fragmented_events_on_scratch_servers() {
     let Some(us) = urls(common::SCRATCH, module_path!()) else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     for url in us {
         let schema = schema_name();

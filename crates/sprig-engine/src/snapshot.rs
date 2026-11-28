@@ -62,6 +62,12 @@ pub trait UnitSnapshotPart: Send + Sync {
     ///
     /// [`export`]: UnitSnapshotPart::export
     fn ingest(&self, unit: UnitId, index: u64, input: &mut dyn Read) -> Result<()>;
+    /// Drops the part's state of `unit`: this node's replica of the unit
+    /// left (a later replica here starts from a snapshot). Nothing by
+    /// default.
+    fn forget(&self, unit: UnitId) {
+        let _ = unit;
+    }
 }
 
 /// A part's bytes from an ingested snapshot, kept until the part registers:
@@ -190,6 +196,17 @@ impl Engine {
     /// Walks the unit's entries (data, then bookkeeping) from one point in
     /// time. Returns the applied index read at that point.
     fn walk_unit(&self, unit: UnitId, f: &mut Visit<'_>) -> Result<u64> {
+        self.walk_unit_at(unit, &mut || {}, f)
+    }
+
+    /// [`Engine::walk_unit`], calling `fixed` once the walk's point in time
+    /// is fixed (its store iterator exists), before anything is read.
+    fn walk_unit_at(
+        &self,
+        unit: UnitId,
+        fixed: &mut dyn FnMut(),
+        f: &mut Visit<'_>,
+    ) -> Result<u64> {
         let (data, meta) = ranges(unit)?;
         let store = self.store();
         let mut it = store.iter(
@@ -199,6 +216,7 @@ impl Engine {
                 ..IterOpts::default()
             },
         );
+        fixed();
         it.seek(&data.start);
         while it.valid() && data.contains(it.key()) {
             f(true, it.key(), it.value())?;
@@ -245,12 +263,29 @@ impl Engine {
     /// # Errors
     /// The store or the writer failed.
     pub fn export_unit_to(&self, unit: UnitId, out: &mut dyn Write) -> Result<UnitExport> {
+        self.export_unit_fixed(unit, &mut || {}, out)
+    }
+
+    /// [`Engine::export_unit_to`], calling `fixed` once the export's point
+    /// in time is fixed, before it reads anything: a caller that keeps the
+    /// unit from applying entries until then (a Raft group's lock) learns
+    /// exactly which applied index the export holds, while the export
+    /// itself runs on after the call returns (on a thread of its own).
+    ///
+    /// # Errors
+    /// The store or the writer failed.
+    pub fn export_unit_fixed(
+        &self,
+        unit: UnitId,
+        fixed: &mut dyn FnMut(),
+        out: &mut dyn Write,
+    ) -> Result<UnitExport> {
         out.write_all(MAGIC).map_err(|e| io("write", e))?;
         let mut all = SpanChecksum::default();
         let mut all_crc = flate2::Crc::new();
         let mut sum = SpanChecksum::default();
         let mut crc = flate2::Crc::new();
-        let index = self.walk_unit(unit, &mut |data, k, v| {
+        let index = self.walk_unit_at(unit, fixed, &mut |data, k, v| {
             out.write_all(&len32(k.len()).to_be_bytes())
                 .and_then(|()| out.write_all(k))
                 .and_then(|()| out.write_all(&len32(v.len()).to_be_bytes()))
@@ -315,6 +350,18 @@ impl Engine {
         self.load_stream(unit, input)
     }
 
+    /// [`Engine::replace_unit_from`], then the store flushed: the unit's
+    /// new state survives a crash without its source (a large snapshot is
+    /// read from a file that goes once it is in).
+    ///
+    /// # Errors
+    /// As for [`Engine::replace_unit_from`]; the flush failed.
+    pub fn replace_unit_durably(&self, unit: UnitId, input: &mut dyn Read) -> Result<u64> {
+        let index = self.replace_unit_from(unit, input)?;
+        self.store().flush_all()?;
+        Ok(index)
+    }
+
     fn load_stream(&self, unit: UnitId, input: &mut dyn Read) -> Result<u64> {
         let (data, meta) = ranges(unit)?;
         let mut magic = [0u8; 8];
@@ -370,6 +417,27 @@ impl Engine {
         let index = self.finish_ingest(unit)?;
         self.ingest_parts(unit, index, input)?;
         Ok(index)
+    }
+
+    /// Tells every registered part that this node's replica of `unit` is
+    /// gone (its keys were dropped): their state of it goes too. Bytes of
+    /// the unit left aside for a part not registered yet are dropped.
+    pub fn forget_unit_parts(&self, unit: UnitId) {
+        self.pending_parts()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|(_, u, ..)| *u != unit);
+        let parts = self
+            .snapshot_parts()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        for p in parts {
+            p.forget(unit);
+        }
+        if let Err(e) = self.forget_log_floors_of(unit) {
+            tracing::warn!(unit = unit.0, error = %e, "a departed unit's log floors weren't dropped");
+        }
     }
 
     /// Registers a part unit snapshots carry.

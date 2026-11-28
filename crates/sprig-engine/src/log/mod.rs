@@ -344,6 +344,14 @@ impl Ticket {
         self.durable(&self.unit)
     }
 
+    /// Whether the log reported the entry lost before it met its
+    /// durability class (a replicated log after a leadership change): it
+    /// never will, or its fate is unknown. Never true once durable.
+    #[must_use]
+    pub fn is_lost(&self) -> bool {
+        !self.durable(&self.unit) && self.failed(&self.unit)
+    }
+
     /// Blocks until the entry meets its durability class. Replies whose
     /// content depends on this entry wait here.
     ///

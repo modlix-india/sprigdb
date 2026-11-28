@@ -175,10 +175,11 @@ async fn fresh_db(c: &mut Conn, db: &str) {
     exec(c, &format!("USE {db}")).await;
 }
 
+#[ignore = "live: needs SPRIG_TEST_R6_GATEWAY, SPRIG_TEST_R6_USER, SPRIG_TEST_R6_PASSWORD, ...; tools/live/README.md"]
 #[tokio::test]
 async fn types_and_subtypes() {
     let Some(eps) = endpoints("types_and_subtypes") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     for (pi, ep) in eps.iter().enumerate() {
         let db = format!("r6_types_{}", persona(pi));
@@ -836,10 +837,11 @@ impl Tree {
     }
 }
 
+#[ignore = "live: needs SPRIG_TEST_R6_GATEWAY, SPRIG_TEST_R6_USER, SPRIG_TEST_R6_PASSWORD, ...; tools/live/README.md"]
 #[tokio::test]
 async fn hierarchies_match_a_reference_tree() {
     let Some(eps) = endpoints("hierarchies_match_a_reference_tree") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     for (pi, ep) in eps.iter().enumerate() {
         let db = format!("r6_hier_{}", persona(pi));
@@ -1159,10 +1161,11 @@ async fn check_fleet(c: &mut Conn, m: &Fleet, joined: bool, step: &str) {
     }
 }
 
+#[ignore = "live: needs SPRIG_TEST_R6_GATEWAY, SPRIG_TEST_R6_USER, SPRIG_TEST_R6_PASSWORD, ...; tools/live/README.md"]
 #[tokio::test]
 async fn discriminator_columns() {
     let Some(eps) = endpoints("discriminator_columns") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     for (pi, ep) in eps.iter().enumerate() {
         for storage in ["single_table", "joined"] {
@@ -1412,10 +1415,11 @@ async fn discriminator_columns() {
 /// NULL` column without a default (a CHECK on the subtype's rows, refused
 /// when existing rows can't fill it), and an existing `_type` hierarchy
 /// taking a discriminator column and giving it back, online.
+#[ignore = "live: needs SPRIG_TEST_R6_GATEWAY, SPRIG_TEST_R6_USER, SPRIG_TEST_R6_PASSWORD, ...; tools/live/README.md"]
 #[tokio::test]
 async fn not_null_checks_and_discriminator_conversion() {
     let Some(eps) = endpoints("not_null_checks_and_discriminator_conversion") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     for (pi, ep) in eps.iter().enumerate() {
         let db = format!("r6_round_{}", persona(pi));

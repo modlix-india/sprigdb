@@ -1,8 +1,10 @@
-//! The broadcast log of inherited streams, as engine records of the
-//! definition's declarer:
+//! The broadcast log of inherited streams, exchanges and queues, as
+//! engine records of the definition's declarer:
 //!
 //! ```text
-//! INSERT INTO s FOR ALL TENANTS [WITH INSTANCE] [UNDER u] ... by P:
+//! INSERT INTO s FOR ALL TENANTS [WITH INSTANCE] [UNDER u] ... by P, or a
+//! publish into an inherited exchange or queue with x-sprig-tenant = *
+//! (AMQP, sprig.mq_publish):
 //!   limits (39244): each record <= inherit.broadcast_max_bytes, fewer than
 //!     inherit.broadcasts_per_hour of the definition in the last hour,
 //!     members <= inherit.broadcast_max_members
@@ -19,12 +21,18 @@
 //!     __sprig_ib_<object>, instance m, in A's records) is <= seq:
 //!     its instance made if needed; then ONE transaction moves the mark
 //!     from what was read to seq + 1 (compare-and-set) and appends the
-//!     records to m's instance: once, and in broadcast order, per member
+//!     records to m's stream instance (or puts them in m's queue outbox on
+//!     the engine, routed by its vhost's forwarder): once, and in
+//!     broadcast order, per member
+//!   residency.cross_tenant_messaging_strict = on: a member whose home DC
+//!     P's residency doesn't allow gets nothing (its mark moves on)
 //!   a member whose delivery fails waits (1 s doubling to 5 min) and its
 //!     later entries wait behind it; the others go on
 //!   an entry every member took moves the floor; entries below the floor
 //!     older than inherit.broadcast_retention_hours are removed
 //! paced at inherit.broadcast_rate deliveries a second
+//! inherit.broadcast_replay = on: a member's new instance gets the entries
+//!   still in the log that it was below the publisher (and inside UNDER) for
 //! ```
 //!
 //! Records keep the publisher's timestamps; each member's copy carries
@@ -42,8 +50,9 @@ use sprig_common::{Result, SprigCode, SprigError};
 use sprig_engine::keys::{KeyPrefix, KeyRange, kind, memcmp};
 use sprig_engine::txn::{Dir, Isolation, LockRequest, ReadMode, Txn, TxnOptions};
 use sprig_inherit::msg::settings as s;
-use sprig_inherit::msg::{DefKey, DefKind, DefState, Definition};
+use sprig_inherit::msg::{DefKey, DefKind, DefState, Definition, InstanceState};
 use sprig_meta::{ListOpts, Record, Versioned};
+use sprig_proto_amqp::message::Message;
 use sprig_proto_kafka::broker::data::ProduceRecord;
 use sprig_proto_kafka::records::Header;
 use sprig_sql::lex::LexOptions;
@@ -325,7 +334,7 @@ async fn check_limits(
 /// # Errors
 /// 39244 (limits); the log's.
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn publish(
+pub(crate) async fn publish(
     svc: &Arc<TenantServices>,
     eng: &EngineStreams,
     def: &Definition,
@@ -443,8 +452,145 @@ async fn definition(svc: &TenantServices, def: DefKey) -> Result<Option<Arc<Defi
     Ok(inherited::state_of(&cat)
         .defs
         .values()
-        .find(|d| d.object_id == def.object && d.kind == DefKind::Stream)
+        .find(|d| {
+            d.object_id == def.object
+                && matches!(d.kind, DefKind::Stream | DefKind::Exchange | DefKind::Queue)
+        })
         .cloned())
+}
+
+/// The record header keeping a queue message's encoding.
+const FMT_HEADER: &str = "x-sprig-fmt";
+/// The record header keeping a queue message's properties.
+const PROPS_HEADER: &str = "x-sprig-props";
+
+/// A queue message as a log record: key = the routing key, value = the
+/// body, the encoding and properties in two headers.
+fn mq_record(m: &Message, key: &str) -> ProduceRecord {
+    ProduceRecord {
+        key: Some(key.as_bytes().to_vec()),
+        value: Some(m.body.to_vec()),
+        headers: vec![
+            Header {
+                key: FMT_HEADER.to_owned(),
+                value: Some(vec![sprig_queues::msg::fmt_code(m.format)]),
+            },
+            Header {
+                key: PROPS_HEADER.to_owned(),
+                value: Some(m.props.to_vec()),
+            },
+        ],
+        timestamp_ms: i64::try_from(sprig_inherit::msg::store::now_ms()).unwrap_or(0),
+    }
+}
+
+/// [`mq_record`]'s message again, published to `exchange`.
+fn mq_message(r: &ProduceRecord, exchange: &str) -> Result<Message> {
+    let h = |k: &str| {
+        r.headers
+            .iter()
+            .find(|h| h.key == k)
+            .and_then(|h| h.value.clone())
+            .unwrap_or_default()
+    };
+    sprig_queues::msg::rebuild(
+        h(FMT_HEADER).first().copied().unwrap_or(0),
+        exchange.to_owned(),
+        String::from_utf8_lossy(r.key.as_deref().unwrap_or_default()).into_owned(),
+        h(PROPS_HEADER).into(),
+        r.value.clone().unwrap_or_default().into(),
+    )
+    .map_err(|e| SprigError::internal(e.to_string()))
+}
+
+fn streams() -> Result<Arc<EngineStreams>> {
+    crate::kafka::engine::streams().ok_or_else(|| {
+        SprigError::internal(
+            "the broadcast log is kept on the SprigDB engine, which failed to start on this node; \
+             see the node's log",
+        )
+    })
+}
+
+/// A broadcast of queue message `m` (routing key `key`, without its
+/// `@*:` prefix) into exchange or queue definition `def`: its log entry,
+/// in `txn` when given (the publisher's engine transaction). The seq.
+///
+/// # Errors
+/// As [`publish`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn publish_message(
+    svc: &Arc<TenantServices>,
+    def: &Definition,
+    publisher: TenantId,
+    origin: &str,
+    form: Form,
+    m: &Message,
+    key: &str,
+    txn: Option<&mut Txn>,
+) -> Result<u64> {
+    let eng = streams()?;
+    publish(
+        svc,
+        &eng,
+        def,
+        publisher,
+        origin,
+        form,
+        &[mq_record(m, key)],
+        txn,
+    )
+    .await
+}
+
+/// Whether member `m` has an instance of `def` now.
+async fn has_instance(
+    svc: &TenantServices,
+    eng: &EngineStreams,
+    m: TenantId,
+    def: &Definition,
+) -> Result<bool> {
+    if def.kind == DefKind::Stream {
+        let full = format!("{}.{}", def.db_name, def.name);
+        return Ok(eng.topic(m.0, &full)?.is_some());
+    }
+    // Instance rows aren't versioned: the store, not the snapshot.
+    Ok(
+        sprig_inherit::msg::MsgStore::new(Arc::clone(&svc.writers), m)
+            .instance(def.key())
+            .await?
+            .is_some_and(|i| i.state == InstanceState::Active),
+    )
+}
+
+/// Under `residency.cross_tenant_messaging_strict`: whether `publisher`'s
+/// residency keeps its broadcasts out of member `m`'s home data center.
+async fn kept_out(
+    svc: &TenantServices,
+    strict: bool,
+    def: &Definition,
+    publisher: TenantId,
+    m: TenantId,
+) -> bool {
+    if !strict || m == publisher {
+        return false;
+    }
+    let code = if def.kind == DefKind::Stream {
+        SprigCode::StreamResidency
+    } else {
+        SprigCode::InheritResidency
+    };
+    // Anything but the residency refusal delivers (the directory read is
+    // retried at the delivery).
+    let Err(e) = inherited::check_residency(svc, publisher, m, code).await else {
+        return false;
+    };
+    if e.code() != Some(code) {
+        return false;
+    }
+    tracing::info!(def = %def.key(), member = %m, error = %e, "broadcast not delivered: residency");
+    metrics::counter!("sprig_inherit_refused_total", "reason" => "residency").increment(1);
+    true
 }
 
 /// One fan-out pass over definition `def`'s log.
@@ -491,7 +637,11 @@ async fn fan_out(
     );
     let pause = Duration::from_micros(1_000_000 / rate.max(1));
     let lex = LexOptions::mariadb();
-    let full = format!("{}.{}", def.db_name, def.name);
+    let strict = svc.settings.get(
+        &s::CROSS_TENANT_MESSAGING_STRICT,
+        &ctx,
+        Some(&dcat.settings),
+    ) == "on";
     let mut names: HashMap<TenantId, String> = HashMap::new();
     let mut blocked: std::collections::HashSet<TenantId> = std::collections::HashSet::new();
     let mut new_floor = floor;
@@ -521,9 +671,10 @@ async fn fan_out(
                 blocked.insert(m);
                 continue;
             }
-            if entry.form.with_instance && eng.topic(m.0, &full)?.is_none() {
+            if entry.form.with_instance && !has_instance(svc, eng, m, &def).await? {
                 continue;
             }
+            let skip = kept_out(svc, strict, &def, TenantId(entry.publisher), m).await;
             let name = if let Some(n) = names.get(&m) {
                 n.clone()
             } else {
@@ -531,7 +682,7 @@ async fn fan_out(
                 names.insert(m, n.clone());
                 n
             };
-            match deliver(svc, eng, &def, m, &name, seq, mark, entry, &lex).await {
+            match deliver(svc, eng, &def, m, &name, seq, mark, entry, &lex, skip).await {
                 Ok(true) => {
                     marks.insert(m.0, i64::try_from(seq + 1).unwrap_or(i64::MAX));
                     backoff.remove(&(key, m));
@@ -595,8 +746,8 @@ async fn clear(eng: &EngineStreams, a: u64, def: u64) -> Result<()> {
 }
 
 /// One member's copy of entry `seq`: the mark moves from `mark` to the
-/// next entry and the records go into its instance, in one transaction.
-/// `false` when the mark had moved.
+/// next entry and the records go into its instance, in one transaction
+/// (with `skip`, only the mark moves). `false` when the mark had moved.
 #[allow(clippy::too_many_arguments)]
 async fn deliver(
     svc: &Arc<TenantServices>,
@@ -608,27 +759,63 @@ async fn deliver(
     mark: i64,
     entry: &Entry,
     lex: &LexOptions,
+    skip: bool,
 ) -> Result<bool> {
-    super::streams::ensure_instance(svc, eng, m, def, lex).await?;
-    let full = format!("{}.{}", def.db_name, def.name);
-    let topic = eng
-        .topic(m.0, &full)?
-        .ok_or_else(|| SprigError::internal("an inherited stream instance went missing"))?;
-    let parts = u32::try_from(topic.partitions.max(1)).unwrap_or(1);
     let id = format!("{}.{seq}", def.object_id);
-    let mut by_part: BTreeMap<u32, Vec<ProduceRecord>> = BTreeMap::new();
-    for (n, r) in entry.records.iter().enumerate() {
-        let mut r = r.record();
-        super::streams::stamp(&mut r, super::streams::TENANT_HEADER, name);
-        super::streams::stamp(&mut r, super::streams::ORIGIN_HEADER, &entry.origin);
-        super::streams::stamp(&mut r, BROADCAST_HEADER, &id);
-        let p = match r.key.as_deref() {
-            Some(k) => sprig_streams::partition::for_key(k, parts).0,
-            None => u32::try_from(n).unwrap_or(0) % parts,
-        };
-        by_part.entry(p).or_default().push(r);
-    }
     let mut t = begin(eng)?;
+    let mut queued = None;
+    if !skip && def.kind == DefKind::Stream {
+        super::streams::ensure_instance(svc, eng, m, def, lex).await?;
+        let full = format!("{}.{}", def.db_name, def.name);
+        let topic = eng
+            .topic(m.0, &full)?
+            .ok_or_else(|| SprigError::internal("an inherited stream instance went missing"))?;
+        let parts = u32::try_from(topic.partitions.max(1)).unwrap_or(1);
+        let mut by_part: BTreeMap<u32, Vec<ProduceRecord>> = BTreeMap::new();
+        for (n, r) in entry.records.iter().enumerate() {
+            let mut r = r.record();
+            super::streams::stamp(&mut r, super::streams::TENANT_HEADER, name);
+            super::streams::stamp(&mut r, super::streams::ORIGIN_HEADER, &entry.origin);
+            super::streams::stamp(&mut r, BROADCAST_HEADER, &id);
+            let p = match r.key.as_deref() {
+                Some(k) => sprig_streams::partition::for_key(k, parts).0,
+                None => u32::try_from(n).unwrap_or(0) % parts,
+            };
+            by_part.entry(p).or_default().push(r);
+        }
+        for (p, recs) in by_part {
+            eng.log().append_in(
+                &mut t,
+                sprig_streams::seg::Key {
+                    tenant: m.0,
+                    stream: topic.stream_id,
+                    partition: p,
+                },
+                &encode_records(&recs, None)?,
+            )?;
+        }
+    } else if !skip {
+        // An exchange or queue: rows of the member's queue outbox on the
+        // engine, which its vhost's forwarder routes with its bindings.
+        let mcat = inherited::catalog(svc, m).await?;
+        let chain = inherited::chain(svc, &mcat).await?;
+        let (v, store) = inherited::mq::engine_vhost(svc, &chain, &def.db_name).await?;
+        let exchange = if def.kind == DefKind::Exchange {
+            def.name.clone()
+        } else {
+            String::new()
+        };
+        for r in &entry.records {
+            let msg = mq_message(&r.record(), &exchange)?;
+            let key = msg.routing_key.clone();
+            let msg = inherited::mq::stamp(&msg, &key, name, &entry.origin)
+                .map_err(|e| SprigError::internal(e.text))?;
+            let msg = inherited::broadcast::with_header(&msg, BROADCAST_HEADER, &id)?;
+            let row = inherited::mq::outbox_row(inherited::outbox::new_id(), &exchange, &msg);
+            inherited::mq::txn_put(&mut t, store.txn_publish(&row))?;
+        }
+        queued = Some(v);
+    }
     if !sprig_streams::seg::records::move_offset_on(
         &mut t,
         def.declarer.0,
@@ -645,19 +832,173 @@ async fn deliver(
         t.rollback();
         return Ok(false);
     }
-    for (p, recs) in by_part {
-        eng.log().append_in(
-            &mut t,
-            sprig_streams::seg::Key {
-                tenant: m.0,
-                stream: topic.stream_id,
-                partition: p,
-            },
-            &encode_records(&recs, None)?,
-        )?;
-    }
     commit(t).await?;
+    if let Some(v) = queued {
+        v.committed();
+    }
     Ok(true)
+}
+
+/// With `inherit.broadcast_replay = on` on `def`: the entries still in its
+/// log that member `t` was below the publisher (and inside `UNDER`) for,
+/// delivered into `t`'s new instance in order, each once (the member's
+/// mark).
+pub(crate) fn replay(
+    svc: Arc<TenantServices>,
+    def: Arc<Definition>,
+    t: TenantId,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+    Box::pin(async move {
+        match Box::pin(replay_inner(&svc, &def, t)).await {
+            Ok(0) => {}
+            Ok(n) => {
+                tracing::info!(tenant = %t, def = %def.key(), replayed = n, "broadcasts replayed into a new instance");
+            }
+            Err(e) => {
+                tracing::warn!(tenant = %t, def = %def.key(), error = %e, "broadcast replay failed");
+            }
+        }
+    })
+}
+
+async fn replay_inner(svc: &Arc<TenantServices>, def: &Definition, t: TenantId) -> Result<usize> {
+    let dcat = inherited::catalog(svc, def.declarer).await?;
+    let mut ctx = dcat.object_ctx(&svc.dc, sprig_common::ids::ObjectId(def.object_id));
+    if let Some(d) = dcat
+        .databases
+        .iter()
+        .find(|d| d.name.eq_ignore_ascii_case(&def.db_name))
+    {
+        ctx = ctx.with_db(d.db_id);
+    }
+    if svc
+        .settings
+        .get(&s::BROADCAST_REPLAY, &ctx, Some(&dcat.settings))
+        != "on"
+    {
+        return Ok(0);
+    }
+    let eng = streams()?;
+    let a = def.declarer.0;
+    let path = inherited::dir_entry(svc, t)
+        .await?
+        .map(|e| e.path_ids())
+        .unwrap_or_default();
+    let name = inherited::tenant_name(svc, t).await?;
+    let strict = svc.settings.get(
+        &s::CROSS_TENANT_MESSAGING_STRICT,
+        &ctx,
+        Some(&dcat.settings),
+    ) == "on";
+    let lex = LexOptions::mariadb();
+    let marks_of = group(def.object_id);
+    let mut replayed = 0;
+    let mut mark = eng
+        .records()
+        .offsets_on(a, &marks_of)?
+        .into_iter()
+        .find(|(i, _)| *i == t.0)
+        .map_or(1, |(_, o)| o.offset)
+        .max(1);
+    let mut from = u64::try_from(mark).unwrap_or(1);
+    loop {
+        let page = {
+            let mut tx = begin(&eng)?;
+            let l = entries(&mut tx, a, def.object_id, from, PASS_ENTRIES)?;
+            tx.rollback();
+            l
+        };
+        let Some(last) = page.last().map(|(q, _)| *q) else {
+            return Ok(replayed);
+        };
+        for (seq, e) in &page {
+            let below = t.0 == e.publisher || path.contains(&e.publisher);
+            let inside = e.form.under.is_none_or(|u| path.contains(&u));
+            if !(below && inside) {
+                continue;
+            }
+            let skip = kept_out(svc, strict, def, TenantId(e.publisher), t).await;
+            if !deliver(svc, &eng, def, t, &name, *seq, mark, e, &lex, skip).await? {
+                // The fan-out took it meanwhile: it goes on from there.
+                return Ok(replayed);
+            }
+            mark = i64::try_from(seq + 1).unwrap_or(i64::MAX);
+            replayed += 1;
+        }
+        if page.len() < PASS_ENTRIES || last == u64::MAX {
+            return Ok(replayed);
+        }
+        from = last + 1;
+    }
+}
+
+/// One row of `SHOW INHERITED BROADCASTS`.
+pub(crate) type ShowRow = Vec<Option<String>>;
+
+/// `SHOW INHERITED BROADCASTS FOR kind db.name` over the engine log: the
+/// newest 1,000 entries still kept, newest first. `Delivered` counts the
+/// members whose mark is past the entry; `Pending` the members in reach
+/// not yet past it while the entry is above the floor.
+///
+/// # Errors
+/// The log's and the directory's.
+pub(crate) async fn show(svc: &Arc<TenantServices>, def: &Definition) -> Result<Vec<ShowRow>> {
+    let eng = streams()?;
+    let a = def.declarer.0;
+    let (floor, list) = {
+        let mut t = begin(&eng)?;
+        let floor = read_u64(&mut t, &keyed(a, FLOOR, kind::META, def.object_id))?.max(1);
+        let newest = read_u64(&mut t, &keyed(a, SEQ, kind::COUNTERS, def.object_id))?;
+        let list = entries(
+            &mut t,
+            a,
+            def.object_id,
+            newest.saturating_sub(999).max(1),
+            1000,
+        )?;
+        t.rollback();
+        (floor, list)
+    };
+    let marks: Vec<i64> = eng
+        .records()
+        .offsets_on(a, &group(def.object_id))?
+        .into_iter()
+        .map(|(_, o)| o.offset)
+        .collect();
+    let mut rows = Vec::with_capacity(list.len());
+    for (seq, e) in list.into_iter().rev() {
+        let past = i64::try_from(seq).unwrap_or(i64::MAX);
+        let delivered = marks.iter().filter(|o| **o > past).count();
+        let done = seq < floor;
+        let pending = if done {
+            0
+        } else {
+            inherited::broadcast::members(svc, def, TenantId(e.publisher), e.form, e.committed_ms)
+                .await?
+                .len()
+                .saturating_sub(delivered)
+        };
+        rows.push(vec![
+            Some(format!("{}.{seq}", def.object_id)),
+            Some(e.publisher.to_string()),
+            Some(e.committed_ms.to_string()),
+            Some(
+                if e.form.with_instance {
+                    "with_instance"
+                } else {
+                    "all"
+                }
+                .to_owned(),
+            ),
+            e.form.under.map(|u| u.to_string()),
+            Some(if done { "delivered" } else { "fanning_out" }.to_owned()),
+            Some(delivered.to_string()),
+            Some("0".to_owned()),
+            None,
+            Some(pending.to_string()),
+        ]);
+    }
+    Ok(rows)
 }
 
 #[cfg(test)]

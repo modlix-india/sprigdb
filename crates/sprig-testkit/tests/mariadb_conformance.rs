@@ -49,21 +49,25 @@ async fn shared(target: Target, var: &str) {
     );
 }
 
+#[ignore = "live: needs SPRIG_TEST_MARIADB_SINGLE; tools/live/README.md"]
 #[tokio::test]
 async fn single_node() {
     shared(Target::Single, skip::MARIADB_SINGLE).await;
 }
 
+#[ignore = "live: needs SPRIG_TEST_MARIADB_REPLICATION; tools/live/README.md"]
 #[tokio::test]
 async fn primary_and_replicas() {
     shared(Target::Replication, skip::MARIADB_REPLICATION).await;
 }
 
+#[ignore = "live: needs SPRIG_TEST_MARIADB_GALERA; tools/live/README.md"]
 #[tokio::test]
 async fn galera() {
     shared(Target::Galera, skip::MARIADB_GALERA).await;
 }
 
+#[ignore = "live: needs SPRIG_TEST_DOCKER; tools/live/README.md"]
 #[tokio::test]
 async fn throwaway_crash_and_fencing() {
     sprig_testkit::require_env!(skip::DOCKER);

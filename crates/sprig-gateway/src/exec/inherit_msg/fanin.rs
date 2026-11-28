@@ -8,7 +8,8 @@
 //!   privileges  SPRIG_FAN_IN (1227) and SELECT on db.s (1142)
 //!   members     every member below this tenant with an instance (this
 //!               tenant too with INCLUDING SELF), at most
-//!               inherit.fan_in_sql_max_tenants (39244 above it)
+//!               inherit.fan_in_sql_max_tenants (1104 above it,
+//!               naming the members)
 //!   rows        each member's newest 1,000 records, as the stream's
 //!               columns with `tenant` (the member's name) first
 //!   the query   planned and run over those rows as the stream reads are
@@ -22,7 +23,7 @@ use std::sync::Arc;
 use sprig_auth::authz::{Action, Target as AuthzTarget};
 use sprig_catalog::TenantCatalog;
 use sprig_common::ids::TenantId;
-use sprig_common::{Result, SprigCode, SprigError};
+use sprig_common::{Result, SprigError};
 use sprig_engine::row::{ColumnType, Value};
 use sprig_exec::ops::Row;
 use sprig_inherit::msg::{DefKind, DefState, Definition, MsgState};
@@ -259,6 +260,7 @@ fn member_rows(eng: &EngineStreams, t: u64, name: &str, stream: u64) -> Result<V
 impl PassSession {
     /// Runs a fan-in query (see the module docs); `charset` is the
     /// connection's results character set.
+    #[allow(clippy::too_many_lines)] // the checks, the members, then the rows
     pub(super) async fn fan_in_select(
         &self,
         svc: &Arc<TenantServices>,
@@ -307,14 +309,30 @@ impl PassSession {
             Some(&cat.settings),
         );
         if members.len() as u64 > max {
-            return Err(SprigError::new(
-                SprigCode::InheritBroadcastLimit,
+            // MySQL's "too big a SELECT" (1104), naming the members, as the
+            // design has it (narrow with `WHERE tenant IN (...)` or raise
+            // the setting).
+            let mut names = Vec::new();
+            for t in members.iter().take(10) {
+                names.push(
+                    inherited::tenant_name(svc, *t)
+                        .await
+                        .unwrap_or_else(|_| t.to_string()),
+                );
+            }
+            if members.len() > 10 {
+                names.push(format!("and {} more", members.len() - 10));
+            }
+            return Err(SprigError::standard(
+                1104,
+                *b"42000",
                 format!(
-                    "ER_SPRIG_INHERIT_BROADCAST_LIMIT: {} members have an instance of {}.{}; a \
-                     fan-in SELECT reads at most inherit.fan_in_sql_max_tenants = {max}",
+                    "The SELECT would read {} members' instances of {}.{} ({}); a fan-in \
+                     SELECT reads at most inherit.fan_in_sql_max_tenants = {max}",
                     members.len(),
                     f.db,
-                    def.name
+                    def.name,
+                    names.join(", ")
                 ),
             ));
         }

@@ -769,6 +769,14 @@ impl Manager {
         }
     }
 
+    /// Drops every index of `tenant`'s tables, with its files and floors,
+    /// and whatever else is left under the tenant unit's directory: the
+    /// tenant was deleted and its unit left this node.
+    pub(crate) fn forget_tenant(&self, tenant: u64) {
+        self.retain_tables(tenant, &|_| false);
+        remove_dir(&self.root.join(format!("u{tenant}")));
+    }
+
     /// Drops every index of tables of `tenant` that `keep` doesn't name
     /// (tables dropped, or with no `FULLTEXT` key any more).
     pub(crate) fn retain_tables(&self, tenant: u64, keep: &dyn Fn(u32) -> bool) {

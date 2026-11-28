@@ -48,11 +48,12 @@ fn code(r: &Result<(), mysql_async::Error>) -> u16 {
     }
 }
 
+#[ignore = "live: needs SPRIG_TEST_SET_PASSWORD; tools/live/README.md"]
 #[tokio::test]
 async fn set_password_for_another_account_follows_mysql() {
     let Ok(v) = std::env::var("SPRIG_TEST_SET_PASSWORD") else {
         eprintln!("skipped: set SPRIG_TEST_SET_PASSWORD=<mysql port>,<mariadb port>");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let ports: Vec<u16> = v.split(',').filter_map(|p| p.trim().parse().ok()).collect();
     let login = std::env::var("SPRIG_TEST_SET_PASSWORD_LOGIN")

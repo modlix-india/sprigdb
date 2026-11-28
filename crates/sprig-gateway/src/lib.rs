@@ -120,6 +120,7 @@ pub mod tenant;
 pub mod tls;
 // Workers' runs of triggers on streams and queues.
 pub(crate) mod engine_schedules;
+pub(crate) mod led;
 pub(crate) mod sql_events;
 pub mod triggers;
 // Orphans across tenants and materialized copies on engine databases,
@@ -492,6 +493,20 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
         );
         // Overrides in child tenants of records gone above become orphans.
         let _orphans = inherit_orphans::spawn(Arc::clone(t), stop.clone());
+        // Embedded columns of engine tables, filled on the tenant's leader.
+        let _embedding = exec::embed_ddl::runner::spawn(
+            Arc::clone(t),
+            Arc::clone(&login),
+            Arc::clone(&engine),
+            stop.clone(),
+        );
+        // Retrieval indexes of engine databases, kept on the tenant's leader.
+        let _retrieval = exec::spawn_retrieval_sync(
+            Arc::clone(t),
+            Arc::clone(&login),
+            Arc::clone(&shared_exec),
+            stop.clone(),
+        );
     }
     let drain_lc = lifecycle.clone();
     let core = Arc::new(http::Core {

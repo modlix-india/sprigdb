@@ -7,9 +7,9 @@
 //!   a digest for it exists -> nothing
 //!   facts (deterministic, statistics only):
 //!     schema changes in the period (object, verb; never the statement text)
-//!     data volume per table (approximate rows, bytes) against the previous digest's
+//!     data volume per table (approximate rows, bytes) against the previous
+//!       digest's, when the gatherer can read sizes (not yet for engine tables)
 //!     the slowest statements (normalized text, calls, mean and max time, errors)
-//!     automatic indexes created, activated or dropped
 //!     the tenant's workload numbers (statements, errors, mean time) against
 //!       the period before; notable movements by fixed thresholds
 //!     recommendations waiting for review (kind, target, age)
@@ -18,13 +18,14 @@
 //!   the data model (ai.model.data, else ai.model.dba), no tools, the tenant's
 //!     budgets, a stored conversation -> the digest's words
 //!   no model, a spent budget, a failed call -> stored with the facts alone
-//!   stored in ai_digests (module ai_digests); ai.digest_email -> emailed
+//!   stored in the tenant's catalog records (module ai_digests, [`rec`]);
+//!     ai.digest_email -> emailed
 //! ```
 //!
 //! [`Facts::text`] is what people read first and what the model gets; the
 //! model's words follow it and never replace it.
 
-pub mod gather;
+pub mod rec;
 pub mod store;
 
 use std::fmt::Write as _;
@@ -43,7 +44,8 @@ use crate::tools::testdata::civil_from_days;
 use crate::tools::{NoHost, ToolRegistry};
 use crate::turn::{Agent, TurnConfig, TurnEvent, TurnRequest};
 
-pub use store::{CatalogDigests, Digest, DigestStore, MemoryDigests, NewDigest, Status};
+pub use rec::RecDigests;
+pub use store::{Digest, DigestStore, MemoryDigests, NewDigest, Status};
 
 /// The user id digest turns are stored and budgeted under: no person has
 /// it, so the digest counts against the tenant's daily budget and its
@@ -787,7 +789,5 @@ pub async fn build(
     Ok((d, true))
 }
 
-#[cfg(test)]
-mod live_tests;
 #[cfg(test)]
 mod tests;

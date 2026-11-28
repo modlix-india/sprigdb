@@ -131,11 +131,12 @@ async fn scores(db: &Database, coll: &str, q: &str) -> Vec<(String, f64)> {
     out
 }
 
+#[ignore = "live: needs SPRIG_TEST_MONGO_URI, SPRIG_TEST_MONGO_REF_URI; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn text_scores_match_mongodb() {
     let (Some(s), Some(r)) = (uri("SPRIG_TEST_MONGO_URI"), uri("SPRIG_TEST_MONGO_REF_URI")) else {
         eprintln!("SPRIG_TEST_MONGO_URI or SPRIG_TEST_MONGO_REF_URI not set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let sdb = Client::with_uri_str(&s)
         .await

@@ -7,8 +7,16 @@
 //!   M | 1 | bytes(name)                                  -> topic record (JSON)
 //!   M | 2 | bytes(group) | instance u64 | stream u64 | partition u32 -> offset (JSON)
 //!   M | 6 | bytes(group)                                 -> group row (JSON)
+//!   M | 7 | member u64 | stream u64                      -> fan-in topic id u64
+//!   M | 8 | fan-in topic id u64                          -> member u64 | stream u64
 //!   C | 0                                                -> last stream id u64
+//!   C | 7                                                -> last fan-in topic id u64
 //! ```
+//!
+//! A fan-in topic id (from [`FIRST_FANIN_ID`]) names, in a reader's
+//! tenant, a member's instance of a stream the reader declares (Kafka's
+//! `__t.<member>.<db>.<stream>`): given once, kept for good, so the
+//! topic's id and a group's committed offsets on it stay put.
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -24,6 +32,17 @@ pub const OBJECT: u32 = 0x4B00_0000;
 const TOPICS: u16 = 1;
 const OFFSETS: u16 = 2;
 const GROUPS: u16 = 6;
+const FANIN_IDS: u16 = 7;
+const FANIN_TARGETS: u16 = 8;
+
+/// The first fan-in topic id: above every stream id the records give.
+pub const FIRST_FANIN_ID: u64 = 1 << 62;
+
+/// Whether `stream` is a fan-in topic id.
+#[must_use]
+pub const fn is_fan_in(stream: u64) -> bool {
+    stream >= FIRST_FANIN_ID
+}
 
 /// A stream stored on the engine, as its catalog record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,6 +99,19 @@ fn topic_key(tenant: u64, name: &str) -> Vec<u8> {
 
 fn counter_key(tenant: u64) -> Vec<u8> {
     prefix(tenant, kind::COUNTERS, 0)
+}
+
+fn fanin_id_key(reader: u64, member: u64, stream: u64) -> Vec<u8> {
+    let mut k = prefix(reader, kind::META, FANIN_IDS);
+    memcmp::put_u64(&mut k, member);
+    memcmp::put_u64(&mut k, stream);
+    k
+}
+
+fn fanin_target_key(reader: u64, id: u64) -> Vec<u8> {
+    let mut k = prefix(reader, kind::META, FANIN_TARGETS);
+    memcmp::put_u64(&mut k, id);
+    k
 }
 
 fn group_prefix(tenant: u64, index: u16, group: &str) -> Vec<u8> {
@@ -267,6 +299,63 @@ impl StreamRecords {
         let gate = t.reply_gate();
         t.commit()?.wait_async().await?;
         gate.wait_async().await
+    }
+
+    /// Reader `reader`'s fan-in topic id of member `member`'s stream
+    /// `stream`: the one given before, else a new one (recorded both
+    /// ways, in one transaction).
+    ///
+    /// # Errors
+    /// The engine's.
+    pub async fn fan_in_id(&self, reader: u64, member: u64, stream: u64) -> Result<u64> {
+        let k = fanin_id_key(reader, member, stream);
+        let u64_of = |b: &[u8]| <[u8; 8]>::try_from(b).ok().map(u64::from_be_bytes);
+        {
+            let mut t = self.begin()?;
+            let have = t.read_current(&k)?;
+            t.rollback();
+            if let Some(id) = have.as_deref().and_then(u64_of) {
+                return Ok(id);
+            }
+        }
+        let mut t = self.begin()?;
+        let counter = Bytes::from(prefix(reader, kind::COUNTERS, FANIN_IDS));
+        t.lock(&counter, LockRequest::write()).await?;
+        if let Some(id) = t.read_current(&k)?.as_deref().and_then(u64_of) {
+            t.rollback();
+            return Ok(id);
+        }
+        let last = t
+            .read_current(&counter)?
+            .as_deref()
+            .and_then(u64_of)
+            .unwrap_or(FIRST_FANIN_ID - 1);
+        let id = last.max(FIRST_FANIN_ID - 1) + 1;
+        t.put(counter.to_vec(), id.to_be_bytes().to_vec())?;
+        t.put(k, id.to_be_bytes().to_vec())?;
+        let mut target = member.to_be_bytes().to_vec();
+        target.extend_from_slice(&stream.to_be_bytes());
+        t.put(fanin_target_key(reader, id), target)?;
+        Self::commit(t).await?;
+        Ok(id)
+    }
+
+    /// The member and stream reader `reader`'s fan-in topic id `id`
+    /// names, if it was given.
+    ///
+    /// # Errors
+    /// The engine's.
+    pub fn fan_in_target(&self, reader: u64, id: u64) -> Result<Option<(u64, u64)>> {
+        let mut t = self.begin()?;
+        let v = t.read_current(&fanin_target_key(reader, id))?;
+        t.rollback();
+        Ok(v.filter(|b| b.len() == 16).map(|b| {
+            let mut m = [0u8; 8];
+            let mut s = [0u8; 8];
+            m.copy_from_slice(&b[..8]);
+            s.copy_from_slice(&b[8..]);
+            (u64::from_be_bytes(m), u64::from_be_bytes(s))
+        }))
     }
 
     fn scan(&self, r: &KeyRange) -> Result<Vec<(Vec<u8>, Bytes)>> {
@@ -527,6 +616,79 @@ impl StreamRecords {
             })
         })
         .transpose()
+    }
+
+    /// The names of every group of a tenant that holds a committed offset,
+    /// in name order (a group that commits from SQL has offsets and no
+    /// group row).
+    ///
+    /// # Errors
+    /// The engine failed or a record is corrupt.
+    pub fn offset_groups(&self, tenant: u64) -> Result<Vec<String>> {
+        let p = prefix(tenant, kind::META, OFFSETS);
+        let mut out: Vec<String> = Vec::new();
+        for (k, _) in self.scan(&KeyRange::prefix(&p))? {
+            let (name, _) = memcmp::get_bytes(&k[p.len()..]).map_err(|_| bad("offset key"))?;
+            let name = String::from_utf8_lossy(&name).into_owned();
+            if out.last() != Some(&name) {
+                out.push(name);
+            }
+        }
+        Ok(out)
+    }
+
+    /// As [`offsets_on`](Self::offsets_on), with each offset's commit time
+    /// (ms since the epoch).
+    ///
+    /// # Errors
+    /// The engine failed or a record is corrupt.
+    pub fn offsets_on_timed(
+        &self,
+        tenant: u64,
+        group: &str,
+    ) -> Result<Vec<(u64, CommittedOffset, i64)>> {
+        let p = group_prefix(tenant, OFFSETS, group);
+        let mut out = Vec::new();
+        for (k, v) in self.scan(&KeyRange::prefix(&p))? {
+            let rest = &k[p.len()..];
+            let (instance, rest) = memcmp::get_uint(rest, 8).map_err(|_| bad("offset key"))?;
+            let (stream, rest) = memcmp::get_uint(rest, 8).map_err(|_| bad("offset key"))?;
+            let (partition, _) = memcmp::get_int(rest, 4).map_err(|_| bad("offset key"))?;
+            let partition = i32::try_from(partition).map_err(|_| bad("offset key"))?;
+            let row: OffsetRow = parse(&v)?;
+            out.push((
+                instance,
+                CommittedOffset {
+                    stream_id: stream,
+                    partition,
+                    offset: row.offset,
+                    leader_epoch: row.leader_epoch,
+                    metadata: row.metadata,
+                },
+                row.committed_ms,
+            ));
+        }
+        Ok(out)
+    }
+
+    /// Every group row of a tenant as stored: name, generation and state
+    /// (`dead` ones included).
+    ///
+    /// # Errors
+    /// The engine failed or a record is corrupt.
+    pub fn group_states(&self, tenant: u64) -> Result<Vec<(String, i32, String)>> {
+        let p = prefix(tenant, kind::META, GROUPS);
+        let mut out = Vec::new();
+        for (k, v) in self.scan(&KeyRange::prefix(&p))? {
+            let (name, _) = memcmp::get_bytes(&k[p.len()..]).map_err(|_| bad("group key"))?;
+            let r: GroupRow = parse(&v)?;
+            out.push((
+                String::from_utf8_lossy(&name).into_owned(),
+                r.generation,
+                r.state,
+            ));
+        }
+        Ok(out)
     }
 
     /// Every group row of a tenant.

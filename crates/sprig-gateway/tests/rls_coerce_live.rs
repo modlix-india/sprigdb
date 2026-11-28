@@ -90,11 +90,12 @@ async fn record_ids(c: &mut mysql_async::Conn, from: &str) -> Result<BTreeSet<i6
 /// restrictive policy hides on the table.
 const SHOWN: [i64; 2] = [1, 9];
 
+#[ignore = "live: needs SPRIG_TEST_RLS_SQL; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn every_path_decides_as_the_table() {
     let Ok(addr) = std::env::var("SPRIG_TEST_RLS_SQL") else {
         eprintln!("skipped: set SPRIG_TEST_RLS_SQL");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let mut ck = Checks {
         n: 0,

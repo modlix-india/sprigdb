@@ -1134,11 +1134,12 @@ impl Deployment {
 // Primary + replicas
 // ============================================================================
 
+#[ignore = "live: needs SPRIG_TEST_DOCKER; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn bins_primary_replica_kill9() {
     if !skip::flag(skip::DOCKER) {
         skip::report_missing(skip::DOCKER, "bins_primary_replica_kill9");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     }
     let _one = ONE_AT_A_TIME.lock().await;
     let Some(mut d) = deploy("pr").await else {
@@ -1420,11 +1421,12 @@ fn net_after<const N: usize>(net: Net, dbs: [Db; N]) -> Net {
 // Galera
 // ============================================================================
 
+#[ignore = "live: needs SPRIG_TEST_DOCKER; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn bins_galera_node_loss() {
     if !skip::flag(skip::DOCKER) {
         skip::report_missing(skip::DOCKER, "bins_galera_node_loss");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     }
     let _one = ONE_AT_A_TIME.lock().await;
     let Some(mut d) = deploy("galera").await else {
@@ -1553,11 +1555,12 @@ fn tally(history: &[OpRecord], errors: &BTreeMap<String, u64>) -> (usize, u64) {
 /// gateway. 60 s with 300-1,500 ms of added round trip (downstream
 /// 900 +- 600 ms): no 39501. Then 25 s cut off: 39501 within the permits'
 /// 7 s, and no acknowledgement after that until the heal.
+#[ignore = "live: needs SPRIG_TEST_DOCKER; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn bins_dc_lease_survives_a_slow_etcd() {
     if !skip::flag(skip::DOCKER) {
         skip::report_missing(skip::DOCKER, "bins_dc_lease_survives_a_slow_etcd");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     }
     let Some(tox_url) = skip::var(skip::TOXIPROXY) else {
         skip::report_missing(skip::TOXIPROXY, "bins_dc_lease_survives_a_slow_etcd");

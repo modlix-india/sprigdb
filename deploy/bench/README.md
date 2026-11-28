@@ -118,6 +118,41 @@ Families: `mysql`, `pg`, `mongo`, `surreal`, `arango`, `couchbase` (`query`,
   the median and spread reported; durability matched across products
   (fsync per acknowledged write) or reported both ways.
 
+## A SQL comparison that can be quoted
+
+`sql/sysbench.sh` refuses the shortcuts that made earlier SQL ratios weak:
+
+- **The same isolation level.** `--isolation read-committed` (the default)
+  is the level SprigDB, MySQL, TiDB and CockroachDB all offer; each
+  connection sets it (`sql/isolation.lua`) and the run stops if the server
+  reports another. On CockroachDB first run
+  `SET CLUSTER SETTING sql.txn.read_committed_isolation.enabled = true`, or it
+  quietly runs SERIALIZABLE. A SERIALIZABLE comparison is SprigDB against
+  CockroachDB only (TiDB has no SERIALIZABLE).
+- **Three runs or more per cell**, after a warm-up, with the median, minimum,
+  maximum and spread written by `lib/summarize.py`. Report the spread next to
+  the ratio; a ratio inside the two products' spreads is a tie.
+- **Data on disk.** Every product runs under the same memory cap per node,
+  counting the page cache: a container's `--memory 4g --memory-swap 4g` for
+  the rivals, `systemd-run --scope -p MemoryMax=4G -p MemorySwapMax=0` around
+  `sprigdb` (with `SPRIGDB_ENGINE_MB` at half the cap), and each product's
+  own cache at a quarter of it (CockroachDB `--cache=1GiB
+  --max-sql-memory=1GiB`, TiKV `storage.block-cache.capacity = "1GB"`).
+  The tables are sized so one node's data directory is at least three times
+  the cap (10 tables of 10,000,000 rows for a 4 GiB cap), and the script
+  checks it with `--data-bytes-cmd` (for example
+  `"ssh vm1 sudo du -sb /data/engine"`) before it measures. A run that fits in
+  memory must say so (`--in-memory`) and is never paired with one that
+  doesn't.
+- Rivals at a current release, and their versions in the result.
+
+```sh
+sql/sysbench.sh --target 10.97.1.11:3306 --product SprigDB --version "$BUILD" \
+  --user bench.app --password "$PW" --db sbtest -- \
+  --isolation read-committed --table-size 10000000 \
+  --memory-cap-gb 4 --data-bytes-cmd "ssh ubuntu@10.97.1.11 sudo du -sb /data/engine"
+```
+
 ## e0/: the storage-engine prototype's harness
 
 `e0/` measures the engine prototype against MySQL 8.4 and Redis 7.4

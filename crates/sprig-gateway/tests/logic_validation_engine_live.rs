@@ -222,10 +222,11 @@ async fn per_row(c: &mut Conn, n: u32, q: impl Fn(u32) -> String) -> f64 {
     started.elapsed().as_secs_f64() * 1000.0 / f64::from(n)
 }
 
+#[ignore = "live: needs SPRIG_TEST_VALID_GATEWAY, SPRIG_TEST_VALID_USER, SPRIG_TEST_VALID_PASSWORD, ...; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn validations_on_engine_tables() {
     let Some(mut c) = connect("validations_on_engine_tables").await else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let mut ck = Checks {
         passed: 0,

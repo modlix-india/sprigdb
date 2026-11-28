@@ -1,0 +1,26 @@
+# SQL triggers with UPDATE / ON DUPLICATE KEY UPDATE whose assignments read columns assigned earlier in the same list.
+x:DROP TABLE IF EXISTS ts_t
+x:DROP TABLE IF EXISTS ts_p
+x:DROP TABLE IF EXISTS ts_log
+x:CREATE TABLE ts_t (id INT PRIMARY KEY, a INT, b INT, c VARCHAR(20))
+x:CREATE TABLE ts_log (k INT AUTO_INCREMENT PRIMARY KEY, msg VARCHAR(120))
+q:CREATE TRIGGER ts_bu BEFORE UPDATE ON ts_t FOR EACH ROW INSERT INTO ts_log (msg) VALUES (CONCAT('bu ', OLD.id, ' ', OLD.a, ',', OLD.b, ' -> ', NEW.a, ',', NEW.b, ' ', IFNULL(NEW.c, '-')))
+q:CREATE TRIGGER ts_au AFTER UPDATE ON ts_t FOR EACH ROW INSERT INTO ts_log (msg) VALUES (CONCAT('au ', NEW.id, ' ', NEW.a, ',', NEW.b))
+q:INSERT INTO ts_t VALUES (1, 1, 10, 'x'), (2, 2, 20, 'y'), (3, 3, 30, NULL)
+q:UPDATE ts_t SET a = a + 1, b = a * 100 WHERE id <= 2
+q:UPDATE ts_t SET b = b + 1, a = b, c = CONCAT(c, a, ts_t.b) WHERE id = 1
+q:UPDATE ts_t SET a = 5, a = a + 1, b = `a` WHERE id = 3
+q:UPDATE ts_t SET c = 'a', b = LENGTH(c) ORDER BY id DESC LIMIT 1
+q:SELECT * FROM ts_t ORDER BY id
+q:INSERT INTO ts_t (id, a, b) VALUES (2, 9, 9) ON DUPLICATE KEY UPDATE a = a + 10, b = a + VALUES(b)
+q:INSERT INTO ts_t (id, a, b) VALUES (1, 0, 0), (4, 4, 40) ON DUPLICATE KEY UPDATE b = 7, a = b * 2
+q:SELECT * FROM ts_t ORDER BY id
+q:SELECT msg FROM ts_log ORDER BY k
+q:CREATE TABLE ts_p (id INT PRIMARY KEY, a INT, b INT)
+q:INSERT INTO ts_p VALUES (1, 1, 10)
+q:UPDATE ts_p SET a = a + 1, b = a * 100
+q:INSERT INTO ts_p VALUES (1, 0, 0) ON DUPLICATE KEY UPDATE a = a + 1, b = a
+q:SELECT * FROM ts_p
+x:DROP TABLE IF EXISTS ts_p
+x:DROP TABLE IF EXISTS ts_t
+x:DROP TABLE IF EXISTS ts_log

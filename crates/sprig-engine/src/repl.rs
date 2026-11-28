@@ -65,6 +65,26 @@ pub trait ReplicatedLog: Consensus {
         Ok(())
     }
 
+    /// [`Consensus::propose`], accepted only while this replica leads
+    /// `unit` in `term`, the leader epoch the engine was given when it took
+    /// the unit ([`crate::Engine::lead_at`]). What the engine decides as a
+    /// unit's leader rests on the unit's state at the start of that term
+    /// and on its own proposals since; in another term other leaders'
+    /// entries may lie in between. The default proposes regardless.
+    ///
+    /// # Errors
+    /// As for [`Consensus::propose`]; retryable when the term has passed.
+    fn propose_in_term(
+        &self,
+        unit: UnitId,
+        term: u64,
+        payload: Vec<u8>,
+        durability: Durability,
+    ) -> Result<Ticket> {
+        let _ = term;
+        self.propose(unit, payload, durability)
+    }
+
     /// Before a read of `unit` on the replica that leads it: returns once
     /// it is known that no other replica can have committed to the unit as
     /// its leader, so this replica's own state holds every acknowledged
@@ -243,11 +263,41 @@ impl Router {
     }
 }
 
+impl Router {
+    /// A proposal to `unit` under leader epoch `epoch`: refused
+    /// (retryable) when this node's epoch for the unit is another by now.
+    /// A replicated unit's entry is also bound to the Raft term of that
+    /// epoch, so it can't land in a later term of this node.
+    pub(crate) fn propose_under(
+        &self,
+        unit: UnitId,
+        epoch: u64,
+        payload: Vec<u8>,
+        durability: Durability,
+    ) -> Result<Ticket> {
+        if epoch == 0 || self.leaders.epoch(unit) != epoch {
+            return Err(SprigError::new(
+                SprigCode::ShardMoved,
+                "the unit's leader changed since the write was decided; retry",
+            ));
+        }
+        match self.route_write(unit)? {
+            Route::Local(l) => l.propose(unit, payload, durability),
+            Route::Repl(r) => r.propose_in_term(unit, epoch, payload, durability),
+            Route::NotYet => Err(not_started()),
+        }
+    }
+}
+
 impl Consensus for Router {
     fn propose(&self, unit: UnitId, payload: Vec<u8>, durability: Durability) -> Result<Ticket> {
         match self.route_write(unit)? {
             Route::Local(l) => l.propose(unit, payload, durability),
-            Route::Repl(r) => r.propose(unit, payload, durability),
+            // In the term this node's engine leads the unit under: its
+            // locks and caches are that term's.
+            Route::Repl(r) => {
+                r.propose_in_term(unit, self.leaders.epoch(unit), payload, durability)
+            }
             Route::NotYet => Err(not_started()),
         }
     }

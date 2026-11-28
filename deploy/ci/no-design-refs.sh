@@ -3,7 +3,7 @@
 # explaining themselves: "chapter 12", "ch. 7", "Appendix C", "the LLD",
 # "build step 3", or decision ids such as "decision S149" and "(bugfix-12)".
 #
-# Scans tracked and new files under crates/, studio/src, deploy/ and charts/.
+# Scans tracked and new files under crates/, studio/src, deploy/, charts/ and tools/.
 # Usage: deploy/ci/no-design-refs.sh   (run from anywhere inside the repo)
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
@@ -18,7 +18,7 @@ pattern='\b[Cc]hapters? [0-9]|\b[Cc]h\. ?[0-9]|\b[Aa]ppendi(x|ces) [A-G]\b|\bLLD
 # "chapter N" citations from text, and its tests feed it such text.
 allow='^crates/sprig-docs/src/reference\.rs$'
 
-hits=$(git ls-files -co --exclude-standard -- crates studio/src deploy charts |
+hits=$(git ls-files -co --exclude-standard -- crates studio/src deploy charts tools |
   grep -vE '\.(png|jpe?g|svg|ico|woff2?|lock|bin|binlog|gz|parquet|class|jar)$|/fuzz/(corpus|work|artifacts)/|^deploy/ci/no-design-refs\.sh$' |
   grep -vE "$allow" |
   tr '\n' '\0' |

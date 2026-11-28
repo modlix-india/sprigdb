@@ -185,11 +185,12 @@ fn text(i: usize) -> String {
     format!("{} number {i}", WORDS[i % WORDS.len()])
 }
 
+#[ignore = "live: needs SPRIG_TEST_EMB_SQL; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn embedded_columns_end_to_end() {
     let Ok(addr) = std::env::var("SPRIG_TEST_EMB_SQL") else {
         eprintln!("skipped: set SPRIG_TEST_EMB_SQL");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let dir = std::env::var("SPRIG_EMBED_MODEL_DIR").expect("SPRIG_EMBED_MODEL_DIR");
     let model = sprig_embed::Embedder::load(std::path::Path::new(&dir)).unwrap();

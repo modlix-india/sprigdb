@@ -1,0 +1,19 @@
+# Functional key parts: MySQL builds the index; MariaDB has none (1064).
+x:DROP TABLE IF EXISTS fx_a
+x:DROP TABLE IF EXISTS fx_b
+q:CREATE TABLE fx_a (id INT PRIMARY KEY, e VARCHAR(20), INDEX ((LOWER(e))))
+@mysql q:INSERT INTO fx_a VALUES (1, 'Ab'), (2, 'cd')
+@mysql q:SELECT id FROM fx_a WHERE LOWER(e) = 'ab'
+q:CREATE TABLE fx_b (id INT PRIMARY KEY, e VARCHAR(20), KEY k ((e + 1), e))
+@mysql q:SHOW CREATE TABLE fx_b
+@mysql q:INSERT INTO fx_b VALUES (1,'5'),(2,'7.5'),(3,' 5'),(4,'1e3'),(5,'+3'),(6,''),(7,NULL)
+@mysql q:INSERT INTO fx_b VALUES (8,'abc')
+@mysql q:INSERT INTO fx_b VALUES (9,'5abc')
+@mysql q:INSERT INTO fx_b VALUES (10,'-')
+@mysql q:INSERT INTO fx_b VALUES (11,'0x10')
+@mysql q:SELECT id, e FROM fx_b WHERE e + 1 = 6 ORDER BY id
+@mysql q:SELECT id FROM fx_b WHERE e + 1 > 2 ORDER BY id
+@mysql q:SHOW INDEX FROM fx_b
+@mysql q:SELECT INDEX_NAME, SEQ_IN_INDEX, COLUMN_NAME, EXPRESSION FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'fx_b' ORDER BY INDEX_NAME, SEQ_IN_INDEX
+x:DROP TABLE IF EXISTS fx_a
+x:DROP TABLE IF EXISTS fx_b

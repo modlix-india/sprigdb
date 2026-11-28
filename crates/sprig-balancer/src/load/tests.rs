@@ -86,11 +86,12 @@ fn accumulator_reports_cumulative_counters() {
 
 /// Live: `SPRIG_TEST_MARIADB_SINGLE`; creates and drops
 /// `placement_scan_<pid>`.
+#[ignore = "live: needs SPRIG_TEST_MARIADB_SINGLE; tools/live/README.md"]
 #[tokio::test]
 async fn live_storage_scan_reads_innodb_table_stats() {
     let Ok(url) = std::env::var("SPRIG_TEST_MARIADB_SINGLE") else {
         eprintln!("skipped: set SPRIG_TEST_MARIADB_SINGLE to run it");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let pool = mysql_async::Pool::new(mysql_async::Opts::from_url(&url).unwrap());
     let mut conn = pool.get_conn().await.unwrap();

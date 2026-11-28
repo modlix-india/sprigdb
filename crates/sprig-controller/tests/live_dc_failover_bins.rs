@@ -1582,18 +1582,22 @@ async fn scenario(fault: Fault) {
     let _ = std::fs::remove_dir_all(&work);
 }
 
+#[ignore = "live: needs SPRIG_TEST_DOCKER; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn bins_dc_cut_from_the_global_tier() {
-    if !skip::flag(skip::DOCKER) {
-        return;
-    }
+    assert!(
+        skip::flag(skip::DOCKER),
+        "live test run without its environment: see tools/live/README.md"
+    );
     Box::pin(scenario(Fault::CutFromGlobal)).await;
 }
 
+#[ignore = "live: needs SPRIG_TEST_DOCKER; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn bins_dc_frozen_by_a_process_pause() {
-    if !skip::flag(skip::DOCKER) {
-        return;
-    }
+    assert!(
+        skip::flag(skip::DOCKER),
+        "live test run without its environment: see tools/live/README.md"
+    );
     Box::pin(scenario(Fault::Freeze)).await;
 }

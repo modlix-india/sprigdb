@@ -302,7 +302,10 @@ fn every_role_with_telemetry_has_a_service_the_service_monitor_scrapes() {
         }
     }
     roles.sort();
-    assert_eq!(roles, ["controller", "gateway", "operator", "worker"]);
+    assert_eq!(
+        roles,
+        ["controller", "gateway", "node", "operator", "worker"]
+    );
     for r in &roles {
         let n = docs
             .iter()
@@ -356,9 +359,9 @@ fn every_pod_template_carries_the_chart_labels() {
             checked += 1;
         }
     }
-    // controller, gateway, worker, operator, etcd-dc, etcd-global, the
-    // settings Job and the defrag CronJob.
-    assert_eq!(checked, 8);
+    // controller, gateway, worker, operator, the storage engine nodes,
+    // etcd-dc, etcd-global, the settings Job and the defrag CronJob.
+    assert_eq!(checked, 9);
 }
 
 /// The settings Job's calls only the DC leader serves are sent again to

@@ -365,10 +365,11 @@ fn basic(e: &Env) -> String {
     )
 }
 
+#[ignore = "live: needs SPRIG_TEST_M7_GATEWAY, SPRIG_TEST_M7_USER, SPRIG_TEST_M7_PASSWORD; tools/live/README.md"]
 #[tokio::test]
 async fn rest_and_grpc_match_the_wire() {
     let Some(e) = env("rest_and_grpc_match_the_wire") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let auth = basic(&e);
     // The wire pass, in one session.
@@ -423,10 +424,11 @@ async fn rest_and_grpc_match_the_wire() {
         .unwrap();
 }
 
+#[ignore = "live: needs SPRIG_TEST_M7_GATEWAY, SPRIG_TEST_M7_USER, SPRIG_TEST_M7_PASSWORD; tools/live/README.md"]
 #[tokio::test]
 async fn transactions_hold_a_session_across_calls() {
     let Some(e) = env("transactions_hold_a_session_across_calls") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let auth = basic(&e);
     let mut admin = wire_conn(&e, None).await;
@@ -546,10 +548,11 @@ async fn transactions_hold_a_session_across_calls() {
         .unwrap();
 }
 
+#[ignore = "live: needs SPRIG_TEST_M7_GATEWAY, SPRIG_TEST_M7_USER, SPRIG_TEST_M7_PASSWORD; tools/live/README.md"]
 #[tokio::test]
 async fn idle_transaction_handles_expire() {
     let Some(e) = env("idle_transaction_handles_expire") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let auth = basic(&e);
     let set = |v: &str| format!("{{\"scope\": \"dc\", \"value\": {v}, \"reason\": \"http_live\"}}");
@@ -604,10 +607,11 @@ async fn idle_transaction_handles_expire() {
     );
 }
 
+#[ignore = "live: needs SPRIG_TEST_M7_GATEWAY, SPRIG_TEST_M7_USER, SPRIG_TEST_M7_PASSWORD; tools/live/README.md"]
 #[tokio::test]
 async fn transport_and_credential_errors() {
     let Some(e) = env("transport_and_credential_errors") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     // Wrong password: 401, 1045, WWW-Authenticate.
     let bad = format!(
@@ -651,10 +655,11 @@ async fn transport_and_credential_errors() {
 /// A failed `USE` must not leave a session on a pooled connection that
 /// still has another default schema (a `USE` may borrow such a
 /// connection; a failed one closes it).
+#[ignore = "live: needs SPRIG_TEST_M7_GATEWAY, SPRIG_TEST_M7_USER, SPRIG_TEST_M7_PASSWORD; tools/live/README.md"]
 #[tokio::test]
 async fn a_failed_use_never_leaves_another_schema() {
     let Some(e) = env("a_failed_use_never_leaves_another_schema") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let mut admin = wire_conn(&e, None).await;
     admin

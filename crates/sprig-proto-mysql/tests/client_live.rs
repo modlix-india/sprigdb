@@ -47,6 +47,7 @@ fn cfg(user: &str, pass: &str, tls: TlsMode, opts: &TlsOptions) -> ClientConfig 
     c
 }
 
+#[ignore = "live: needs SPRIG_TEST_MARIADB_SINGLE; tools/live/README.md"]
 #[tokio::test]
 async fn native_password_over_tls_against_mariadb() {
     let Some((user, pass, addr)) = url(skip::MARIADB_SINGLE) else {
@@ -54,7 +55,7 @@ async fn native_password_over_tls_against_mariadb() {
             skip::MARIADB_SINGLE,
             "native_password_over_tls_against_mariadb",
         );
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let mut c = MysqlClient::connect(&addr, &cfg(&user, &pass, TlsMode::Required, &skip_verify()))
         .await
@@ -126,11 +127,12 @@ async fn native_password_over_tls_against_mariadb() {
     c.quit().await;
 }
 
+#[ignore = "live: needs SPRIG_TEST_MARIADB_SINGLE; tools/live/README.md"]
 #[tokio::test]
 async fn compressed_plaintext_against_mariadb() {
     let Some((user, pass, addr)) = url(skip::MARIADB_SINGLE) else {
         skip::report_missing(skip::MARIADB_SINGLE, "compressed_plaintext_against_mariadb");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let mut cfg = cfg(&user, &pass, TlsMode::Disabled, &skip_verify());
     cfg.compress = true;
@@ -179,10 +181,11 @@ async fn mysql84() -> Option<(OwnContainer, String)> {
     Some((c, addr))
 }
 
+#[ignore = "live: needs SPRIG_TEST_MARIADB_SINGLE, SPRIG_TEST_DOCKER; tools/live/README.md"]
 #[tokio::test]
 async fn caching_sha2_full_and_fast_paths_and_client_cert() {
     let Some((container, addr)) = mysql84().await else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let mut root = MysqlClient::connect(
         &addr,

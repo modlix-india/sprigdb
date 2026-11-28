@@ -47,6 +47,8 @@ The graph has two parameters:
 
 `VECTOR(n)`, `VECTOR INDEX`, the `VEC_*` functions and `IGNORE INDEX` pass through both SQL personas unchanged, on port 3306 and port 3307. You write MariaDB's vector SQL as you would against MariaDB.
 
+> **On SprigDB's own storage engine** (every database created since the engine replaced MariaDB), the `VECTOR(n)` column type and `VECTOR INDEX` aren't available yet. What works there: [embedded columns](#embedded-columns), `AI_EMBED`, and the functions `VEC_DISTANCE_COSINE(a, b)`, `VEC_DISTANCE_EUCLIDEAN(a, b)`, `VEC_FromText('[...]')` and `VEC_ToText(v)` over binary strings of little-endian 32-bit floats (a `VARBINARY` column holds them). Two vectors of different lengths give `NULL`, and so does the cosine distance of a zero vector; a binary string that isn't a whole number of floats is error 4206, and text that isn't a JSON array of numbers error 4205. Searches over them are exact.
+
 ```sql test
 CREATE TABLE products (
   id        BIGINT PRIMARY KEY,
@@ -158,17 +160,21 @@ ALTER TABLE items ADD COLUMN embedding VECTOR(384)
   USING MODEL 'local:bge-small';
 ```
 
-The model `local:bge-small` is bundled with SprigDB: BAAI's bge-small-en-v1.5, 384 dimensions, English. It runs inside SprigDB's worker processes, so your rows never leave SprigDB. The full syntax and its rules are in [Search and vectors in SQL](../sql/search-and-vectors.md#embedded-columns).
+The model `local:bge-small` is bundled with SprigDB: BAAI's bge-small-en-v1.5, 384 dimensions, English. It runs inside SprigDB's own processes, so your rows never leave SprigDB. The full syntax and its rules are in [Search and vectors in SQL](../sql/search-and-vectors.md#embedded-columns).
 
 ### How the column is filled
 
-- **After the write.** A worker follows the table's [change feed](../concepts/change-feed.md) and embeds each new or changed source, usually within a second or two. Until then the column is `NULL`, so a search should skip unfilled rows: `WHERE embedding IS NOT NULL`. Your statement never waits for the model.
-- **Only when the source changes.** SprigDB keeps a hash of the text it embedded with each row. An update that leaves the source as it was costs nothing. A source that becomes `NULL` or blank makes the vector `NULL`.
-- **Existing rows.** Declaring the column on a table with rows starts a backfill that embeds them in key order, at most `ai.embedding.backfill_rows_per_s` rows a second (500 by default), while new changes are embedded as they come. A worker that stops carries on where the backfill was.
-- **Exactly once.** The worker records how far it has read the feed only after its writes commit, and writes a vector only if the row's source is still the one it embedded. A worker killed in the middle of a batch is replaced, reads the last changes again and passes over the rows it had already written; a row changed again meanwhile gets the vector of its newest source.
-- **A background check.** Once the column is filled, the worker also rereads its rows slowly (at a tenth of `ai.embedding.backfill_rows_per_s`, resting a minute after each pass) and embeds any row whose vector isn't its current source's, so a change the worker missed is embedded late rather than never.
-- **Graceful stops.** A worker stopped gracefully (`SIGTERM`) first finishes the changes written up to its stop, for at most 3 seconds, and records how far it got, so binary logs purged right after the stop take nothing it needs. After a `kill -9`, keep the binary logs until the worker has caught up.
+- **After the write.** The node that holds the table follows its change log and embeds each new or changed source, usually within a second or two. Until then the column is `NULL`, so a search should skip unfilled rows: `WHERE embedding IS NOT NULL`. Your statement never waits for the model.
+- **Only when the source changes.** SprigDB keeps a hash of the text it embedded with each row. An update that leaves the source as it was costs nothing. A source that becomes `NULL` or blank makes the vector `NULL`. A deleted row's vector goes with the row.
+- **Existing rows.** Declaring the column on a table with rows starts a backfill that embeds them in key order, at most `ai.embedding.backfill_rows_per_s` rows a second (500 by default), while new changes are embedded as they come.
+- **Exactly once, across restarts.** SprigDB records how far it has read the change log, and how far the backfill got, only after its writes commit, and writes a vector only if the row's source is still the one it embedded. After a restart (or a `kill -9`) it reads the last changes again and passes over the rows it had already written; a row changed again meanwhile gets the vector of its newest source.
+- **A background check.** Once the column is filled, SprigDB also rereads its rows slowly (at a tenth of `ai.embedding.backfill_rows_per_s`, resting a minute after each pass) and embeds any row whose vector isn't its current source's, so a change that was missed is embedded late rather than never.
+- **Whose rights.** The column is filled as the user who declared it, with that user's privileges on the table (`SELECT` and `UPDATE`), and every row is filled whatever row-level security policies say; readers' own policies apply when they read it. So on a table with row-level security, only a user its policies don't limit (`BYPASS RLS`, an administrator, or exempt from the table's policies) can declare one (39997). If the declarer is dropped, loses the privileges or becomes limited by a policy, the column stops until that is fixed.
+- **Not a change of the row.** Filling the vector fires none of the table's triggers or validations and doesn't move `ON UPDATE CURRENT_TIMESTAMP` columns. `CHECK`, `NOT NULL`, foreign keys and unique keys still apply.
+- **A row that can't be filled** (a constraint refuses it, say) is passed over and tried again later; the other rows are filled.
 - **Long inputs.** A source is cut to `ai.embedding.max_input_bytes` (64 KiB) and to the model's 512 tokens, or fewer with `WITH (max_input_tokens = n)`.
+
+On disk the column holds the vector's bytes (`n` little-endian 32-bit floats, as `VECTOR(n)` does), so `information_schema` and `SHOW CREATE TABLE` show it as `VARBINARY(4n)`, beside two hidden columns, `_sprig_emb_<column>_src` and `_sprig_emb_<column>_hash`, that `SELECT *` leaves out.
 
 ### Searching
 
@@ -203,23 +209,27 @@ The model's vectors have length 1, so cosine distance is the one to use. A `VECT
 
 ### Changing the model or the source
 
+To embed with another model or another expression, drop the column and add it again; the new column is backfilled:
+
 ```sql
-ALTER TABLE items MODIFY COLUMN embedding VECTOR(384)
+ALTER TABLE items DROP COLUMN embedding;
+ALTER TABLE items ADD COLUMN embedding VECTOR(384)
   GENERATED BY EMBEDDING(description)
   USING MODEL 'local:bge-small';
 ```
 
-A new model, source or token limit starts a re-embedding into a new generation of the column, kept in hidden columns beside it. Readers keep the old vectors until every row has its new one; then one statement per table shard swaps the new generation in. A change of the model alone is swapped in place; a new source rebuilds the table. While a re-embedding runs, a second change to the column is refused (39997).
+`ALTER TABLE ... MODIFY COLUMN` with a new embedding clause, which re-embedded in place on MariaDB-backed tables, isn't available yet (39997).
 
 ### What you can't do
 
-- Change the column with `CHANGE`, `MODIFY` (without the clause), `RENAME COLUMN` or `ALTER COLUMN`: drop it and add it again, or change its model or source as above (39997).
-- Drop a column the source uses while the embedded column exists: MariaDB refuses it (1054).
-- Declare an embedded column on a table without a primary key, or in a temporary table (39997).
+- Change the column with `CHANGE`, `MODIFY`, `RENAME COLUMN` or `ALTER COLUMN`: drop it and add it again (39997).
+- Drop a column the source uses while the embedded column exists: it is refused, as for any generated column (1054 on port 3307, 3837 on port 3306).
+- Declare an embedded column on a table without a primary key, or whose primary key is a floating-point, `JSON` or `BIT` column (39997).
+- Make a `TEMPORARY` copy of such a table with `CREATE TEMPORARY TABLE ... LIKE` (39997). A plain `CREATE TABLE ... LIKE` copy gets embedded columns of its own, filled like a new table.
 - Embed something that isn't a function of the row, such as `RAND()`, `NOW()`, `USER()`, a variable or a subquery (39997).
 - Use a provider's embedding model or `ON CHANGE SYNC`: neither is available yet (39997).
 
-Writing to the column yourself is allowed, but the next change to the row's source replaces what you wrote.
+Writing to the column yourself is allowed, but SprigDB replaces what you wrote with the model's vector of the row's source within seconds.
 
 The column is a visible column like any other, so an `INSERT` without a column list must give it a value: name your columns, or give `NULL` for it.
 
@@ -233,14 +243,13 @@ The column is a visible column like any other, so an `INSERT` without a column l
 | `ai.embedding.batch_rows` | `64` | global | Inputs sent to the model at once |
 | `ai.embedding.max_input_bytes` | `65536` | global | Source bytes embedded at most |
 
-The worker finds the model in `docs.model_dir`, the same directory the docs search uses.
+SprigDB finds the model in `docs.model_dir`, the same directory the docs search uses.
 
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
 | `sprig_ai_embedding_rows_total` | counter | `model`, `result` | Rows handled: `embedded`, `cleared`, `skipped` (already current), `superseded` (changed again first) |
 | `sprig_ai_embedding_seconds` | histogram | `model` | Time of one model batch |
-| `sprig_ai_embedding_backlog` | gauge | none | Changed rows a worker has read and not yet written |
-| `sprig_ai_embedding_cutovers_total` | counter | `result` | Re-embeddings swapped in: `done` or `failed` |
+| `sprig_ai_embedding_backlog` | gauge | none | Changed rows read and not yet written, in this process |
 
 ## Retrieval indexes
 

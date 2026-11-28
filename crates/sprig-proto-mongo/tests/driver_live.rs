@@ -78,12 +78,13 @@ fn all_types() -> Document {
     }
 }
 
+#[ignore = "live: needs SPRIG_TEST_MONGO_URI; tools/live/README.md"]
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn gateway_live() {
     let Some(u) = uri("SPRIG_TEST_MONGO_URI") else {
         eprintln!("SPRIG_TEST_MONGO_URI not set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let c = client(&u, None).await;
     let admin = c.database("admin");
@@ -1304,11 +1305,12 @@ fn same(a: &Bson, b: &Bson) -> bool {
         == mongodb::bson::to_vec(&doc! {"v": b.clone()}).unwrap()
 }
 
+#[ignore = "live: needs SPRIG_TEST_MONGO_URI, SPRIG_TEST_MONGO_REF_URI; tools/live/README.md"]
 #[tokio::test]
 async fn differential_against_mongodb() {
     let (Some(g), Some(r)) = (uri("SPRIG_TEST_MONGO_URI"), uri("SPRIG_TEST_MONGO_REF_URI")) else {
         eprintln!("SPRIG_TEST_MONGO_URI or SPRIG_TEST_MONGO_REF_URI not set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let gdb = client(&g, None).await.database("r5mongo_diff");
     let rdb = client(&r, None).await.database("r5mongo_diff");
@@ -1338,11 +1340,12 @@ async fn differential_against_mongodb() {
 /// microseconds, printed for the gateway and (when set) the reference.
 /// A probe, not a benchmark: run it against a release build on quiet
 /// hardware for numbers worth comparing.
+#[ignore = "live: needs SPRIG_TEST_MONGO_URI; tools/live/README.md"]
 #[tokio::test]
 async fn point_read_latency() {
     let Some(g) = uri("SPRIG_TEST_MONGO_URI") else {
         eprintln!("SPRIG_TEST_MONGO_URI not set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let mut targets = vec![("sprig", g)];
     if let Some(r) = uri("SPRIG_TEST_MONGO_REF_URI") {

@@ -6,33 +6,30 @@
 
 <p align="center">
   <b>One database for every data model. It runs itself.</b><br>
-  An open-source, multi-model, multi-data-centre database, built in Rust as a layer over MariaDB.
+  An open-source, multi-model database with its own storage engine, built in Rust.
 </p>
 
 <p align="center">
   <a href="LICENSE"><img alt="Licence: Apache-2.0" src="https://img.shields.io/badge/licence-Apache--2.0-e0805a"></a>
   <img alt="Rust" src="https://img.shields.io/badge/built%20with-Rust-a5502c">
-  <img alt="MariaDB 11.8 and 12.3" src="https://img.shields.io/badge/MariaDB-11.8%20%7C%2012.3-5d6573">
 </p>
 
 ---
 
 Say hello to **Sprig** 👋, the axolotl on this page. Axolotls regrow what they lose, and SprigDB aims to do the same for your data: it moves, reshapes and heals itself so you don't have to.
 
-Your applications connect as they already do, with a MySQL or MariaDB driver, `mongosh`, `redis-cli`, a Neo4j driver or a Kafka client. Behind that, SprigDB keeps everything in MariaDB and takes care of what normally needs a DBA:
+Your applications connect as they already do, with a MySQL or MariaDB driver, `mongosh`, `redis-cli`, a Neo4j driver, a Kafka client or an AMQP client. Behind that, every model lives in one storage engine of SprigDB's own: RocksDB underneath, multi-version transactions with row locks on top, and each tenant's data replicated over Raft across nodes. SprigDB aims to take care of what normally needs a DBA:
 - deciding where data lives;
-- splitting it into shards;
-- creating indexes;
-- surviving a failed node or a whole data centre.
+- moving and replicating it as nodes come and go;
+- keeping tenants apart;
+- surviving a failed node.
 
 ## Why SprigDB
 
-- **Many models, one store.** Tables, documents, key-value, vectors, graphs, streams and queues, all in MariaDB, joinable in one query.
+- **Many models, one store.** Tables, documents, key-value, vectors, graphs, streams and queues in one engine, with transactions that span them.
 - **Your drivers just work.** MySQL 8.4 and MariaDB personas, the MongoDB 8 wire protocol, Redis (RESP), Neo4j Bolt, Kafka and AMQP, plus REST and gRPC.
-- **Sharding without a DBA.** Tenants start on one shard. SprigDB learns the workload, chooses the keys, and splits, merges and moves shards online.
-- **Indexes from your queries.** Repeated slow queries get indexes that are designed, checked on a replica, rolled out and retired automatically.
-- **Many data centres.** Routing, moves, residency pins and safe failover across sites, on Galera, primary with replicas, a single node or managed MariaDB.
-- **Multi-tenant by design.** Tenant trees, inherited settings, row-level security, and isolation enforced by MariaDB's own grants.
+- **Placement without a DBA.** Each tenant's data is placed on nodes in distinct failure domains, replicated, and moved or re-replicated when a node drains or dies.
+- **Multi-tenant by design.** Tenant trees, inherited settings, grants per user and row-level security.
 - **Logic next to the data.** Functions and triggers in KIRun, JavaScript or Lua, and sinks to other systems.
 - **You stay in charge.** Every automatic decision can run on its own, wait for your approval, or only recommend.
 - **Studio and `sprig`.** A browser workspace and a terminal shell with the same calm, coral-gold look.
@@ -47,18 +44,20 @@ Your applications connect as they already do, with a MySQL or MariaDB driver, `m
 
 ## Quick start
 
-You need Docker with Compose v2, and Rust: `rust-toolchain.toml` pins the version, and rustup installs it on first use.
+You need Docker (for etcd), `jq`, and Rust: `rust-toolchain.toml` pins the version, and rustup installs it on first use.
 
 ```sh
-# 1. MariaDB (single node, primary with replicas, and Galera) and etcd
-cd deploy/compose && docker compose --profile all up -d --wait && cd -
+# 1. Build the node and the command-line tool
+cargo build -p sprigdb -p sprigctl
 
-# 2. A controller and a gateway on your machine
-deploy/compose/gateway-dev.sh up
+# 2. etcd in a container, a controller and one node on your machine (tools/live/README.md)
+tools/live/stack.sh up 1
 
-# 3. Connect with any MySQL or MariaDB client, as user app of the sample tenant acme
-mysql -h 127.0.0.1 -P 13306 -u acme.app -psprig-dev-app \
-      --ssl-mode=VERIFY_IDENTITY --ssl-ca=deploy/compose/gateway-certs/ca.pem
+# 3. A tenant, acme, with the user app
+tools/live/stack.sh tenant acme sprig-dev-app
+
+# 4. Connect with any MySQL client (port 45107 is the MariaDB persona)
+mysql -h 127.0.0.1 -P 45106 -u acme.app -psprig-dev-app --ssl-mode=REQUIRED
 ```
 
 ```sql
@@ -68,9 +67,9 @@ INSERT INTO shop.orders VALUES (1, 'paid', 42.50);
 SELECT * FROM shop.orders;
 ```
 
-The gateway makes two sample tenants, `acme` and `globex`, each with a user `app`. Port 13307 is the MariaDB persona.
+`tools/live/stack.sh up 3` starts three nodes that replicate each tenant over Raft; `tools/live/stack.sh down` stops everything.
 
-To try **Studio**, run Studio's test setup, `deploy/compose/studio/e2e.sh setup`. It turns on the HTTP listener and adds sample data; then open <http://127.0.0.1:18080/studio> and sign in as `acme.app`. The **`sprig`** shell is `cargo run -p sprig-shell --bin sprig -- --url http://127.0.0.1:18080 -u acme.app`.
+**Studio** is served on the node's HTTP port, <http://127.0.0.1:45101/studio> (sign in as `acme.app`), from a build that includes it: `cd studio && pnpm install && pnpm build`, then build `sprigdb` again (it embeds `studio/dist`). The **`sprig`** shell is `cargo run -p sprig-shell --bin sprig -- --url http://127.0.0.1:45101 -u acme.app`.
 
 These credentials are for local development only. Never reuse them.
 
@@ -87,16 +86,19 @@ The same pages are published as a website, with search and a PDF download, from 
 
 ## Project status
 
-SprigDB is under active development, and not yet ready for production. The protocols, sharding, automatic indexing, multi-data-centre failover, Studio and `sprig` all work today. Expect changes before 1.0.
+SprigDB is under active development, and not yet ready for production. A single node, its protocols, Studio and `sprig` work today. Replication, failover and placement across nodes are built and still being verified; until that is done, don't rely on them. Expect changes before 1.0.
 
 ## Building from source
 
 ```sh
 cargo build --workspace
-cargo test --workspace
+cargo test --workspace          # tests that need a running stack are ignored here
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
+tools/live/run.sh list          # the live suites, against a local stack
 ```
+
+The checkers behind the correctness numbers (the kill loop, follower reads under faults, the SQL differential) are in [`tools/`](tools/README.md).
 
 See [Developing SprigDB](docs/operate/development.md) for everything else.
 

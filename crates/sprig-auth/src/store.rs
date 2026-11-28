@@ -692,9 +692,7 @@ impl AuthStore {
         let mut row = r.clone();
         row.verifier_id = id;
         row.created_at = crate::rec::to_micros(row.created_at);
-        VERIFIERS
-            .put(tx, &verifier_pk(r.user_id, id), &row)
-            .await?;
+        VERIFIERS.put(tx, &verifier_pk(r.user_id, id), &row).await?;
         Ok(id)
     }
 

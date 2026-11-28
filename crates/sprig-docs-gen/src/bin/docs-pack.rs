@@ -34,6 +34,7 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
+use sprig_docs::index::DocsIndex;
 use sprig_docs::pack::{Chunk, Pack, chunk_pages, hex};
 use sprig_docs::page::read_pages;
 use sprig_docs::search::{
@@ -377,10 +378,12 @@ fn run_eval(args: &Args) -> Result<ExitCode, String> {
     // Per kind of question: hits in each mode, then the question count.
     let mut by_kind: BTreeMap<String, [usize; 5]> = BTreeMap::new();
     let mut embed_times: Vec<Duration> = Vec::new();
+    let mut qvs: Vec<Vec<f32>> = Vec::new();
     for q in &golden.question {
         let t = Instant::now();
         let qv = embedder.embed_query(&q.q).map_err(|e| e.to_string())?;
         embed_times.push(t.elapsed());
+        qvs.push(qv.to_vec());
         let found = index
             .rank(&q.q, &qv, TOP)
             .map(|m| m.iter().any(|&(i, _)| q.answered_by(&chunks[i])));
@@ -428,11 +431,52 @@ fn run_eval(args: &Args) -> Result<ExitCode, String> {
         ms(embed_times.get(embed_times.len() * 9 / 10)),
         ms(embed_times.last())
     );
+    check_node_index(&bytes, &golden, &qvs, &index)?;
     Ok(if r(hits[2]) >= 0.9 {
         ExitCode::SUCCESS
     } else {
         ExitCode::from(1)
     })
+}
+
+/// The index every node serves docs search from (in memory, the vector
+/// list an exact scan): its hybrid hits must be eval's, question by
+/// question. Prints its recall and search times.
+fn check_node_index(
+    bytes: &[u8],
+    golden: &Golden,
+    qvs: &[Vec<f32>],
+    index: &Index<'_>,
+) -> Result<(), String> {
+    let node = DocsIndex::from_bytes(bytes).map_err(|e| e.to_string())?;
+    let n = golden.question.len();
+    let (mut node_found, mut same) = (0usize, 0usize);
+    let mut search_times: Vec<Duration> = Vec::new();
+    for (q, qv) in golden.question.iter().zip(qvs) {
+        let started = Instant::now();
+        let got = node.hybrid(&q.q, Some(qv), None, TOP);
+        search_times.push(started.elapsed());
+        let want = index.rank(&q.q, qv, TOP)[2].clone();
+        if got.iter().map(|f| f.chunk).eq(want.iter().map(|w| w.0)) {
+            same += 1;
+        }
+        node_found += usize::from(got.iter().any(|f| q.answered_by(&node.chunks()[f.chunk])));
+    }
+    search_times.sort_unstable();
+    let ms = |d: Option<&Duration>| d.map_or(0.0, |d| d.as_secs_f64() * 1000.0);
+    #[allow(clippy::cast_precision_loss)]
+    let recall = node_found as f64 / n.max(1) as f64;
+    println!(
+        "node index (in memory): recall@{TOP} {recall:.3} ({node_found}/{n}), same hits as hybrid \
+         {same}/{n}; search (without the query embedding) median {:.2} ms, max {:.2} ms",
+        ms(search_times.get(search_times.len() / 2)),
+        ms(search_times.last())
+    );
+    if same == n {
+        Ok(())
+    } else {
+        Err("the node index's hybrid hits differ from eval's".into())
+    }
 }
 
 fn mark(b: bool) -> &'static str {

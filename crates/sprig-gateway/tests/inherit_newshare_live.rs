@@ -140,11 +140,12 @@ async fn share_with(p: &mut Conn, db: &str, opts: &str) {
     .await;
 }
 
+#[ignore = "live: needs SPRIG_TEST_NEWSHARE_GATEWAY, SPRIG_TEST_NEWSHARE_PARENT, SPRIG_TEST_NEWSHARE_BACKEND, ...; tools/live/README.md"]
 #[tokio::test]
 async fn a_new_share_is_usable_before_the_childs_first_statement() {
     let Some(e) = env() else {
         eprintln!("SPRIG_TEST_NEWSHARE_* not set; skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let db = format!("bf11ns{}", suffix());
     let mut p = conn(&e.addr, &e.parent).await;
@@ -204,11 +205,12 @@ async fn a_new_share_is_usable_before_the_childs_first_statement() {
     }
 }
 
+#[ignore = "live: needs SPRIG_TEST_NEWSHARE_GATEWAY, SPRIG_TEST_NEWSHARE_PARENT, SPRIG_TEST_NEWSHARE_BACKEND, ...; tools/live/README.md"]
 #[tokio::test]
 async fn a_child_keeps_its_rows_when_the_parent_drops_a_shared_database() {
     let Some(e) = env() else {
         eprintln!("SPRIG_TEST_NEWSHARE_* not set; skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let db = format!("bf11nk{}", suffix());
     let mut p = conn(&e.addr, &e.parent).await;
@@ -311,11 +313,12 @@ async fn share_views() -> Option<Vec<String>> {
     Some(v.into_iter().map(|(s, t)| format!("{s}.{t}")).collect())
 }
 
+#[ignore = "live: needs SPRIG_TEST_NEWSHARE_GATEWAY, SPRIG_TEST_NEWSHARE_PARENT, SPRIG_TEST_NEWSHARE_BACKEND, ...; tools/live/README.md"]
 #[tokio::test]
 async fn a_dropped_share_leaves_the_childs_overrides_as_its_own_rows() {
     let Some(e) = env() else {
         eprintln!("SPRIG_TEST_NEWSHARE_* not set; skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let gk = std::env::var("SPRIG_TEST_NEWSHARE_GRANDCHILD")
         .ok()
@@ -453,11 +456,12 @@ async fn rows_become(c: &mut Conn, db: &str, want: &[(&str, &str)]) -> Vec<(Stri
 /// `a_dropped_share_leaves_the_childs_overrides_as_its_own_rows`).
 /// Before, the hide rows stayed (record 2 stayed hidden under the new
 /// share) and the copy table stayed, emptied by the worker.
+#[ignore = "live: needs SPRIG_TEST_NEWSHARE_GATEWAY, SPRIG_TEST_NEWSHARE_PARENT, SPRIG_TEST_NEWSHARE_BACKEND, ...; tools/live/README.md"]
 #[tokio::test]
 async fn a_dropped_share_takes_the_childs_hides_and_copy_with_it() {
     let Some(e) = env() else {
         eprintln!("SPRIG_TEST_NEWSHARE_* not set; skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let db = format!("bf13dh{}", suffix());
     let mut p = conn(&e.addr, &e.parent).await;
@@ -561,11 +565,12 @@ fn restart_gateway() -> bool {
 /// cleanup. The cleanup is held up with a row lock on the child's
 /// override (an open transaction of the child's), the gateway is killed
 /// while it waits, and started again. Needs `SPRIG_TEST_NEWSHARE_RESTART`.
+#[ignore = "live: needs SPRIG_TEST_NEWSHARE_GATEWAY, SPRIG_TEST_NEWSHARE_PARENT, SPRIG_TEST_NEWSHARE_BACKEND, ...; tools/live/README.md"]
 #[tokio::test]
 async fn a_drop_cut_off_by_a_gateway_crash_is_finished_by_the_next_statement() {
     let Some(e) = env() else {
         eprintln!("SPRIG_TEST_NEWSHARE_* not set; skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     if std::env::var("SPRIG_TEST_NEWSHARE_RESTART").is_err() {
         eprintln!("SPRIG_TEST_NEWSHARE_RESTART not set; skipped");
@@ -683,11 +688,12 @@ async fn share_states(b: &mut Conn, like: &str, name: &str) -> Vec<String> {
 /// on the backend only until the row is gone, so no gateway statement can
 /// have done it. Needs `SPRIG_TEST_NEWSHARE_RESTART`, the backend variables
 /// and a worker.
+#[ignore = "live: needs SPRIG_TEST_NEWSHARE_GATEWAY, SPRIG_TEST_NEWSHARE_PARENT, SPRIG_TEST_NEWSHARE_BACKEND, ...; tools/live/README.md"]
 #[tokio::test]
 async fn a_drop_cut_off_by_a_gateway_crash_is_finished_by_the_copy_worker() {
     let Some(e) = env() else {
         eprintln!("SPRIG_TEST_NEWSHARE_* not set; skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     if std::env::var("SPRIG_TEST_NEWSHARE_RESTART").is_err() {
         eprintln!("SPRIG_TEST_NEWSHARE_RESTART not set; skipped");
@@ -777,11 +783,12 @@ async fn drop_conns(v: Vec<Conn>) {
 /// grandchild's) follows for the records the filter now hides or shows
 /// (before, only changes of the source's rows reached it). Needs
 /// `SPRIG_TEST_NEWSHARE_GRANDCHILD` and a worker.
+#[ignore = "live: needs SPRIG_TEST_NEWSHARE_GATEWAY, SPRIG_TEST_NEWSHARE_PARENT, SPRIG_TEST_NEWSHARE_BACKEND, ...; tools/live/README.md"]
 #[tokio::test]
 async fn a_childs_reseed_reaches_the_grandchilds_copy() {
     let Some(e) = env() else {
         eprintln!("SPRIG_TEST_NEWSHARE_* not set; skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let Some(gk) = std::env::var("SPRIG_TEST_NEWSHARE_GRANDCHILD")
         .ok()
@@ -861,11 +868,12 @@ async fn a_childs_reseed_reaches_the_grandchilds_copy() {
 /// also records the parent writes while forced. Before the share definer,
 /// the views ran as the share's creator, whom `FORCE` bound, and every
 /// child's read failed with 1142.
+#[ignore = "live: needs SPRIG_TEST_NEWSHARE_GATEWAY, SPRIG_TEST_NEWSHARE_PARENT, SPRIG_TEST_NEWSHARE_BACKEND, ...; tools/live/README.md"]
 #[tokio::test]
 async fn a_parents_forced_policies_dont_bind_its_share_views() {
     let Some(e) = env() else {
         eprintln!("SPRIG_TEST_NEWSHARE_* not set; skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     for merge in ["read_through", "materialized"] {
         let db = format!("sf20fp{}{}", &merge[..1], suffix());
@@ -995,11 +1003,12 @@ fn rest_rows(v: &serde_json::Value) -> Vec<(String, String)> {
 /// `Begin` named; an unknown space is 39880 and one above the user's home
 /// space 39884. Needs `SPRIG_TEST_NEWSHARE_HTTP` (the gateway's HTTP
 /// listener, plain HTTP).
+#[ignore = "live: needs SPRIG_TEST_NEWSHARE_GATEWAY, SPRIG_TEST_NEWSHARE_PARENT, SPRIG_TEST_NEWSHARE_BACKEND, ...; tools/live/README.md"]
 #[tokio::test]
 async fn the_space_header_picks_the_calls_space() {
     let Some(e) = env() else {
         eprintln!("SPRIG_TEST_NEWSHARE_* not set; skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let Some(http) = std::env::var("SPRIG_TEST_NEWSHARE_HTTP")
         .ok()
@@ -1206,11 +1215,12 @@ async fn the_space_header_picks_the_calls_space() {
 /// overrides, hide markers, other spaces' records). A model over one is
 /// refused (39752) when it is made, and at its next query when a table
 /// becomes inheritable later. Needs `SPRIG_TEST_NEWSHARE_HTTP`.
+#[ignore = "live: needs SPRIG_TEST_NEWSHARE_GATEWAY, SPRIG_TEST_NEWSHARE_PARENT, SPRIG_TEST_NEWSHARE_BACKEND, ...; tools/live/README.md"]
 #[tokio::test]
 async fn analytics_models_refuse_inheritable_tables() {
     let Some(e) = env() else {
         eprintln!("SPRIG_TEST_NEWSHARE_* not set; skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let Some(http) = std::env::var("SPRIG_TEST_NEWSHARE_HTTP")
         .ok()

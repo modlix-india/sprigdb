@@ -1,0 +1,39 @@
+# Correlated subqueries beyond the equality shapes: EXISTS / NOT EXISTS / IN / NOT IN / scalar subqueries that read
+# the outer query through any condition, in WHERE, the select list and HAVING; joins, grouping, LIMIT, derived
+# tables and set operations inside; nested; NULL semantics of NOT IN; 1242.
+x:DROP TABLE IF EXISTS cq_c, cq_o, cq_i
+x:CREATE TABLE cq_c (id INT PRIMARY KEY, name VARCHAR(20), tier VARCHAR(10), lim DECIMAL(8,2), KEY (tier))
+x:CREATE TABLE cq_o (id INT PRIMARY KEY, cid INT, amount DECIMAL(8,2), st VARCHAR(10), d DATE, KEY (cid))
+x:CREATE TABLE cq_i (oid INT, line INT, sku VARCHAR(10), qty INT, PRIMARY KEY (oid, line))
+x:INSERT INTO cq_c VALUES (1, 'ann', 'gold', 100.00), (2, 'bob', 'silver', 50.00), (3, 'cy', 'gold', NULL), (4, 'dee', NULL, 10.00), (5, 'eve', 'none', 0.00)
+x:INSERT INTO cq_o VALUES (10, 1, 120.00, 'paid', '2024-01-05'), (11, 1, 30.00, 'new', '2024-02-01'), (12, 2, 45.50, 'paid', '2024-01-20'), (13, 2, 60.00, 'sent', '2024-03-02'), (14, 3, 5.00, 'new', NULL), (15, 4, NULL, 'paid', '2024-02-02'), (16, NULL, 9.99, 'new', '2024-01-01')
+x:INSERT INTO cq_i VALUES (10, 1, 'a1', 2), (10, 2, 'b2', 1), (11, 1, 'a1', 5), (12, 1, 'c3', NULL), (13, 1, 'a1', 1), (13, 2, 'a1', 3), (15, 1, 'z9', 7)
+q:SELECT id FROM cq_o o WHERE NOT EXISTS (SELECT 1 FROM cq_o p WHERE p.cid = o.cid AND p.amount > o.amount) ORDER BY id
+q:SELECT id FROM cq_o o WHERE EXISTS (SELECT 1 FROM cq_c c WHERE c.id = o.cid AND o.amount > c.lim) ORDER BY id
+q:SELECT id FROM cq_c c WHERE EXISTS (SELECT 1 FROM cq_o o WHERE o.cid = c.id AND o.amount BETWEEN c.lim / 2 AND c.lim) ORDER BY id
+q:SELECT id FROM cq_c c WHERE id IN (SELECT cid FROM cq_o o WHERE o.amount > c.lim) ORDER BY id
+q:SELECT id FROM cq_c c WHERE id NOT IN (SELECT cid FROM cq_o o WHERE o.st = 'new' OR o.amount < c.lim) ORDER BY id
+q:SELECT id FROM cq_c c WHERE tier NOT IN (SELECT st FROM cq_o o WHERE o.cid = c.id OR o.cid IS NULL) ORDER BY id
+q:SELECT id, id IN (SELECT cid FROM cq_o o WHERE o.amount > c.lim), id NOT IN (SELECT cid FROM cq_o o WHERE o.amount > c.lim) FROM cq_c c ORDER BY id
+q:SELECT id, (SELECT COUNT(*) FROM cq_o o WHERE o.amount > c.lim) FROM cq_c c ORDER BY id
+q:SELECT id, (SELECT SUM(qty) FROM cq_o o JOIN cq_i i ON i.oid = o.id WHERE o.cid = c.id) FROM cq_c c ORDER BY id
+q:SELECT id, (SELECT MAX(o.d) FROM cq_o o WHERE o.cid = c.id AND o.st <> c.tier) FROM cq_c c ORDER BY id
+q:SELECT id, (SELECT o.id FROM cq_o o WHERE o.cid <= c.id ORDER BY o.amount DESC, o.id LIMIT 1) FROM cq_c c ORDER BY id
+q:SELECT id, (SELECT st FROM cq_o o WHERE o.cid = c.id GROUP BY st ORDER BY COUNT(*) DESC, st LIMIT 1) FROM cq_c c ORDER BY id
+q:SELECT id, EXISTS (SELECT 1 FROM cq_o o WHERE o.cid = c.id AND o.amount > 50), NOT EXISTS (SELECT 1 FROM cq_o o WHERE o.amount < c.lim) FROM cq_c c ORDER BY id
+q:SELECT id FROM cq_c c WHERE EXISTS (SELECT 1 FROM cq_o o WHERE o.cid = c.id AND EXISTS (SELECT 1 FROM cq_i i WHERE i.oid = o.id AND i.qty > c.id)) ORDER BY id
+q:SELECT id FROM cq_c c WHERE (SELECT COUNT(*) FROM cq_o o WHERE o.cid = c.id AND o.amount > 20) >= 2 ORDER BY id
+q:SELECT id FROM cq_c c WHERE c.lim < (SELECT MAX(amount) FROM cq_o o WHERE o.cid = c.id) ORDER BY id
+q:SELECT id FROM cq_c c WHERE EXISTS (SELECT 1 FROM cq_o o WHERE o.cid = c.id UNION SELECT 1 FROM cq_o o WHERE o.amount = c.lim) ORDER BY id
+q:SELECT id FROM cq_c c WHERE 2 = (SELECT COUNT(*) FROM cq_o o WHERE o.cid = c.id) OR c.tier = 'none' ORDER BY id
+q:SELECT tier, COUNT(*) FROM cq_c c WHERE EXISTS (SELECT 1 FROM cq_o o WHERE o.cid = c.id AND o.amount > c.lim / 4) GROUP BY tier ORDER BY tier
+q:SELECT c.id, o.id FROM cq_c c JOIN cq_o o ON o.cid = c.id WHERE o.amount = (SELECT MAX(p.amount) FROM cq_o p WHERE p.cid = c.id AND p.st = o.st) ORDER BY 1, 2
+q:SELECT id FROM cq_o o WHERE o.amount > (SELECT AVG(p.amount) FROM cq_o p WHERE p.st = o.st) ORDER BY id
+q:SELECT id, (SELECT name FROM cq_c c WHERE c.id = o.cid AND c.lim >= o.amount) FROM cq_o o ORDER BY id
+q:SELECT id, (SELECT id FROM cq_o o WHERE o.cid > c.id) FROM cq_c c ORDER BY id
+q:SELECT id, (SELECT id, cid FROM cq_o o WHERE o.cid = c.id LIMIT 1) FROM cq_c c ORDER BY id
+q:SELECT id FROM cq_c c WHERE id IN (SELECT cid FROM cq_o o WHERE o.amount > c.lim LIMIT 1) ORDER BY id
+@mysql q:SELECT id FROM cq_c c WHERE EXISTS (SELECT 1 FROM cq_o o WHERE o.cid = c.id AND o.amount > c.lim LIMIT 1) ORDER BY id
+x:DROP TABLE cq_i
+x:DROP TABLE cq_o
+x:DROP TABLE cq_c

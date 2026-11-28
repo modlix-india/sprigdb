@@ -780,6 +780,25 @@ impl PassSession {
         RunReply { logs, ..reply }
     }
 
+    /// A held message's deletes as plain writes of the session's engine
+    /// transaction: 1, or 0 when the message is no longer stored.
+    fn engine_ack_in_txn(&mut self, t: &sprig_queues::token::TokenData) -> Result<u64> {
+        let store = super::queues::engine_msg_store(t.tenant, t.db)?;
+        let Some(ops) = store
+            .txn_ack(t.id.queue, &t.msg_id)
+            .map_err(|e| SprigError::internal(e.to_string()))?
+        else {
+            return Ok(0);
+        };
+        let tx = self.eng.txn.open_tx().ok_or_else(|| {
+            SprigError::internal("a queue trigger's transaction isn't on the engine")
+        })?;
+        for op in ops {
+            super::queues::plain_write(tx.engine_txn(), op)?;
+        }
+        Ok(1)
+    }
+
     /// The next message of a queue (see the module docs).
     #[allow(clippy::too_many_lines)]
     async fn run_queue_trigger(&mut self, cx: &mut ExecCtx<'_>, req: &RunRequest) -> RunReply {
@@ -887,15 +906,29 @@ impl PassSession {
                     self.rollback_quietly(cx).await;
                     return with_id(RunReply::of(RunOutcome::Moved)).with_note(&mq_err(&e));
                 }
-                let deleted = match self
-                    .run_checked(cx, &sprig_queues::sql::ack_sql(&db, &t), true)
-                    .await
-                {
-                    Ok(c) => c.affected.unwrap_or(0),
-                    Err(e) => {
-                        self.rollback_quietly(cx).await;
-                        v.release(&t, false);
-                        return with_id(RunReply::failed(&e));
+                let deleted = if self.mq_on_engine(&db) {
+                    // Messages on the engine: the message's deletes are
+                    // plain writes of the session's engine transaction,
+                    // applied with its commit.
+                    match self.engine_ack_in_txn(&t) {
+                        Ok(n) => n,
+                        Err(e) => {
+                            self.rollback_quietly(cx).await;
+                            v.release(&t, false);
+                            return with_id(RunReply::failed(&e));
+                        }
+                    }
+                } else {
+                    match self
+                        .run_checked(cx, &sprig_queues::sql::ack_sql(&db, &t), true)
+                        .await
+                    {
+                        Ok(c) => c.affected.unwrap_or(0),
+                        Err(e) => {
+                            self.rollback_quietly(cx).await;
+                            v.release(&t, false);
+                            return with_id(RunReply::failed(&e));
+                        }
                     }
                 };
                 if deleted == 0 {

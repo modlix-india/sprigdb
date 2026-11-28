@@ -175,13 +175,14 @@ async fn delete_prefix(store: &dyn MetaStore, prefix: &Key) {
     }
 }
 
+#[ignore = "live: needs a running stack or reference server; tools/live/README.md"]
 #[test]
 fn etcd_controller_bootstraps_leads_dispatches_and_hands_over() {
     let Ok(endpoints) = std::env::var(sprig_meta::conformance::ETCD_ENV) else {
         eprintln!(
             "skipping etcd_controller_bootstraps_leads_dispatches_and_hands_over: set SPRIG_TEST_ETCD"
         );
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)

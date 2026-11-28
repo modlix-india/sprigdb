@@ -348,6 +348,10 @@ fn tenant_context(text: &str) -> bool {
         "watch_resolved(",
         "tenant_get(",
         "OwnedCtx",
+        // The gateway's per-tenant readers (`reader::tenant_value` and
+        // `reader::tenant_value_latest`): the tenant's own rows from its
+        // catalog first, then the DC's and global ones.
+        "reader::tenant_value",
         // A resolver handed a getter: the caller picks the context, which
         // this scan can't follow (not counted as a gap).
         "impl Fn(&",

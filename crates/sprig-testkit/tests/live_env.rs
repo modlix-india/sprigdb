@@ -8,6 +8,7 @@ use std::time::Duration;
 use sprig_testkit::util::wait_for_tcp;
 use sprig_testkit::{Env, skip};
 
+#[ignore = "live: needs SPRIG_TEST_DOCKER, SPRIG_TEST_ENV_FILE; tools/live/README.md"]
 #[tokio::test]
 async fn every_endpoint_accepts_connections() {
     let env = Env::from_env().unwrap();
@@ -16,7 +17,7 @@ async fn every_endpoint_accepts_connections() {
             "SPRIG_TEST_ENV_FILE or a SPRIG_TEST_* variable",
             module_path!(),
         );
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     }
     let mut endpoints: Vec<&str> = env.global_etcd.iter().map(String::as_str).collect();
     for dc in &env.dcs {
@@ -35,6 +36,7 @@ async fn every_endpoint_accepts_connections() {
 
 /// With the three-DC layout running (`deploy/compose/3dc.sh up -d --wait`),
 /// the fixture attaches to it and its published ports match `env.3dc.toml`.
+#[ignore = "live: needs SPRIG_TEST_DOCKER; tools/live/README.md"]
 #[test]
 fn three_dc_fixture_matches_its_env_file() {
     sprig_testkit::require_env!(skip::DOCKER);

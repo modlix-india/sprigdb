@@ -1,0 +1,4 @@
+# JSON_TABLE, MariaDB-only forms: non-string DEFAULT, ERROR ON ERROR stores the text.
+q:SELECT * FROM JSON_TABLE('[1]', '$[*]' COLUMNS (a INT PATH '$.z' DEFAULT 1 ON EMPTY)) jt
+q:SELECT * FROM JSON_TABLE('[{"a":"x"}]', '$[*]' COLUMNS (a INT PATH '$.a' DEFAULT 5 ON ERROR)) jt
+q:SELECT * FROM JSON_TABLE('[{"a":[1]}]', '$[*]' COLUMNS (a VARCHAR(4) PATH '$.a' DEFAULT 'zzzzzz' ON ERROR)) jt

@@ -1,5 +1,6 @@
 //! Feedback: a thumbs up or down (and a note) on an answer, and what
-//! became of each proposal, in `ai_feedback` (module `ai`).
+//! became of each proposal, in the catalog records (module `ai`,
+//! [`crate::audit::rec`]).
 //!
 //! - **Whose.** A user rates only answers and proposals of their own
 //!   conversations; anything else is "not found".
@@ -13,13 +14,12 @@
 use std::fmt::Write as _;
 
 use async_trait::async_trait;
-use mysql_async::prelude::Queryable as _;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sprig_common::Result;
 use sprig_common::ids::UserId;
 
-use crate::audit::{CatalogAudit, MemoryAudit, MsgKind, unavailable};
+use crate::audit::{MemoryAudit, MsgKind};
 use crate::role::Role;
 
 /// Notes the prompt carries at most.
@@ -351,144 +351,6 @@ impl FeedbackStore for MemoryAudit {
                 }
             })
             .collect())
-    }
-}
-
-#[async_trait]
-impl FeedbackStore for CatalogAudit {
-    async fn vote(
-        &self,
-        user: UserId,
-        msg_id: u64,
-        vote: i8,
-        note: Option<&str>,
-    ) -> Result<Option<Role>> {
-        let mut c = self.conn().await?;
-        let role: Option<String> = c
-            .exec_first(
-                format!(
-                    "SELECT c.role FROM {} m JOIN {} c ON c.conv_id = m.conv_id \
-                     WHERE m.msg_id = ? AND m.kind = 'assistant' AND c.user_id = ?",
-                    self.t("ai_messages"),
-                    self.t("ai_conversations")
-                ),
-                (msg_id, user.0),
-            )
-            .await
-            .map_err(unavailable)?;
-        let Some(role) = role.as_deref().and_then(Role::parse) else {
-            return Ok(None);
-        };
-        c.exec_drop(
-            format!(
-                "INSERT INTO {} (user_id, msg_id, vote, note, created_at) \
-                 VALUES (?, ?, ?, ?, UTC_TIMESTAMP(3))",
-                self.t("ai_feedback")
-            ),
-            (user.0, msg_id, vote, clean_note(note)),
-        )
-        .await
-        .map_err(unavailable)?;
-        Ok(Some(role))
-    }
-
-    async fn outcome(
-        &self,
-        user: UserId,
-        proposal_id: &str,
-        outcome: Outcome,
-        note: Option<&str>,
-    ) -> Result<Option<(Role, String)>> {
-        let mut c = self.conn().await?;
-        let row: Option<(u64, String, Option<String>)> = c
-            .exec_first(
-                format!(
-                    "SELECT m.msg_id, c.role, JSON_UNQUOTE(JSON_EXTRACT(m.body, '$.kind')) \
-                     FROM {} c JOIN {} m ON m.conv_id = c.conv_id \
-                     WHERE c.user_id = ? AND m.kind = 'proposal' \
-                     AND JSON_UNQUOTE(JSON_EXTRACT(m.body, '$.id')) = ?",
-                    self.t("ai_conversations"),
-                    self.t("ai_messages")
-                ),
-                (user.0, proposal_id),
-            )
-            .await
-            .map_err(unavailable)?;
-        let Some((msg_id, role, kind)) = row else {
-            return Ok(None);
-        };
-        let Some(role) = Role::parse(&role) else {
-            return Ok(None);
-        };
-        c.exec_drop(
-            format!(
-                "INSERT INTO {} (user_id, proposal_id, outcome, note, created_at) \
-                 VALUES (?, ?, ?, ?, UTC_TIMESTAMP(3))",
-                self.t("ai_feedback")
-            ),
-            (user.0, msg_id, outcome.as_str(), clean_note(note)),
-        )
-        .await
-        .map_err(unavailable)?;
-        Ok(Some((role, kind.unwrap_or_default())))
-    }
-
-    async fn recent(&self, limit: u32) -> Result<Vec<Note>> {
-        let mut c = self.conn().await?;
-        let rows: Vec<(Option<i8>, Option<String>, Option<String>, Option<String>)> = c
-            .exec(
-                format!(
-                    "SELECT f.vote, f.outcome, f.note, CAST(m.body AS CHAR) FROM {} f \
-                     LEFT JOIN {} m ON m.msg_id = f.proposal_id \
-                     WHERE f.outcome IS NOT NULL OR f.note IS NOT NULL \
-                     ORDER BY f.fb_id DESC LIMIT ?",
-                    self.t("ai_feedback"),
-                    self.t("ai_messages")
-                ),
-                (limit,),
-            )
-            .await
-            .map_err(unavailable)?;
-        Ok(rows
-            .into_iter()
-            .map(|(vote, outcome, note, body)| {
-                let p: Option<Value> = body.and_then(|b| serde_json::from_str(&b).ok());
-                note_of(vote, outcome.as_deref(), note, p.as_ref())
-            })
-            .collect())
-    }
-
-    async fn proposal(&self, user: UserId, proposal_id: &str) -> Result<Option<Found>> {
-        let mut c = self.conn().await?;
-        let row: Option<(u64, String, String, Option<String>)> = c
-            .exec_first(
-                format!(
-                    "SELECT m.msg_id, c.role, CAST(m.body AS CHAR), \
-                     (SELECT f.outcome FROM {} f WHERE f.proposal_id = m.msg_id \
-                      AND f.outcome IS NOT NULL ORDER BY f.fb_id DESC LIMIT 1) \
-                     FROM {} c JOIN {} m ON m.conv_id = c.conv_id \
-                     WHERE c.user_id = ? AND m.kind = 'proposal' \
-                     AND JSON_UNQUOTE(JSON_EXTRACT(m.body, '$.id')) = ?",
-                    self.t("ai_feedback"),
-                    self.t("ai_conversations"),
-                    self.t("ai_messages")
-                ),
-                (user.0, proposal_id),
-            )
-            .await
-            .map_err(unavailable)?;
-        let Some((msg_id, role, body, decided)) = row else {
-            return Ok(None);
-        };
-        let (Some(role), Ok(proposal)) = (Role::parse(&role), serde_json::from_str(&body)) else {
-            return Ok(None);
-        };
-        Ok(Some(Found {
-            msg_id,
-            role,
-            proposal,
-            decided: decided.as_deref().and_then(Outcome::parse),
-        }))
     }
 }
 

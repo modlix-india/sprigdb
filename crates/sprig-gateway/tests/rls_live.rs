@@ -801,11 +801,12 @@ async fn enforcement_switch(ck: &mut Checks, admin: &mut Conn, a: &mut Conn, db:
     }
 }
 
+#[ignore = "live: needs SPRIG_TEST_RLS, SPRIG_TEST_RLS_TENANT, SPRIG_TEST_RLS_SHARDED, ...; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn row_level_security_suite() {
     let Some(addrs) = skip::var(GATEWAY) else {
         skip::report_missing(GATEWAY, "row_level_security_suite");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let addrs = skip::urls(&addrs);
     let db = std::env::var("SPRIG_TEST_RLS_DB").unwrap_or_else(|_| "rls_suite".into());

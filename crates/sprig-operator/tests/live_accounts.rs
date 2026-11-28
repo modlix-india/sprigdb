@@ -6,6 +6,7 @@
 
 use sprig_operator::accounts::{BootstrapTarget, MysqlAccounts, SystemAccounts};
 
+#[ignore = "live: needs SPRIG_OPERATOR_LIVE_ADDR, SPRIG_OPERATOR_LIVE_ROOT; tools/live/README.md"]
 #[tokio::test]
 async fn accounts_and_the_gtid_domain_on_a_real_server() {
     let (Ok(addr), Ok(root)) = (
@@ -13,7 +14,7 @@ async fn accounts_and_the_gtid_domain_on_a_real_server() {
         std::env::var("SPRIG_OPERATOR_LIVE_ROOT"),
     ) else {
         eprintln!("skipped: SPRIG_OPERATOR_LIVE_ADDR is not set");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let acc = MysqlAccounts::new(None);
     let t = BootstrapTarget {

@@ -35,13 +35,15 @@ mod read_from;
 // A dropped database's sinks and logic modules go with it.
 mod dropdb;
 // Embedded columns in table DDL.
-mod embed_ddl;
+pub(crate) mod embed_ddl;
 // The read-only `sprig_docs` database.
 mod docs;
 // Retrieval indexes: their DDL and `RETRIEVE()`.
 mod retrieval;
+pub(crate) use inherit_msg::bcast as inherited_bcast;
 pub(crate) use inherit_msg::bcast::start as start_inherited_broadcasts;
 pub(crate) use retrieval::KEY_JSON_HINT as RETRIEVE_KEY_JSON_HINT;
+pub(crate) use retrieval::sync::spawn as spawn_retrieval_sync;
 mod fence;
 // A mover's fence never reaches clients as 1146 or 1049.
 pub(crate) mod binary_text;

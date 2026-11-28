@@ -25,6 +25,8 @@ fn rels(t: u64) -> Vec<String> {
         format!("feed/checkpoints/{t}/orders"),
         format!("logic/schedules/{t}/7"),
         format!("mover/shard-locks/{t}/g902s1"),
+        format!("doc-acks/{t}/gw1"),
+        format!("doc-publish/{t}"),
     ]
 }
 
@@ -162,5 +164,9 @@ fn prefixes_end_with_a_slash() {
         "a deleted member's instance index entries go with it"
     );
     assert!(meta_prefixes(TenantId(3)).contains(&"inherit-xo/3/".to_owned()));
-    assert_eq!(meta_keys(TenantId(3)), ["pins/3", "promotions/3"]);
+    assert!(meta_prefixes(TenantId(3)).contains(&"doc-acks/3/".to_owned()));
+    assert_eq!(
+        meta_keys(TenantId(3)),
+        ["pins/3", "promotions/3", "doc-publish/3"]
+    );
 }

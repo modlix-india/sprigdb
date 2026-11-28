@@ -49,10 +49,16 @@ fn instance(object: u64, id: u64) -> Instance {
 async fn definitions_overrides_and_instances() {
     let m = MemRecords::new();
     let mut tx = m.begin(T).await.unwrap();
-    MsgStore::put_def(&mut *tx, &def(10, "ev"), 3).await.unwrap();
+    MsgStore::put_def(&mut *tx, &def(10, "ev"), 3)
+        .await
+        .unwrap();
     // A definition of the same name under another id replaces it.
-    MsgStore::put_def(&mut *tx, &def(11, "ev"), 4).await.unwrap();
-    MsgStore::put_def(&mut *tx, &def(12, "other"), 4).await.unwrap();
+    MsgStore::put_def(&mut *tx, &def(11, "ev"), 4)
+        .await
+        .unwrap();
+    MsgStore::put_def(&mut *tx, &def(12, "other"), 4)
+        .await
+        .unwrap();
     let key = DefKey {
         tenant: TenantId(1),
         object: 12,
@@ -74,12 +80,22 @@ async fn definitions_overrides_and_instances() {
     let mut tx = m.begin(T).await.unwrap();
     let st = MsgStore::load(&mut *tx, T).await.unwrap();
     assert_eq!(st.defs.len(), 2);
-    assert!(st.defs.values().all(|d| d.declarer == T && d.changed_version == 4));
+    assert!(
+        st.defs
+            .values()
+            .all(|d| d.declarer == T && d.changed_version == 4)
+    );
     assert_eq!(st.overrides.len(), 2);
     assert_eq!(
-        MsgStore::delete_override(&mut *tx, key, TenantId(9), AppliesTo::Subtree, Some(What::State))
-            .await
-            .unwrap(),
+        MsgStore::delete_override(
+            &mut *tx,
+            key,
+            TenantId(9),
+            AppliesTo::Subtree,
+            Some(What::State)
+        )
+        .await
+        .unwrap(),
         1
     );
     assert_eq!(

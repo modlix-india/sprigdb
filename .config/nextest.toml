@@ -8,9 +8,11 @@
 # within the group; other tests keep running beside them.
 #
 # Profiles:
-# - default: S0 unit tests (no SPRIG_TEST_* variables, live tests skip).
-# - ci-s1: CI's "S1 integration (Compose, one DC)" job, first pass:
-#   everything but the exclusions below and the exclusive tests.
+# - default: S0 workspace tests (no SPRIG_TEST_* variables; live tests are
+#   #[ignore = "live: ..."] and listed as skipped).
+# - ci-s1: CI's "S1 integration (Compose, one DC)" job, first pass, run with
+#   --run-ignored all: everything but the exclusions below and the exclusive
+#   tests. A live test whose variables the job doesn't set fails.
 # - ci-s1-exclusive: the same job's second pass, one test at a time, after
 #   the first: tests that disturb the shared Compose servers for everyone
 #   (a Galera partition, a desynced node) or measure timings that other

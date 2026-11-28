@@ -51,7 +51,6 @@ impl TokenProtocol {
             TokenProtocol::Http => "http",
         }
     }
-
 }
 
 /// `oidc_issuers.kind`.

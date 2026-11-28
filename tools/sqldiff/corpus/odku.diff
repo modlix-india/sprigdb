@@ -1,0 +1,51 @@
+# ON DUPLICATE KEY UPDATE on engine tables: assignments left to right, generated columns, MySQL's row alias (a syntax error on MariaDB).
+x:DROP TABLE IF EXISTS ok_t
+x:DROP TABLE IF EXISTS ok_g
+x:DROP TABLE IF EXISTS ok_r
+x:DROP TABLE IF EXISTS ok_log
+q:CREATE TABLE ok_t (id INT PRIMARY KEY, a INT, b INT, c VARCHAR(20))
+q:INSERT INTO ok_t VALUES (1, 1, 10, 'x'), (2, 2, 20, 'y')
+q:INSERT INTO ok_t VALUES (1, 0, 0, 'z') ON DUPLICATE KEY UPDATE a = a + 1, b = a
+q:SELECT * FROM ok_t ORDER BY id
+q:INSERT INTO ok_t VALUES (2, 5, 50, 'w') ON DUPLICATE KEY UPDATE b = b + 1, a = b, b = a * 10 + b
+q:SELECT * FROM ok_t ORDER BY id
+q:INSERT INTO ok_t VALUES (1, 7, 70, 'v') ON DUPLICATE KEY UPDATE a = 3, a = a * 2, b = VALUES(b) + a
+q:SELECT * FROM ok_t ORDER BY id
+q:INSERT INTO ok_t VALUES (1, 7, 70, 'v'), (3, 3, 30, 'n') ON DUPLICATE KEY UPDATE b = 1, a = b + 100
+q:SELECT * FROM ok_t ORDER BY id
+q:CREATE TABLE ok_g (id INT PRIMARY KEY, a INT, b INT, s INT AS (a + b) STORED, v INT AS (a * b) VIRTUAL)
+q:INSERT INTO ok_g (id, a, b) VALUES (1, 1, 2)
+q:INSERT INTO ok_g (id, a, b) VALUES (1, 9, 9) ON DUPLICATE KEY UPDATE a = a + 10, b = a
+q:SELECT * FROM ok_g
+q:CREATE TABLE ok_r (id INT PRIMARY KEY, a INT, b INT)
+q:INSERT INTO ok_r VALUES (1, 1, 10)
+q:INSERT INTO ok_r VALUES (1, 5, 50) AS new ON DUPLICATE KEY UPDATE a = new.a + ok_r.a, b = new.b
+q:SELECT * FROM ok_r
+q:INSERT INTO ok_r VALUES (1, 5, 50) AS new ON DUPLICATE KEY UPDATE a = new.a + a
+q:INSERT INTO ok_r VALUES (1, 7, 70) AS n(x, y, z) ON DUPLICATE KEY UPDATE a = y, b = n.z + b
+q:SELECT * FROM ok_r
+q:INSERT INTO ok_r SET id = 1, a = 2, b = 3 AS new ON DUPLICATE KEY UPDATE b = new.a + new.b
+q:SELECT * FROM ok_r
+q:INSERT INTO ok_r VALUES (1, 7, 70) AS n(x, y) ON DUPLICATE KEY UPDATE a = y
+q:INSERT INTO ok_r VALUES (1, 7, 70) AS N ON DUPLICATE KEY UPDATE a = n.a
+q:INSERT INTO ok_r VALUES (1, 7, 70) AS n(a, b, c) ON DUPLICATE KEY UPDATE a = b
+q:INSERT INTO ok_r VALUES (1, 8, 80) AS n ON DUPLICATE KEY UPDATE a = VALUES(a)
+q:SHOW WARNINGS
+q:INSERT INTO ok_r (id, b) VALUES (1, 99) AS n ON DUPLICATE KEY UPDATE a = n.a, b = n.b
+q:INSERT INTO ok_r (id, b) VALUES (1, 99) AS n ON DUPLICATE KEY UPDATE a = a + 1, b = n.b
+q:SELECT * FROM ok_r
+q:INSERT INTO ok_r VALUES (2, 7, 70) AS n
+q:INSERT INTO ok_r VALUES (1, 7, 70) AS ok_r ON DUPLICATE KEY UPDATE a = ok_r.a + 1
+q:INSERT INTO ok_r VALUES (1, 1, 1), (2, 2, 2), (3, 3, 3) AS r ON DUPLICATE KEY UPDATE a = r.a * 100 + a, b = a
+q:SELECT * FROM ok_r ORDER BY id
+q:CREATE TABLE ok_log (k INT AUTO_INCREMENT PRIMARY KEY, msg VARCHAR(100))
+q:CREATE TRIGGER ok_bu BEFORE UPDATE ON ok_r FOR EACH ROW INSERT INTO ok_log (msg) VALUES (CONCAT('bu ', OLD.a, ',', OLD.b, ' -> ', NEW.a, ',', NEW.b))
+q:INSERT INTO ok_r VALUES (1, 4, 40) AS new ON DUPLICATE KEY UPDATE a = new.a + a, b = new.b
+q:INSERT INTO ok_r VALUES (2, 4, 40) AS n(p, q, r) ON DUPLICATE KEY UPDATE a = q + 1, b = a
+q:INSERT INTO ok_r VALUES (2, 4, 40) AS new ON DUPLICATE KEY UPDATE a = new.a + a
+q:SELECT * FROM ok_r ORDER BY id
+q:SELECT msg FROM ok_log ORDER BY k
+x:DROP TABLE IF EXISTS ok_t
+x:DROP TABLE IF EXISTS ok_g
+x:DROP TABLE IF EXISTS ok_r
+x:DROP TABLE IF EXISTS ok_log

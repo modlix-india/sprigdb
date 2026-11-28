@@ -91,6 +91,11 @@ pub struct TenantServices {
     pub auth: AuthCatalog,
     /// This node's catalog records (unversioned auth writes).
     pub records: Arc<dyn RecordStore>,
+    /// The catalog records' writers: a transaction runs on this node when
+    /// it leads the tenant's unit, else on the unit's leader (what the auth
+    /// versioner writes through). Use it for any write a replica that
+    /// doesn't lead the tenant may take.
+    pub writers: Arc<dyn RecordStore>,
     /// The DDL write path.
     pub ddl: DdlEngine<MariaBackend>,
     /// Setting writes at tenant, database and object scope.
@@ -237,10 +242,17 @@ impl TenantServices {
             dc.clone(),
             Arc::clone(&global),
         );
+        // Auth changes, catalog changes and every other record write that
+        // may start on a node not leading the tenant's unit run on its
+        // leader, wherever it is.
+        let writers: Arc<dyn RecordStore> = Arc::new(catalog_records::LeaderRecords::new(
+            Arc::clone(&records),
+            Arc::clone(&stores.dc),
+        ));
         let catalog = Versioner::new(
             MariaBackend::new(Arc::clone(&dyn_locator))
                 .with_clock(Arc::clone(&clock))
-                .with_records(Arc::clone(&records)),
+                .with_records(Arc::clone(&writers)),
             Arc::new(DirectoryAllocator::new(Arc::clone(&global))),
         );
         // One replica of several: the two-version rule across nodes.
@@ -251,13 +263,8 @@ impl TenantServices {
         } else {
             catalog
         };
-        // Auth changes run on the tenant unit's leader, wherever it is.
-        let writers: Arc<dyn RecordStore> = Arc::new(catalog_records::LeaderRecords::new(
-            Arc::clone(&records),
-            Arc::clone(&stores.dc),
-        ));
         let auth = Versioner::new(
-            RecBackend::new(writers).with_clock(Arc::clone(&clock)),
+            RecBackend::new(Arc::clone(&writers)).with_clock(Arc::clone(&clock)),
             Arc::new(DirectoryAllocator::new(Arc::clone(&global))),
         );
         // No destructive change of a shared object, checked
@@ -283,6 +290,7 @@ impl TenantServices {
             catalog,
             auth,
             records,
+            writers,
             ddl,
             writer,
             locator,
@@ -370,6 +378,14 @@ fn close_deleted_tenants(svc: &Arc<TenantServices>) {
                         svc.authz.deleting(t);
                         svc.locator.retire_tenant(t);
                         svc.authz.forget(t);
+                        // Its cleanup finished: this node's copies of its
+                        // units go (and their keys and index files). On a
+                        // cluster placing units per tenant the descriptor's
+                        // removal already did it; this is then a no-op.
+                        let id = t.0;
+                        drop(tokio::task::spawn_blocking(move || {
+                            crate::node_engine::drop_tenant_units(id)
+                        }));
                         tracing::info!(tenant = %t, "tenant deleted: its backend connections closed");
                     }
                 }

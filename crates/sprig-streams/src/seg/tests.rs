@@ -1123,3 +1123,19 @@ async fn unclaimed_outcomes_of_other_units_never_push_out_a_fresh_one() {
             .is_none()
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fan_in_topic_ids_are_given_once_and_kept() {
+    let d = TempDir::new("fanin-ids");
+    let e = engine(d.path());
+    let r = records::StreamRecords::new(e.clone());
+    let a = r.fan_in_id(7, 70, 1 << 48).await.unwrap();
+    let b = r.fan_in_id(7, 71, 1 << 48).await.unwrap();
+    assert!(records::is_fan_in(a) && records::is_fan_in(b) && a != b);
+    assert_eq!(r.fan_in_id(7, 70, 1 << 48).await.unwrap(), a);
+    assert_eq!(r.fan_in_target(7, a).unwrap(), Some((70, 1 << 48)));
+    assert_eq!(r.fan_in_target(7, b).unwrap(), Some((71, 1 << 48)));
+    // Another reader's ids are its own.
+    assert_eq!(r.fan_in_target(8, a).unwrap(), None);
+    assert_eq!(r.fan_in_id(8, 70, 1 << 48).await.unwrap(), a);
+}

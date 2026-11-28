@@ -267,6 +267,7 @@ fn shell(cmd: &str) -> bool {
         .is_ok_and(|s| s.success())
 }
 
+#[ignore = "live: needs SPRIG_TEST_AIFNB_GATEWAY, SPRIG_TEST_AIFNB_TENANT, SPRIG_TEST_AIFNB_STUB, ...; tools/live/README.md"]
 #[tokio::test]
 async fn ai_functions_bound_end_to_end() {
     let Some(addr) = skip::var(GATEWAY) else {

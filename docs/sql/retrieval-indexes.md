@@ -30,7 +30,7 @@ CREATE RETRIEVAL INDEX kb ON articles (body)
   FILTERS (product, lang);
 ```
 
-The worker indexes the rows in the background, within a few seconds:
+SprigDB indexes the rows in the background, within a few seconds:
 
 ```sql test
 SELECT SLEEP(15) INTO @waited;
@@ -79,26 +79,27 @@ Rules:
 
 - **Privileges:** `INDEX` on the table.
 - The table needs a primary key: hits are returned with it, and searches check each hit's row through it.
-- The statement returns at once. The index starts in state `building`: a worker cuts and embeds the existing rows, at most `ai.embedding.backfill_rows_per_s` rows a second (500 by default), and follows new changes meanwhile. Searches during the build find the rows indexed so far. `SHOW RETRIEVAL INDEXES` shows the progress.
+- The statement returns at once. The index starts in state `building`: the node that leads the tenant's data cuts and embeds the existing rows, at most `ai.embedding.backfill_rows_per_s` rows a second (500 by default), and follows new changes meanwhile. Searches during the build find the rows indexed so far. `SHOW RETRIEVAL INDEXES` shows the progress.
+- The index is kept up to date as the user who created it, so `CREATE RETRIEVAL INDEX` needs a login of a tenant user.
 - A row keeps at most `ai.retrieval.max_chunks_per_row` chunks (64); the rest of a longer text isn't indexed. Each chunk is embedded with its title, cut to the model's 512 tokens.
 
 ## Keeping in step
 
-A worker follows the table's [change feed](../concepts/change-feed.md):
+The node that leads the tenant's data follows the table's changes in its change log:
 
-- **Inserts and updates** are indexed within a second or two. An update that doesn't change the text, the title, a filter column or the key costs nothing.
+- **Inserts and updates** are indexed within a second or two. An update that doesn't change the text, the title, a filter column or the key costs nothing: the row's hash still matches its chunks.
 - **Deletes** remove the row's chunks. A deleted row never shows up in a search even before that, because every hit is checked against the table.
-- **Exactly once.** The worker records how far it has read the feed only after its writes commit, and replaces a row's chunks only if the row still holds the text it embedded. A worker killed in the middle is replaced, reads the last changes again and passes over the rows it had already done.
-- **A background check.** Once the index is `ready`, the worker also rereads the table slowly (at a tenth of `ai.embedding.backfill_rows_per_s`, resting a minute after each pass), indexes again any row whose chunks aren't its current text's and removes chunks whose row is gone, so a change the worker missed is indexed late rather than never.
-- **Graceful stops.** A worker stopped gracefully (`SIGTERM`) first indexes the changes written up to its stop, for at most 3 seconds, and records how far it got, so binary logs purged right after the stop take nothing it needs. After a `kill -9`, keep the binary logs until the worker has caught up.
-- **Shards.** Each shard of the table keeps the chunks of its own rows, next to them, and each chunk carries its row's routing hash. When a shard is split, merged or moved, its chunks move with its rows, so searches find them in the new shards as soon as the move is done. The worker then checks the new shards: it reads each row's hash and embeds again only a row whose chunks are missing or out of date, and the index stays `ready`. Moving a table into a table group moves its chunks with it too. One case makes a shard indexed again from scratch (state `rebuilding`; meanwhile searches miss that shard's rows): a re-key, whose new routing can't be computed from a chunk. A shard that arrives without its chunks for any other reason is filled the same way.
+- **Exactly once.** How far the changes have been read is recorded only after the chunks are written, and each changed row is read again as it is now. A change read twice, after a restart or a change of leader, changes nothing.
+- **Storage.** The chunks live in a hidden table beside the source table, in the same database. It is never listed and can't be named in a statement. Its full-text index is kept as rows commit. Its vectors are searched exactly, by a scan, which takes a few milliseconds per thousand chunks. An index with more than `ai.retrieval.max_scan_chunks` chunks (50,000) answers from its full-text list alone and says so with warning 39827; an approximate vector index for large tables is planned.
+- **History.** When the change log no longer holds the place where the index stopped reading (it was down longer than the log keeps changes), the index is filled again from the start, in state `rebuilding`.
 
 | State | Meaning |
 |---|---|
 | `building` | Existing rows are being indexed |
-| `ready` | Every shard is indexed; changes are followed |
-| `rebuilding` | A shard is being indexed again from scratch: after a re-key, or when a shard arrived without its chunks |
-| `failed` | Stopped on an error, shown in `SHOW RETRIEVAL INDEXES`: for example, a column the index reads was dropped, or the model isn't available. The worker tries again every 30 to 60 seconds. |
+| `ready` | Every row is indexed; changes are followed |
+| `rebuilding` | The index is being filled again from the start, because the changes it hadn't read were no longer kept |
+
+An error (for example, a column the index reads was dropped, or the model isn't available) is shown in the `Error` column of `SHOW RETRIEVAL INDEXES`, and the index is tried again about every second until it goes away. A successful step clears it.
 
 ## RETRIEVE()
 
@@ -137,20 +138,20 @@ Order by `rank` (or `score`) when the order matters: like any derived table, the
 How a search works:
 
 1. The query is embedded with the index's model, in the gateway.
-2. Each shard finds its 40 best chunks by full-text relevance and its 40 nearest chunks by cosine distance (`ai.retrieval.candidates`), with the filter applied.
+2. The index finds its 40 best chunks by full-text relevance (`MATCH ... AGAINST` on its chunks) and its 40 nearest chunks by cosine distance (an exact scan of its vectors), with the filter applied (`ai.retrieval.candidates`).
 3. The candidates' rows are read through your session: rows you can't `SELECT`, rows a row-level security policy hides from you, and rows that no longer exist are dropped. You also need `SELECT` on the text column (and the title column).
 4. The two lists are fused with reciprocal-rank fusion (each chunk scores `1 / (60 + rank)` in each list it is in), keeping at most two chunks of a row. A query that names an exact identifier, such as an error code or a setting key, weighs the full-text list three times, since the model doesn't know such names.
-5. When a policy hid so many candidates that fewer than `limit` hits are left, the search runs again with four times the candidates, up to 1,000 per list and shard.
+5. When a policy hid so many candidates that fewer than `limit` hits are left, the search runs again with four times the candidates, up to 1,000 per list.
 
-**Ranking for a user that row-level security restricts.** MariaDB's full-text relevance weighs each word by how many chunks of the whole index contain it, so a plain full-text ranking would depend on rows you can't see. When a row-level security policy on the table applies to you, the full-text list is ranked over the rows you may see alone:
+**Ranking for a user that row-level security restricts.** Full-text relevance weighs each word by how many chunks of the whole index contain it, so a plain full-text ranking would depend on rows you can't see. When a row-level security policy on the table applies to you, the full-text list is ranked over the rows you may see alone:
 
-- Every chunk that contains a word of the query is a candidate, at most 1,000 per shard.
+- Every chunk that contains a word of the query is a candidate, at most 1,000.
 - The candidates whose rows you can read are ranked by BM25, with word counts and lengths taken from those chunks only. Equal scores go to the lower key.
-- Both lists are cut at the same depth (40 per shard), counted in chunks you can see, so how many hidden rows there are changes nothing.
+- Both lists are cut at the same depth (40), counted in chunks you can see, so how many hidden rows there are changes nothing.
 
-Your hits and ranks are then the same whether or not the hidden rows exist. Users no policy restricts keep the full-text relevance of the whole index. The nearest-chunk search uses MariaDB's approximate vector index, whose answers can still vary slightly with the rows in the index.
+Your hits and ranks are then the same whether or not the hidden rows exist. Users no policy restricts keep the full-text relevance of the whole index. The nearest-chunk search is exact, so its ranks never depend on hidden rows either.
 
-A query whose words match more than 1,000 chunks in one shard gets no full-text list for you: its hits come from the vector list alone, and their `bm25_rank` is `NULL`. The statement then carries warning 39827 (`ER_SPRIG_SEARCH_WINDOW_EXCEEDED`), once for each index it searched this way, naming the index and how many of its shards had too many matches. Rarer or more specific words, or a filter, bring the full-text list back.
+A query whose words match more than 1,000 chunks gets no full-text list for you: its hits come from the vector list alone, and their `bm25_rank` is `NULL`. The statement then carries warning 39827 (`ER_SPRIG_SEARCH_WINDOW_EXCEEDED`), once for each index it searched this way, naming the index. Rarer or more specific words, or a filter, bring the full-text list back.
 
 Arguments:
 
@@ -202,9 +203,9 @@ SHOW CREATE RETRIEVAL INDEX [database.]index_name;
 SHOW RETRIEVAL INDEXES [FROM database];
 ```
 
-- `DROP RETRIEVAL INDEX` needs `INDEX` on the table. Searches stop at once; the worker removes the chunks shortly after. Dropping the table or its database drops its indexes too.
+- `DROP RETRIEVAL INDEX` needs `INDEX` on the table. Searches stop at once, and the chunks are removed with it. Dropping the table or its database drops its indexes too.
 - `SHOW CREATE RETRIEVAL INDEX` prints the index's statement with every clause, defaults included, so it can be run again elsewhere.
-- `SHOW RETRIEVAL INDEXES` lists the database's indexes over tables you can read: `Index`, `Table`, `Column`, `Model`, `State`, `Rows`, `Shards` and `Error`. `Rows` is the number of the table's rows indexed so far: rows that have their chunks, over the index's shards. Rows without text have no chunks and aren't counted. It is exact once a build ends; during one it grows as rows are indexed. A split, merge, move or re-key of the table's shards doesn't change it, even when the rows are embedded again (a re-key fills the new shards again, and `Rows` dips meanwhile). Embeddings are counted by the metric `sprig_retrieval_rows_total{result="indexed"}`.
+- `SHOW RETRIEVAL INDEXES` lists the database's indexes over tables you can read: `Index`, `Table`, `Column`, `Model`, `State`, `Rows`, `Shards` and `Error`. `Rows` is the number of the table's rows indexed so far: rows that have their chunks. Rows without text have no chunks and aren't counted. During a build it grows as rows are indexed. `Shards` is 1. Embeddings are counted by the metric `sprig_retrieval_rows_total{result="indexed"}`.
 
 Changing an index means dropping it and creating it again. A column the index reads can be dropped from the table, but the index then fails until it is dropped.
 
@@ -212,8 +213,9 @@ Changing an index means dropping it and creating it again. A column the index re
 
 | Setting | Default | Scopes | Meaning |
 |---|---|---|---|
-| `ai.retrieval.candidates` | `40` | global | Hits a search takes from each shard's full-text list and vector list before fusing them |
+| `ai.retrieval.candidates` | `40` | global | Hits a search takes from its full-text list and its vector list before fusing them |
 | `ai.retrieval.max_chunks_per_row` | `64` | global | Chunks an index keeps of one row at most |
+| `ai.retrieval.max_scan_chunks` | `50000` | global | Chunks a search compares with the query's vector at most; a larger index answers from its full-text list alone, with warning 39827 |
 | `ai.embedding_models` | the bundled model | global | Model aliases offered to `EMBED WITH MODEL` |
 | `ai.embedding.backfill_rows_per_s` | `500` | tenant, global | Existing rows an index's build reads per second at most |
 | `ai.embedding.rows_per_s` | `2000` | tenant, global | Rows one index handles per second at most, changes and build together |
@@ -228,9 +230,9 @@ The model is found in `docs.model_dir`, as for [embedded columns](../data-models
 |---|---|---|---|
 | `sprig_retrieval_searches_total` | counter | `result` | Searches: `ok`, `empty` or `error` |
 | `sprig_retrieval_search_seconds` | histogram | `mode` | Time of one search: `hybrid`, or `keyword` when the query couldn't be embedded |
-| `sprig_retrieval_rows_total` | counter | `result` | Rows a worker handled: `indexed` (embedded and written; a row embedded again counts again), `cleared` (chunks removed), `skipped` (already current), `superseded` (changed again first) |
+| `sprig_retrieval_rows_total` | counter | `result` | Rows the indexes' job handled: `indexed` (embedded and written; a row embedded again counts again), `cleared` (chunks removed), `skipped` (already current) |
 | `sprig_retrieval_chunks_total` | counter | none | Chunks written |
-| `sprig_retrieval_backlog` | gauge | none | Changed rows a worker has read and not yet indexed |
+| `sprig_retrieval_backlog` | gauge | none | Changed rows the job has read and not yet indexed |
 | `sprig_ai_embedding_seconds` | histogram | `model` | Time of one model batch, shared with embedded columns |
 
 ## Errors
@@ -244,7 +246,7 @@ The model is found in `docs.model_dir`, as for [embedded columns](../data-models
 | 1142 | | No `INDEX` on the table (create, drop), or no `SELECT` on it or its text column (search) |
 | 1210, 1582 | | `RETRIEVE()` with arguments of the wrong kind or number |
 | 39051 | `ER_SPRIG_NAME_REWRITE_UNSUPPORTED` | `RETRIEVE()` in a prepared statement |
-| 39827 | `ER_SPRIG_SEARCH_WINDOW_EXCEEDED` | A warning, not an error: for a user that row-level security restricts, the query's words matched more than 1,000 chunks in a shard, so the hits come from the vector list alone |
+| 39827 | `ER_SPRIG_SEARCH_WINDOW_EXCEEDED` | A warning, not an error: for a user that row-level security restricts, the query's words matched more than 1,000 chunks, so the hits come from the vector list alone; or the index has more chunks than `ai.retrieval.max_scan_chunks`, so the hits come from the full-text list alone |
 
 ## Related
 

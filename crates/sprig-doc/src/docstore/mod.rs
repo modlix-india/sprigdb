@@ -588,8 +588,9 @@ impl DocStore {
         Ok(out)
     }
 
-    /// The tenants with collections here: the registry, and those served
-    /// since start.
+    /// The tenants that may hold collections here: those served since
+    /// start, and the registry's; on a replicated engine, which keeps no
+    /// registry, every tenant whose unit this node holds a copy of.
     #[must_use]
     pub fn tenants(&self) -> Vec<u64> {
         let mut all: std::collections::BTreeSet<u64> = self
@@ -599,6 +600,17 @@ impl DocStore {
             .iter()
             .copied()
             .collect();
+        if self.keeps_no_registry() {
+            // A tenant's unit is the tenant (its id); the node's own unit
+            // holds no collections.
+            all.extend(
+                self.path
+                    .held_units()
+                    .into_iter()
+                    .filter(|u| *u < sprig_engine::NODE_UNIT.0),
+            );
+            return all.into_iter().collect();
+        }
         let p = layout::tenant_entries();
         let mut t = self.begin(false);
         if let Ok(rows) = t.scan(&p, &layout::after_prefix(&p), Dir::Forward, usize::MAX) {
@@ -612,6 +624,16 @@ impl DocStore {
         }
         t.rollback();
         all.into_iter().collect()
+    }
+
+    /// Whether this store keeps no tenant registry: its key lives under
+    /// tenant 0, in a unit of its own, and where units have leaders (a
+    /// replicated engine) writing it with a tenant's first collection
+    /// would make that a commit across two units, refused when another
+    /// node leads unit 0.
+    fn keeps_no_registry(&self) -> bool {
+        let tk = layout::tenant_entries();
+        self.path.unit_has_leader(self.path.unit_of(&tk))
     }
 
     /// Notes that `tenant` is served here.
@@ -788,7 +810,7 @@ impl DocStore {
             ));
         }
         t.put(ck, (n + 1).to_be_bytes().to_vec())?;
-        if n == 1 {
+        if n == 1 && !self.keeps_no_registry() {
             // The tenant's first collection: register the tenant.
             let tk = layout::tenant_entry(tenant);
             t.lock_entry(&tk).await?;

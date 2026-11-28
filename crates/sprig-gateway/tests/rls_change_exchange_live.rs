@@ -118,6 +118,7 @@ fn shown(body: &str) -> String {
     )
 }
 
+#[ignore = "live: needs SPRIG_TEST_RLS_SQL, SPRIG_TEST_RLS_AMQP; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn change_exchanges_filtered_per_change() {
     let (Ok(sql_addr), Ok(amqp)) = (
@@ -125,7 +126,7 @@ async fn change_exchanges_filtered_per_change() {
         std::env::var("SPRIG_TEST_RLS_AMQP"),
     ) else {
         eprintln!("skipped: set SPRIG_TEST_RLS_SQL and SPRIG_TEST_RLS_AMQP");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let mut ck = Checks {
         n: 0,

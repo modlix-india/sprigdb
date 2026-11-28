@@ -510,11 +510,12 @@ fn pools(entries: &[(&ClusterId, &str)]) -> direct::Pools {
     )
 }
 
+#[ignore = "live: needs SPRIG_TEST_MARIADB_SINGLE; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread")]
 async fn live_unique_lookup_concurrent() {
     let Ok(single) = std::env::var("SPRIG_TEST_MARIADB_SINGLE") else {
         eprintln!("skipped: SPRIG_TEST_MARIADB_SINGLE not set");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let c1 = ClusterId::new("r1shard-c1").unwrap();
     let gws = vec![pools(&[(&c1, &single)]), pools(&[(&c1, &single)])];
@@ -548,11 +549,12 @@ async fn live_unique_lookup_concurrent() {
 /// build with 1062 and drops the lookup; without it the back-fill makes it
 /// public. An automatic (non-unique) lookup from automatic indexing's hook
 /// builds the same way and routes to every owner of a value.
+#[ignore = "live: needs SPRIG_TEST_MARIADB_SINGLE; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread")]
 async fn live_lookup_build_backfill_and_auto() {
     let Ok(single) = std::env::var("SPRIG_TEST_MARIADB_SINGLE") else {
         eprintln!("skipped: SPRIG_TEST_MARIADB_SINGLE not set");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let c1 = ClusterId::new("r1shard-c1").unwrap();
     let gws = vec![pools(&[(&c1, &single)])];

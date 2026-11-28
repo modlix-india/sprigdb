@@ -1,0 +1,24 @@
+# String primary and secondary keys (MariaDB persona: same default collation as the oracle).
+q:CREATE TABLE named (name VARCHAR(20) NOT NULL, k INT, tag VARCHAR(10), PRIMARY KEY (name), KEY tag (tag))
+q:INSERT INTO named VALUES ('Alice', 1, 'x'), ('bob', 2, 'X'), ('carol', 3, NULL)
+q:INSERT INTO named VALUES ('ALICE ', 9, NULL)
+q:INSERT INTO named VALUES ('alice', 9, NULL)
+q:SELECT k FROM named WHERE name = 'alice'
+q:SELECT k FROM named WHERE name = 'ALICE  '
+q:SELECT name, k FROM named WHERE tag = 'x'
+q:SELECT name FROM named WHERE name > 'b'
+q:SELECT name FROM named WHERE name BETWEEN 'a' AND 'bz'
+p:SELECT k, tag FROM named WHERE name = ?
+e:1:s=BOB
+e:1:s=nobody
+q:UPDATE named SET name = 'dave', tag = 'y' WHERE name = 'BOB'
+q:SELECT name, k, tag FROM named WHERE name = 'Dave'
+q:SELECT name FROM named WHERE tag = 'X'
+q:DELETE FROM named WHERE name = 'CAROL'
+q:SELECT name FROM named
+q:CREATE TABLE uq (id INT NOT NULL PRIMARY KEY, email VARCHAR(40), UNIQUE KEY email (email))
+q:INSERT INTO uq VALUES (1, 'a@x.org'), (2, NULL), (3, NULL)
+q:INSERT INTO uq VALUES (4, 'A@X.ORG')
+q:SELECT id FROM uq WHERE email = 'A@x.org'
+q:DROP TABLE named
+q:DROP TABLE uq

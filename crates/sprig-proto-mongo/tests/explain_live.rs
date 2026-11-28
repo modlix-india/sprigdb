@@ -54,6 +54,7 @@ fn code_of(e: &mongodb::error::Error) -> i32 {
     }
 }
 
+#[ignore = "live: needs SPRIG_TEST_MONGO_URI; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn explain_of_searches() {
     let Some(u) = std::env::var("SPRIG_TEST_MONGO_URI")
@@ -61,7 +62,7 @@ async fn explain_of_searches() {
         .filter(|s| !s.is_empty())
     else {
         eprintln!("SPRIG_TEST_MONGO_URI not set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let client = Client::with_uri_str(&u).await.unwrap();
     let db = client.database("r5seven_explain");
@@ -175,6 +176,7 @@ async fn explain_of_searches() {
     db.drop().await.unwrap();
 }
 
+#[ignore = "live: needs SPRIG_TEST_MONGO_URI; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn explain_of_reads_and_writes() {
     let Some(u) = std::env::var("SPRIG_TEST_MONGO_URI")
@@ -182,7 +184,7 @@ async fn explain_of_reads_and_writes() {
         .filter(|s| !s.is_empty())
     else {
         eprintln!("SPRIG_TEST_MONGO_URI not set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let client = Client::with_uri_str(&u).await.unwrap();
     let db = client.database("r5eight_explain");

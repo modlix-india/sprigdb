@@ -265,10 +265,11 @@ if old ~= sprig.null then prev = old.qty end
 db.exec('INSERT INTO audit_lua (id, op, qty, prev_qty) VALUES (?, ?, ?, ?)',
         ctx.row.id, ctx.trigger.op, ctx.row.qty, prev)";
 
+#[ignore = "live: needs SPRIG_TEST_LOGIC_GATEWAY, SPRIG_TEST_LOGIC_USER, SPRIG_TEST_LOGIC_PASSWORD, ...; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lua_compiles_and_matches_the_engine_tier() {
     let Some(mut c) = connect("lua_compiles_and_matches_the_engine_tier").await else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let started = Instant::now();
     setup(&mut c).await;
@@ -638,11 +639,12 @@ const QUEUE_LUA: &str = "return function (c)
   print('lq {src} job ' .. job.id .. ' x' .. job.qty)
 end";
 
+#[ignore = "live: needs SPRIG_TEST_LOGIC_GATEWAY, SPRIG_TEST_LOGIC_USER, SPRIG_TEST_LOGIC_PASSWORD, ...; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lua_message_triggers_match_the_engine_tier() {
     const MDB: &str = "lua_msg_live";
     let Some(mut c) = connect("lua_message_triggers_match_the_engine_tier").await else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let started = Instant::now();
     let mut ck = Checks::new();

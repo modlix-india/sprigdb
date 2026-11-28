@@ -236,11 +236,12 @@ async fn listener_follows_settings_in_memstore() {
     listener_follows_settings(stores).await;
 }
 
+#[ignore = "live: needs a running stack or reference server; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn listener_follows_settings_in_etcd() {
     let Ok(endpoints) = std::env::var(ETCD_ENV) else {
         eprintln!("skipping: set {ETCD_ENV} to run the etcd half");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let cfg = EtcdConfig::new(endpoints.split(',').map(str::to_owned).collect());
     let dc = EtcdStore::connect(unique_tier(), &cfg).await.unwrap();

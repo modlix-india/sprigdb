@@ -16,6 +16,8 @@ struct Env {
     cache: Arc<MemoryFnCache>,
     used: Mutex<u64>,
     embedded: Mutex<Vec<String>>,
+    /// The next this many usage writes fail, with this code.
+    usage_fails: Mutex<(u32, SprigCode)>,
 }
 
 impl Env {
@@ -32,6 +34,7 @@ impl Env {
             cache: Arc::new(MemoryFnCache::default()),
             used: Mutex::new(0),
             embedded: Mutex::new(Vec::new()),
+            usage_fails: Mutex::new((0, SprigCode::CatalogUnavailable)),
         }
     }
 
@@ -84,6 +87,13 @@ impl FnEnv for Env {
         Ok(UsageToday { tenant: u, user: u })
     }
     async fn add_usage(&self, usage: &Usage) -> Result<()> {
+        {
+            let mut f = self.usage_fails.lock().unwrap();
+            if f.0 > 0 {
+                f.0 -= 1;
+                return Err(SprigError::new(f.1, "usage store down"));
+            }
+        }
         *self.used.lock().unwrap() += usage.billable();
         Ok(())
     }
@@ -463,4 +473,50 @@ fn json_answers_in_words_and_schema_checks() {
     ));
     assert_eq!(label_of(&["Bug".into()], " \"bug\". "), Some("Bug"));
     assert_eq!(cut("héllo", 2), "h");
+}
+
+#[tokio::test]
+async fn tokens_that_cant_be_counted_fail_the_statement() {
+    // A lock conflict (nothing written) is tried again and counted.
+    let env = Env::new(vec![tool("classify", json!({"answers": ["bug"]}))]);
+    *env.usage_fails.lock().unwrap() = (1, SprigCode::CatalogConflict);
+    let (out, _) = evaluate(
+        &env,
+        &settings(),
+        &classify_call(),
+        &inputs(&[Some("it crashes")]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(text(&out[0]), Some("bug"));
+    assert_eq!(*env.used.lock().unwrap(), 110);
+    // Any other failure may have committed: no second write, the
+    // statement fails rather than spend uncounted tokens.
+    let env = Env::new(vec![tool("classify", json!({"answers": ["bug"]}))]);
+    *env.usage_fails.lock().unwrap() = (1, SprigCode::CatalogUnavailable);
+    let e = evaluate(
+        &env,
+        &settings(),
+        &classify_call(),
+        &inputs(&[Some("it crashes")]),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(e.code(), Some(SprigCode::CatalogUnavailable));
+    assert_eq!(
+        *env.usage_fails.lock().unwrap(),
+        (0, SprigCode::CatalogUnavailable)
+    );
+    // Two conflicts in a row: it fails too.
+    let env = Env::new(vec![tool("classify", json!({"answers": ["bug"]}))]);
+    *env.usage_fails.lock().unwrap() = (2, SprigCode::CatalogConflict);
+    let e = evaluate(
+        &env,
+        &settings(),
+        &classify_call(),
+        &inputs(&[Some("it crashes")]),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(e.code(), Some(SprigCode::CatalogConflict));
 }

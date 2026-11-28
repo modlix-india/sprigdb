@@ -360,10 +360,11 @@ async fn pair() -> Option<(
     Some((s, r))
 }
 
+#[ignore = "live: needs SPRIG_TEST_REDIS_ENGINE, SPRIG_TEST_REDIS_REF; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn corpus_matches_redis() {
     let Some((mut s, mut r)) = pair().await else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let cmds = corpus();
     assert!(cmds.len() >= 100, "corpus not found: {}", cmds.len());
@@ -465,10 +466,11 @@ fn random_cmd(g: &mut Rng) -> Vec<String> {
     }
 }
 
+#[ignore = "live: needs SPRIG_TEST_REDIS_ENGINE, SPRIG_TEST_REDIS_REF; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn random_ops_match_redis() {
     let Some((mut s, mut r)) = pair().await else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let mut g = Rng(20_261_118);
     let cmds: Vec<Vec<String>> = (0..3000).map(|_| random_cmd(&mut g)).collect();
@@ -578,12 +580,13 @@ async fn raw(url_or_addr: &str, auth: bool) -> tokio::net::TcpStream {
 }
 
 /// Pipelines sent in one write each, replies compared byte for byte.
+#[ignore = "live: needs SPRIG_TEST_REDIS_REF; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pipelines_match_redis_bytes() {
     use tokio::io::AsyncWriteExt;
     let Some(refaddr) = var("SPRIG_TEST_REDIS_REF") else {
         eprintln!("SPRIG_TEST_REDIS_REF not set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let url = sprig_url().await;
     let mut sprig = raw(&url, true).await;
@@ -690,10 +693,11 @@ async fn concurrent_pipelines_lose_nothing() {
 /// (they are in the random and model tests).
 const ENGINE_CORPUS: &str = include_str!("engine_corpus.txt");
 
+#[ignore = "live: needs SPRIG_TEST_REDIS_ENGINE, SPRIG_TEST_REDIS_REF; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn engine_corpus_matches_redis() {
     let Some((mut s, mut r)) = pair().await else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let cmds = lines(ENGINE_CORPUS);
     for c in &cmds {
@@ -850,10 +854,11 @@ fn random_kv_cmd(g: &mut Rng) -> Vec<String> {
     c
 }
 
+#[ignore = "live: needs SPRIG_TEST_REDIS_ENGINE, SPRIG_TEST_REDIS_REF; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn random_keyspace_and_strings_match_redis() {
     let Some((mut s, mut r)) = pair().await else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let mut g = Rng(20_261_121);
     let cmds: Vec<Vec<String>> = (0..4000).map(|_| random_kv_cmd(&mut g)).collect();
@@ -894,10 +899,11 @@ async fn scan_all(c: &mut redis::aio::MultiplexedConnection, opts: &[&str]) -> V
 
 /// A full `SCAN` (with `MATCH`, `COUNT` and `TYPE`) returns the same keys
 /// as Redis; `RANDOMKEY` and `DBSIZE` agree with them.
+#[ignore = "live: needs SPRIG_TEST_REDIS_ENGINE, SPRIG_TEST_REDIS_REF; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn scan_iterations_match_redis() {
     let Some((mut s, mut r)) = pair().await else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     for c in [&mut s, &mut r] {
         let mut p = redis::pipe();
@@ -1206,10 +1212,11 @@ fn random_coll_cmd(g: &mut Rng) -> Vec<String> {
     }
 }
 
+#[ignore = "live: needs SPRIG_TEST_REDIS_ENGINE, SPRIG_TEST_REDIS_REF; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn random_collections_match_redis() {
     let Some((mut s, mut r)) = pair().await else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     for c in [&mut s, &mut r] {
         let mut p = redis::pipe();
@@ -1260,10 +1267,11 @@ async fn replies(c: &mut redis::aio::MultiplexedConnection, cmds: &[&str]) -> Ve
 
 /// `WATCH`, then another client's write (or not), then `MULTI`/`EXEC`, on
 /// both servers: the same outcomes.
+#[ignore = "live: needs SPRIG_TEST_REDIS_ENGINE, SPRIG_TEST_REDIS_REF; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn watch_and_exec_match_redis() {
     let Some((_, _)) = pair().await else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let url = sprig_url().await;
     let refaddr = var("SPRIG_TEST_REDIS_REF").unwrap();
@@ -1385,10 +1393,11 @@ async fn watch_and_exec_match_redis() {
 
 /// A blocking command, then (after a pause) another client's commands: the
 /// blocked reply, on both servers.
+#[ignore = "live: needs SPRIG_TEST_REDIS_ENGINE, SPRIG_TEST_REDIS_REF; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn blocking_commands_match_redis() {
     let Some((_, _)) = pair().await else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let url = sprig_url().await;
     let refaddr = var("SPRIG_TEST_REDIS_REF").unwrap();
@@ -1520,10 +1529,11 @@ async fn watched_counter_loses_nothing() {
 /// Random `PFADD`, `PFCOUNT` and `PFMERGE` over a few sketches, from a pool
 /// of 50,000 elements: the same answers as Redis (same hash, registers and
 /// estimator), through the sparse and dense forms.
+#[ignore = "live: needs SPRIG_TEST_REDIS_ENGINE, SPRIG_TEST_REDIS_REF; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn random_hyperloglog_match_redis() {
     let Some((mut s, mut r)) = pair().await else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let mut g = Rng(20_261_123);
     let keys = ["p0", "p1", "p2", "p3"];
@@ -1564,10 +1574,11 @@ async fn random_hyperloglog_match_redis() {
 
 /// Hash fields with short lifetimes really expire, on both servers: reads,
 /// lengths, scans and the key's own existence.
+#[ignore = "live: needs SPRIG_TEST_REDIS_ENGINE, SPRIG_TEST_REDIS_REF; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn hash_fields_expire_like_redis() {
     let Some((mut s, mut r)) = pair().await else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let big: Vec<String> = (0..140).map(|i| format!("f{i} v{i}")).collect();
     let steps: &[&[&str]] = &[
@@ -1614,10 +1625,11 @@ async fn hash_fields_expire_like_redis() {
 /// Long strings changed in place (SprigDB stores them in chunks): random
 /// `SETRANGE`, `SETBIT`, `APPEND`, `BITFIELD`, `GETRANGE`, `GETBIT`,
 /// `STRLEN`, `BITCOUNT`, `BITPOS` and `GET` agree with Redis.
+#[ignore = "live: needs SPRIG_TEST_REDIS_ENGINE, SPRIG_TEST_REDIS_REF; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn random_long_strings_match_redis() {
     let Some((mut s, mut r)) = pair().await else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let mut g = Rng(20_261_124);
     let keys = ["b0", "b1"];

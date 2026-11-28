@@ -39,7 +39,6 @@
 //! sprigctl settings set sink.internal_destinations '["127.0.0.1:<SPRIG_TEST_INHERIT_HOOK_PORT>"]' --scope global ...
 //! ```
 //!
-//! Clean-up: each test first drops what an earlier run left
 //! in its declaring tenant's databases (every `FOR EACH TENANT` definition
 //! there, by the exact names `SHOW INHERITED DEFINITIONS` lists, then the
 //! database), and a failing test does the same before it ends and starts
@@ -299,10 +298,11 @@ async fn publish_for(c: &mut Conn, tenant: &str, from: u64, to: u64) {
     }
 }
 
+#[ignore = "live: needs SPRIG_TEST_INHERIT_GATEWAY, SPRIG_TEST_INHERIT_SYSTEM, SPRIG_TEST_INHERIT_MEMBERS, ...; tools/live/README.md"]
 #[tokio::test]
 async fn for_each_tenant_end_to_end() {
     let Some(e) = env("for_each_tenant_end_to_end") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let mut sys = conn(&e.addr, &e.system).await;
     // A failure drops what the test declared.
@@ -689,10 +689,11 @@ async fn for_each_tenant_end_to_end() {
 /// The platform stream: a client publishes up into the system
 /// tenant's ordinary stream only with the owner's consent, keyed by its
 /// own name.
+#[ignore = "live: needs SPRIG_TEST_INHERIT_GATEWAY, SPRIG_TEST_INHERIT_SYSTEM, SPRIG_TEST_INHERIT_MEMBERS, ...; tools/live/README.md"]
 #[tokio::test]
 async fn in_tenant_publish_up() {
     let Some(e) = env("in_tenant_publish_up") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let mut sys = conn(&e.addr, &e.system).await;
     // A failure drops what the test declared.
@@ -767,10 +768,11 @@ async fn in_tenant_publish_up() {
 
 /// The cross-tenant outbox: `FOR TENANT` and `IN TENANT` inside a
 /// transaction land exactly once if it commits, never if it rolls back.
+#[ignore = "live: needs SPRIG_TEST_INHERIT_GATEWAY, SPRIG_TEST_INHERIT_SYSTEM, SPRIG_TEST_INHERIT_MEMBERS, ...; tools/live/README.md"]
 #[tokio::test]
 async fn cross_tenant_publishes_in_transactions() {
     let Some(e) = env("cross_tenant_publishes_in_transactions") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let mut sys = conn(&e.addr, &e.system).await;
     // A failure drops what the test declared.
@@ -964,10 +966,11 @@ async fn publish(
     .is_ack()
 }
 
+#[ignore = "live: needs SPRIG_TEST_INHERIT_GATEWAY, SPRIG_TEST_INHERIT_SYSTEM, SPRIG_TEST_INHERIT_MEMBERS, ...; tools/live/README.md"]
 #[tokio::test]
 async fn drop_database_forwards_the_outbox_first() {
     let Some(e) = env("drop_database_forwards_the_outbox_first") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let Some(root) = var("SPRIG_TEST_INHERIT_ROOT") else {
         eprintln!("no SPRIG_TEST_INHERIT_ROOT: skipped");
@@ -1153,10 +1156,11 @@ export default function (ctx) {
 }
 $$";
 
+#[ignore = "live: needs SPRIG_TEST_INHERIT_GATEWAY, SPRIG_TEST_INHERIT_SYSTEM, SPRIG_TEST_INHERIT_MEMBERS, ...; tools/live/README.md"]
 #[tokio::test]
 async fn inherited_queues_end_to_end() {
     let Some(e) = env("inherited_queues_end_to_end") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let Some(amqp_addr) = var("SPRIG_TEST_INHERIT_AMQP") else {
         eprintln!("no SPRIG_TEST_INHERIT_AMQP: skipped");
@@ -1471,10 +1475,11 @@ async fn inherited_queues_end_to_end() {
     ok(&mut sys, "DROP QUEUE r9mq.audit_q IMMEDIATE").await;
 }
 
+#[ignore = "live: needs SPRIG_TEST_INHERIT_GATEWAY, SPRIG_TEST_INHERIT_SYSTEM, SPRIG_TEST_INHERIT_MEMBERS, ...; tools/live/README.md"]
 #[tokio::test]
 async fn broadcast_end_to_end() {
     let Some(e) = env("broadcast_end_to_end") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let mut sys = conn(&e.addr, &e.system).await;
     // A failure drops what the test declared.
@@ -1708,10 +1713,11 @@ async fn broadcast_end_to_end() {
     ok(&mut sys, "DROP STREAM security.bc_events IMMEDIATE").await;
 }
 
+#[ignore = "live: needs SPRIG_TEST_INHERIT_GATEWAY, SPRIG_TEST_INHERIT_SYSTEM, SPRIG_TEST_INHERIT_MEMBERS, ...; tools/live/README.md"]
 #[tokio::test]
 async fn detach_and_the_end_of_the_drop_grace() {
     let Some(e) = env("detach_and_the_end_of_the_drop_grace") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let mut sys = conn(&e.addr, &e.system).await;
     // A failure drops what the test declared.
@@ -1812,10 +1818,11 @@ async fn detach_and_the_end_of_the_drop_grace() {
 /// A member whose broadcast delivery fails gets it later,
 /// once and in order, from the saved retry list; and `DROP DATABASE` of a
 /// declarer's database is refused while live definitions are in it.
+#[ignore = "live: needs SPRIG_TEST_INHERIT_GATEWAY, SPRIG_TEST_INHERIT_SYSTEM, SPRIG_TEST_INHERIT_MEMBERS, ...; tools/live/README.md"]
 #[tokio::test]
 async fn broadcast_retry_and_the_drop_database_guard() {
     let Some(e) = env("broadcast_retry_and_the_drop_database_guard") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let Some(root) = var("SPRIG_TEST_INHERIT_ROOT") else {
         eprintln!("no SPRIG_TEST_INHERIT_ROOT: skipped");
@@ -2057,10 +2064,11 @@ async fn publish_fi(c: &mut Conn, tenant: &str, from: u64, to: u64) {
 /// start, those before it from then on), with its own positions per
 /// instance, through a `kill -9` of the worker; a member created later
 /// joins.
+#[ignore = "live: needs SPRIG_TEST_INHERIT_GATEWAY, SPRIG_TEST_INHERIT_SYSTEM, SPRIG_TEST_INHERIT_MEMBERS, ...; tools/live/README.md"]
 #[tokio::test]
 async fn fan_in_trigger_end_to_end() {
     let Some(e) = env("fan_in_trigger_end_to_end") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let mut sys = conn(&e.addr, &e.system).await;
     // A failure drops what the test declared.
@@ -2199,10 +2207,11 @@ $$";
 /// Dead letters of a trigger on a stream are replayed with
 /// `sprigctl logic dead-letters replay`, in order, once each (a second
 /// replay of the same ones runs nothing), outside the trigger's position.
+#[ignore = "live: needs SPRIG_TEST_INHERIT_GATEWAY, SPRIG_TEST_INHERIT_SYSTEM, SPRIG_TEST_INHERIT_MEMBERS, ...; tools/live/README.md"]
 #[tokio::test]
 async fn stream_trigger_dead_letter_replay() {
     let Some(e) = env("stream_trigger_dead_letter_replay") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let (Some(ctl), Some(sys_id)) = (var("SPRIG_TEST_SPRIGCTL"), tenant_id_of(&e.system)) else {
         eprintln!("no SPRIG_TEST_SPRIGCTL or SPRIG_TEST_INHERIT_IDS: skipped");
@@ -2382,11 +2391,12 @@ fn fan_in_args() -> FieldTable {
     a
 }
 
+#[ignore = "live: needs SPRIG_TEST_INHERIT_GATEWAY, SPRIG_TEST_INHERIT_SYSTEM, SPRIG_TEST_INHERIT_MEMBERS, ...; tools/live/README.md"]
 #[tokio::test]
 async fn amqp_fan_in_consumer() {
     use lapin::options::{BasicConsumeOptions, BasicQosOptions};
     let Some(e) = env("amqp_fan_in_consumer") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let Some(amqp_addr) = var("SPRIG_TEST_INHERIT_AMQP") else {
         eprintln!("no SPRIG_TEST_INHERIT_AMQP: skipped");
@@ -2739,10 +2749,11 @@ fn distinct_in(
         .collect()
 }
 
+#[ignore = "live: needs SPRIG_TEST_INHERIT_GATEWAY, SPRIG_TEST_INHERIT_SYSTEM, SPRIG_TEST_INHERIT_MEMBERS, ...; tools/live/README.md"]
 #[tokio::test]
 async fn fan_in_sink_end_to_end() {
     let Some(e) = env("fan_in_sink_end_to_end") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let Some(port) = var("SPRIG_TEST_INHERIT_HOOK_PORT").and_then(|p| p.parse::<u16>().ok()) else {
         eprintln!("no SPRIG_TEST_INHERIT_HOOK_PORT: skipped");
@@ -3062,10 +3073,11 @@ $$";
 /// Dead-letter replay for queue triggers: a queue trigger's dead letters are
 /// replayed with `sprigctl logic dead-letters replay`, in order, once each
 /// (marking them again runs nothing), while new messages keep flowing.
+#[ignore = "live: needs SPRIG_TEST_INHERIT_GATEWAY, SPRIG_TEST_INHERIT_SYSTEM, SPRIG_TEST_INHERIT_MEMBERS, ...; tools/live/README.md"]
 #[tokio::test]
 async fn queue_trigger_dead_letter_replay() {
     let Some(e) = env("queue_trigger_dead_letter_replay") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let (Some(ctl), Some(sys_id), Some(amqp_addr)) = (
         var("SPRIG_TEST_SPRIGCTL"),
@@ -3233,10 +3245,11 @@ fn arrived(r: &[(String, String, String)], m: &str) -> Vec<u64> {
 /// arrive once each, in queue order; a member created later gets its sink
 /// with its first message. Needs `sink.destination_allowlist` with the
 /// hook port for the members (global scope on a private deployment).
+#[ignore = "live: needs SPRIG_TEST_INHERIT_GATEWAY, SPRIG_TEST_INHERIT_SYSTEM, SPRIG_TEST_INHERIT_MEMBERS, ...; tools/live/README.md"]
 #[tokio::test]
 async fn inherited_queue_sink_end_to_end() {
     let Some(e) = env("inherited_queue_sink_end_to_end") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let Some(port) = var("SPRIG_TEST_INHERIT_HOOK_PORT").and_then(|p| p.parse::<u16>().ok()) else {
         eprintln!("no SPRIG_TEST_INHERIT_HOOK_PORT: skipped");
@@ -3461,10 +3474,11 @@ async fn wait_fan_in_tasks(
 /// three tasks, each reading its members only (every record arrives once); a
 /// member created later grows it to four tasks (the old ones stop before
 /// the new ones start), and nothing is lost through the regrouping.
+#[ignore = "live: needs SPRIG_TEST_INHERIT_GATEWAY, SPRIG_TEST_INHERIT_SYSTEM, SPRIG_TEST_INHERIT_MEMBERS, ...; tools/live/README.md"]
 #[tokio::test]
 async fn grouped_fan_in_sink_end_to_end() {
     let Some(e) = env("grouped_fan_in_sink_end_to_end") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let Some(port) = var("SPRIG_TEST_INHERIT_HOOK_PORT").and_then(|p| p.parse::<u16>().ok()) else {
         eprintln!("no SPRIG_TEST_INHERIT_HOOK_PORT: skipped");
@@ -3755,10 +3769,11 @@ async fn publish_fq(c: &mut Conn, m: &str, from: u64, to: u64) {
 /// back what the dead one held in each member at once (its lease tag), so
 /// every message arrives well before `queue_lease_ms` (here 120 s; before,
 /// those messages waited it out).
+#[ignore = "live: needs SPRIG_TEST_INHERIT_GATEWAY, SPRIG_TEST_INHERIT_SYSTEM, SPRIG_TEST_INHERIT_MEMBERS, ...; tools/live/README.md"]
 #[tokio::test]
 async fn fan_in_queue_sink_after_a_crash() {
     let Some(e) = env("fan_in_queue_sink_after_a_crash") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let Some(port) = var("SPRIG_TEST_INHERIT_HOOK_PORT").and_then(|p| p.parse::<u16>().ok()) else {
         eprintln!("no SPRIG_TEST_INHERIT_HOOK_PORT: skipped");
@@ -3853,10 +3868,11 @@ async fn fan_in_queue_sink_after_a_crash() {
 /// member's own instance, stamped with the member's name, through a
 /// `kill -9` of the worker mid-stream (its forwarder publishes again what
 /// came after its checkpoint; the message ids make that a no-op).
+#[ignore = "live: needs SPRIG_TEST_INHERIT_GATEWAY, SPRIG_TEST_INHERIT_SYSTEM, SPRIG_TEST_INHERIT_MEMBERS, ...; tools/live/README.md"]
 #[tokio::test]
 async fn inherited_change_exchange_exactly_once() {
     let Some(e) = env("inherited_change_exchange_exactly_once") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let Some(amqp_addr) = var("SPRIG_TEST_INHERIT_AMQP") else {
         eprintln!("no SPRIG_TEST_INHERIT_AMQP: skipped");
@@ -4021,10 +4037,11 @@ $$";
 /// the account and the deploy took a third, so two busy ones made it time
 /// out. Two DDL sessions of another member wait on its catalog version row,
 /// locked from a root session, holding a connection each.
+#[ignore = "live: needs SPRIG_TEST_INHERIT_GATEWAY, SPRIG_TEST_INHERIT_SYSTEM, SPRIG_TEST_INHERIT_MEMBERS, ...; tools/live/README.md"]
 #[tokio::test]
 async fn first_publish_with_the_catalog_pool_half_busy() {
     let Some(e) = env("first_publish_with_the_catalog_pool_half_busy") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let (Some(root), Some(busy_id)) = (
         var("SPRIG_TEST_INHERIT_ROOT"),
@@ -4263,10 +4280,11 @@ $$";
 ///
 /// Each must answer within 5 s. Needs three members on one cluster,
 /// `SPRIG_TEST_INHERIT_ROOT` and `SPRIG_TEST_INHERIT_IDS`.
+#[ignore = "live: needs SPRIG_TEST_INHERIT_GATEWAY, SPRIG_TEST_INHERIT_SYSTEM, SPRIG_TEST_INHERIT_MEMBERS, ...; tools/live/README.md"]
 #[tokio::test]
 async fn inherited_paths_with_one_catalog_connection_free() {
     let Some(e) = env("inherited_paths_with_one_catalog_connection_free") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let (Some(root), Some(busy_id)) = (
         var("SPRIG_TEST_INHERIT_ROOT"),
@@ -4532,10 +4550,11 @@ const CTL_QTY_RULE: &str = r#"{"namespace": "Test", "name": "QtyPositive",
 /// Needs three members on one cluster, `SPRIG_TEST_INHERIT_ROOT` and
 /// `SPRIG_TEST_INHERIT_IDS`; the third member's deploys hold the
 /// connections.
+#[ignore = "live: needs SPRIG_TEST_INHERIT_GATEWAY, SPRIG_TEST_INHERIT_SYSTEM, SPRIG_TEST_INHERIT_MEMBERS, ...; tools/live/README.md"]
 #[tokio::test]
 async fn delivery_and_deploys_with_one_sprig_ctl_connection_free() {
     let Some(e) = env("delivery_and_deploys_with_one_sprig_ctl_connection_free") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let (Some(root), Some(busy_id)) = (
         var("SPRIG_TEST_INHERIT_ROOT"),
@@ -4744,10 +4763,11 @@ async fn pool_timeouts(addr: &str) -> std::collections::BTreeMap<String, u64> {
 /// tenant's inherited copies' states through `sprig_ctl`, which it skips
 /// when that fails). The gateway must count the timeouts, and once the
 /// holder lets go both statements work again.
+#[ignore = "live: needs SPRIG_TEST_INHERIT_GATEWAY, SPRIG_TEST_INHERIT_SYSTEM, SPRIG_TEST_INHERIT_MEMBERS, ...; tools/live/README.md"]
 #[tokio::test]
 async fn pool_waits_end_when_the_one_connection_is_held() {
     let Some(e) = env("pool_waits_end_when_the_one_connection_is_held") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let (Some(root), Some(busy_id), Some(metrics), Some(_)) = (
         var("SPRIG_TEST_INHERIT_ROOT"),

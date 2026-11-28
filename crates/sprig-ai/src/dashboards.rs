@@ -1,6 +1,6 @@
 //! Dashboards: tiles of charts over read-only queries, for one user or
-//! shared with the whole tenant, in the tenant's catalog (`t<id>_sprig`,
-//! module `dashboards`, created the first time a gateway needs it).
+//! shared with the whole tenant, in the tenant's catalog records in the
+//! storage engine ([`RecordsDashboards`], module `dashboards`).
 //!
 //! - **Whose.** A dashboard belongs to the user who made it. Shared, every
 //!   user of the tenant sees it. Its owner edits it; a shared one may also
@@ -25,19 +25,17 @@
 //!   ([`accept_tile`]) adds it to a dashboard the user picks, or to one of
 //!   their own by the name the assistant gave, made if missing.
 
-use sprig_catalog::pool_wait::Bounded as _;
 use std::collections::BTreeMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use mysql_async::prelude::Queryable as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use sprig_catalog::migrate::{MigrateOpts, Migration, Migrator, Module, Phase};
-use sprig_common::ids::UserId;
-use sprig_common::names::quote;
+use sprig_catalog::migrate::{Migration, Module, Phase};
+use sprig_catalog::records::{next_ids, prefix_end, scan_all};
+use sprig_catalog::{Pk, RecordStore, RecordTx, RowTable};
+use sprig_common::ids::{TenantId, UserId};
 use sprig_common::{Result, SprigCode, SprigError};
-use tokio::sync::OnceCell;
 
 use crate::tools::ResultSet;
 use crate::tools::builtin::check_chart;
@@ -100,7 +98,9 @@ const DDL_TILES: &str = "CREATE TABLE IF NOT EXISTS dashboard_tiles (
   KEY by_dash (dash_id)
 ) ENGINE=InnoDB";
 
-/// The module's migrations.
+/// The module's migrations, for tenant catalogs on MariaDB made before
+/// the dashboards moved to the catalog records (the contracts listing
+/// still names the module); nothing creates these tables now.
 pub static DASHBOARD_MIGRATIONS: &[Migration] = &[Migration {
     format: 1,
     phase: Phase::Expand,
@@ -120,6 +120,14 @@ fn invalid(m: impl Into<String>) -> SprigError {
 
 fn denied(m: &str) -> SprigError {
     SprigError::standard(1227, *b"42000", format!("Access denied; {m}"))
+}
+
+fn too_many_tiles() -> SprigError {
+    invalid(format!("a dashboard holds at most {MAX_TILES} tiles"))
+}
+
+fn no_tile(dash: u64, tile: u64) -> SprigError {
+    invalid(format!("dashboard {dash} has no tile {tile}"))
 }
 
 fn missing(id: u64) -> SprigError {
@@ -744,7 +752,10 @@ pub trait DashStore: Send + Sync {
     async fn update(&self, d: &Dashboard) -> Result<()>;
     /// Deletes a dashboard and its tiles.
     async fn delete(&self, id: u64) -> Result<()>;
-    /// Adds (`tile` `None`) or replaces a tile; its id.
+    /// Adds (`tile` `None`) or replaces a tile; its id. Checked with the
+    /// dashboard held, so concurrent changes can't get past them: a tile
+    /// replaced must still be there, and a dashboard takes at most
+    /// [`MAX_TILES`].
     async fn put_tile(&self, dash: u64, tile: Option<u64>, t: &TileReq, pos: Pos) -> Result<u64>;
     /// Moves tiles.
     async fn move_tiles(&self, dash: u64, moves: &[(u64, Pos)]) -> Result<()>;
@@ -844,6 +855,11 @@ impl DashStore for MemoryDashboards {
         g.0 += 1;
         let fresh = g.0;
         let d = g.1.get_mut(&dash).ok_or_else(|| missing(dash))?;
+        match tile {
+            Some(id) if !d.tiles.iter().any(|x| x.id == id) => return Err(no_tile(dash, id)),
+            None if d.tiles.len() >= MAX_TILES => return Err(too_many_tiles()),
+            _ => {}
+        }
         let id = tile.unwrap_or(fresh);
         let row = Tile {
             id,
@@ -883,160 +899,121 @@ impl DashStore for MemoryDashboards {
     }
 }
 
-/// In the tenant's catalog.
-pub struct CatalogDashboards {
-    pool: mysql_async::Pool,
-    schema: String,
-    ready: OnceCell<()>,
+/// The dashboards' rows in a tenant's catalog records
+/// (`m/dashboards/dash/<id>` and `m/dashboards/tile/<dashboard><tile>`),
+/// their ids from the counters `dashboards.dash` and `dashboards.tile`.
+/// Each call is one record transaction; a tile change locks its
+/// dashboard's row, so two editors of one dashboard take turns.
+pub const DASH_ROWS: RowTable = RowTable::new(MODULE, "dash");
+/// The tiles' rows (see [`DASH_ROWS`]).
+pub const TILE_ROWS: RowTable = RowTable::new(MODULE, "tile");
+const DASH_COUNTER: &str = "dashboards.dash";
+const TILE_COUNTER: &str = "dashboards.tile";
+
+/// A dashboard's row as stored (its tiles are their own rows).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct DashRec {
+    id: u64,
+    owner_id: u32,
+    owner: String,
+    shared: bool,
+    name: String,
+    filters: Vec<Filter>,
+    layout: Value,
+    created_ms: i64,
+    updated_ms: i64,
 }
 
-impl std::fmt::Debug for CatalogDashboards {
+/// In the tenant's catalog records (the storage engine).
+pub struct RecordsDashboards {
+    records: Arc<dyn RecordStore>,
+    tenant: TenantId,
+}
+
+impl std::fmt::Debug for RecordsDashboards {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CatalogDashboards")
-            .field("schema", &self.schema)
+        f.debug_struct("RecordsDashboards")
+            .field("tenant", &self.tenant)
             .finish_non_exhaustive()
     }
 }
 
-fn unavailable(e: mysql_async::Error) -> SprigError {
-    SprigError::new(
-        SprigCode::CatalogUnavailable,
-        "the tenant's catalog is unreachable",
-    )
-    .with_source(e)
+fn dash_pk(id: u64) -> Pk {
+    Pk::new().u64(id)
 }
 
-type DashRow = (u64, String, u32, String, bool, String, String, i64);
-type TileRow = (u64, String, Option<String>, String, String, u32, String);
+fn tile_pk(dash: u64, tile: u64) -> Pk {
+    Pk::new().u64(dash).u64(tile)
+}
 
-impl CatalogDashboards {
-    /// The dashboards in `schema` (`t<id>_sprig`), reached through `pool`
-    /// (the catalog writer's).
+impl RecordsDashboards {
+    /// `tenant`'s dashboards in `records`.
     #[must_use]
-    pub fn new(pool: mysql_async::Pool, schema: impl Into<String>) -> Self {
-        Self {
-            pool,
-            schema: schema.into(),
-            ready: OnceCell::new(),
-        }
+    pub fn new(records: Arc<dyn RecordStore>, tenant: TenantId) -> Self {
+        Self { records, tenant }
     }
 
-    fn t(&self, table: &str) -> String {
-        format!("{}.{}", quote(&self.schema), quote(table))
+    async fn begin(&self) -> Result<Box<dyn RecordTx>> {
+        self.records.begin(self.tenant).await
     }
 
-    async fn conn(&self) -> Result<mysql_async::Conn> {
-        let mut conn = self.pool.get_conn_bounded().await.map_err(unavailable)?;
-        self.ready
-            .get_or_try_init(|| async {
-                let have: Option<u64> = conn
-                    .exec_first(
-                        "SELECT COUNT(*) FROM information_schema.TABLES \
-                         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'dashboard_tiles'",
-                        (self.schema.as_str(),),
-                    )
-                    .await
-                    .map_err(unavailable)?;
-                if have.unwrap_or(0) == 0 {
-                    Migrator::new(&[DASHBOARD_MODULE])?
-                        .run(&mut conn, &self.schema, &MigrateOpts::existing())
-                        .await?;
-                }
-                Ok::<(), SprigError>(())
-            })
-            .await?;
-        Ok(conn)
+    /// The dashboard's row, locked until the transaction ends.
+    async fn locked(tx: &mut dyn RecordTx, id: u64) -> Result<Option<DashRec>> {
+        DASH_ROWS.get_for_update(tx, &dash_pk(id)).await
     }
-}
 
-fn json_text(v: &impl Serialize) -> String {
-    serde_json::to_string(v).unwrap_or_else(|_| "null".to_owned())
+    async fn touch(tx: &mut dyn RecordTx, mut d: DashRec) -> Result<()> {
+        d.updated_ms = now_ms();
+        DASH_ROWS.put(tx, &dash_pk(d.id), &d).await
+    }
 }
 
 #[async_trait]
-impl DashStore for CatalogDashboards {
+impl DashStore for RecordsDashboards {
     async fn list(&self, user: UserId) -> Result<Vec<Header>> {
-        let mut c = self.conn().await?;
-        let rows: Vec<(u64, String, u32, String, bool, i64, u64)> = c
-            .exec(
-                format!(
-                    "SELECT d.dash_id, d.name, d.owner_id, d.owner, d.shared != 0, \
-                     CAST(TIMESTAMPDIFF(MICROSECOND, '1970-01-01', d.updated_at) DIV 1000 AS SIGNED), \
-                     (SELECT COUNT(*) FROM {} t WHERE t.dash_id = d.dash_id) \
-                     FROM {} d WHERE d.owner_id = ? OR d.shared = 1 ORDER BY d.name, d.dash_id",
-                    self.t("dashboard_tiles"),
-                    self.t("dashboards")
-                ),
-                (user.0,),
-            )
-            .await
-            .map_err(unavailable)?;
-        Ok(rows
-            .into_iter()
-            .map(|(id, name, owner_id, owner, shared, at, tiles)| Header {
-                id,
-                name,
-                owner_id,
-                owner,
-                shared,
+        let mut tx = self.begin().await?;
+        let mut out = Vec::new();
+        for d in DASH_ROWS.rows::<DashRec>(&mut *tx, &Pk::new()).await? {
+            if d.owner_id != user.0 && !d.shared {
+                continue;
+            }
+            let tiles = TILE_ROWS
+                .scan::<Value>(&mut *tx, &dash_pk(d.id))
+                .await?
+                .len();
+            out.push(Header {
+                id: d.id,
+                name: d.name,
+                owner_id: d.owner_id,
+                owner: d.owner,
+                shared: d.shared,
                 tiles: u32::try_from(tiles).unwrap_or(u32::MAX),
-                updated_ms: at,
-            })
-            .collect())
+                updated_ms: d.updated_ms,
+            });
+        }
+        tx.rollback().await?;
+        out.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
+        Ok(out)
     }
 
     async fn get(&self, id: u64) -> Result<Option<Dashboard>> {
-        let mut c = self.conn().await?;
-        let row: Option<DashRow> = c
-            .exec_first(
-                format!(
-                    "SELECT dash_id, name, owner_id, owner, shared != 0, filters, layout, \
-                     CAST(TIMESTAMPDIFF(MICROSECOND, '1970-01-01', updated_at) DIV 1000 AS SIGNED) \
-                     FROM {} WHERE dash_id = ?",
-                    self.t("dashboards")
-                ),
-                (id,),
-            )
-            .await
-            .map_err(unavailable)?;
-        let Some((id, name, owner_id, owner, shared, filters, layout, at)) = row else {
+        let mut tx = self.begin().await?;
+        let Some(d) = DASH_ROWS.get::<DashRec>(&mut *tx, &dash_pk(id)).await? else {
+            tx.rollback().await?;
             return Ok(None);
         };
-        let tiles: Vec<TileRow> = c
-            .exec(
-                format!(
-                    "SELECT tile_id, title, db_name, sql_text, chart, refresh_seconds, pos \
-                     FROM {} WHERE dash_id = ? ORDER BY tile_id",
-                    self.t("dashboard_tiles")
-                ),
-                (id,),
-            )
-            .await
-            .map_err(unavailable)?;
-        let mut tiles: Vec<Tile> = tiles
-            .into_iter()
-            .filter_map(|(tid, title, db, sql, chart, refresh, pos)| {
-                Some(Tile {
-                    id: tid,
-                    title,
-                    database: db,
-                    sql,
-                    chart: serde_json::from_str(&chart).ok()?,
-                    refresh_seconds: refresh,
-                    pos: serde_json::from_str(&pos).ok()?,
-                })
-            })
-            .collect();
+        let mut tiles = TILE_ROWS.rows::<Tile>(&mut *tx, &dash_pk(id)).await?;
+        tx.rollback().await?;
         tiles.sort_by_key(|t| (t.pos.y, t.pos.x, t.id));
         Ok(Some(Dashboard {
-            id,
-            name,
-            owner_id,
-            owner,
-            shared,
-            filters: serde_json::from_str(&filters).unwrap_or_default(),
-            layout: serde_json::from_str(&layout).unwrap_or(Value::Null),
-            updated_ms: at,
+            id: d.id,
+            name: d.name,
+            owner_id: d.owner_id,
+            owner: d.owner,
+            shared: d.shared,
+            filters: d.filters,
+            layout: d.layout,
+            updated_ms: d.updated_ms,
             tiles,
         }))
     }
@@ -1049,152 +1026,116 @@ impl DashStore for CatalogDashboards {
         shared: bool,
         filters: &[Filter],
     ) -> Result<u64> {
-        let mut c = self.conn().await?;
-        c.exec_drop(
-            format!(
-                "INSERT INTO {} (owner_id, owner, shared, name, filters, layout, created_at, updated_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3))",
-                self.t("dashboards")
-            ),
-            (
-                owner.0,
-                owner_name,
-                shared,
-                name,
-                json_text(&filters),
-                json!({"columns": GRID_COLUMNS}).to_string(),
-            ),
-        )
-        .await
-        .map_err(unavailable)?;
-        c.last_insert_id()
-            .ok_or_else(|| SprigError::internal("no id for the new dashboard"))
+        let mut tx = self.begin().await?;
+        let id = next_ids(&mut *tx, DASH_COUNTER, 1).await?;
+        let now = now_ms();
+        let d = DashRec {
+            id,
+            owner_id: owner.0,
+            owner: owner_name.to_owned(),
+            shared,
+            name: name.to_owned(),
+            filters: filters.to_vec(),
+            layout: json!({"columns": GRID_COLUMNS}),
+            created_ms: now,
+            updated_ms: now,
+        };
+        DASH_ROWS.put(&mut *tx, &dash_pk(id), &d).await?;
+        tx.commit().await?;
+        Ok(id)
     }
 
     async fn update(&self, d: &Dashboard) -> Result<()> {
-        let mut c = self.conn().await?;
-        c.exec_drop(
-            format!(
-                "UPDATE {} SET name = ?, shared = ?, filters = ?, layout = ?, \
-                 updated_at = UTC_TIMESTAMP(3) WHERE dash_id = ?",
-                self.t("dashboards")
-            ),
-            (
-                &d.name,
-                d.shared,
-                json_text(&d.filters),
-                d.layout.to_string(),
-                d.id,
-            ),
-        )
-        .await
-        .map_err(unavailable)
+        let mut tx = self.begin().await?;
+        if let Some(mut have) = Self::locked(&mut *tx, d.id).await? {
+            have.name.clone_from(&d.name);
+            have.shared = d.shared;
+            have.filters.clone_from(&d.filters);
+            have.layout.clone_from(&d.layout);
+            Self::touch(&mut *tx, have).await?;
+        }
+        tx.commit().await
     }
 
     async fn delete(&self, id: u64) -> Result<()> {
-        let mut c = self.conn().await?;
-        c.exec_drop(
-            format!(
-                "DELETE FROM {} WHERE dash_id = ?",
-                self.t("dashboard_tiles")
-            ),
-            (id,),
-        )
-        .await
-        .map_err(unavailable)?;
-        c.exec_drop(
-            format!("DELETE FROM {} WHERE dash_id = ?", self.t("dashboards")),
-            (id,),
-        )
-        .await
-        .map_err(unavailable)
+        let mut tx = self.begin().await?;
+        if Self::locked(&mut *tx, id).await?.is_some() {
+            for (pk, _) in TILE_ROWS.scan::<Value>(&mut *tx, &dash_pk(id)).await? {
+                TILE_ROWS.delete(&mut *tx, &pk).await?;
+            }
+            DASH_ROWS.delete(&mut *tx, &dash_pk(id)).await?;
+        }
+        tx.commit().await
     }
 
     async fn put_tile(&self, dash: u64, tile: Option<u64>, t: &TileReq, pos: Pos) -> Result<u64> {
-        let mut c = self.conn().await?;
-        let id = if let Some(tile) = tile {
-            c.exec_drop(
-                format!(
-                    "UPDATE {} SET title = ?, db_name = ?, sql_text = ?, chart = ?, \
-                     refresh_seconds = ?, pos = ? WHERE tile_id = ? AND dash_id = ?",
-                    self.t("dashboard_tiles")
-                ),
-                (
-                    &t.title,
-                    &t.database,
-                    &t.sql,
-                    t.chart.to_string(),
-                    t.refresh_seconds,
-                    json_text(&pos),
-                    tile,
-                    dash,
-                ),
-            )
-            .await
-            .map_err(unavailable)?;
-            tile
+        let mut tx = self.begin().await?;
+        let d = Self::locked(&mut *tx, dash)
+            .await?
+            .ok_or_else(|| missing(dash))?;
+        let id = if let Some(id) = tile {
+            if tx
+                .get_for_update(&TILE_ROWS.key(&tile_pk(dash, id)))
+                .await?
+                .is_none()
+            {
+                return Err(no_tile(dash, id));
+            }
+            id
         } else {
-            c.exec_drop(
-                format!(
-                    "INSERT INTO {} (dash_id, title, db_name, sql_text, chart, refresh_seconds, pos) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    self.t("dashboard_tiles")
-                ),
-                (
-                    dash,
-                    &t.title,
-                    &t.database,
-                    &t.sql,
-                    t.chart.to_string(),
-                    t.refresh_seconds,
-                    json_text(&pos),
-                ),
-            )
-            .await
-            .map_err(unavailable)?;
-            c.last_insert_id()
-                .ok_or_else(|| SprigError::internal("no id for the new tile"))?
+            // Counted by key, with the dashboard held.
+            let lo = TILE_ROWS.key(&dash_pk(dash));
+            let have = scan_all(&mut *tx, &lo, &prefix_end(&lo)).await?.len();
+            if have >= MAX_TILES {
+                return Err(too_many_tiles());
+            }
+            next_ids(&mut *tx, TILE_COUNTER, 1).await?
         };
-        c.exec_drop(
-            format!(
-                "UPDATE {} SET updated_at = UTC_TIMESTAMP(3) WHERE dash_id = ?",
-                self.t("dashboards")
-            ),
-            (dash,),
-        )
-        .await
-        .map_err(unavailable)?;
+        let row = Tile {
+            id,
+            title: t.title.clone(),
+            database: t.database.clone(),
+            sql: t.sql.clone(),
+            chart: t.chart.clone(),
+            refresh_seconds: t.refresh_seconds,
+            pos,
+        };
+        TILE_ROWS.put(&mut *tx, &tile_pk(dash, id), &row).await?;
+        Self::touch(&mut *tx, d).await?;
+        tx.commit().await?;
         Ok(id)
     }
 
     async fn move_tiles(&self, dash: u64, moves: &[(u64, Pos)]) -> Result<()> {
-        let mut c = self.conn().await?;
+        let mut tx = self.begin().await?;
+        let Some(d) = Self::locked(&mut *tx, dash).await? else {
+            return tx.commit().await;
+        };
         for (id, p) in moves {
-            c.exec_drop(
-                format!(
-                    "UPDATE {} SET pos = ? WHERE tile_id = ? AND dash_id = ?",
-                    self.t("dashboard_tiles")
-                ),
-                (json_text(p), id, dash),
-            )
-            .await
-            .map_err(unavailable)?;
+            let pk = tile_pk(dash, *id);
+            if let Some(mut t) = TILE_ROWS.get::<Tile>(&mut *tx, &pk).await? {
+                t.pos = *p;
+                TILE_ROWS.put(&mut *tx, &pk, &t).await?;
+            }
         }
-        Ok(())
+        Self::touch(&mut *tx, d).await?;
+        tx.commit().await
     }
 
     async fn delete_tile(&self, dash: u64, tile: u64) -> Result<bool> {
-        let mut c = self.conn().await?;
-        c.exec_drop(
-            format!(
-                "DELETE FROM {} WHERE tile_id = ? AND dash_id = ?",
-                self.t("dashboard_tiles")
-            ),
-            (tile, dash),
-        )
-        .await
-        .map_err(unavailable)?;
-        Ok(c.affected_rows() > 0)
+        let mut tx = self.begin().await?;
+        let Some(d) = Self::locked(&mut *tx, dash).await? else {
+            tx.rollback().await?;
+            return Ok(false);
+        };
+        let pk = tile_pk(dash, tile);
+        let had = TILE_ROWS.get::<Value>(&mut *tx, &pk).await?.is_some();
+        if had {
+            TILE_ROWS.delete(&mut *tx, &pk).await?;
+            Self::touch(&mut *tx, d).await?;
+        }
+        tx.commit().await?;
+        Ok(had)
     }
 }
 
@@ -1450,9 +1391,7 @@ pub async fn add_tile(store: &dyn DashStore, who: &Who, id: u64, b: &Value) -> R
     let d = editable(store, who, id).await?;
     let t = TileReq::from_json(b)?;
     if d.tiles.len() >= MAX_TILES {
-        return Err(invalid(format!(
-            "a dashboard holds at most {MAX_TILES} tiles"
-        )));
+        return Err(too_many_tiles());
     }
     let tile = put_tile_checked(store, &d, None, &t).await?;
     Ok(json!({"tile": tile.to_string(), "dashboard": get(store, who, id).await?}))
@@ -1471,7 +1410,7 @@ pub async fn update_tile(
 ) -> Result<Value> {
     let d = editable(store, who, id).await?;
     if !d.tiles.iter().any(|t| t.id == tile) {
-        return Err(invalid(format!("dashboard {id} has no tile {tile}")));
+        return Err(no_tile(id, tile));
     }
     let t = TileReq::from_json(b)?;
     put_tile_checked(store, &d, Some(tile), &t).await?;
@@ -1628,9 +1567,7 @@ pub async fn accept_tile(
     };
     let d = editable(store, who, dash).await?;
     if d.tiles.len() >= MAX_TILES {
-        return Err(invalid(format!(
-            "a dashboard holds at most {MAX_TILES} tiles"
-        )));
+        return Err(too_many_tiles());
     }
     let tile = put_tile_checked(store, &d, None, &t).await?;
     Ok((dash, tile))

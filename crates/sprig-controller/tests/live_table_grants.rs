@@ -293,6 +293,7 @@ async fn grant_rows(e: &Env, tenant: u64, table: &str) -> Vec<NodeRows> {
     out
 }
 
+#[ignore = "live: needs SPRIG_TEST_TABLE_GRANTS, SPRIG_TEST_TABLE_GRANTS_TENANT, SPRIG_TEST_TABLE_GRANTS_MOVE_TO, ...; tools/live/README.md"]
 #[tokio::test]
 async fn table_grants_follow_regroups_splits_merges_and_moves() {
     let Some(e) = env() else {
@@ -300,7 +301,7 @@ async fn table_grants_follow_regroups_splits_merges_and_moves() {
             "skipped: set SPRIG_TEST_TABLE_GRANTS=<gateway mysql port>,<admin port> and \
              SPRIG_TEST_TABLE_GRANTS_NODES"
         );
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let created = ctl_retry(&e, &["tenant", "create", &e.tenant, "--cluster", "dc-a-c1"]).await;
     let tid = tenant_id(&created).as_u64().unwrap_or(0);

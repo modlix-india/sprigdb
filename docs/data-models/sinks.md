@@ -158,7 +158,8 @@ SPRIG SET (sink.destination_allowlist = '[
 
 - An entry is a host, `host:port`, `*.domain` or an address, as a JSON string or a `{"host": ..., "tags": {...}}` object. The list can also be comma-separated text.
 - An entry without a port allows ports 80 and 443, plus the connection type's default port (3306, 5432, 9092 or 9093).
-- Private, loopback, link-local, shared and unspecified addresses are refused unless an entry names the address itself.
+- Internal addresses (private, loopback, link-local including cloud instance metadata, shared and unspecified) are refused, whether a name resolves to them or the entry is a literal IP. An operator lifts the block for chosen addresses with `sink.internal_destinations` (addresses or CIDR ranges with an optional port, operator only); the address must still be on the tenant's allowlist. Instance metadata is reached only when the operator sets `sink.platform_identity` to `full`.
+- A sink's or connection's `WITH` can't set `destination_allowlist`, `platform_identity`, `enabled`, `allowed_kinds` or per-tenant limits (39218); those are settings.
 - SprigDB resolves the name once, checks the address and connects to that address, so a second DNS answer can't swap it.
 - Hosts are checked at `CREATE CONNECTION`, at `ALTER CONNECTION`, at every task start and at every connection a target or script opens. A host not on the list fails with `ER_SPRIG_SINK_DESTINATION_NOT_ALLOWED` (39213).
 
@@ -687,7 +688,7 @@ A fan-in sink lives in the tenant that declared the inherited stream or queue, o
 | 39210 | `ER_SPRIG_SINK_NOT_FOUND` | Unknown sink or connection |
 | 39211 | `ER_SPRIG_SINK_EXISTS` | Name in use |
 | 39212 | `ER_SPRIG_SINK_PRIVILEGE` | No `SPRIG_SINK_ADMIN`, no `USAGE` on a connection, no `SELECT` on the source, or a fan-in sink without `SPRIG_FAN_IN` |
-| 39213 | `ER_SPRIG_SINK_DESTINATION_NOT_ALLOWED` | A host not on `sink.destination_allowlist`, or a private address not listed literally |
+| 39213 | `ER_SPRIG_SINK_DESTINATION_NOT_ALLOWED` | A host not on `sink.destination_allowlist`, or an internal address `sink.internal_destinations` doesn't name |
 | 39214 | `ER_SPRIG_SINK_RESIDENCY` | The destination's tags don't satisfy the residency policy |
 | 39215 | `ER_SPRIG_SINK_CONNECTION_IN_USE` | Dropping a connection a sink uses |
 | 39216 | `ER_SPRIG_SINK_CREDENTIALS_INVALID` | An unknown or missing credential, or no credential key on the gateway |

@@ -1,0 +1,5 @@
+id,name,amt
+1,"a, b",1.5
+2,"say ""hi""",2
+3,NULL,
+4,plain,4

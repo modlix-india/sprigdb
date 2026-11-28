@@ -366,6 +366,7 @@ fn percentile(v: &mut [Duration], p: f64) -> Duration {
     v[i.min(v.len() - 1)]
 }
 
+#[ignore = "live: needs SPRIG_TEST_BOLT_ADDR, SPRIG_TEST_BOLT_USER, SPRIG_TEST_BOLT_PASSWORD, ...; tools/live/README.md"]
 #[tokio::test]
 #[allow(clippy::too_many_lines)] // load, read, compare, report
 async fn ldbc_shaped_workload() {
@@ -376,7 +377,7 @@ async fn ldbc_shaped_workload() {
         env("SPRIG_TEST_LDBC_GRAPH"),
     ) else {
         eprintln!("skipped: SPRIG_TEST_BOLT_* / SPRIG_TEST_LDBC_GRAPH not set");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let persons: i64 = env("SPRIG_TEST_LDBC_PERSONS")
         .and_then(|v| v.parse().ok())

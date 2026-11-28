@@ -151,6 +151,7 @@ fn domains(pos: &str) -> BTreeSet<u64> {
         .collect()
 }
 
+#[ignore = "live: needs SPRIG_TEST_FTG_SQL, SPRIG_TEST_FTG_HTTP, SPRIG_TEST_FTG_NODES; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn galera_streams_start_at_a_time() {
     let (Ok(sql_addr), Ok(http_addr), Ok(nodes)) = (
@@ -159,7 +160,7 @@ async fn galera_streams_start_at_a_time() {
         std::env::var("SPRIG_TEST_FTG_NODES"),
     ) else {
         eprintln!("skipped: set SPRIG_TEST_FTG_SQL, SPRIG_TEST_FTG_HTTP and SPRIG_TEST_FTG_NODES");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let mut ck = Checks {
         n: 0,

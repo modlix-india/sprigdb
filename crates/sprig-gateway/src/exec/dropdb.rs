@@ -128,7 +128,9 @@ impl DbDrop {
             return Err(e);
         }
         let v = c.commit().await?;
-        let store = sprig_sinks::store::SinksStore::new(Arc::clone(&svc.records), self.tenant);
+        // On the unit's leader, also when the leadership moved after the
+        // catalog change committed.
+        let store = sprig_sinks::store::SinksStore::new(Arc::clone(&svc.writers), self.tenant);
         for ch in &changes {
             sprig_sinks::sql::after_commit(&store, ch).await?;
         }
@@ -138,7 +140,7 @@ impl DbDrop {
     }
 
     async fn drop_logic(&self, svc: &TenantServices, version: u64) -> Result<()> {
-        let mut c = svc.records.begin(self.tenant).await?;
+        let mut c = svc.writers.begin(self.tenant).await?;
         sprig_logic::dropdb::database_dropped(
             &mut *c,
             "",

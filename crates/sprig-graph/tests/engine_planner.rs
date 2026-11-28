@@ -886,7 +886,10 @@ async fn planner_speed() {
     eprintln!("| query | one by one p50 | batched p50 | ratio | rows |");
     eprintln!("|---|---|---|---|---|");
     for (name, q, names) in far {
-        if only.as_ref().is_some_and(|o| !name.starts_with(o.as_str()) && !name.starts_with('F')) {
+        if only
+            .as_ref()
+            .is_some_and(|o| !name.starts_with(o.as_str()) && !name.starts_with('F'))
+        {
             continue;
         }
         let sets: Vec<Params> = (0..31)

@@ -457,7 +457,7 @@ pub async fn drop_trigger_here(svc: &Arc<TenantServices>, g: DefKey) -> Result<u
         if super::dir_entry(svc, t).await?.is_none() {
             continue;
         }
-        let store = sprig_inherit::msg::MsgStore::new(Arc::clone(&svc.records), t);
+        let store = sprig_inherit::msg::MsgStore::new(Arc::clone(&svc.writers), t);
         if let Some(i) = store.instance(g).await? {
             if let Some(b) = i
                 .physical
@@ -473,7 +473,7 @@ pub async fn drop_trigger_here(svc: &Arc<TenantServices>, g: DefKey) -> Result<u
                     .and_then(|p| p.get("module"))
                     .and_then(Value::as_u64)
                     .unwrap_or(0);
-                let mut tx = svc.records.begin(t).await?;
+                let mut tx = svc.writers.begin(t).await?;
                 if sprig_logic::LogicStore::default()
                     .mark_dropped(&mut *tx, module, 0)
                     .await

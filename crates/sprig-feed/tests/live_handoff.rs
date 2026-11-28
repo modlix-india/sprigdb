@@ -790,11 +790,12 @@ async fn cleanup(tenant: TenantId, jobs: &[JobId]) {
     eprintln!("cleaned up tenant {tenant} and jobs {jobs:?}");
 }
 
+#[ignore = "live: needs SPRIG_TEST_FEED_LIVE; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_consumer_resumes_across_moves_without_loss_or_duplicates() {
     if std::env::var("SPRIG_TEST_FEED_LIVE").is_err() {
         eprintln!("skipped: set SPRIG_TEST_FEED_LIVE=1 with the Compose stack up");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     }
     let _ = tracing_subscriber::fmt()
         .with_env_filter(

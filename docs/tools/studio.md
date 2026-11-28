@@ -198,7 +198,7 @@ Choosing an object opens its page:
 - **Triggers** lists SQL triggers with their timing, event and statement.
 - **Policies** lists the table's [row-level security](../security/row-level-security.md) policies; with none, every user with `SELECT` sees every row.
 - **Inheritance** shows whether the table is inheritable (see [Inheritance](../data-models/inheritance.md)).
-- **Shards** shows the table's table group and shards.
+- **Shards** showed the table's table group and shards; in this release there are none (see [Shards](#shards)).
 - **Definition** shows `SHOW CREATE`.
 
 ![The Columns tab of the orders table, listing each column with its type, nullability, key, default and extra](../img/studio/table-columns.png)
@@ -354,6 +354,8 @@ Two tabs:
 
 - **Table groups**: each table's routing, key columns and parent, and each group's shards with their hash range, cluster, state, epoch and any running job. You see tables in the databases you hold grants on.
 - **Advisor runs**: the [sharding advisor](../performance/sharding-advisor.md)'s runs with their cause, mode, status, verdict, best score, confidence and times. These cover every database, so they need `SPRIG_TENANT_ADMIN` or a grant on `*.*`.
+
+In this release the page has nothing to show: table groups, shard maps and the sharding advisor's runs belonged to MariaDB shards, and their routes are gone (`/v1/shards` answers 404). SprigDB's storage engine places a tenant's data itself.
 
 ## Access control
 

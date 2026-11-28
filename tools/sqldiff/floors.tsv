@@ -1,0 +1,43 @@
+# corpus	side	byte-identical floor	of	recorded
+# Seeded from the counts the SQL agents recorded on their last runs (20-27 Nov 2026, engine builds of those days);
+# re-record with `run.sh --record` on a current build. A corpus missing here is reported, not judged.
+aggs	maria	2	10	seed
+aggs	mysql	3	10	seed
+corr	maria	19	25	seed
+corr	mysql	14	26	seed
+ctas	maria	22	22	seed
+ctas	mysql	18	22	seed
+dates	maria	53	57	seed
+dates	mysql	50	57	seed
+funcs	maria	7	10	seed
+funcs	mysql	8	14	seed
+funcs2	maria	10	10	seed
+funcs2	mysql	10	10	seed
+fxkey	maria	2	2	seed
+fxkey	mysql	3	4	seed
+inssel	maria	23	24	seed
+inssel	mysql	24	24	seed
+is2	maria	8	9	seed
+is2	mysql	4	9	seed
+json	maria	5	15	seed
+json	mysql	2	15	seed
+jsonagg	maria	3	8	seed
+jsonagg	mysql	2	8	seed
+left6	maria	8	11	seed
+left6	mysql	8	11	seed
+rollup	maria	8	10	seed
+rollup	mysql	2	10	seed
+rowcmp	maria	18	18	seed
+rowcmp	mysql	18	18	seed
+stats	maria	24	25	seed
+stats	mysql	35	36	seed
+temp	maria	70	72	seed
+temp	mysql	66	72	seed
+upsert	maria	27	27	seed
+upsert	mysql	27	27	seed
+uservar	maria	15	26	seed
+uservar	mysql	10	26	seed
+views	maria	47	56	seed
+views	mysql	45	56	seed
+windows	maria	14	17	seed
+windows	mysql	16	18	seed

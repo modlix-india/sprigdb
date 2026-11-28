@@ -263,6 +263,7 @@ async fn an_ancestor_homed_in_another_dc_is_found_through_its_home() {
 /// Live on the Compose single node; skipped without
 /// `SPRIG_TEST_MARIADB_SINGLE`. Its catalog is `t<id>_sprig` with an id
 /// from 9,200,000,000 + pid × 1000, dropped by exact name afterwards.
+#[ignore = "live: needs SPRIG_TEST_MARIADB_SINGLE; tools/live/README.md"]
 #[tokio::test]
 async fn live_migrations_skip_a_fenced_catalog_and_the_unfence_restores_it() {
     use futures::FutureExt;
@@ -279,7 +280,7 @@ async fn live_migrations_skip_a_fenced_catalog_and_the_unfence_restores_it() {
         .filter(|v| !v.trim().is_empty())
     else {
         eprintln!("skipped: set SPRIG_TEST_MARIADB_SINGLE");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let tenant = TenantId(9_200_000_000 + u64::from(std::process::id()) * 1000);
     let catalog = format!("t{tenant}_sprig");

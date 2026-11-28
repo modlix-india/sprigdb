@@ -99,6 +99,7 @@ async fn count(c: &mut mysql_async::Conn, t: &str) -> u64 {
         .unwrap()
 }
 
+#[ignore = "live: needs SPRIG_TEST_KV_MYSQL; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sweeper_removes_expired_keys_and_orphans() {
     let Some(url) = std::env::var("SPRIG_TEST_KV_MYSQL")
@@ -106,7 +107,7 @@ async fn sweeper_removes_expired_keys_and_orphans() {
         .filter(|s| !s.is_empty())
     else {
         eprintln!("SPRIG_TEST_KV_MYSQL not set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let opts = mysql_async::Opts::from_url(&url).unwrap();
     let mut root = mysql_async::Conn::new(opts.clone()).await.unwrap();
@@ -254,6 +255,7 @@ async fn sweeper_removes_expired_keys_and_orphans() {
 /// - `SPRIG_TEST_REDIS_SPRIG`: the gateway's Redis listener as a tenant.
 /// - `SPRIG_TEST_KV_MYSQL`: the tenant's cluster as root.
 /// - `SPRIG_TEST_SWEEP_SCHEMA`: the physical schema of its Redis database.
+#[ignore = "live: needs SPRIG_TEST_REDIS_SPRIG, SPRIG_TEST_KV_MYSQL, SPRIG_TEST_SWEEP_SCHEMA; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn worker_sweeps_through_a_gateway() {
     let (Some(url), Some(root_url), Some(schema)) = (
@@ -264,7 +266,7 @@ async fn worker_sweeps_through_a_gateway() {
         eprintln!(
             "SPRIG_TEST_REDIS_SPRIG, SPRIG_TEST_KV_MYSQL or SPRIG_TEST_SWEEP_SCHEMA not set: skipped"
         );
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let client = redis::Client::open(url).unwrap();
     let mut c = client.get_multiplexed_async_connection().await.unwrap();

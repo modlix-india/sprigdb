@@ -118,12 +118,13 @@ async fn agg(c: &Collection<Document>, p: Vec<Document>) -> Result<Vec<Document>
     r.try_collect().await.map_err(|e| code_of(&e))
 }
 
+#[ignore = "live: needs SPRIG_TEST_MONGO_URI, SPRIG_TEST_MONGO_REF_URI; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn geo_matches_mongodb() {
     let (Some(s_uri), Some(r_uri)) = (uri("SPRIG_TEST_MONGO_URI"), uri("SPRIG_TEST_MONGO_REF_URI"))
     else {
         eprintln!("SPRIG_TEST_MONGO_URI or SPRIG_TEST_MONGO_REF_URI not set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let s = Client::with_uri_str(&s_uri)
         .await
@@ -414,11 +415,12 @@ async fn geo_matches_mongodb() {
 /// `$vectorSearch` against brute force: an exact search returns the
 /// nearest documents in order with Atlas's scores, filters on declared
 /// fields, refuses undeclared ones; search index commands round-trip.
+#[ignore = "live: needs SPRIG_TEST_MONGO_URI; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn vector_search_matches_brute_force() {
     let Some(s_uri) = uri("SPRIG_TEST_MONGO_URI") else {
         eprintln!("SPRIG_TEST_MONGO_URI not set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let db = Client::with_uri_str(&s_uri)
         .await

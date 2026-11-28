@@ -69,12 +69,12 @@ mod skip {
             .collect()
     }
 
+    /// A live test run without its environment fails (they are `#[ignore]`d,
+    /// so they run only when asked for).
     pub(crate) fn report_missing(name: &str, test: &str) {
-        assert!(
-            var("SPRIG_TEST_STRICT").is_none_or(|v| v == "0"),
-            "{test}: {name} is not set (SPRIG_TEST_STRICT)"
+        panic!(
+            "{test}: {name} is not set; a live test needs its environment (see tools/live/README.md)"
         );
-        eprintln!("skipped {test}: set {name} to run it");
     }
 }
 
@@ -323,6 +323,7 @@ async fn insert(c: &mut mysql_async::Conn, schema: &str, id: u32) -> Result<(), 
         })
 }
 
+#[ignore = "live: needs SPRIG_TEST_MARIADB_SINGLE; tools/live/README.md"]
 #[tokio::test]
 async fn revoke_kill_stops_an_open_transaction_and_unfence_restores_grants() {
     let eps = topology_or_skip!(skip::MARIADB_SINGLE);
@@ -392,6 +393,7 @@ async fn revoke_kill_stops_an_open_transaction_and_unfence_restores_grants() {
     .await;
 }
 
+#[ignore = "live: needs SPRIG_TEST_MARIADB_SINGLE; tools/live/README.md"]
 #[tokio::test]
 async fn rename_waits_for_lock_holders_then_fences_and_unfences() {
     let eps = topology_or_skip!(skip::MARIADB_SINGLE);
@@ -473,6 +475,7 @@ async fn rename_waits_for_lock_holders_then_fences_and_unfences() {
 /// while a rename fence held (catalog migrations did, on a fenced
 /// catalog). The unfence drops a recreation only if it is empty and was
 /// created after the fence; otherwise it fails and drops nothing.
+#[ignore = "live: needs SPRIG_TEST_MARIADB_SINGLE; tools/live/README.md"]
 #[tokio::test]
 async fn unfence_drops_only_empty_recreations_made_after_the_fence() {
     let eps = topology_or_skip!(skip::MARIADB_SINGLE);
@@ -543,6 +546,7 @@ async fn unfence_drops_only_empty_recreations_made_after_the_fence() {
     .await;
 }
 
+#[ignore = "live: needs SPRIG_TEST_MARIADB_SINGLE; tools/live/README.md"]
 #[tokio::test]
 async fn without_connection_admin_only_rename_remains() {
     let eps = topology_or_skip!(skip::MARIADB_SINGLE);
@@ -626,6 +630,7 @@ async fn without_connection_admin_only_rename_remains() {
     .await;
 }
 
+#[ignore = "live: needs SPRIG_TEST_MARIADB_REPLICATION; tools/live/README.md"]
 #[tokio::test]
 async fn replication_all_scope_kills_replica_readers() {
     let eps = topology_or_skip!(skip::MARIADB_REPLICATION);
@@ -689,6 +694,7 @@ async fn replication_all_scope_kills_replica_readers() {
     .await;
 }
 
+#[ignore = "live: needs SPRIG_TEST_MARIADB_GALERA; tools/live/README.md"]
 #[tokio::test]
 async fn galera_fence_kills_on_every_node() {
     let eps = topology_or_skip!(skip::MARIADB_GALERA);
@@ -734,6 +740,7 @@ async fn galera_fence_kills_on_every_node() {
     .await;
 }
 
+#[ignore = "live: needs SPRIG_TEST_MARIADB_SINGLE, SPRIG_TEST_MARIADB_REPLICATION or SPRIG_TEST_MARIADB_GALERA; tools/live/README.md"]
 #[tokio::test]
 async fn feed_requirements_hold_on_every_topology() {
     let mut seen = 0;

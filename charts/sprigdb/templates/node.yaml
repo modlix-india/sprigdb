@@ -142,7 +142,8 @@ spec:
           requests: {storage: {{ .Values.node.storage.size }}}
 ---
 # Headless: a stable DNS name per node pod, published before it is ready
-# (Raft peers find each other while starting).
+# (Raft peers find each other while starting). It also publishes each
+# pod's telemetry for the ServiceMonitor, a starting node's included.
 apiVersion: v1
 kind: Service
 metadata:
@@ -155,6 +156,7 @@ spec:
   ports:
     - {name: peer, port: 7403}
     - {name: raft, port: {{ .Values.node.raftPort }}}
+    - {name: telemetry, port: 9180}
 ---
 # Clients: any node accepts any connection and hands it to the tenant's
 # leader.

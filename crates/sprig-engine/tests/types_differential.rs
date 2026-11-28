@@ -858,6 +858,7 @@ fn run_oracle(oracle: &Oracle, rows: usize, report: &mut String) -> usize {
     failed
 }
 
+#[ignore = "live: needs SPRIG_TYPES_ORACLE_ROWS, SPRIG_TYPES_ORACLE_MARIADB, SPRIG_TYPES_ORACLE_MYSQL; tools/live/README.md"]
 #[test]
 fn key_order_matches_the_servers() {
     let rows = std::env::var("SPRIG_TYPES_ORACLE_ROWS")
@@ -879,7 +880,7 @@ fn key_order_matches_the_servers() {
     .collect();
     if oracles.is_empty() {
         eprintln!("skipped: set SPRIG_TYPES_ORACLE_MARIADB and SPRIG_TYPES_ORACLE_MYSQL to run it");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     }
     let mut report = String::new();
     let mut failed = 0;
@@ -929,11 +930,12 @@ fn helpers() {
 /// directory `SPRIG_TYPES_ORACLE_DUMPS` names (files `maria_<collation>.tsv`,
 /// `maria_utf8mb4_uca1400_as_cs_l<level>.tsv`, `mysql_<collation>.tsv`).
 /// Skipped when the variable is unset.
+#[ignore = "live: needs SPRIG_TYPES_ORACLE_DUMPS; tools/live/README.md"]
 #[test]
 fn every_code_point_weighs_as_dumped() {
     let Ok(dir) = std::env::var("SPRIG_TYPES_ORACLE_DUMPS") else {
         eprintln!("skipped: set SPRIG_TYPES_ORACLE_DUMPS to a directory of weight dumps");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let unit = |c: Collation, n: u32| -> Vec<u8> {
         if c.charset() == Charset::Utf8mb4 {

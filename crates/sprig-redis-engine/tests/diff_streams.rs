@@ -509,11 +509,12 @@ fn report(name: &str, t: &Tally) {
 
 /// The corpus, in RESP2 then RESP3. A line starting with `!` runs on both
 /// without comparing (protocol switches, setup); `SLEEP ms` waits.
+#[ignore = "live: needs SPRIG_TEST_REDIS_ENGINE, SPRIG_TEST_REDIS_REF, SPRIG_TEST_STREAM_ROUNDS; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stream_corpus_matches_redis() {
     let Some(mut p) = Pair::new().await else {
         eprintln!("SPRIG_TEST_REDIS_REF not set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let mut t = Tally::default();
     for proto in ["2", "3"] {
@@ -710,11 +711,12 @@ fn random_cmd(g: &mut Rng, next_ms: &mut u64) -> Vec<String> {
     v
 }
 
+#[ignore = "live: needs SPRIG_TEST_REDIS_ENGINE, SPRIG_TEST_REDIS_REF, SPRIG_TEST_STREAM_ROUNDS; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn random_stream_ops_match_redis() {
     let Some(mut p) = Pair::new().await else {
         eprintln!("SPRIG_TEST_REDIS_REF not set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let mut t = Tally::default();
     let rounds: u64 = var("SPRIG_TEST_STREAM_ROUNDS").map_or(6, |s| s.parse().unwrap());
@@ -746,11 +748,12 @@ async fn random_stream_ops_match_redis() {
 }
 
 /// Blocked reads served by another connection's write, and timeouts.
+#[ignore = "live: needs SPRIG_TEST_REDIS_REF; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn blocking_reads_match_redis() {
     let Some(refaddr) = var("SPRIG_TEST_REDIS_REF") else {
         eprintln!("SPRIG_TEST_REDIS_REF not set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let (addr, u, pw) = sprig_server().await;
     let a = |s: &str| split(s);
@@ -851,11 +854,12 @@ async fn blocking_reads_match_redis() {
 
 /// Approximate trimming (`~`) over hundreds of small entries: Redis drops
 /// whole nodes of 100 entries.
+#[ignore = "live: needs SPRIG_TEST_REDIS_ENGINE, SPRIG_TEST_REDIS_REF, SPRIG_TEST_STREAM_ROUNDS; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn approximate_trims_match_redis() {
     let Some(mut p) = Pair::new().await else {
         eprintln!("SPRIG_TEST_REDIS_REF not set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let mut t = Tally::default();
     let mut script: Vec<String> = Vec::new();

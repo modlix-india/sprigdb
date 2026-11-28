@@ -1,0 +1,77 @@
+# Temporary tables on engine databases: create, shadow, DML, joins, drop, truncate, rename, transactions, SHOW.
+x:DROP TABLE IF EXISTS tt_base
+x:DROP TABLE IF EXISTS tt_other
+q:CREATE TABLE tt_base (id INT PRIMARY KEY, v VARCHAR(10))
+q:INSERT INTO tt_base VALUES (1,'base'),(2,'base2')
+q:CREATE TABLE tt_other (id INT PRIMARY KEY, n INT)
+q:INSERT INTO tt_other VALUES (5,50),(6,60),(7,70)
+q:CREATE TEMPORARY TABLE tt_base (id INT PRIMARY KEY, w INT)
+q:INSERT INTO tt_base VALUES (5,6),(6,7)
+q:SELECT * FROM tt_base ORDER BY id
+q:SELECT * FROM rg_a.tt_base WHERE id = 5
+q:SHOW CREATE TABLE tt_base
+q:SHOW TABLES
+q:SHOW FULL TABLES
+q:CREATE TEMPORARY TABLE tt_base (a INT)
+q:CREATE TEMPORARY TABLE IF NOT EXISTS tt_base (a INT)
+q:SHOW WARNINGS
+q:SELECT o.id, o.n, t.w FROM tt_other o JOIN tt_base t ON t.id = o.id ORDER BY o.id
+q:SELECT COUNT(*), SUM(w) FROM tt_base
+q:UPDATE tt_base SET w = w + 100 WHERE id = 6
+q:DELETE FROM tt_base WHERE id = 5
+q:SELECT * FROM tt_base
+q:SELECT id FROM tt_other WHERE id IN (SELECT id FROM tt_base)
+q:INSERT INTO tt_base SELECT id, n FROM tt_other WHERE id = 7
+q:SELECT * FROM tt_base ORDER BY id
+q:DROP TEMPORARY TABLE tt_base
+q:SELECT * FROM tt_base ORDER BY id
+q:DROP TEMPORARY TABLE tt_base
+q:DROP TEMPORARY TABLE IF EXISTS tt_base
+q:SHOW WARNINGS
+q:CREATE TEMPORARY TABLE tt_t1 (id INT AUTO_INCREMENT PRIMARY KEY, s VARCHAR(20) NOT NULL DEFAULT 'x', KEY ks (s))
+q:INSERT INTO tt_t1 (s) VALUES ('a'),('b'),('c')
+q:SELECT * FROM tt_t1 WHERE s = 'b'
+q:SHOW CREATE TABLE tt_t1
+q:CREATE TEMPORARY TABLE tt_t2 LIKE tt_other
+q:SHOW CREATE TABLE tt_t2
+q:INSERT INTO tt_t2 VALUES (1, 1)
+q:SELECT * FROM tt_t2
+q:BEGIN
+q:INSERT INTO tt_t2 VALUES (2, 2)
+q:CREATE TEMPORARY TABLE tt_t3 (a INT)
+q:ROLLBACK
+q:SELECT * FROM tt_t2 ORDER BY id
+q:SELECT * FROM tt_t3
+q:BEGIN
+q:INSERT INTO tt_t2 VALUES (3, 3)
+q:DROP TABLE tt_t3
+q:ROLLBACK
+q:SELECT * FROM tt_t2 ORDER BY id
+q:TRUNCATE TABLE tt_t1
+q:SELECT * FROM tt_t1
+q:INSERT INTO tt_t1 (s) VALUES ('again')
+q:SELECT * FROM tt_t1
+q:ALTER TABLE tt_t2 RENAME TO tt_t4
+q:SELECT * FROM tt_t4 ORDER BY id
+q:SELECT * FROM tt_t2
+q:CREATE TEMPORARY TABLE tt_fk (id INT PRIMARY KEY, p INT, FOREIGN KEY (p) REFERENCES tt_other(id))
+q:CREATE TEMPORARY TABLE rg_b.tt_b (a INT)
+q:INSERT INTO rg_b.tt_b VALUES (9)
+q:SELECT * FROM rg_b.tt_b
+q:DROP TEMPORARY TABLE tt_t1, tt_missing
+q:SELECT * FROM tt_t1
+q:DROP TABLE tt_t4
+q:SELECT * FROM tt_base ORDER BY id
+q:SHOW TABLES
+q:CREATE TEMPORARY TABLE tt_s AS SELECT 1 AS x, 'ab' AS y
+q:SHOW CREATE TABLE tt_s
+q:SELECT * FROM tt_s
+q:CREATE TEMPORARY TABLE tt_s2 SELECT id, v, CONCAT(v, '!') AS w, id * 2.5 AS d, NOW() > '2000-01-01' AS b FROM tt_base ORDER BY id
+q:SELECT * FROM tt_s2 ORDER BY id
+q:SHOW CREATE TABLE tt_s2
+q:CREATE TEMPORARY TABLE tt_s3 SELECT o.id, COUNT(*) AS c, SUM(o.n) AS s FROM tt_other o GROUP BY o.id
+q:SELECT * FROM tt_s3 ORDER BY id
+q:CREATE TEMPORARY TABLE tt_s3 SELECT 1
+q:CREATE TEMPORARY TABLE IF NOT EXISTS tt_s3 SELECT 1
+x:DROP TABLE IF EXISTS tt_base
+x:DROP TABLE IF EXISTS tt_other

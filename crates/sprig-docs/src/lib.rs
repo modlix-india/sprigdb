@@ -14,6 +14,8 @@
 //!     their tables' rows;
 //!   - [`pack`] is the reproducible pack file, written and verified;
 //!   - [`search`] is in-process BM25, cosine and reciprocal-rank fusion;
+//!   - [`index`] is one release's pack in memory, as every node serves
+//!     docs search from it;
 //!   - [`table`] is the pack as rows of the `__sprig_docs` system tables
 //!     every cluster holds, and the digest their loader verifies;
 //!   - [`settings`] holds the `docs.*` keys.
@@ -21,6 +23,7 @@
 //!   Embeddings come from `sprig-embed`; this crate has no model.
 
 pub mod chunk;
+pub mod index;
 pub mod metrics_scan;
 pub mod pack;
 pub mod page;

@@ -90,6 +90,7 @@ async fn a_pool_without_a_limit_waits_as_the_drivers_does() {
 /// Against a real server (`SPRIG_TEST_MARIADB_SINGLE`): with the one
 /// connection held, the next wait fails at the limit; once it is back, the
 /// pool works again.
+#[ignore = "live: needs SPRIG_TEST_MARIADB_SINGLE; tools/live/README.md"]
 #[tokio::test]
 async fn a_held_connection_makes_the_next_wait_fail_then_frees() {
     let Some(url) = std::env::var("SPRIG_TEST_MARIADB_SINGLE")
@@ -97,7 +98,7 @@ async fn a_held_connection_makes_the_next_wait_fail_then_frees() {
         .filter(|v| !v.trim().is_empty())
     else {
         eprintln!("skipped: set SPRIG_TEST_MARIADB_SINGLE to run it");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let pool = one_conn(OptsBuilder::from_opts(Opts::from_url(url.trim()).unwrap()));
     let after = Duration::from_millis(400);

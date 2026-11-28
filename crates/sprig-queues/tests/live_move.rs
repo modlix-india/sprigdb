@@ -80,11 +80,12 @@ struct Seen {
     redelivered: u64,
 }
 
+#[ignore = "live: needs SPRIG_TEST_QUEUE_MOVE; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn a_queue_moves_with_its_tenant_under_load() {
     if var("SPRIG_TEST_QUEUE_MOVE").is_none() {
         eprintln!("skipped: set SPRIG_TEST_QUEUE_MOVE=1 (see the module docs)");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     }
     let etcd = var("SPRIG_ETCD").unwrap();
     let (a, b) = (

@@ -1,0 +1,52 @@
+# utf8mb3: deprecation warnings (MySQL 8.4) and collation names of utf8mb3 values, on each port.
+x:DROP TABLE IF EXISTS m3_a
+x:DROP TABLE IF EXISTS m3_b
+x:DROP TABLE IF EXISTS m3_c
+q:CREATE TABLE m3_a (id INT PRIMARY KEY, a VARCHAR(5) CHARACTER SET utf8mb3, b VARCHAR(5) COLLATE utf8mb3_bin, c VARCHAR(5))
+q:SHOW WARNINGS
+q:INSERT INTO m3_a VALUES (1,'x','y','z'),(2,'z','Y','x')
+q:SELECT COLLATION(a), CHARSET(a), COLLATION(b), CHARSET(b), COLLATION(c) FROM m3_a WHERE id = 1
+q:SELECT COLLATION(CONCAT(a,'q')), COLLATION(CONCAT(a,c)), COLLATION(UPPER(a)), COLLATION(LOWER(b)), COLLATION(SUBSTRING(a,1,1)) FROM m3_a WHERE id = 1
+q:SELECT id, a = c, a = 'x', b = 'y', a < c FROM m3_a ORDER BY id
+q:SELECT id FROM m3_a WHERE a = c
+q:SELECT CONCAT(a, c) FROM m3_a ORDER BY id
+q:SELECT COLLATION(CONVERT(c USING utf8mb3)), CHARSET(CONVERT(c USING utf8mb3)) FROM m3_a WHERE id = 1
+q:SELECT COLLATION(CONVERT('a' USING utf8mb3)), COLLATION(CONVERT('a' USING utf8))
+q:SHOW WARNINGS
+q:SELECT _utf8mb3'a', COLLATION(_utf8mb3'a'), CHARSET(_utf8mb3'a')
+q:SHOW WARNINGS
+q:SELECT COLLATION(_utf8'a')
+q:SHOW WARNINGS
+q:SELECT COLLATION(_utf8mb3'x' COLLATE utf8mb3_bin)
+q:SHOW WARNINGS
+q:SELECT 'a' COLLATE utf8mb3_general_ci
+q:SELECT a COLLATE utf8mb4_bin FROM m3_a
+q:SELECT COLLATION(a COLLATE utf8mb3_bin) FROM m3_a WHERE id = 1
+q:SHOW WARNINGS
+q:CREATE TABLE m3_b (id INT PRIMARY KEY, a VARCHAR(5) CHARACTER SET utf8)
+q:SHOW WARNINGS
+q:CREATE TABLE m3_c (id INT PRIMARY KEY, a VARCHAR(5) CHARSET utf8mb3 COLLATE utf8mb3_unicode_ci, b VARCHAR(5) COLLATE utf8_bin)
+q:SHOW WARNINGS
+q:ALTER TABLE m3_b CONVERT TO CHARACTER SET utf8
+q:SHOW WARNINGS
+q:SET NAMES utf8mb3
+q:SHOW WARNINGS
+q:SELECT @@character_set_client, @@collation_connection, COLLATION('a'), CHARSET('a')
+q:SELECT id FROM m3_a WHERE a = 'x'
+q:SELECT id FROM m3_a WHERE c = 'x'
+q:SELECT COLLATION(CONCAT('a', c)) FROM m3_a WHERE id = 1
+q:SET NAMES utf8
+q:SHOW WARNINGS
+q:SET NAMES utf8mb4
+q:SET character_set_client = utf8
+q:SHOW WARNINGS
+q:SET character_set_client = utf8mb4
+q:SET collation_connection = utf8mb3_general_ci
+q:SHOW WARNINGS
+q:SELECT COLLATION('a')
+q:SET collation_connection = utf8_bin
+q:SHOW WARNINGS
+q:SET NAMES utf8mb4
+x:DROP TABLE IF EXISTS m3_a
+x:DROP TABLE IF EXISTS m3_b
+x:DROP TABLE IF EXISTS m3_c

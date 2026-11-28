@@ -9,7 +9,7 @@ use raft::{GetEntriesContext, RaftState, Storage, StorageError};
 
 /// One group's log as raft-rs reads it. The driver keeps it equal to what it
 /// has written to the log store.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub(crate) struct GroupStorage {
     hs: HardState,
     /// The conf state at the snapshot point: what raft-rs starts from.
@@ -124,11 +124,30 @@ impl GroupStorage {
     /// Offers `snap` to followers that need one, without trimming the log.
     /// The size of the snapshot held to send, in bytes (0: none).
     pub(crate) fn cached_len(&self) -> usize {
-        self.cached.as_ref().map_or(0, |s| s.data.len())
+        self.cached
+            .as_ref()
+            .map_or(0, |s| crate::snapfile::size_of(&s.data))
     }
 
     pub(crate) fn set_cached(&mut self, snap: Snapshot) {
         self.cached = Some(snap);
+    }
+
+    /// The data and index of the snapshot held to send, if any.
+    pub(crate) fn cached_data(&self) -> Option<(&[u8], u64)> {
+        self.cached
+            .as_ref()
+            .map(|s| (&s.data[..], s.get_metadata().index))
+    }
+
+    /// Forgets the snapshot held to send (its file goes).
+    pub(crate) fn clear_cached(&mut self) {
+        self.cached = None;
+    }
+
+    /// Asks again for a snapshot (one couldn't be started now).
+    pub(crate) fn want(&self) {
+        self.wanted.set(true);
     }
 
     /// Whether raft-rs asked for a snapshot since the last call.

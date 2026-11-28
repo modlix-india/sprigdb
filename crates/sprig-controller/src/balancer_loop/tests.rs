@@ -55,13 +55,14 @@ fn gateway_counters_become_rates() {
 /// Compose single node), three tenants' catalogs mapped to the first, a
 /// planning run, and `explain placement`. Schemas `t917000N_placement`
 /// are dropped afterwards.
+#[ignore = "live: needs SPRIG_TEST_MARIADB_SINGLE; tools/live/README.md"]
 #[tokio::test]
 async fn live_run_builds_the_view_and_explains() {
     use sprig_meta::{MemStore, Op, Tier, Txn};
 
     let Ok(url) = std::env::var("SPRIG_TEST_MARIADB_SINGLE") else {
         eprintln!("skipped: set SPRIG_TEST_MARIADB_SINGLE to run it");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let dc = DcId::new("mum1").unwrap();
     let global: Arc<dyn MetaStore> = Arc::new(MemStore::new(Tier::Global));

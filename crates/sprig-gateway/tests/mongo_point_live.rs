@@ -173,11 +173,12 @@ async fn teardown(mut admin_sql: mysql_async::Conn) {
         .await;
 }
 
+#[ignore = "live: needs SPRIG_TEST_POINT_SQL, SPRIG_TEST_POINT_MONGO, SPRIG_TEST_POINT_TENANT, ...; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn point_reads_fall_back_when_something_changes() {
     let Some((sql_addr, mongo_addr)) = env() else {
         eprintln!("skipped: set SPRIG_TEST_POINT_SQL and SPRIG_TEST_POINT_MONGO");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let (mut admin_sql, admin) = setup(&sql_addr, &mongo_addr).await;
     let mut failed: Vec<String> = Vec::new();
@@ -361,11 +362,12 @@ async fn point_reads_fall_back_when_something_changes() {
     );
 }
 
+#[ignore = "live: needs SPRIG_TEST_POINT_SQL, SPRIG_TEST_POINT_MONGO, SPRIG_TEST_POINT_TENANT, ...; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn point_reads_follow_a_move() {
     let Some((sql_addr, mongo_addr)) = env() else {
         eprintln!("skipped: set SPRIG_TEST_POINT_SQL and SPRIG_TEST_POINT_MONGO");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let Some(cmds) = std::env::var("SPRIG_TEST_MOVE_CMDS")
         .ok()

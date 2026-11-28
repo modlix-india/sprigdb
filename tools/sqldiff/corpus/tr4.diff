@@ -1,0 +1,20 @@
+# SQL triggers with INSERT ... ON DUPLICATE KEY UPDATE: BEFORE INSERT for every row, then AFTER INSERT or BEFORE/AFTER UPDATE.
+x:DROP TABLE IF EXISTS tu_t
+x:DROP TABLE IF EXISTS tu_log
+x:CREATE TABLE tu_t (id INT PRIMARY KEY, code VARCHAR(10) UNIQUE, n INT NOT NULL DEFAULT 0, note VARCHAR(40))
+x:CREATE TABLE tu_log (k INT AUTO_INCREMENT PRIMARY KEY, msg VARCHAR(120))
+q:CREATE TRIGGER tu_bi BEFORE INSERT ON tu_t FOR EACH ROW BEGIN SET NEW.note = CONCAT('bi:', NEW.code); INSERT INTO tu_log (msg) VALUES (CONCAT('bi ', NEW.id, ' ', NEW.n)); END
+q:CREATE TRIGGER tu_ai AFTER INSERT ON tu_t FOR EACH ROW INSERT INTO tu_log (msg) VALUES (CONCAT('ai ', NEW.id, ' ', NEW.n, ' ', NEW.note))
+q:CREATE TRIGGER tu_bu BEFORE UPDATE ON tu_t FOR EACH ROW BEGIN SET NEW.note = CONCAT(OLD.note, '>bu'); INSERT INTO tu_log (msg) VALUES (CONCAT('bu ', OLD.id, ' ', OLD.n, '->', NEW.n)); END
+q:CREATE TRIGGER tu_au AFTER UPDATE ON tu_t FOR EACH ROW INSERT INTO tu_log (msg) VALUES (CONCAT('au ', NEW.id, ' ', NEW.n, ' ', NEW.note))
+q:INSERT INTO tu_t (id, code, n) VALUES (1, 'a', 10), (2, 'b', 20) ON DUPLICATE KEY UPDATE n = n + 1
+q:INSERT INTO tu_t (id, code, n) VALUES (1, 'a', 5) ON DUPLICATE KEY UPDATE n = n + VALUES(n)
+q:INSERT INTO tu_t (id, code, n) VALUES (3, 'b', 7), (4, 'd', 8) ON DUPLICATE KEY UPDATE n = 100, code = CONCAT(code, '!')
+q:INSERT INTO tu_t (id, code, n) VALUES (4, 'zz', 8) ON DUPLICATE KEY UPDATE n = n
+q:INSERT INTO tu_t SET id = 2, code = 'q', n = 1 ON DUPLICATE KEY UPDATE n = VALUES(n) * 3
+q:SELECT * FROM tu_t ORDER BY id
+q:SELECT msg FROM tu_log ORDER BY k
+q:INSERT INTO tu_t (id, code, n) VALUES (1, 'a', 1) ON DUPLICATE KEY UPDATE nosuch = 1
+q:SELECT COUNT(*) FROM tu_log
+x:DROP TABLE IF EXISTS tu_t
+x:DROP TABLE IF EXISTS tu_log

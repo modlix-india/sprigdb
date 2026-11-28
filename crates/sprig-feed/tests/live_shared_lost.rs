@@ -175,11 +175,12 @@ fn exactly_once(what: &str, got: &Got, upto: u64) -> Result<(), String> {
     }
 }
 
+#[ignore = "live: needs SPRIG_TEST_FEED_LOST_NODE; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_lost_subscription_fails_alone() {
     let Ok(url) = std::env::var("SPRIG_TEST_FEED_LOST_NODE") else {
         eprintln!("skipped: set SPRIG_TEST_FEED_LOST_NODE");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let base: u64 = std::env::var("SPRIG_TEST_FEED_LOST_TENANT")
         .ok()

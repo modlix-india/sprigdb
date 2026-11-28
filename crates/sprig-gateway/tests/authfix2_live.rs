@@ -26,7 +26,6 @@
 //! export AF2_LOG=<the gateway's log file>  AF2_HOOK_PORT=33881
 //! # sink.destination_allowlist must include 127.0.0.1:$AF2_HOOK_PORT, and
 //! # the operator's sink.internal_destinations must cover it
-//! cargo test -p sprig-gateway --test authfix2_live -- --nocapture --test-threads 1
 //! ```
 //!
 //! Tenants `acme` and `globex`, each with `app` (password `sprig-dev-app`)
@@ -188,11 +187,13 @@ where
 // ---------------------------------------------------------------------
 // 1. SET GLOBAL as tenant defaults.
 
+#[ignore = "live: needs AF2_MYSQL, AF2_SET, AF2_MARIADB, ...; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn set_global_tenant_defaults() {
-    if !on() {
-        return;
-    }
+    assert!(
+        on(),
+        "live test run without its environment: see tools/live/README.md"
+    );
     let (p, pm) = (port("AF2_MYSQL"), port("AF2_MARIADB"));
     let mut ck = Checks::new();
     let mut app = my(p, "acme.app", PW, None).await.unwrap();
@@ -375,11 +376,13 @@ async fn set_global_tenant_defaults() {
 // ---------------------------------------------------------------------
 // 2. SET_ANY_DEFINER.
 
+#[ignore = "live: needs AF2_MYSQL, AF2_SET, AF2_MARIADB, ...; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn set_any_definer() {
-    if !on() {
-        return;
-    }
+    assert!(
+        on(),
+        "live test run without its environment: see tools/live/README.md"
+    );
     let p = port("AF2_MYSQL");
     let mut ck = Checks::new();
     let mut app = my(p, "acme.app", PW, None).await.unwrap();
@@ -771,11 +774,13 @@ async fn amqp_offered(port: u16, cert: Option<&Pem>) -> String {
     }
 }
 
+#[ignore = "live: needs AF2_MYSQL, AF2_SET, AF2_MARIADB, ...; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn client_certificates_everywhere() {
-    if !on() {
-        return;
-    }
+    assert!(
+        on(),
+        "live test run without its environment: see tools/live/README.md"
+    );
     let (p, pm) = (port("AF2_MYSQL"), port("AF2_MARIADB"));
     let (https, kafka, amqps, bolt) = (
         port("AF2_HTTPS"),
@@ -1066,11 +1071,13 @@ async fn client_certificates_everywhere() {
 // ---------------------------------------------------------------------
 // 4. Audit of account changes.
 
+#[ignore = "live: needs AF2_MYSQL, AF2_SET, AF2_MARIADB, ...; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn account_changes_are_audited() {
-    if !on() {
-        return;
-    }
+    assert!(
+        on(),
+        "live test run without its environment: see tools/live/README.md"
+    );
     let Some(log) = var("AF2_LOG") else {
         eprintln!("AF2_LOG not set: skipped");
         return;
@@ -1158,11 +1165,13 @@ async fn sink_state(c: &mut Conn, db: &str, sink: &str) -> String {
     }
 }
 
+#[ignore = "live: needs AF2_MYSQL, AF2_SET, AF2_MARIADB, ...; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sink_pauses_when_its_owner_loses_select() {
-    if !on() {
-        return;
-    }
+    assert!(
+        on(),
+        "live test run without its environment: see tools/live/README.md"
+    );
     let Some(hook) = var("AF2_HOOK_PORT") else {
         eprintln!("AF2_HOOK_PORT not set: skipped");
         return;

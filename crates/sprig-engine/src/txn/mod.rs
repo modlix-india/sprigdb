@@ -64,6 +64,7 @@ use sprig_common::Result;
 
 pub use durable::DurableTicket;
 pub use hlc::Ts;
+pub(crate) use shared::cross::PREPARE as CROSS_PREPARE;
 pub use shared::cross::{CrossFault, CrossFaults, CrossStage};
 pub use shared::{TxnShared, TxnStats};
 pub use transaction::{
@@ -277,6 +278,36 @@ pub trait CommitPath: Send + Sync {
             .map(|(_, p)| self.propose(p, durability))
             .collect()
     }
+    /// Queues `payload` for `unit` alone, only if this node still leads
+    /// the unit under `epoch` (what [`CommitPath::leader_epoch_of`]
+    /// answered before the caller read what the payload was decided on).
+    /// A unit's leader has everything its earlier leaders committed in its
+    /// store, and only it proposes while its epoch lasts: a decision read
+    /// from the store under an epoch and proposed under the same one can't
+    /// have missed another leader's entry. A log without leaders takes the
+    /// payload as [`CommitPath::propose_many`] does.
+    ///
+    /// # Errors
+    /// The unit's leadership changed (retryable), or the log is closed.
+    fn propose_led(
+        &self,
+        unit: u64,
+        epoch: u64,
+        payload: Vec<u8>,
+        durability: Option<Durability>,
+    ) -> Result<DurableTicket> {
+        let _ = epoch;
+        self.propose_many(vec![(unit, payload)], durability)?
+            .pop()
+            .ok_or_else(|| sprig_common::SprigError::internal("the log returned no ticket"))
+    }
+    /// Whether `unit` has a leader that can change (a replicated unit):
+    /// only its leader proposes to it, and another node's copy of it may
+    /// lag. `false` for a unit this node alone holds.
+    fn unit_has_leader(&self, unit: u64) -> bool {
+        let _ = unit;
+        false
+    }
     /// The highest index of `unit` applied to the store.
     fn applied_index_of(&self, unit: u64) -> u64 {
         let _ = unit;
@@ -325,6 +356,14 @@ pub trait CommitPath: Send + Sync {
     /// units found it led elsewhere). Nothing by default.
     fn request_lead(&self, unit: u64) {
         let _ = unit;
+    }
+    /// The units this node holds a copy of (on a replicated engine, those
+    /// of its Raft groups): where a model finds the tenants it may have to
+    /// look after (the document store's TTL sweeper) without a registry
+    /// key outside each tenant's own range. A path with one unit holds
+    /// only it.
+    fn held_units(&self) -> Vec<u64> {
+        vec![self.unit_id()]
     }
     /// Tells the store side the oldest timestamp readers may still need.
     fn set_gc_watermark(&self, _ts: Ts) {}
@@ -384,6 +423,22 @@ impl CommitPath for Engine {
         Ok(tickets.into_iter().map(DurableTicket::Log).collect())
     }
 
+    fn propose_led(
+        &self,
+        unit: u64,
+        epoch: u64,
+        payload: Vec<u8>,
+        durability: Option<Durability>,
+    ) -> Result<DurableTicket> {
+        let d = durability.unwrap_or(self.config().default_durability);
+        self.propose_under(UnitId(unit), epoch, payload, d)
+            .map(DurableTicket::Log)
+    }
+
+    fn unit_has_leader(&self, unit: u64) -> bool {
+        self.is_replicated_unit(UnitId(unit))
+    }
+
     fn applied_index_of(&self, unit: u64) -> u64 {
         self.consensus().applied_index(UnitId(unit))
     }
@@ -424,6 +479,10 @@ impl CommitPath for Engine {
         if let Some(r) = self.replicated_log() {
             r.request_lead(UnitId(unit));
         }
+    }
+
+    fn held_units(&self) -> Vec<u64> {
+        self.units().into_iter().map(|(u, _)| u.0).collect()
     }
 
     fn set_gc_watermark(&self, ts: Ts) {

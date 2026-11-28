@@ -1097,10 +1097,34 @@ pub fn show_create(text: &str) -> Cow<'_, str> {
                 None => (*l, ""),
             };
             let body = body.strip_suffix(" DEFAULT NULL").unwrap_or(body);
+            // On engine tables the vector is stored as `varbinary(4n)`:
+            // shown as the `vector(n)` it was declared as.
+            let body = vector_type(body);
             format!("{body}{c}{comma}")
         })
         .collect();
     Cow::Owned(out.join("\n"))
+}
+
+/// A column line's `varbinary(4n)` type as `vector(n)`; other lines as
+/// they are.
+fn vector_type(line: &str) -> Cow<'_, str> {
+    let Some(at) = line.find("` varbinary(") else {
+        return Cow::Borrowed(line);
+    };
+    let from = at + "` varbinary(".len();
+    let Some(len) = line[from..].find(')') else {
+        return Cow::Borrowed(line);
+    };
+    match line[from..from + len].parse::<u32>() {
+        Ok(n) if n % 4 == 0 && n > 0 => Cow::Owned(format!(
+            "{}` vector({}){}",
+            &line[..at],
+            n / 4,
+            &line[from + len + 1..]
+        )),
+        _ => Cow::Borrowed(line),
+    }
 }
 
 #[cfg(test)]

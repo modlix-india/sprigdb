@@ -1072,6 +1072,16 @@ impl CheckCtx<'_> {
         {
             return Ok(());
         }
+        // Retrieval indexes' chunk tables: the gateway's own statements
+        // read and write them for a user of the database (searches check
+        // every hit on the source table through the user's session).
+        if name
+            .get(..sprig_ai::retrieval::TABLE_PREFIX.len())
+            .is_some_and(|p| p.eq_ignore_ascii_case(sprig_ai::retrieval::TABLE_PREFIX))
+            && self.p.sees_database(&key, Some(row.db_id))
+        {
+            return Ok(());
+        }
         let okey = object_key(ObjectKind::Table, name, self.lctn);
         let target = self.relation(&key, row.db_id, &okey);
         if let Some(a) = any.iter().find(|a| self.p.allows(*a, target)) {

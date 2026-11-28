@@ -359,6 +359,19 @@ async fn data(
             Bytes::from(reply.body_json),
         ));
     }
+    // Outside a transaction, a call of a tenant another node leads runs
+    // there; a streamed answer stays here (reads only: a write in it
+    // answers retryably).
+    if transaction.is_empty()
+        && !ndjson
+        && let Some(reply) =
+            forward_to_leader(core, &caller, rpc, &m, &body, space.as_deref()).await?
+    {
+        return Ok(bytes_response(
+            u16::try_from(reply.http_status).unwrap_or(500),
+            Bytes::from(reply.body_json),
+        ));
+    }
     let (status_code, v) = super::sql::SPACE
         .scope(space, run_local(core, &caller, rpc, &m, &body, ndjson))
         .await?;
@@ -422,6 +435,61 @@ async fn forward_if_remote(
         client_addr: caller.peer.to_string(),
     };
     Ok(Some(peers.forward(&h.gateway_id, req).await?))
+}
+
+/// The gateway of the node leading `tenant`'s engine unit, when another
+/// node leads it and that node's gateway is known; `None`: run here (this
+/// node leads it, the engine doesn't replicate, or no leader is known, in
+/// which case a write answers retryably as before).
+pub(crate) fn leader_gateway(
+    core: &Core,
+    tenant: Option<sprig_common::ids::TenantId>,
+) -> Option<String> {
+    let crate::node_engine::UnitLeader::Node(id) = crate::node_engine::tenant_leader(tenant?.0)
+    else {
+        return None;
+    };
+    let gw = crate::ops::nodes::directory()?.get(id)?.gateway_id;
+    (gw != core.engine.gateway_id && core.engine.peers.is_some()).then_some(gw)
+}
+
+/// The key a call forwarded to the tenant's leader carries its session's
+/// data-inheritance space under (the `Sprig-Space` header doesn't travel).
+pub(crate) const SPACE_KEY: &str = "__sprig_space";
+
+/// Forwards a data call outside a transaction to the gateway of the node
+/// leading the caller's tenant unit: only the leader can commit the
+/// tenant's writes (data, catalog changes, catalog records), so a call to
+/// any other node runs there, as a wire login does.
+async fn forward_to_leader(
+    core: &Arc<Core>,
+    caller: &Caller,
+    rpc: &str,
+    m: &Matched,
+    body: &Value,
+    space: Option<&str>,
+) -> Result<Option<ForwardReply>, SprigError> {
+    let Some(gw) = leader_gateway(core, caller.principal.tenant) else {
+        return Ok(None);
+    };
+    let Some(peers) = core.engine.peers.as_ref() else {
+        return Ok(None);
+    };
+    let mut request = request_json(m, body);
+    if let Some(sp) = space {
+        request[SPACE_KEY] = Value::String(sp.to_owned());
+    }
+    let req = ForwardRequest {
+        authorization: super::auth::forwarded_authorization(
+            caller.authorization.as_deref(),
+            &caller.principal,
+        ),
+        method: rpc.to_owned(),
+        request_json: request.to_string(),
+        client_addr: caller.peer.to_string(),
+    };
+    tracing::debug!(tenant = ?caller.principal.tenant, gateway = gw, rpc, "data call forwarded to the tenant's leader");
+    Ok(Some(peers.forward(&gw, req).await?))
 }
 
 /// Runs a data call here; `(status, reply)`.
@@ -711,7 +779,14 @@ pub async fn forwarded(core: &Arc<Core>, req: ForwardRequest) -> ForwardReply {
             }
         }
         let m = Matched { route, vars };
-        let (status_code, out) = run_local(core, &caller, &req.method, &m, &body, false).await?;
+        // A call forwarded to the tenant's leader brings its session's space.
+        let space = Some(s(&body, SPACE_KEY)).filter(|sp| !sp.is_empty());
+        let (status_code, out) = super::sql::SPACE
+            .scope(
+                space,
+                run_local(core, &caller, &req.method, &m, &body, false),
+            )
+            .await?;
         match out {
             Local::Json(v) | Local::Rows(v, _) => Ok((status_code, v)),
             Local::Stream(_) => Err(SprigError::internal("a forwarded call can't stream")),

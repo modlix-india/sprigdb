@@ -200,10 +200,11 @@ async fn mark(r: &mut Conn, id: u64) -> Option<String> {
     row.map(Option::unwrap_or_default)
 }
 
+#[ignore = "live: needs SPRIG_TEST_CATSCHEMA, SPRIG_TEST_CATSCHEMA_SPRIGCTL, SPRIG_TEST_CATSCHEMA_NODE, ...; tools/live/README.md"]
 #[tokio::test]
 async fn a_new_tenants_catalog_is_marked_before_the_gateway_migrates_it() {
     let Some(e) = env("a_new_tenants_catalog_is_marked_before_the_gateway_migrates_it") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let name = format!("{}-new", e.prefix);
     let id = create(&e, &name);
@@ -262,10 +263,11 @@ async fn a_new_tenants_catalog_is_marked_before_the_gateway_migrates_it() {
     }
 }
 
+#[ignore = "live: needs SPRIG_TEST_CATSCHEMA, SPRIG_TEST_CATSCHEMA_SPRIGCTL, SPRIG_TEST_CATSCHEMA_NODE, ...; tools/live/README.md"]
 #[tokio::test]
 async fn a_dropped_catalog_isnt_made_again_by_the_gateway() {
     let Some(e) = env("a_dropped_catalog_isnt_made_again_by_the_gateway") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let name = format!("{}-gone", e.prefix);
     let id = create(&e, &name);

@@ -363,11 +363,12 @@ async fn mongo_oidc(user: &str, token: String) -> Result<(), String> {
 
 use futures::FutureExt as _;
 
+#[ignore = "live: needs AJ_MYSQL; tools/live/README.md"]
 #[tokio::test]
 async fn jwt_logins_live() {
     if var("AJ_MYSQL").is_none() {
         eprintln!("AJ_MYSQL not set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     }
     let (mysql, mariadb, admin) = (port("AJ_MYSQL"), port("AJ_MARIADB"), port("AJ_ADMIN"));
     let mut c = Checks {

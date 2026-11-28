@@ -1,0 +1,5 @@
+# LOAD DATA on the MySQL port: a server file is refused.
+x:DROP TABLE IF EXISTS ld_t
+q:CREATE TABLE ld_t (id INT PRIMARY KEY, name VARCHAR(10), amt DECIMAL(6,2))
+q:LOAD DATA INFILE '/etc/hosts' INTO TABLE ld_t
+x:DROP TABLE IF EXISTS ld_t

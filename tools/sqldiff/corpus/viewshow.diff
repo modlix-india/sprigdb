@@ -1,0 +1,15 @@
+# SHOW CREATE VIEW texts (the definer differs between the oracles' root and SprigDB's app user: compare the rest).
+x:DROP VIEW IF EXISTS vs_a, vs_b, vs_c, vs_d
+x:DROP TABLE IF EXISTS vs_t, vs_u
+x:CREATE TABLE vs_t (id INT PRIMARY KEY, a INT, b VARCHAR(10))
+x:CREATE TABLE vs_u (k INT PRIMARY KEY, id INT)
+x:CREATE VIEW vs_a AS SELECT id, a + 1 AS a1, b FROM vs_t WHERE a > 0 OR b LIKE 'x%' WITH CHECK OPTION
+x:CREATE VIEW vs_b (x, y) AS SELECT id, a FROM vs_t
+x:CREATE VIEW vs_c AS SELECT t.b, COUNT(*) c, SUM(u.k) FROM vs_t t JOIN vs_u u ON u.id = t.id WHERE t.a BETWEEN 1 AND 5 GROUP BY t.b HAVING COUNT(*) > 1 ORDER BY t.b DESC LIMIT 3
+x:CREATE VIEW vs_d AS SELECT * FROM vs_t WHERE id NOT IN (SELECT id FROM vs_u) AND a IS NOT NULL
+q:SHOW CREATE VIEW vs_a
+q:SHOW CREATE VIEW vs_b
+q:SHOW CREATE TABLE vs_c
+q:SHOW CREATE VIEW vs_d
+x:DROP VIEW IF EXISTS vs_a, vs_b, vs_c, vs_d
+x:DROP TABLE IF EXISTS vs_t, vs_u

@@ -14,8 +14,6 @@
 //! # the login needs CREATE USER and SPRIG_SINK_ADMIN, and the tenant
 //! # sink.destination_allowlist = ["127.0.0.1:9"] for the connection case
 //! # (and the operator's sink.internal_destinations covering 127.0.0.1:9)
-//! cargo test -p sprig-gateway --test processlist_secrets_live -- --nocapture --test-threads 1
-//! ```
 
 #![allow(
     clippy::unwrap_used,
@@ -68,11 +66,12 @@ async fn infos(c: &mut Conn, within: Duration) -> Vec<String> {
     all
 }
 
+#[ignore = "live: needs SPRIG_TEST_PROCESSLIST_SECRETS, SPRIG_TEST_PROCESSLIST_USER, SPRIG_TEST_PROCESSLIST_PASSWORD; tools/live/README.md"]
 #[tokio::test]
 async fn secrets_never_show_in_the_process_list() {
     let Some(addr) = skip::var(ADDR) else {
         skip::report_missing(ADDR, "secrets_never_show_in_the_process_list");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let n = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

@@ -144,11 +144,12 @@ async fn ids(c: &Collection<Document>, f: Document) -> Vec<Bson> {
         .collect()
 }
 
+#[ignore = "live: needs SPRIG_TEST_MONGO_URI; tools/live/README.md"]
 #[tokio::test]
 async fn retried_writes_run_once() {
     let Some(u) = uri("SPRIG_TEST_MONGO_URI") else {
         eprintln!("SPRIG_TEST_MONGO_URI not set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let target = ClientOptions::parse(&u).await.unwrap();
     let host = target.hosts[0].to_string();
@@ -308,12 +309,13 @@ fn as_user(u: &str, user: &str, pwd: &str) -> String {
 /// collections still gets exactly-once retries. The record table is
 /// reached through the backend grants on `__sprig_doc_sessions`
 /// that every collection-level writer holds, not skipped.
+#[ignore = "live: needs SPRIG_TEST_MONGO_URI; tools/live/README.md"]
 #[tokio::test]
 async fn collection_only_users_retry_once() {
     const DB: &str = "r5mongo3_retry_cu";
     let Some(u) = uri("SPRIG_TEST_MONGO_URI") else {
         eprintln!("SPRIG_TEST_MONGO_URI not set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let admin = Client::with_options(ClientOptions::parse(&u).await.unwrap()).unwrap();
     let data = admin.database(DB);

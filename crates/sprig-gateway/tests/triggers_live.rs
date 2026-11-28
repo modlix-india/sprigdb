@@ -222,10 +222,11 @@ fn kill_worker(e: &Env) -> bool {
     true
 }
 
+#[ignore = "live: needs SPRIG_TEST_TRIGGERS_GATEWAY, SPRIG_TEST_TRIGGERS_AMQP, SPRIG_TEST_TRIGGERS_ROOT, ...; tools/live/README.md"]
 #[tokio::test]
 async fn stream_triggers_each_run_every_event_once_across_a_worker_kill() {
     let Some(e) = env("stream_triggers_each_run_every_event_once_across_a_worker_kill") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let mut c = conn(&e.mysql).await;
     reset(&mut c).await;
@@ -303,10 +304,11 @@ async fn stream_triggers_each_run_every_event_once_across_a_worker_kill() {
     eprintln!("worker killed mid-way: {killed}");
 }
 
+#[ignore = "live: needs SPRIG_TEST_TRIGGERS_GATEWAY, SPRIG_TEST_TRIGGERS_AMQP, SPRIG_TEST_TRIGGERS_ROOT, ...; tools/live/README.md"]
 #[tokio::test]
 async fn a_queue_triggers_failing_message_becomes_a_dead_letter() {
     let Some(e) = env("a_queue_triggers_failing_message_becomes_a_dead_letter") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let Some(amqp) = e.amqp.clone() else {
         eprintln!("no SPRIG_TEST_TRIGGERS_AMQP: skipped");
@@ -405,10 +407,11 @@ $$",
     a.close(200, "done".into()).await.unwrap();
 }
 
+#[ignore = "live: needs SPRIG_TEST_TRIGGERS_GATEWAY, SPRIG_TEST_TRIGGERS_AMQP, SPRIG_TEST_TRIGGERS_ROOT, ...; tools/live/README.md"]
 #[tokio::test]
 async fn publishing_from_logic_follows_the_transaction() {
     let Some(e) = env("publishing_from_logic_follows_the_transaction") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let mut c = conn(&e.mysql).await;
     // The stream of the first test, or a fresh one.
@@ -576,10 +579,11 @@ $$",
     }
 }
 
+#[ignore = "live: needs SPRIG_TEST_TRIGGERS_GATEWAY, SPRIG_TEST_TRIGGERS_AMQP, SPRIG_TEST_TRIGGERS_ROOT, ...; tools/live/README.md"]
 #[tokio::test]
 async fn twelve_streams_on_one_worker_are_all_sequenced() {
     let Some(e) = env("twelve_streams_on_one_worker_are_all_sequenced") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let mut c = conn(&e.mysql).await;
     let _ = sql(&mut c, "DROP DATABASE IF EXISTS r9t_many").await;

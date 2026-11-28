@@ -94,11 +94,12 @@ async fn one(addr: &str, user: &str, pass: &str, vhost: &str, open: bool) -> Res
     r.map_err(|e| format!("{vhost}: {e}"))
 }
 
+#[ignore = "live: needs SPRIG_IDLE_AMQP_ADDR; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn many_vhosts() {
     let Some(addr) = var("SPRIG_IDLE_AMQP_ADDR") else {
         eprintln!("skipped: set SPRIG_IDLE_AMQP_ADDR");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let user = var("SPRIG_IDLE_USER").unwrap();
     let pass = var("SPRIG_IDLE_PASSWORD").unwrap();

@@ -85,11 +85,12 @@ async fn cells(c: &mut mysql_async::Conn, q: &str) -> Result<Vec<String>, String
         .collect())
 }
 
+#[ignore = "live: needs SPRIG_TEST_SQLS_SQL; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn search_through_prepare_and_explain() {
     let Ok(addr) = std::env::var("SPRIG_TEST_SQLS_SQL") else {
         eprintln!("skipped: set SPRIG_TEST_SQLS_SQL");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let tenant = std::env::var("SPRIG_TEST_SQLS_TENANT").unwrap_or_else(|_| "acme".into());
     let (host, port) = addr.split_once(':').unwrap();

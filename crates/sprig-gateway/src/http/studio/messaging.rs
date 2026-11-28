@@ -4,9 +4,9 @@
 //!
 //! | Route | Does |
 //! |---|---|
-//! | `GET /v1/databases/{db}/streams/{name}/groups` | `Streams.ListGroups`: per partition the log start and high watermark (read as the caller, so `SELECT` on the stream is checked), and every consumer group with its committed offset, lag, generation and state (`stream_groups`, `stream_offsets`) |
-//! | `GET /v1/databases/{db}/mq` | The database's virtual host (`mq_vhosts`, else the database's own name once it has topology), exchanges, queues and bindings, with names (`mq_exchanges`, `mq_queues`, `mq_bindings`) |
-//! | `GET /v1/databases/{db}/sinks/{name}/deadLetters` | The sink's dead letters (`sink_dead_letters`) |
+//! | `GET /v1/databases/{db}/streams/{name}/groups` | `Streams.ListGroups`: per partition the log start and high watermark (read as the caller, so `SELECT` on the stream is checked), and every consumer group with its committed offset, lag and generation (the engine's stream records) |
+//! | `GET /v1/databases/{db}/mq` | The database's virtual host (its vhost record, else the database's own name once it has topology), exchanges, queues and bindings, with names (the queues module's catalog records) |
+//! | `GET /v1/databases/{db}/sinks/{name}/deadLetters` | The sink's dead letters (the sinks module's catalog records) |
 //! | `POST /v1/databases/{db}/sinks/{name}/deadLetters:replay`, `:discard` | `{ids}` or `{all: true}`: marked `replaying` (the sink's task feeds them back) or `discarded` |
 //! | `POST /v1/databases/{db}/sinks/{name}:test` | `Sinks.Test`: `{sample}` (10 by default): `TEST SINK db.name WITH SAMPLE n` as the caller; `{columns, rows}` |
 //! | `POST /v1/databases/{db}/connections/{name}:test` | `Connections.Test`: `{platform, write, to}`: `TEST [PLATFORM] CONNECTION [db.]name [WRITE [TO 'to']]` as the caller; `{columns, rows}` |
@@ -24,14 +24,14 @@
 //! `SPRIG_SINK_ADMIN` or `SPRIG_TENANT_ADMIN`, or being the sink's owner
 //! (1227 otherwise).
 
-use sprig_catalog::pool_wait::Bounded as _;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use hyper::body::Incoming;
 use hyper::{Method, Request, Response};
-use mysql_async::prelude::Queryable as _;
 use serde_json::{Value, json};
+use sprig_catalog::{Pk, RecordStore};
+use sprig_common::ids::TenantId;
 use sprig_common::{SprigCode, SprigError};
 use tonic::body::Body;
 
@@ -42,24 +42,6 @@ use super::{hdr, invalid, json_response, parse_json, read_body, rows_of, run_sql
 
 /// Dead letters listed at most.
 const MAX_DEAD: u32 = 1000;
-
-/// A committed offset: group, partition, offset, when, generation, state.
-type Off = (String, u32, u64, String, Option<u32>, Option<String>);
-/// An exchange row: id, name, type, durable, auto-delete, internal, arguments.
-type Ex = (u64, Vec<u8>, String, bool, bool, bool, Option<String>);
-/// A queue row: id, name, type, durable, auto-delete, arguments, lanes, state.
-type Qu = (
-    u64,
-    Vec<u8>,
-    String,
-    bool,
-    bool,
-    Option<String>,
-    u16,
-    String,
-);
-/// A binding row: source, destination, destination kind, key, arguments.
-type Bind = (u64, u64, String, Vec<u8>, Option<String>);
 
 /// Whether `path` is one of these routes.
 #[must_use]
@@ -168,17 +150,6 @@ fn decode(seg: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-fn db_err(e: &mysql_async::Error) -> SprigError {
-    SprigError::new(
-        SprigCode::CatalogUnavailable,
-        format!("the tenant's catalog: {e}"),
-    )
-}
-
-fn missing_table(e: &mysql_async::Error) -> bool {
-    matches!(e, mysql_async::Error::Server(s) if s.code == 1146)
-}
-
 fn ident(s: &str) -> String {
     format!("`{}`", s.replace('`', "``"))
 }
@@ -191,12 +162,13 @@ async fn grant_lines(core: &Arc<Core>, caller: &Caller) -> Result<Vec<String>, S
         .collect())
 }
 
-/// The catalog connection, its schema and the database's id.
-async fn catalog(
+/// The caller's tenant, its catalog records, the database's id and its
+/// name as the catalog spells it.
+fn catalog(
     core: &Arc<Core>,
     caller: &Caller,
     db: &str,
-) -> Result<(mysql_async::Conn, String, u32), SprigError> {
+) -> Result<(TenantId, Arc<dyn RecordStore>, u32, String), SprigError> {
     let (Some(svc), Some(tid)) = (&core.studio.tenants, caller.principal.tenant) else {
         return Err(invalid("these views need a tenant login"));
     };
@@ -208,16 +180,7 @@ async fn catalog(
         .database(db)
         .or_else(|| cat.database(&db.to_ascii_lowercase()))
         .ok_or_else(|| SprigError::standard(1049, *b"42000", format!("Unknown database '{db}'")))?;
-    let db_id = row.db_id.0;
-    let ep = sprig_catalog::CatalogLocator::writer(&*svc.locator, tid).await?;
-    let conn = ep.pool.get_conn_bounded().await.map_err(|e| {
-        SprigError::new(
-            SprigCode::CatalogUnavailable,
-            "the tenant's catalog is unreachable",
-        )
-        .with_source(e)
-    })?;
-    Ok((conn, ep.store.schema().to_owned(), db_id))
+    Ok((tid, Arc::clone(&svc.records), row.db_id.0, row.name.clone()))
 }
 
 fn denied_db(caller: &Caller, db: &str) -> SprigError {
@@ -291,6 +254,35 @@ async fn groups(
     if !access_of(&lines, db).list {
         return Err(denied_db(caller, db));
     }
+    let (tid, _, _, db_name) = catalog(core, caller, db)?;
+    let eng = crate::kafka::engine::streams().ok_or_else(|| {
+        SprigError::new(
+            SprigCode::StreamNotFound,
+            format!("no stream {db}.{name}: streams aren't served on this node"),
+        )
+    })?;
+    // The stream as its record names it: the catalog's spelling of the
+    // database, and the stream's own (the URL's may differ in case).
+    let topic = match eng.topic(tid.0, &format!("{db_name}.{name}"))? {
+        Some(t) => Some(t),
+        None => eng.topics(tid.0)?.into_iter().find(|t| {
+            t.name
+                .split_once('.')
+                .is_some_and(|(d, s)| d == db_name && s.eq_ignore_ascii_case(name))
+        }),
+    };
+    let Some(topic) = topic else {
+        return Err(SprigError::new(
+            SprigCode::StreamNotFound,
+            format!("Unknown stream '{db}.{name}'"),
+        ));
+    };
+    let name = topic
+        .name
+        .split_once('.')
+        .map_or(name, |(_, s)| s)
+        .to_owned();
+    let name = name.as_str();
     // Watermarks as the caller: SELECT on the stream is checked here.
     let marks = run_sql(
         core,
@@ -317,58 +309,24 @@ async fn groups(
             );
         }
     }
-    let (mut conn, schema, db_id) = catalog(core, caller, db).await?;
-    let s = ident(&schema);
-    let stream: Option<(u64, u32, String, String)> = conn
-        .exec_first(
-            format!(
-                "SELECT stream_id, partitions, kind, cleanup FROM {s}.streams WHERE db_id = ? AND name = ?"
-            ),
-            (db_id, name),
-        )
-        .await
-        .map_err(|e| db_err(&e))?;
-    let Some((stream_id, partitions, kind, cleanup)) = stream else {
-        return Err(SprigError::new(
-            SprigCode::StreamNotFound,
-            format!("Unknown stream '{db}.{name}'"),
-        ));
-    };
-    for p in 0..u64::from(partitions) {
+    let partitions = u64::try_from(topic.partitions).unwrap_or(0);
+    for p in 0..partitions {
         parts.entry(p).or_insert_with(
             || json!({"partition": p, "log_start": null, "high_watermark": 0, "records": 0}),
         );
     }
-    let offs: Vec<Off> = match conn
-        .exec(
-            format!(
-                "SELECT o.group_name, o.partition_no, o.offset_no, DATE_FORMAT(o.committed_at, '%Y-%m-%d %H:%i:%s'), \
-                 g.generation, CAST(g.state AS CHAR) FROM {s}.stream_offsets o LEFT JOIN {s}.stream_groups g \
-                 ON g.group_name = o.group_name WHERE o.stream_id = ? ORDER BY o.group_name, o.partition_no"
-            ),
-            (stream_id,),
-        )
-        .await
-    {
-        Ok(v) => v,
-        Err(e) if missing_table(&e) => Vec::new(),
-        Err(e) => return Err(db_err(&e)),
+    let groups = stream_groups(&eng, tid, topic.stream_id, &parts)?;
+    // As SHOW STREAMS names them: a table's change topic, else events.
+    let kind = if name.ends_with(".changes") {
+        "changes"
+    } else {
+        "events"
     };
-    let mut groups: BTreeMap<String, Value> = BTreeMap::new();
-    for (g, p, off, at, generation, state) in offs {
-        let hw = parts
-            .get(&u64::from(p))
-            .and_then(|v| v["high_watermark"].as_u64())
-            .unwrap_or(0);
-        let e = groups.entry(g.clone()).or_insert_with(|| {
-            json!({"group": g, "generation": generation, "state": state, "partitions": [], "lag": 0})
-        });
-        let lag = hw.saturating_sub(off);
-        e["lag"] = json!(e["lag"].as_u64().unwrap_or(0) + lag);
-        if let Some(a) = e["partitions"].as_array_mut() {
-            a.push(json!({"partition": p, "committed": off, "lag": lag, "committed_at": at}));
-        }
-    }
+    let cleanup = if topic.compact == Some(true) {
+        "compact"
+    } else {
+        "delete"
+    };
     Ok(json_response(
         200,
         &json!({
@@ -381,117 +339,192 @@ async fn groups(
     ))
 }
 
-fn text(b: Option<Vec<u8>>) -> Value {
-    b.map_or(Value::Null, |v| {
-        Value::String(String::from_utf8_lossy(&v).into_owned())
-    })
+/// `ms` since the epoch as UTC `YYYY-MM-DD HH:MM:SS` (what the view showed
+/// before the engine: MariaDB's `DATE_FORMAT`).
+fn utc_text(ms: i64) -> String {
+    let secs = ms.div_euclid(1000);
+    let (days, rest) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    // Days since 1970-01-01 to a civil date (proleptic Gregorian).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02}",
+        rest / 3600,
+        rest % 3600 / 60,
+        rest % 60
+    )
 }
 
-fn json_text(s: Option<String>) -> Value {
-    s.and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or(Value::Null)
+/// Every group of the tenant with an offset on stream `stream`, with its
+/// committed offsets and lag against the partitions' high watermarks.
+fn stream_groups(
+    eng: &sprig_streams::seg::kafka::EngineStreams,
+    tid: TenantId,
+    stream: u64,
+    parts: &BTreeMap<u64, Value>,
+) -> Result<BTreeMap<String, Value>, SprigError> {
+    // Every group of the tenant with an offset on this stream (the
+    // tenant's own streams are instance 0): those committing from SQL have
+    // offsets only, Kafka clients' groups also a group row (generation and
+    // state).
+    let rows: BTreeMap<String, (i32, String)> = eng
+        .records()
+        .group_states(tid.0)?
+        .into_iter()
+        .map(|(g, generation, state)| (g, (generation, state)))
+        .collect();
+    let mut groups: BTreeMap<String, Value> = BTreeMap::new();
+    for group in eng.records().offset_groups(tid.0)? {
+        let mut offs: Vec<(i32, i64, i64)> = eng
+            .records()
+            .offsets_on_timed(tid.0, &group)?
+            .into_iter()
+            .filter(|(instance, o, _)| *instance == 0 && o.stream_id == stream)
+            .map(|(_, o, at)| (o.partition, o.offset, at))
+            .collect();
+        if offs.is_empty() {
+            continue;
+        }
+        offs.sort_unstable();
+        let mut lag_all = 0u64;
+        let mut list = Vec::new();
+        for (p, off, at) in offs {
+            let p = u64::try_from(p).unwrap_or(0);
+            let off = u64::try_from(off).unwrap_or(0);
+            let hw = parts
+                .get(&p)
+                .and_then(|v| v["high_watermark"].as_u64())
+                .unwrap_or(0);
+            let lag = hw.saturating_sub(off);
+            lag_all += lag;
+            list.push(json!({"partition": p, "committed": off, "lag": lag,
+                             "committed_at": utc_text(at)}));
+        }
+        let row = rows.get(&group);
+        groups.insert(
+            group.clone(),
+            json!({"group": group, "generation": row.map(|r| r.0), "state": row.map(|r| r.1.clone()),
+                   "partitions": list, "lag": lag_all}),
+        );
+    }
+    Ok(groups)
 }
 
-/// The database's virtual host and its topology.
-#[allow(clippy::too_many_lines)] // one query and one mapping per object kind
+/// A binding key's parts after its database: source id, destination id,
+/// routing key (escaped bytes up to `00 00`, as [`Pk::bytes`] wrote them).
+fn binding_parts(k: &[u8]) -> Option<(u64, u64, String)> {
+    let src = u64::from_be_bytes(k.get(..8)?.try_into().ok()?);
+    let dst = u64::from_be_bytes(k.get(8..16)?.try_into().ok()?);
+    let mut key = Vec::new();
+    let mut i = 16;
+    loop {
+        let b = *k.get(i)?;
+        if b == 0 {
+            match *k.get(i + 1)? {
+                0 => break,
+                0xFF => {
+                    key.push(0);
+                    i += 2;
+                    continue;
+                }
+                _ => return None,
+            }
+        }
+        key.push(b);
+        i += 1;
+    }
+    Some((src, dst, String::from_utf8_lossy(&key).into_owned()))
+}
+
+/// The database's virtual host and its topology, from the queues
+/// module's catalog records.
 async fn topology(
     core: &Arc<Core>,
     caller: &Caller,
     db: &str,
 ) -> Result<Response<Body>, SprigError> {
+    use sprig_queues::catalog::{
+        BINDINGS, BindingRow, EXCHANGES, ExchangeRow, QUEUES, QueueRow, VHOSTS, VhostRow,
+    };
     let lines = grant_lines(core, caller).await?;
     if !access_of(&lines, db).list {
         return Err(denied_db(caller, db));
     }
-    let (mut conn, schema, db_id) = catalog(core, caller, db).await?;
-    let s = ident(&schema);
-    let vhost: Option<(String, String)> = match conn
-        .exec_first(
-            format!("SELECT vhost_name, CAST(default_queue_type AS CHAR) FROM {s}.mq_vhosts WHERE db_id = ?"),
-            (db_id,),
-        )
-        .await
-    {
-        Ok(v) => v,
-        Err(e) if missing_table(&e) => {
-            return Ok(json_response(
-                200,
-                &json!({"vhost": null, "exchanges": [], "queues": [], "bindings": []}),
-            ));
-        }
-        Err(e) => return Err(db_err(&e)),
-    };
-    let ex: Vec<Ex> = conn
-        .exec(
-            format!(
-                "SELECT object_id, name, CAST(type AS CHAR), durable, auto_delete, internal, CAST(arguments AS CHAR) \
-                 FROM {s}.mq_exchanges WHERE db_id = ? ORDER BY name"
-            ),
-            (db_id,),
-        )
-        .await
-        .map_err(|e| db_err(&e))?;
-    let qs: Vec<Qu> = conn
-        .exec(
-            format!(
-                "SELECT object_id, name, CAST(qtype AS CHAR), durable, auto_delete, CAST(arguments AS CHAR), lanes, \
-                 CAST(state AS CHAR) FROM {s}.mq_queues WHERE db_id = ? ORDER BY name"
-            ),
-            (db_id,),
-        )
-        .await
-        .map_err(|e| db_err(&e))?;
-    let bs: Vec<Bind> = conn
-        .exec(
-            format!(
-                "SELECT source_id, dest_id, CAST(dest_kind AS CHAR), binding_key, CAST(arguments AS CHAR) \
-                 FROM {s}.mq_bindings WHERE db_id = ?"
-            ),
-            (db_id,),
-        )
-        .await
-        .map_err(|e| db_err(&e))?;
+    let (tid, records, db_id, _) = catalog(core, caller, db)?;
+    let mut tx = records.begin(tid).await?;
+    let vhost = VHOSTS
+        .rows::<VhostRow>(&mut *tx, &Pk::new())
+        .await?
+        .into_iter()
+        .find(|v| v.db_id == db_id);
+    let mut ex: Vec<ExchangeRow> = EXCHANGES
+        .rows::<ExchangeRow>(&mut *tx, &Pk::new())
+        .await?
+        .into_iter()
+        .filter(|x| x.db_id == db_id)
+        .collect();
+    let mut qs: Vec<QueueRow> = QUEUES
+        .rows::<QueueRow>(&mut *tx, &Pk::new())
+        .await?
+        .into_iter()
+        .filter(|q| q.db_id == db_id)
+        .collect();
+    let bs = BINDINGS
+        .scan::<BindingRow>(&mut *tx, &Pk::new().u32(db_id))
+        .await?;
+    drop(tx);
+    ex.sort_by(|a, b| a.name.cmp(&b.name));
+    qs.sort_by(|a, b| a.name.cmp(&b.name));
     let mut names: BTreeMap<u64, Value> = BTreeMap::new();
     let exchanges: Vec<Value> = ex
         .into_iter()
-        .map(|(id, name, ty, durable, auto_delete, internal, args)| {
-            let n = text(Some(name));
-            names.insert(id, n.clone());
-            json!({"id": id, "name": n, "type": ty, "durable": durable, "auto_delete": auto_delete,
-                   "internal": internal, "arguments": json_text(args)})
+        .map(|x| {
+            names.insert(x.object_id, json!(x.name));
+            json!({"id": x.object_id, "name": x.name, "type": x.kind, "durable": x.durable,
+                   "auto_delete": x.auto_delete, "internal": x.internal, "arguments": x.arguments})
         })
         .collect();
     let queues: Vec<Value> = qs
         .into_iter()
-        .map(|(id, name, ty, durable, auto_delete, args, lanes, state)| {
-            let n = text(Some(name));
-            names.insert(id, n.clone());
-            json!({"id": id, "name": n, "type": ty, "durable": durable, "auto_delete": auto_delete,
-                   "arguments": json_text(args), "lanes": lanes, "state": state})
+        .map(|q| {
+            names.insert(q.object_id, json!(q.name));
+            json!({"id": q.object_id, "name": q.name, "type": q.qtype, "durable": q.durable,
+                   "auto_delete": q.auto_delete, "arguments": q.arguments, "lanes": q.lanes,
+                   "state": q.state})
         })
         .collect();
     let bindings: Vec<Value> = bs
         .into_iter()
-        .map(|(src, dst, kind, key, args)| {
-            json!({"source": names.get(&src).cloned().unwrap_or(Value::Null),
+        .filter_map(|(pk, r)| {
+            let (src, dst, key) = binding_parts(pk.0.get(4..)?)?;
+            Some(
+                json!({"source": names.get(&src).cloned().unwrap_or(Value::Null),
                    "destination": names.get(&dst).cloned().unwrap_or(Value::Null),
-                   "destination_kind": kind, "binding_key": text(Some(key)), "arguments": json_text(args)})
+                   "destination_kind": r.dest_kind, "binding_key": key, "arguments": r.arguments}),
+            )
         })
         .collect();
     // A database is its own virtual host (AMQP clients name it in the
-    // vhost; `/` maps to `amqp.default_vhost_database`). `mq_vhosts` only
-    // holds a row when a vhost got limits or a description, so without one
+    // vhost; `/` maps to `amqp.default_vhost_database`). A vhost record
+    // exists only when a vhost got limits or a description, so without one
     // the database's name is the vhost once it has any topology (otherwise
     // the queue pages would show "no virtual host yet").
     let vhost_name = vhost
         .as_ref()
-        .map(|v| v.0.clone())
+        .map(|v| v.vhost_name.clone())
         .or_else(|| (!exchanges.is_empty() || !queues.is_empty()).then(|| db.to_owned()));
     Ok(json_response(
         200,
         &json!({
             "vhost": vhost_name,
-            "default_queue_type": vhost.map(|v| v.1),
+            "default_queue_type": vhost.map(|v| v.default_queue_type),
             "exchanges": exchanges,
             "queues": queues,
             "bindings": bindings,
@@ -518,19 +551,24 @@ async fn sink_dead(
     act: Option<(&str, &Value)>,
 ) -> Result<Response<Body>, SprigError> {
     let lines = grant_lines(core, caller).await?;
-    let (mut conn, schema, db_id) = catalog(core, caller, db).await?;
-    let s = ident(&schema);
-    let sink: Option<(u64, u32)> = match conn
-        .exec_first(
-            format!("SELECT sink_id, owner_user_id FROM {s}.sinks WHERE db_id = ? AND name = ?"),
-            (db_id, name),
-        )
-        .await
-    {
-        Ok(v) => v,
-        Err(e) if missing_table(&e) => None,
-        Err(e) => return Err(db_err(&e)),
+    // Sink rows are engine catalog records.
+    let (tid, records, db_id, _) = catalog(core, caller, db)?;
+    // Replay and discard write the dead letters' states: on the tenant
+    // unit's leader, whichever node took the request.
+    let records = match (act, &core.studio.tenants) {
+        (Some(_), Some(svc)) => Arc::clone(&svc.writers),
+        _ => records,
     };
+    let store = sprig_sinks::store::SinksStore::new(records, tid);
+    let mut sink = None;
+    for id in store.ids_named(name).await? {
+        if let Some(d) = store.sink(id).await?
+            && d.db_id == db_id
+        {
+            sink = Some((d.id.0, d.owner_user_id));
+            break;
+        }
+    }
     let Some((sink_id, owner)) = sink else {
         return Err(SprigError::new(
             SprigCode::SinkNotFound,
@@ -545,11 +583,6 @@ async fn sink_dead(
             "Access denied; you need (at least one of) the SPRIG_SINK_ADMIN privilege(s) for this operation, or to own the sink",
         ));
     }
-    // Sink rows are engine catalog records.
-    let (Some(svc), Some(tid)) = (&core.studio.tenants, caller.principal.tenant) else {
-        return Err(invalid("these views need a tenant login"));
-    };
-    let store = sprig_sinks::store::SinksStore::new(Arc::clone(&svc.records), tid);
     let id = sprig_sinks::model::SinkId(sink_id);
     if let Some((verb, body)) = act {
         let ids: Vec<u64> = body
@@ -637,6 +670,14 @@ mod tests {
         assert!(!is_messaging_path("/v1/databases/shop/sql:query"));
         assert_eq!(decode("a%20b%2Fc"), "a b/c");
         assert_eq!(decode("%zz%"), "%zz%");
+    }
+
+    #[test]
+    fn commit_times_read_as_utc() {
+        assert_eq!(utc_text(0), "1970-01-01 00:00:00");
+        assert_eq!(utc_text(1_795_801_857_535), "2026-11-27 17:50:57");
+        assert_eq!(utc_text(951_782_400_000), "2000-02-29 00:00:00");
+        assert_eq!(utc_text(-1000), "1969-12-31 23:59:59");
     }
 
     #[test]

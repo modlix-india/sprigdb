@@ -196,6 +196,7 @@ fn tenant_id(e: &Env, name: &str) -> u64 {
         .unwrap_or(0)
 }
 
+#[ignore = "live: needs SPRIG_TEST_TENANT_DELETE, SPRIG_TEST_TENANT_DELETE_PREFIX, SPRIG_TEST_TENANT_DELETE_SPRIGCTL, ...; tools/live/README.md"]
 #[tokio::test]
 async fn deleted_tenants_finish_and_close_their_connections() {
     let Some(e) = env() else {
@@ -203,7 +204,7 @@ async fn deleted_tenants_finish_and_close_their_connections() {
             "skipped: set SPRIG_TEST_TENANT_DELETE, SPRIG_TEST_TENANT_DELETE_SPRIGCTL and \
              SPRIG_TEST_TENANT_DELETE_NODE"
         );
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let decl = format!("{}-decl", e.prefix);
     let mem = format!("{}-mem", e.prefix);

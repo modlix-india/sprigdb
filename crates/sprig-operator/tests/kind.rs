@@ -73,11 +73,12 @@ fn provisioner() -> Option<(KubernetesProvisioner, Arc<dyn KubeApi>, String)> {
     Some((KubernetesProvisioner::new(Arc::new(rec)), kube, ns))
 }
 
+#[ignore = "live: needs SPRIG_KIND_API, SPRIG_KIND_NS, SPRIG_KIND_TOKEN, ...; tools/live/README.md"]
 #[tokio::test]
 async fn kind_create_and_retire() {
     let Some((prov, kube, ns)) = provisioner() else {
         println!("SPRIG_KIND_API not set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     for pool in env("SPRIG_KIND_CREATE").unwrap_or_default().split(',') {
         if pool.is_empty() {
@@ -136,6 +137,7 @@ async fn kind_create_and_retire() {
 /// gateway acknowledged goes to the out file, one id per line, and errors
 /// are printed with their time. `SPRIG_KIND_VERIFY=<same>` instead reads
 /// the table back and fails if an acknowledged id is missing.
+#[ignore = "live: needs SPRIG_KIND_WORKLOAD, SPRIG_KIND_VERIFY; tools/live/README.md"]
 #[tokio::test]
 async fn kind_ack_workload() {
     use mysql_async::prelude::Queryable;
@@ -146,7 +148,7 @@ async fn kind_ack_workload() {
         (None, Some(v)) => ("verify", v),
         (None, None) => {
             println!("SPRIG_KIND_WORKLOAD not set: skipped");
-            return;
+            panic!("live test run without its environment: see tools/live/README.md");
         }
     };
     let f: Vec<&str> = raw.split(',').collect();

@@ -127,11 +127,12 @@ async fn clean(e: &Env, sys: &mut Conn, db: &str, stream: &str) {
     }
 }
 
+#[ignore = "live: needs SPRIG_TEST_INHDROP_GATEWAY, SPRIG_TEST_INHDROP_SYSTEM, SPRIG_TEST_INHDROP_MEMBERS; tools/live/README.md"]
 #[tokio::test]
 async fn including_self_definitions_can_be_dropped_with_their_database() {
     let Some(e) = env() else {
         eprintln!("skipped: set SPRIG_TEST_INHDROP_GATEWAY, _SYSTEM and _MEMBERS");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let (db, s) = ("bf10self", "selfev");
     let mut sys = conn(&e.addr, &e.system).await;
@@ -209,11 +210,12 @@ async fn including_self_definitions_can_be_dropped_with_their_database() {
     let _ = sql(&mut c0, &format!("DROP DATABASE IF EXISTS {db}")).await;
 }
 
+#[ignore = "live: needs SPRIG_TEST_INHDROP_GATEWAY, SPRIG_TEST_INHDROP_SYSTEM, SPRIG_TEST_INHDROP_MEMBERS; tools/live/README.md"]
 #[tokio::test]
 async fn a_member_dropping_its_instance_database_gets_the_instance_back() {
     let Some(e) = env() else {
         eprintln!("skipped: set SPRIG_TEST_INHDROP_GATEWAY, _SYSTEM and _MEMBERS");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let (db, s) = ("bf10mem", "memev");
     let mut sys = conn(&e.addr, &e.system).await;

@@ -223,10 +223,11 @@ $$"
     ]
 }
 
+#[ignore = "live: needs SPRIG_TEST_LOGIC_GATEWAY, SPRIG_TEST_LOGIC_USER, SPRIG_TEST_LOGIC_PASSWORD; tools/live/README.md"]
 #[tokio::test]
 async fn functions_through_sql_rest_and_grpc() {
     let Some(e) = env("functions_through_sql_rest_and_grpc") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let auth = basic(&e.user, &e.password);
     let mut c = conn(&e.mysql, &e.user, &e.password, None).await;

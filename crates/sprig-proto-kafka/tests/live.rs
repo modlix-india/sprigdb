@@ -606,7 +606,7 @@ async fn live_scram_upgrade_on_login() {
         env("SPRIG_KAFKA_LEGACY_PASSWORD"),
     ) else {
         println!("skipped: set SPRIG_KAFKA_LEGACY_USER and SPRIG_KAFKA_LEGACY_PASSWORD");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     // No SCRAM verifiers yet: both mechanisms fail at the proof.
     for mech in [ScramMechanism::Sha256, ScramMechanism::Sha512] {
@@ -654,7 +654,7 @@ async fn live_scram_dual_passwords() {
         env("SPRIG_KAFKA_DUAL_PASSWORDS"),
     ) else {
         println!("skipped: set SPRIG_KAFKA_DUAL_USER and SPRIG_KAFKA_DUAL_PASSWORDS");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     for pw in pws.split(',') {
         for mech in [ScramMechanism::Sha256, ScramMechanism::Sha512] {
@@ -1339,4 +1339,108 @@ async fn live_print_group_offsets() {
             );
         }
     }
+}
+
+/// A fan-in topic (`__t.<member>.<db>.<stream>`) seen by the declaring
+/// tenant of a `FOR EACH TENANT` stream: listed by Metadata, fetched from
+/// the member's instance (`SPRIG_KAFKA_FANIN_COUNT` records in all), a
+/// group's offset on it committed and read back, and produce refused.
+/// `SPRIG_KAFKA_FANIN_TOPIC` names it; `SPRIG_KAFKA_FANIN_HIDDEN` (when
+/// set) names one the user must not see.
+#[tokio::test]
+#[ignore = "needs a running gateway with the kafka listener"]
+async fn live_fan_in_topics() {
+    let topic = env("SPRIG_KAFKA_FANIN_TOPIC").unwrap();
+    let want: usize = env("SPRIG_KAFKA_FANIN_COUNT").unwrap().parse().unwrap();
+    let mut c = login().await;
+    // Every topic (a null list).
+    let all: MetadataResponse = c
+        .call(
+            12,
+            &MetadataRequest {
+                topics: None,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let names: Vec<String> = all.topics.iter().filter_map(|t| t.name.clone()).collect();
+    println!("topics: {names:?}");
+    assert!(names.contains(&topic), "{topic} listed");
+    if let Some(h) = env("SPRIG_KAFKA_FANIN_HIDDEN") {
+        assert!(!names.contains(&h), "{h} hidden");
+    }
+    let m: MetadataResponse = c.call(12, &metadata_for(&topic)).await.unwrap();
+    let t = &m.topics[0];
+    assert_eq!(t.error_code, 0, "{t:?}");
+    let parts: Vec<i32> = t.partitions.iter().map(|p| p.partition_index).collect();
+    let id = t.topic_id;
+    // The id is stable.
+    let m2: MetadataResponse = c.call(12, &metadata_for(&topic)).await.unwrap();
+    assert_eq!(m2.topics[0].topic_id, id);
+    let mut got = 0;
+    for p in &parts {
+        let f: FetchResponse = c.call(12, &fetch_req(&topic, *p, 0, 0)).await.unwrap();
+        let pd = &f.responses[0].partitions[0];
+        assert_eq!(pd.error_code, 0, "fetch {topic}/{p}");
+        got += values_of(pd).len();
+    }
+    println!("{topic}: {got} records over {} partitions", parts.len());
+    assert_eq!(got, want);
+    // A group's offset on the fan-in topic.
+    let group = format!("fanin-{}", std::process::id());
+    let r: OffsetCommitResponse = c
+        .call(
+            8,
+            &OffsetCommitRequest {
+                group_id: group.clone(),
+                generation_id_or_member_epoch: -1,
+                topics: vec![offset_commit_request::OffsetCommitRequestTopic {
+                    name: topic.clone(),
+                    partitions: vec![offset_commit_request::OffsetCommitRequestPartition {
+                        partition_index: parts[0],
+                        committed_offset: 1,
+                        committed_leader_epoch: -1,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.topics[0].partitions[0].error_code, 0);
+    let r: OffsetFetchResponse = c
+        .call(
+            8,
+            &OffsetFetchRequest {
+                groups: vec![offset_fetch_request::OffsetFetchRequestGroup {
+                    group_id: group,
+                    topics: None,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    println!("fan-in group offsets: {:?}", r.groups[0].topics);
+    assert!(
+        r.groups[0]
+            .topics
+            .iter()
+            .any(|t| t.name == topic && t.partitions[0].committed_offset == 1)
+    );
+    // Read-only.
+    let pr = produce_one(
+        &mut c,
+        9,
+        &topic,
+        parts[0],
+        data_batch(0, 1, 10, Compression::None, None),
+    )
+    .await;
+    println!("produce into {topic}: {}", pr.error_code);
+    assert_eq!(pr.error_code, err::TOPIC_AUTHORIZATION_FAILED);
 }

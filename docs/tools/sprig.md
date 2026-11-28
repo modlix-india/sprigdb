@@ -467,7 +467,7 @@ Typing goes back to the question. `Ctrl-C` stops an answer that is still streami
 
 ### The table view
 
-Open a table from the explorer or the palette and it gets its own tab, the terminal form of Studio's table page, with sub-tabs: **Data**, **Cols** (columns), **Idx** (indexes), **Rel** (foreign keys out of and into the table), **Trig** (triggers), **Pol** (row-level security policies), **Inh** (inheritance), **Shards** (the table group and shards) and **DDL**. A view has Data, Columns, Policies and DDL. `[` and `]` move between sub-tabs; `g` reloads.
+Open a table from the explorer or the palette and it gets its own tab, the terminal form of Studio's table page, with sub-tabs: **Data**, **Cols** (columns), **Idx** (indexes), **Rel** (foreign keys out of and into the table), **Trig** (triggers), **Pol** (row-level security policies), **Inh** (inheritance), **Shards** (the table group and shards; in this release it shows that the shards view's route is gone, since the storage engine places data itself) and **DDL**. A view has Data, Columns, Policies and DDL. `[` and `]` move between sub-tabs; `g` reloads.
 
 The Data tab reads pages of 100 rows in primary-key order.
 

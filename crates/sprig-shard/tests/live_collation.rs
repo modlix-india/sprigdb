@@ -231,11 +231,12 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02X}")).collect()
 }
 
+#[ignore = "live: needs SPRIG_TEST_MARIADB_SINGLE; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread")]
 async fn live_collation_conformance() {
     let Ok(url) = std::env::var("SPRIG_TEST_MARIADB_SINGLE") else {
         eprintln!("skipped: SPRIG_TEST_MARIADB_SINGLE not set");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let n: usize = std::env::var("SPRIG_TEST_COLLATION_STRINGS")
         .ok()

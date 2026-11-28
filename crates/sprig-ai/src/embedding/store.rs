@@ -546,3 +546,239 @@ impl Store {
         .map_err(unavailable)
     }
 }
+
+// ---- engine tables: the tenant's catalog records ----
+
+/// Embedded columns of engine tables, one record each:
+/// `m/ai_embeddings/columns/<id u64>`.
+pub const ENGINE_COLUMNS: sprig_catalog::records::RowTable =
+    sprig_catalog::records::RowTable::new(MODULE, "columns");
+
+/// The id counter of [`ENGINE_COLUMNS`].
+pub const ENGINE_COUNTER: &str = "ai.embedding";
+
+/// An embedded column of an engine table, with its runner's place.
+///
+/// The runner keeps its place here, written only after the writes it
+/// covers committed: the change-log token after the last change it
+/// handled, and the backfill's last primary key. A restarted runner goes
+/// on from there.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EngineColumn {
+    /// The id.
+    pub id: u64,
+    /// The database.
+    pub db_id: u32,
+    /// The table's object id.
+    pub object_id: u64,
+    /// The column.
+    pub column: String,
+    /// The source expression as declared.
+    pub source: String,
+    /// The model.
+    pub model: ModelRef,
+    /// The alias as declared (`USING MODEL`).
+    pub alias: String,
+    /// `WITH (max_input_tokens = n)`.
+    #[serde(default)]
+    pub max_input_tokens: Option<u32>,
+    /// The state.
+    pub state: State,
+    /// Changes committed from this time on (ms since the epoch) are read
+    /// from the change log until a token is kept.
+    pub from_ms: i64,
+    /// The change-log token after the last change handled.
+    #[serde(default)]
+    pub token: Option<String>,
+    /// The backfill is done.
+    #[serde(default)]
+    pub backfilled: bool,
+    /// The backfill's last primary key: one SQL literal per key column.
+    #[serde(default)]
+    pub backfill_after: Option<Vec<String>>,
+    /// Rows embedded so far.
+    #[serde(default)]
+    pub rows_embedded: u64,
+    /// Rows passed over because embedding or writing them failed (each
+    /// tried again by the stale-hash check).
+    #[serde(default)]
+    pub rows_failed: u64,
+    /// Why the column failed, or why a row was last passed over.
+    #[serde(default)]
+    pub last_error: Option<String>,
+    /// Who declared it: the runner reads and writes as this user.
+    pub created_by: u32,
+}
+
+/// The rows of [`ENGINE_COLUMNS`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EngineColumns;
+
+impl EngineColumns {
+    /// Adds `c` with a new id (its `id` is ignored); returns the id.
+    ///
+    /// # Errors
+    /// 39997 when the table already has an embedded column of that name;
+    /// the records'.
+    pub async fn insert(
+        &self,
+        tx: &mut dyn sprig_catalog::records::RecordTx,
+        c: &EngineColumn,
+    ) -> Result<u64> {
+        if self
+            .of_object(tx, c.object_id)
+            .await?
+            .iter()
+            .any(|e| e.column.eq_ignore_ascii_case(&c.column))
+        {
+            return Err(super::failed(format!(
+                "{} is already an embedded column of the table",
+                c.column
+            )));
+        }
+        let id = sprig_catalog::records::next_ids(tx, ENGINE_COUNTER, 1).await?;
+        let mut row = c.clone();
+        row.id = id;
+        ENGINE_COLUMNS
+            .put(tx, &sprig_catalog::records::Pk::new().u64(id), &row)
+            .await?;
+        Ok(id)
+    }
+
+    /// Every embedded column of the tenant's engine tables.
+    ///
+    /// # Errors
+    /// The records'.
+    pub async fn all(
+        &self,
+        tx: &mut dyn sprig_catalog::records::RecordTx,
+    ) -> Result<Vec<EngineColumn>> {
+        ENGINE_COLUMNS
+            .rows(tx, &sprig_catalog::records::Pk::new())
+            .await
+    }
+
+    /// The embedded columns of table `object`.
+    ///
+    /// # Errors
+    /// The records'.
+    pub async fn of_object(
+        &self,
+        tx: &mut dyn sprig_catalog::records::RecordTx,
+        object: u64,
+    ) -> Result<Vec<EngineColumn>> {
+        Ok(self
+            .all(tx)
+            .await?
+            .into_iter()
+            .filter(|c| c.object_id == object)
+            .collect())
+    }
+
+    /// Column `id`.
+    ///
+    /// # Errors
+    /// The records'.
+    pub async fn get(
+        &self,
+        tx: &mut dyn sprig_catalog::records::RecordTx,
+        id: u64,
+    ) -> Result<Option<EngineColumn>> {
+        ENGINE_COLUMNS
+            .get(tx, &sprig_catalog::records::Pk::new().u64(id))
+            .await
+    }
+
+    /// Column `id`, locked until the transaction ends.
+    ///
+    /// # Errors
+    /// The records'.
+    pub async fn get_for_update(
+        &self,
+        tx: &mut dyn sprig_catalog::records::RecordTx,
+        id: u64,
+    ) -> Result<Option<EngineColumn>> {
+        ENGINE_COLUMNS
+            .get_for_update(tx, &sprig_catalog::records::Pk::new().u64(id))
+            .await
+    }
+
+    /// Writes `c` over its row.
+    ///
+    /// # Errors
+    /// The records'.
+    pub async fn put(
+        &self,
+        tx: &mut dyn sprig_catalog::records::RecordTx,
+        c: &EngineColumn,
+    ) -> Result<()> {
+        ENGINE_COLUMNS
+            .put(tx, &sprig_catalog::records::Pk::new().u64(c.id), c)
+            .await
+    }
+
+    /// Deletes column `id`.
+    ///
+    /// # Errors
+    /// The records'.
+    pub async fn delete(
+        &self,
+        tx: &mut dyn sprig_catalog::records::RecordTx,
+        id: u64,
+    ) -> Result<()> {
+        ENGINE_COLUMNS
+            .delete(tx, &sprig_catalog::records::Pk::new().u64(id))
+            .await
+    }
+}
+
+#[cfg(test)]
+mod engine_tests {
+    use super::*;
+    use sprig_catalog::records::RecordStore as _;
+    use sprig_catalog::records::mem::MemRecords;
+    use sprig_common::ids::TenantId;
+
+    fn col(object: u64, name: &str) -> EngineColumn {
+        EngineColumn {
+            id: 0,
+            db_id: 1,
+            object_id: object,
+            column: name.into(),
+            source: "body".into(),
+            model: ModelRef::local(),
+            alias: super::super::LOCAL_ALIAS.into(),
+            max_input_tokens: None,
+            state: State::Backfilling,
+            from_ms: 5,
+            token: None,
+            backfilled: false,
+            backfill_after: None,
+            rows_embedded: 0,
+            rows_failed: 0,
+            last_error: None,
+            created_by: 3,
+        }
+    }
+
+    #[tokio::test]
+    async fn engine_columns_are_records() {
+        let rs = MemRecords::default();
+        let mut tx = rs.begin(TenantId(4)).await.unwrap();
+        let s = EngineColumns;
+        let a = s.insert(&mut *tx, &col(10, "emb")).await.unwrap();
+        let b = s.insert(&mut *tx, &col(11, "emb")).await.unwrap();
+        assert_ne!(a, b);
+        let e = s.insert(&mut *tx, &col(10, "EMB")).await.unwrap_err();
+        assert_eq!(e.code(), Some(SprigCode::EmbeddingFailed));
+        let mut got = s.get(&mut *tx, a).await.unwrap().unwrap();
+        assert_eq!((got.id, got.object_id), (a, 10));
+        got.token = Some("ab".into());
+        got.backfill_after = Some(vec!["7".into()]);
+        s.put(&mut *tx, &got).await.unwrap();
+        assert_eq!(s.of_object(&mut *tx, 10).await.unwrap(), vec![got]);
+        s.delete(&mut *tx, a).await.unwrap();
+        assert_eq!(s.all(&mut *tx).await.unwrap().len(), 1);
+        tx.commit().await.unwrap();
+    }
+}

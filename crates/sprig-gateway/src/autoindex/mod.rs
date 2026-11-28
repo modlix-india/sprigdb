@@ -3,10 +3,11 @@
 //!
 //! ```text
 //! spawn(services, keyring):  one task per process
-//!   tenants: every tenant whose catalog this process loads
+//!   tenants: every tenant whose engine unit this node leads (crate::led;
+//!     every tenant on an engine that doesn't replicate) and that has
+//!     engine databases, its catalog loaded here on demand
 //!   every minute: each tenant due (auto_index.eval_interval_minutes since
-//!     its last pass) whose engine unit this node leads (or any unit, on one
-//!     node) gets a pass: sprig_advisor::autoindex::pass::run over
+//!     its last pass) gets a pass: sprig_advisor::autoindex::pass::run over
 //!     GatewayEnv, one tenant at a time (so one build per tenant at a
 //!     time, and one per node)
 //! GatewayEnv:
@@ -362,10 +363,9 @@ async fn flush_usage(
     svc: &Arc<TenantServices>,
     keyring: &Arc<dyn TenantKeyring>,
     approvals: &Arc<Approvals>,
-    tenants: &BTreeSet<u64>,
 ) {
     for t in usage::take_dirty() {
-        if !tenants.contains(&t) || matches!(node_engine::tenant_leader(t), UnitLeader::Node(_)) {
+        if matches!(node_engine::tenant_leader(t), UnitLeader::Node(_)) {
             continue;
         }
         let r = match GatewayEnv::new(svc, keyring, approvals, TenantId(t)).await {
@@ -421,9 +421,8 @@ pub(crate) fn spawn(
         Arc::new(LocatorStores::new(Arc::clone(&svc.records))),
         Arc::new(SystemClock),
     ));
-    let mut loads = svc.cache.loads();
+    let mut led = crate::led::Led::new(&svc);
     tokio::spawn(async move {
-        let mut tenants: BTreeSet<u64> = BTreeSet::new();
         // Tenants with index records: the ones an operator's request can
         // name.
         let mut known: BTreeSet<u64> = BTreeSet::new();
@@ -433,28 +432,25 @@ pub(crate) fn spawn(
             tokio::select! {
                 () = stop.cancelled() => {
                     // The reads counted since the last minute.
-                    let flush = flush_usage(&svc, &keyring, &approvals, &tenants);
+                    let flush = flush_usage(&svc, &keyring, &approvals);
                     let _ = tokio::time::timeout(Duration::from_secs(5), flush).await;
                     return;
                 }
-                l = loads.recv() => {
-                    if let Ok(l) = l {
-                        tenants.insert(l.tenant.0);
-                    }
-                    continue;
-                }
+                _ = led.changed() => continue,
                 _ = timer.tick() => {}
             }
-            flush_usage(&svc, &keyring, &approvals, &tenants).await;
+            flush_usage(&svc, &keyring, &approvals).await;
             apply_requests(&svc, &keyring, &approvals, &known).await;
-            for &t in &tenants {
+            let cats = led
+                .catalogs(&svc, |cat| {
+                    catalog::of(cat).is_some_and(|e| !e.dbs.is_empty())
+                })
+                .await;
+            let led_now: BTreeSet<u64> = cats.iter().map(|c| c.tenant.0).collect();
+            last.retain(|t, _| led_now.contains(t));
+            for cat in cats {
+                let t = cat.tenant.0;
                 let tenant = TenantId(t);
-                if matches!(node_engine::tenant_leader(t), UnitLeader::Node(_)) {
-                    continue;
-                }
-                let Some(cat) = svc.cache.cached(tenant) else {
-                    continue;
-                };
                 let every = Duration::from_secs(
                     60 * u64::from(svc.settings.get(
                         &EVAL_INTERVAL_MINUTES,

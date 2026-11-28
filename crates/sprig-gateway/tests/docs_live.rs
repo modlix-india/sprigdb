@@ -114,6 +114,7 @@ fn code(e: &mysql_async::Error) -> u16 {
     }
 }
 
+#[ignore = "live: needs SPRIG_TEST_DOCS_GATEWAY, SPRIG_TEST_DOCS_USER, SPRIG_TEST_DOCS_PASSWORD, ...; tools/live/README.md"]
 #[tokio::test]
 async fn http_search_finds_the_docs() {
     let Some(e) = env("http_search_finds_the_docs") else {
@@ -252,6 +253,7 @@ async fn http_search_finds_the_docs() {
     );
 }
 
+#[ignore = "live: needs SPRIG_TEST_DOCS_GATEWAY, SPRIG_TEST_DOCS_USER, SPRIG_TEST_DOCS_PASSWORD, ...; tools/live/README.md"]
 #[tokio::test]
 async fn sql_reads_and_refuses_writes() {
     let Some(e) = env("sql_reads_and_refuses_writes") else {

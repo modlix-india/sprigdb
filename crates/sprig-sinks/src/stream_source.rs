@@ -17,6 +17,13 @@
 //! Delivery is at least once: records after the saved offsets are read
 //! again after a restart. A partition whose saved offset fell below the
 //! log's start (retention) resumes at the first record the log holds.
+//!
+//! In a `FROM STREAM s FAN IN` sink's task each member instance is one
+//! such source ([`StreamSource::fan_in`]): it reads through
+//! [`crate::peer::SqlOp::FanInStreamRead`], learns the instance's
+//! partitions from what it reads (a partition not read yet starts at the
+//! sink's start), and the task's row keeps every member's offsets
+//! (`{"source": "stream", "members": {member: {p: n}}}`).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -47,6 +54,38 @@ pub struct StreamSource {
     /// Per partition, the offset after its settled prefix.
     settled: BTreeMap<u32, u64>,
     saved: BTreeMap<u32, u64>,
+    /// In a fan-in task: the definition and member read, and every
+    /// member's settled offsets (one task row holds them all).
+    fan_in: Option<(FanInAt, Members, Value)>,
+}
+
+/// A fan-in source's member instance: `(def_tenant, def_object, member)`.
+pub type FanInAt = (u64, u64, u64);
+
+/// A fan-in task's settled offsets, per member, per partition.
+pub type Members = Arc<std::sync::Mutex<BTreeMap<u64, BTreeMap<u32, u64>>>>;
+
+/// The offsets per member a fan-in task's source part holds.
+#[must_use]
+pub fn saved_members(part: &Value) -> BTreeMap<u64, BTreeMap<u32, u64>> {
+    part.get("members")
+        .and_then(Value::as_object)
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, v)| Some((k.parse().ok()?, saved_offsets(&json!({"offsets": v})))))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A fan-in task's source part with every member's `offsets`.
+#[must_use]
+pub fn members_part(members: &BTreeMap<u64, BTreeMap<u32, u64>>) -> Value {
+    let m: serde_json::Map<String, Value> = members
+        .iter()
+        .map(|(t, o)| (t.to_string(), part_of(o)["offsets"].clone()))
+        .collect();
+    json!({"source": "stream", "members": m})
 }
 
 impl std::fmt::Debug for StreamSource {
@@ -204,7 +243,17 @@ impl StreamSource {
             saver,
             settled: kept.clone(),
             saved: kept,
+            fan_in: None,
         }
+    }
+
+    /// This source as a fan-in task's reader of member instance `at`,
+    /// saving into the task's shared `members` offsets; `part` is the rest
+    /// of the task's row (its `of`, kept with the offsets).
+    #[must_use]
+    pub fn fan_in(mut self, at: FanInAt, members: Members, part: Value) -> Self {
+        self.fan_in = Some((at, members, part));
+        self
     }
 
     /// The next offset to read per partition (`None`: not started).
@@ -260,8 +309,20 @@ impl StreamSource {
             return Ok(());
         }
         if let Some(s) = &self.saver {
+            let part = match &self.fan_in {
+                Some(((_, _, member), all, base)) => {
+                    let mut g = all
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    g.insert(*member, self.settled.clone());
+                    let mut part = base.clone();
+                    part["members"] = members_part(&g)["members"].clone();
+                    part
+                }
+                None => part_of(&self.settled),
+            };
             s.store
-                .save_task_part(s.sink, s.task_no, s.epoch, &part_of(&self.settled))
+                .save_task_part(s.sink, s.task_no, s.epoch, &part)
                 .await?;
         }
         self.saved = self.settled.clone();
@@ -288,12 +349,26 @@ impl SourceReader for StreamSource {
                 from_ms: self.from_ms,
             })
             .collect();
-        let op = SqlOp::StreamRead {
-            db: self.db.clone(),
-            stream: self.stream.clone(),
-            from,
-            max_records: per.max(1),
-            wait_ms: u64::try_from(wait.as_millis()).unwrap_or(u64::MAX),
+        let wait_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX);
+        let op = match &self.fan_in {
+            Some(((def_tenant, def_object, member), _, _)) => SqlOp::FanInStreamRead {
+                def_tenant: *def_tenant,
+                def_object: *def_object,
+                member: *member,
+                db: self.db.clone(),
+                stream: self.stream.clone(),
+                from,
+                from_ms: self.from_ms,
+                max_records: per.max(1),
+                wait_ms,
+            },
+            None => SqlOp::StreamRead {
+                db: self.db.clone(),
+                stream: self.stream.clone(),
+                from,
+                max_records: per.max(1),
+                wait_ms,
+            },
         };
         let reply = self
             .peer

@@ -9,7 +9,7 @@ source: the metric macros in the source tree, and docs/metrics-help.toml
 
 Every metric SprigDB records, as exported on each process's telemetry port (`/metrics`, Prometheus text) and through OTLP. Counters end in `_total`; durations are histograms in seconds.
 
-491 metrics in 56 groups.
+493 metrics in 56 groups.
 
 ## `sprig_advisor_*`
 
@@ -283,11 +283,11 @@ Every metric SprigDB records, as exported on each process's telemetry port (`/me
 
 | Metric | Type | Labels | Recorded by | Description |
 |---|---|---|---|---|
-| `sprig_docs_load_seconds` | histogram | - | sprig-controller | Time the controller took to load the docs pack into one cluster's `__sprig_docs`: delete, insert in batches, read back and verify. Unit: seconds. |
-| `sprig_docs_pack_info` | gauge | `sha`, `version` | sprig-controller | The docs pack the controller verified and loads; `version` is its release, `sha` the first bytes of its SHA-256. Always 1. Unit: 0 or 1. |
+| `sprig_docs_load_seconds` | histogram | - | sprig-controller, sprig-gateway | Time to load the docs pack: on a gateway, to read it into memory (verify its SHA-256, index its chunks); on a controller with MariaDB clusters, to load it into one cluster's `__sprig_docs`. Unit: seconds. |
+| `sprig_docs_pack_info` | gauge | `sha`, `version` | sprig-controller, sprig-gateway | The docs pack this process verified and serves (a gateway) or loads (a controller with MariaDB clusters); `version` is its release, `sha` its SHA-256. Always 1. Unit: 0 or 1. |
 | `sprig_docs_search_degraded_total` | counter | - | sprig-gateway | Docs searches answered by keywords only because the gateway's embedding model couldn't be loaded or run (`docs.model_dir`). Unit: count. |
 | `sprig_docs_search_seconds` | histogram | `mode` | sprig-gateway | Duration of docs searches on this gateway; `mode` is `hybrid` (full-text and embedding), `keyword` (full-text only) or `sql` (a statement on the `sprig_docs` database). Unit: seconds. |
-| `sprig_docs_search_total` | counter | `result` | sprig-gateway | Docs searches and `sprig_docs` statements; `result` is `ok`, `empty`, `invalid`, `refused` (a write), `unavailable` (no cluster has the docs) or `error`. Unit: count. |
+| `sprig_docs_search_total` | counter | `result` | sprig-gateway | Docs searches and `sprig_docs` statements; `result` is `ok`, `empty`, `invalid`, `refused` (a write), `unavailable` (no docs pack, or SQL over `sprig_docs` on an engine node) or `error`. Unit: count. |
 | `sprig_docs_verify_failures_total` | counter | - | sprig-controller | Times the docs rows on a cluster didn't match the pack: edited rows found at start, or rows that didn't read back after a load. Each is reloaded. Unit: count. |
 
 ## `sprig_feed_*`
@@ -596,17 +596,18 @@ Every metric SprigDB records, as exported on each process's telemetry port (`/me
 |---|---|---|---|---|
 | `sprig_redis_auth_total` | counter | `result` | sprig-gateway | Redis logins (`AUTH`, `HELLO`); `result` is `ok` or `failed`. Unit: count. |
 | `sprig_redis_block_wakeups_total` | counter | `source` | sprig-gateway | Wake-ups of blocked Redis commands (`BLPOP` and similar); `source` is where the wake-up came from: `local`, `feed`, `poll` or `peer`. Unit: count. |
-| `sprig_redis_connections` | gauge | `dc` | sprig-gateway | Redis connections open on this gateway; `dc` is the data centre. Unit: count. |
-| `sprig_redis_keyspace_events_total` | counter | - | sprig-gateway | Redis keyspace notifications published (`redis.notify_keyspace_events`). Unit: count. |
+| `sprig_redis_commands_total` | counter | `command`, `result` | sprig-gateway | Redis commands answered; `command` is the lower-case command name (`unknown` for a name SprigDB doesn't list), `result` is `ok`, `error`, `wrongtype` or `noperm`. A command queued by `MULTI` counts when queued, and `EXEC` once. Unit: count. |
+| `sprig_redis_connections` | gauge | `dc` | sprig-gateway | - |
+| `sprig_redis_keyspace_events_total` | counter | - | sprig-gateway | - |
 | `sprig_redis_pubsub_messages_total` | counter | `kind` | sprig-gateway | Redis pub/sub messages routed between gateways; `kind` is the message kind. Unit: count. |
 
 ## `sprig_retrieval_*`
 
 | Metric | Type | Labels | Recorded by | Description |
 |---|---|---|---|---|
-| `sprig_retrieval_backlog` | gauge | - | sprig-ai | Changed rows of tables with retrieval indexes that the worker's retrieval jobs have read from the change feed and not yet indexed. Unit: rows. |
-| `sprig_retrieval_chunks_total` | counter | - | sprig-ai | Chunks the retrieval workers wrote into retrieval indexes (each embedded and full-text indexed). Unit: count. |
-| `sprig_retrieval_rows_total` | counter | `result` | sprig-ai | Source rows the retrieval workers handled; `result` is `indexed` (embedded and chunks written; a row embedded again counts again), `cleared` (chunks removed: the row is gone or has no text), `skipped` (already current) or `superseded` (the row changed again before the write). Unit: rows. |
+| `sprig_retrieval_backlog` | gauge | - | sprig-ai | Changed rows of tables with retrieval indexes that the retrieval job has read (from the change log on engine nodes) and not yet indexed. Unit: rows. |
+| `sprig_retrieval_chunks_total` | counter | - | sprig-ai | Chunks the retrieval job wrote into retrieval indexes (each embedded and full-text indexed). Unit: count. |
+| `sprig_retrieval_rows_total` | counter | `result` | sprig-ai | Source rows the retrieval job handled; `result` is `indexed` (embedded and chunks written; a row embedded again counts again), `cleared` (chunks removed: the row is gone or has no text), `skipped` (already current) or `superseded` (the row changed again before the write). Unit: rows. |
 | `sprig_retrieval_search_seconds` | histogram | `mode` | sprig-ai | Time of one retrieval index search (`RETRIEVE()` or the REST route), from the query embedding to the fused hits; `mode` is `hybrid`, or `keyword` when the query couldn't be embedded. Unit: seconds. |
 | `sprig_retrieval_searches_total` | counter | `result` | sprig-ai | Retrieval index searches; `result` is `ok`, `empty` (no hit) or `error`. Unit: count. |
 
@@ -665,6 +666,7 @@ Every metric SprigDB records, as exported on each process's telemetry port (`/me
 | `sprig_sink_fanin_members_joined_total` | counter | - | sprig-sinks | Member tenants joined to fan-in sinks. Unit: count. |
 | `sprig_sink_fanin_queue_gets_total` | counter | - | sprig-gateway | Reads of members' queues by fan-in sinks. Unit: count. |
 | `sprig_sink_fanin_regroups_total` | counter | - | sprig-controller | Times the controller changed a fan-in sink's task count. Unit: count. |
+| `sprig_sink_fanin_stream_reads_total` | counter | - | sprig-gateway | Reads of members' stream instances by fan-in stream sinks (`FROM STREAM s FAN IN`). Unit: count. |
 | `sprig_sink_inflight_bytes` | gauge | - | sprig-sinks | Bytes of records a sink task holds in flight, limited by `sink.max_inflight_bytes`. Unit: bytes. |
 | `sprig_sink_paused` | gauge | `reason` | sprig-sinks | Whether a sink task is paused: `reason` is `failures` (it paused itself after failing for `sink.pause_after_minutes`, 39222) or `owner_privilege` (its owner lost access to its source, 39229). Unit: 0 or 1. |
 | `sprig_sink_platform_connection_opens_total` | counter | `result` | sprig-sinks | Failed opens of platform connections by sinks; `result` is `not_granted` or `secret_unavailable`. Unit: count. |

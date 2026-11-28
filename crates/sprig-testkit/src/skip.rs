@@ -1,11 +1,15 @@
-//! Skipping tests whose environment isn't configured.
+//! Tests whose environment isn't configured.
 //!
-//! Integration tests need real services: etcd, MariaDB in some topology,
-//! Docker. Each one names the variable that points at its service and
-//! returns early, with a message, when the variable isn't set, so
-//! `cargo test` on a laptop without Compose stays green. The variables hold
-//! connection URLs; a variable naming several servers holds a
-//! comma-separated list, writer first (see [`urls`]).
+//! Live tests need real services: a running SprigDB stack, a reference
+//! server, etcd, MariaDB in some topology, Docker. Each one names the
+//! variable that points at its service and is marked
+//! `#[ignore = "live: needs <VAR>; tools/live/README.md"]`, so a plain
+//! `cargo test` or `cargo nextest run` lists it as ignored (skipped) instead
+//! of passing it, and `tools/live/run.sh` (or `--run-ignored`) runs it. A
+//! live test run without its variable fails: [`require_env!`] and
+//! [`report_missing`] panic. The variables hold connection URLs; a variable
+//! naming several servers holds a comma-separated list, writer first (see
+//! [`urls`]).
 //!
 //! | Variable | Holds | Example |
 //! |---|---|---|
@@ -20,9 +24,12 @@
 //! | [`FAULTD`] | the faultd container (profile `faults`) | `sprigdb-dev-faultd-1` |
 //! | [`ELLE`] | how to run elle-cli: `1` (image), an image, or a `.jar` | `1` |
 //!
-//! Rust has no runtime "skipped" status, so a skipped test reports as
-//! passed. CI sets [`STRICT`] in stages that provide the services: there a
-//! missing variable fails the test instead, so a typo can't hide a suite.
+//! Rust has no runtime "skipped" status: a test that returned early would
+//! report as passed, so a green run would say nothing about the suites that
+//! didn't run. That is why the skip is the `#[ignore]` attribute, which the
+//! test runners count, and why a missing variable is a failure. [`STRICT`]
+//! is still read by a few older tests and fixtures; these helpers fail
+//! whether it is set or not.
 
 /// etcd client URLs (single-etcd mode).
 pub const ETCD: &str = "SPRIG_TEST_ETCD";
@@ -45,7 +52,8 @@ pub const TOXIPROXY_UPSTREAM: &str = "SPRIG_TEST_TOXIPROXY_UPSTREAM";
 pub const FAULTD: &str = "SPRIG_TEST_FAULTD";
 /// How to run elle-cli ([`crate::faults::elle::ElleCli::from_env`]).
 pub const ELLE: &str = "SPRIG_TEST_ELLE";
-/// Set to `1` to turn a missing variable into a test failure (CI).
+/// `1` in CI's live stages. The helpers here fail on a missing variable
+/// whatever its value; some older tests and fixtures still read it.
 pub const STRICT: &str = "SPRIG_TEST_STRICT";
 /// Set to `1` to keep Compose projects running after a test, for debugging.
 pub const KEEP: &str = "SPRIG_TEST_KEEP";
@@ -85,34 +93,37 @@ pub fn urls(value: &str) -> Vec<String> {
         .collect()
 }
 
-/// Reports that a test is skipped because `name` is unset; called by
+/// Fails a live test that runs without `name`; called by
 /// [`require_env!`](crate::require_env).
 ///
+/// A live test is `#[ignore]`d, so it runs only when asked for
+/// (`--ignored`, `--run-ignored`, `tools/live/run.sh`); asked for without
+/// its environment, it fails instead of passing having done nothing.
+///
 /// # Panics
-/// In strict mode ([`STRICT`]), so CI notices the missing variable.
+/// Always.
 pub fn report_missing(name: &str, test: &str) {
-    assert!(
-        !strict(),
-        "{test}: {name} is not set and {STRICT} is on; set {name} or unset {STRICT}"
+    panic!(
+        "{test}: {name} is not set; a live test needs its environment (see tools/live/README.md)"
     );
-    eprintln!("skipped {test}: set {name} to run it (see sprig_testkit::skip)");
 }
 
 fn is_true(v: &str) -> bool {
     matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
 }
 
-/// Evaluates to the value of an environment variable, or skips the test.
+/// Evaluates to the value of an environment variable, or fails the test.
 ///
-/// When the variable is unset or empty, prints `skipped <module>: set <VAR>
-/// to run it` and returns from the enclosing function: with `()` by default,
-/// or with the second argument, such as `Ok(())` in a test that returns a
-/// `Result`. In strict mode (`SPRIG_TEST_STRICT=1`) it panics instead.
+/// When the variable is unset or empty it panics ([`report_missing`]). The
+/// second argument, the value an early return would have used, is still
+/// accepted so older call sites compile; it is never returned. Mark the test
+/// `#[ignore = "live: needs <VAR>; tools/live/README.md"]`.
 ///
 /// ```no_run
 /// use sprig_testkit::{require_env, skip};
 ///
 /// #[test]
+/// #[ignore = "live: needs SPRIG_TEST_MARIADB_GALERA; tools/live/README.md"]
 /// fn talks_to_galera() -> Result<(), String> {
 ///     let urls = skip::urls(&require_env!(skip::MARIADB_GALERA, Ok(())));
 ///     assert_eq!(urls.len(), 3);
@@ -164,12 +175,8 @@ mod tests {
     }
 
     #[test]
-    fn require_env_returns_early_when_unset() {
-        // Strict mode would turn the skip into a panic; this test checks the
-        // non-strict path only.
-        if strict() {
-            return;
-        }
-        assert_eq!(gated(), None);
+    #[should_panic(expected = "SPRIG_TEST_SURELY_UNSET_VARIABLE_FOR_TESTKIT is not set")]
+    fn require_env_fails_when_unset() {
+        let _ = gated();
     }
 }

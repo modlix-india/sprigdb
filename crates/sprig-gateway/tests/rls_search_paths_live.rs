@@ -241,6 +241,7 @@ fn scores_of(v: &[(i64, f64)]) -> Vec<i64> {
     v.iter().map(|x| (x.1 * 1e6).round() as i64).collect()
 }
 
+#[ignore = "live: needs SPRIG_TEST_RLS_SQL, SPRIG_TEST_RLS_MONGO, SPRIG_TEST_RLS_REDIS; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn search_paths_under_row_policies() {
     let (Ok(sql_addr), Ok(mongo_addr), Ok(redis_addr)) = (
@@ -249,7 +250,7 @@ async fn search_paths_under_row_policies() {
         std::env::var("SPRIG_TEST_RLS_REDIS"),
     ) else {
         eprintln!("SPRIG_TEST_RLS_SQL, _MONGO or _REDIS not set; skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let mut ck = Checks {
         n: 0,

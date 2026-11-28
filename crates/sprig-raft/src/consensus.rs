@@ -257,6 +257,74 @@ pub trait UnitSnapshots: Send + Sync {
         let _ = (unit, q);
         Vec::new()
     }
+
+    /// Drops everything this node holds of the unit: its replica left the
+    /// node. By default, an ingest of an empty unit.
+    ///
+    /// # Errors
+    /// The state could not be written.
+    fn drop_unit(&self, unit: UnitId) -> std::result::Result<(), RaftError> {
+        self.ingest(unit, 0, &[])
+    }
+
+    /// Whether [`UnitSnapshots::export_to`] writes a unit off the driver
+    /// thread from a fixed point. `false` by default.
+    fn exports_off_driver(&self) -> bool {
+        false
+    }
+
+    /// Writes the unit as of one point in time, calling `fixed` once that
+    /// point is fixed (see [`crate::sm::SnapshotExporter::export`]). Only
+    /// called where [`UnitSnapshots::exports_off_driver`] says so.
+    ///
+    /// # Errors
+    /// Not supported (the default), the state could not be read, or the
+    /// writer failed.
+    fn export_to(
+        &self,
+        unit: UnitId,
+        fixed: &mut dyn FnMut(),
+        out: &mut dyn std::io::Write,
+    ) -> std::result::Result<(), RaftError> {
+        let _ = (unit, fixed, out);
+        Err(RaftError::Invalid(
+            "this state has no off-driver export".into(),
+        ))
+    }
+
+    /// [`UnitSnapshots::ingest`] from a reader, durable before it returns.
+    /// By default the bytes are read into memory first.
+    ///
+    /// # Errors
+    /// As for [`UnitSnapshots::ingest`]; the reader failed.
+    fn ingest_from(
+        &self,
+        unit: UnitId,
+        index: u64,
+        input: &mut dyn std::io::Read,
+    ) -> std::result::Result<(), RaftError> {
+        let mut data = Vec::new();
+        input
+            .read_to_end(&mut data)
+            .map_err(|e| RaftError::Storage(format!("read a snapshot: {e}")))?;
+        self.ingest(unit, index, &data)
+    }
+}
+
+/// A unit's snapshots written off the driver thread.
+struct UnitExporter {
+    unit: UnitId,
+    snaps: Arc<dyn UnitSnapshots>,
+}
+
+impl crate::sm::SnapshotExporter for UnitExporter {
+    fn export(
+        &self,
+        fixed: &mut dyn FnMut(),
+        out: &mut dyn std::io::Write,
+    ) -> std::result::Result<(), RaftError> {
+        self.snaps.export_to(self.unit, fixed, out)
+    }
 }
 
 /// One unit's view of the engine's state machine. Durable: the engine
@@ -299,12 +367,43 @@ impl StateMachine for UnitMachine {
         self.snaps.ingest(self.unit, index, data)
     }
 
+    fn exporter(&self) -> Option<Arc<dyn crate::sm::SnapshotExporter>> {
+        self.snaps.exports_off_driver().then(|| {
+            Arc::new(UnitExporter {
+                unit: self.unit,
+                snaps: Arc::clone(&self.snaps),
+            }) as Arc<dyn crate::sm::SnapshotExporter>
+        })
+    }
+
+    fn restore_from(
+        &mut self,
+        index: u64,
+        input: &mut dyn std::io::Read,
+    ) -> std::result::Result<(), RaftError> {
+        self.snaps.ingest_from(self.unit, index, input)
+    }
+
     fn durable(&self) -> bool {
         true
     }
 
     fn applied_index(&self) -> u64 {
         self.sm.applied_index(self.unit).unwrap_or(0)
+    }
+
+    fn removed(&mut self) {
+        match self.snaps.drop_unit(self.unit) {
+            Ok(()) => {
+                tracing::info!(
+                    unit = self.unit.0,
+                    "raft: this node's replica of the unit left; its keys and stream files are dropped"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(unit = self.unit.0, error = %e, "raft: a departed replica's keys weren't dropped");
+            }
+        }
     }
 }
 
@@ -538,14 +637,23 @@ impl RaftConsensus {
     }
 }
 
-impl Consensus for RaftConsensus {
-    fn propose(&self, unit: UnitId, payload: Vec<u8>, durability: Durability) -> Result<Ticket> {
+impl RaftConsensus {
+    /// [`Consensus::propose`], in `term` only when one is given.
+    fn propose_at(
+        &self,
+        unit: UnitId,
+        term: Option<u64>,
+        payload: Vec<u8>,
+        durability: Durability,
+    ) -> Result<Ticket> {
         let mut progress = None;
-        let proposed = self.node.propose_with(unit.0, payload, durability, |term| {
-            let p = self.epoch(unit, term);
-            progress = Some(p.clone());
-            Box::new(EpochWaiter(p))
-        });
+        let proposed = self
+            .node
+            .propose_in_term(unit.0, term, payload, durability, |term| {
+                let p = self.epoch(unit, term);
+                progress = Some(p.clone());
+                Box::new(EpochWaiter(p))
+            });
         let (_, index) = match proposed {
             Err(RaftError::NoGroup(_)) => {
                 // A unit nobody wrote yet: on a fixed membership (the
@@ -572,6 +680,12 @@ impl Consensus for RaftConsensus {
         let p =
             progress.ok_or_else(|| sprig_common::SprigError::internal("no proposal progress"))?;
         Ok(p.ticket(unit, index, durability))
+    }
+}
+
+impl Consensus for RaftConsensus {
+    fn propose(&self, unit: UnitId, payload: Vec<u8>, durability: Durability) -> Result<Ticket> {
+        self.propose_at(unit, None, payload, durability)
     }
 
     fn durable_index(&self, unit: UnitId) -> u64 {
@@ -622,6 +736,16 @@ impl ReplicatedLog for RaftConsensus {
 
     fn close(&self) {
         self.node.close();
+    }
+
+    fn propose_in_term(
+        &self,
+        unit: UnitId,
+        term: u64,
+        payload: Vec<u8>,
+        durability: Durability,
+    ) -> Result<Ticket> {
+        self.propose_at(unit, Some(term), payload, durability)
     }
 
     fn read_barrier(&self, unit: UnitId) -> Result<()> {

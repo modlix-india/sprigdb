@@ -143,6 +143,34 @@ impl PassSession {
             })?;
             embeds.push(v);
         }
+        // The local pack, in memory: the engine's planner runs the
+        // statement over it (crate::docs::memsql).
+        if let Some(ix) = svc.local() {
+            return match analysis.kind {
+                Kind::Describe if crate::docs::memsql::describes_columns(text) => {
+                    Ok(Some(crate::docs::memsql::describe()))
+                }
+                Kind::Describe => Err(crate::docs::unavailable(
+                    "on this node sprig_docs answers DESCRIBE and SHOW COLUMNS; \
+                     SHOW INDEX and SHOW CREATE TABLE aren't served",
+                )),
+                Kind::Read => {
+                    crate::docs::memsql::check_refs(analysis)?;
+                    let sql = crate::docs::memsql::render(text, analysis, &embeds);
+                    let mysql = self.persona == sprig_proto_mysql::Persona::MySql84;
+                    // Off the runtime's worker: a statement may read up to
+                    // a million rows.
+                    let run = || crate::docs::memsql::query(&ix, &sql, mysql);
+                    if tokio::runtime::Handle::try_current().is_ok_and(|h| {
+                        h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+                    }) {
+                        crate::offload::block_in_place(run).map(Some)
+                    } else {
+                        run().map(Some)
+                    }
+                }
+            };
+        }
         let mut t = svc.target(tenant, None).await?;
         let stmt = sql::render(text, analysis, &t.version, &embeds);
         let server = |e: mysql_async::Error| match e {

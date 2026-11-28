@@ -440,11 +440,13 @@ async fn assert_all_semisync(primary: &Node, tag: &str) {
     assert_eq!(no, "0", "a commit fell back to async");
 }
 
+#[ignore = "live: needs SPRIG_TEST_DOCKER; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sql_thread_stopped_on_the_most_advanced_replica() {
-    if !enabled("sql_thread_stopped_on_the_most_advanced_replica") {
-        return;
-    }
+    assert!(
+        enabled("sql_thread_stopped_on_the_most_advanced_replica"),
+        "live test run without its environment: see tools/live/README.md"
+    );
     let tag = format!("a{}", std::process::id());
     let c = cluster(&tag).await;
     let (db1, db2, db3) = (&c.nodes[0], &c.nodes[1], &c.nodes[2]);
@@ -533,11 +535,13 @@ async fn sql_thread_stopped_on_the_most_advanced_replica() {
     eprintln!("[{tag}] {} caught up: {want} rows", other.name);
 }
 
+#[ignore = "live: needs SPRIG_TEST_DOCKER; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn both_threads_stopped_blocks_the_promotion() {
-    if !enabled("both_threads_stopped_blocks_the_promotion") {
-        return;
-    }
+    assert!(
+        enabled("both_threads_stopped_blocks_the_promotion"),
+        "live test run without its environment: see tools/live/README.md"
+    );
     let tag = format!("b{}", std::process::id());
     let c = cluster(&tag).await;
     let (db1, db2, db3) = (&c.nodes[0], &c.nodes[1], &c.nodes[2]);

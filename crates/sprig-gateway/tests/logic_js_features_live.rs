@@ -205,10 +205,11 @@ async fn setup(c: &mut Conn) {
     }
 }
 
+#[ignore = "live: needs SPRIG_TEST_LOGIC_GATEWAY, SPRIG_TEST_LOGIC_USER, SPRIG_TEST_LOGIC_PASSWORD, ...; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn javascript_features_run_the_same_everywhere() {
     let Some(mut c) = connect("javascript_features_run_the_same_everywhere").await else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let started = Instant::now();
     setup(&mut c).await;

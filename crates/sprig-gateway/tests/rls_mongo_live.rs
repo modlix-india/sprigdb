@@ -154,6 +154,7 @@ async fn sql(addr: &str, user: &str, pw: &str) -> mysql_async::Conn {
     mysql_async::Conn::new(opts).await.unwrap()
 }
 
+#[ignore = "live: needs SPRIG_TEST_RLS_SQL, SPRIG_TEST_RLS_MONGO; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn row_level_security_on_collections() {
     let (Ok(sql_addr), Ok(mongo_addr)) = (
@@ -161,7 +162,7 @@ async fn row_level_security_on_collections() {
         std::env::var("SPRIG_TEST_RLS_MONGO"),
     ) else {
         eprintln!("skipped: set SPRIG_TEST_RLS_SQL and SPRIG_TEST_RLS_MONGO");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let mut ck = Checks {
         n: 0,
@@ -715,6 +716,7 @@ async fn boolean_policies(
 /// The controller writes the time index every 10 s; the stream starts at
 /// its position 30 s or more before the time, so the deployment must have
 /// run for a minute.
+#[ignore = "live: needs SPRIG_TEST_RLS_SQL, SPRIG_TEST_RLS_MONGO; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn change_stream_starts_at_an_operation_time() {
     let (Ok(sql_addr), Ok(mongo_addr)) = (
@@ -722,7 +724,7 @@ async fn change_stream_starts_at_an_operation_time() {
         std::env::var("SPRIG_TEST_RLS_MONGO"),
     ) else {
         eprintln!("SPRIG_TEST_RLS_SQL or SPRIG_TEST_RLS_MONGO not set; skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let mut ck = Checks {
         n: 0,

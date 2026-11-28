@@ -16,7 +16,8 @@
 //! 5. delete T's finished job records, then T's keys in the DC tier:
 //!    shardmaps/T/, pins/T, promotions/T, feed/{ownership,subs,checkpoints}/T/,
 //!    logic/schedules/T/, mover/shard-locks/T/, inherit-instances/T/,
-//!    inherit-xo/T/  (each prefix ends in "/")
+//!    inherit-xo/T/, doc-acks/T/  (each prefix ends in "/"), doc-publish/T,
+//!    and last units/T/ (the unit descriptor: nodes then drop their copies)
 //! 6. delete the directory entry and its name
 //! ```
 
@@ -100,6 +101,9 @@ pub(crate) fn meta_prefixes(tenant: TenantId) -> Vec<String> {
         // objects, and its cross-tenant outbox schemas.
         "inherit-instances",
         "inherit-xo",
+        // Each gateway's acknowledgement of its catalog versions (the DDL
+        // barrier's and MongoDB path publication's).
+        "doc-acks",
         // Where its engine unit lives: gone last, after its records.
         "units",
     ]
@@ -111,7 +115,11 @@ pub(crate) fn meta_prefixes(tenant: TenantId) -> Vec<String> {
 /// The DC tier's single keys of `tenant`.
 #[must_use]
 pub(crate) fn meta_keys(tenant: TenantId) -> Vec<String> {
-    vec![format!("pins/{tenant}"), format!("promotions/{tenant}")]
+    vec![
+        format!("pins/{tenant}"),
+        format!("promotions/{tenant}"),
+        format!("doc-publish/{tenant}"),
+    ]
 }
 
 /// Deletes `tenant`'s keys in `store`'s tier ([`meta_prefixes`],

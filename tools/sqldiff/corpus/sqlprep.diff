@@ -1,0 +1,45 @@
+# PREPARE / EXECUTE / DEALLOCATE PREPARE as statements on engine tables.
+x:DROP TABLE IF EXISTS sp_u
+q:CREATE TABLE sp_u (id INT PRIMARY KEY, v VARCHAR(10)) DEFAULT CHARSET=utf8mb4
+q:INSERT INTO sp_u VALUES (1,'a'),(2,'b'),(3,NULL)
+q:PREPARE s FROM 'SELECT v FROM sp_u WHERE id = ?'
+q:SET @x = 2
+q:EXECUTE s USING @x
+q:EXECUTE s
+q:EXECUTE s USING @x, @x
+q:EXECUTE s USING @nope
+q:SET @q = 'SELECT COUNT(*) AS n FROM sp_u WHERE v = ? OR id > ?'
+q:PREPARE t FROM @q
+q:SET @a = 'a', @b = 2
+q:EXECUTE t USING @a, @b
+q:PREPARE u FROM 'INSERT INTO sp_u VALUES (?, ?)'
+q:SET @i = 9, @s = 'z'
+q:EXECUTE u USING @i, @s
+q:SELECT * FROM sp_u ORDER BY id
+q:PREPARE w FROM 'UPDATE sp_u SET v = ? WHERE id = ?'
+q:EXECUTE w USING @s, @x
+q:SELECT * FROM sp_u ORDER BY id
+q:PREPARE bad FROM 'SELECT * FROM sp_nope'
+q:EXECUTE bad
+q:PREPARE bad2 FROM 'SELEC 1'
+q:EXECUTE zz
+q:DEALLOCATE PREPARE s
+q:EXECUTE s USING @x
+q:DROP PREPARE t
+q:DEALLOCATE PREPARE nope
+q:PREPARE c FROM 'SELECT ? AS p, ? FROM sp_u WHERE id = 1'
+q:SET @f = 1.5
+q:EXECUTE c USING @f, @s
+q:PREPARE S2 FROM 'SELECT id FROM sp_u WHERE id > ? ORDER BY id'
+q:EXECUTE s2 USING @x
+q:PREPARE n FROM 'EXECUTE s2 USING @x'
+q:PREPARE s2 FROM 'SELECT 1 FROM sp_u WHERE id = 1'
+q:EXECUTE s2
+q:SET @nullq = NULL
+q:PREPARE e FROM @nullq
+q:PREPARE g FROM 'SELECT ? + 1, COUNT(?) AS c, v FROM sp_u WHERE id = ? GROUP BY v'
+q:SET @one = 1
+q:EXECUTE g USING @one, @one, @one
+q:PREPARE l FROM 'SELECT id FROM sp_u ORDER BY id LIMIT ?'
+q:EXECUTE l USING @one
+x:DROP TABLE IF EXISTS sp_u

@@ -371,11 +371,12 @@ async fn open(c: &TargetCtx) -> Box<dyn Target> {
     t
 }
 
+#[ignore = "live: needs SPRIG_SINKS_DB_LIVE; tools/live/README.md"]
 #[tokio::test]
 async fn upserts_deletes_and_appends() {
     if !live() {
         eprintln!("skipped: SPRIG_SINKS_DB_LIVE is not 1");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     }
     for s in SERVERS {
         let raw = Raw::new(s).await;
@@ -611,11 +612,13 @@ async fn upserts_deletes_and_appends() {
     }
 }
 
+#[ignore = "live: needs SPRIG_SINKS_DB_LIVE; tools/live/README.md"]
 #[tokio::test]
 async fn schema_policies() {
-    if !live() {
-        return;
-    }
+    assert!(
+        live(),
+        "live test run without its environment: see tools/live/README.md"
+    );
     for s in SERVERS {
         let raw = Raw::new(s).await;
         let t = uniq("sch");
@@ -672,11 +675,13 @@ async fn schema_policies() {
     }
 }
 
+#[ignore = "live: needs SPRIG_SINKS_DB_LIVE; tools/live/README.md"]
 #[tokio::test]
 async fn exactly_once_skips_resent_batches_and_fences_stale_tasks() {
-    if !live() {
-        return;
-    }
+    assert!(
+        live(),
+        "live test run without its environment: see tools/live/README.md"
+    );
     for s in SERVERS {
         let raw = Raw::new(s).await;
         let t = uniq("eo");
@@ -998,11 +1003,13 @@ fn make_stream(n: u64, parts: u32, poison: &HashSet<u64>) -> Arc<Stream> {
     })
 }
 
+#[ignore = "live: needs SPRIG_SINKS_DB_LIVE; tools/live/README.md"]
 #[tokio::test]
 async fn exactly_once_through_the_runtime_with_kills() {
-    if !live() {
-        return;
-    }
+    assert!(
+        live(),
+        "live test run without its environment: see tools/live/README.md"
+    );
     for s in SERVERS {
         let raw = Raw::new(s).await;
         let t = uniq("rt");
@@ -1051,11 +1058,13 @@ async fn exactly_once_through_the_runtime_with_kills() {
     }
 }
 
+#[ignore = "live: needs SPRIG_SINKS_DB_LIVE; tools/live/README.md"]
 #[tokio::test]
 async fn poison_rows_are_split_out_and_dead_lettered() {
-    if !live() {
-        return;
-    }
+    assert!(
+        live(),
+        "live test run without its environment: see tools/live/README.md"
+    );
     for s in SERVERS {
         let raw = Raw::new(s).await;
         let t = uniq("poi");
@@ -1092,11 +1101,13 @@ async fn poison_rows_are_split_out_and_dead_lettered() {
     }
 }
 
+#[ignore = "live: needs SPRIG_SINKS_DB_LIVE; tools/live/README.md"]
 #[tokio::test]
 async fn a_down_destination_retries_then_recovers() {
-    if !live() {
-        return;
-    }
+    assert!(
+        live(),
+        "live test run without its environment: see tools/live/README.md"
+    );
     // Nothing listens on 23999: every delivery is a destination-wide retry.
     for s in SERVERS {
         let c = ctx_port(s, 23999, "t", Guarantee::AtLeastOnce, stream_src(), &[], 1);
@@ -1155,11 +1166,13 @@ async fn a_down_destination_retries_then_recovers() {
     }
 }
 
+#[ignore = "live: needs SPRIG_SINKS_DB_LIVE; tools/live/README.md"]
 #[tokio::test]
 async fn throughput_without_faults() {
-    if !live() {
-        return;
-    }
+    assert!(
+        live(),
+        "live test run without its environment: see tools/live/README.md"
+    );
     for s in SERVERS {
         for (g, mode) in [
             (Guarantee::AtLeastOnce, "upsert"),

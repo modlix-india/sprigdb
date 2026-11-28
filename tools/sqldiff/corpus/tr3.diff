@@ -1,0 +1,22 @@
+# SQL triggers: REPLACE (DELETE triggers for the rows it removes) and INSERT IGNORE (no AFTER trigger for a skipped row).
+x:DROP TABLE IF EXISTS t3_a
+x:CREATE TABLE t3_a (id INT PRIMARY KEY, u INT UNIQUE, v VARCHAR(10))
+x:INSERT INTO t3_a VALUES (1, 10, 'a'), (2, 20, 'b')
+q:CREATE TRIGGER t3_bi BEFORE INSERT ON t3_a FOR EACH ROW SET @log = CONCAT(IFNULL(@log, ''), 'bi', NEW.id, ' ')
+q:CREATE TRIGGER t3_ai AFTER INSERT ON t3_a FOR EACH ROW SET @log = CONCAT(IFNULL(@log, ''), 'ai', NEW.id, ' ')
+q:CREATE TRIGGER t3_bd BEFORE DELETE ON t3_a FOR EACH ROW SET @log = CONCAT(IFNULL(@log, ''), 'bd', OLD.id, ' ')
+q:CREATE TRIGGER t3_ad AFTER DELETE ON t3_a FOR EACH ROW SET @log = CONCAT(IFNULL(@log, ''), 'ad', OLD.id, ' ')
+q:SET @log = ''
+q:REPLACE INTO t3_a VALUES (1, 20, 'c')
+q:SELECT @log
+q:SELECT * FROM t3_a ORDER BY id
+q:SET @log = ''
+q:REPLACE INTO t3_a VALUES (5, 50, 'e'), (6, 60, 'f')
+q:SELECT @log
+q:SET @log = ''
+q:INSERT IGNORE INTO t3_a VALUES (1, 99, 'x'), (7, 70, 'g')
+q:SELECT @log
+q:SELECT * FROM t3_a ORDER BY id
+q:INSERT INTO t3_a VALUES (1, 98, 'y')
+q:SELECT * FROM t3_a ORDER BY id
+x:DROP TABLE IF EXISTS t3_a

@@ -766,6 +766,10 @@ impl Engine {
         found_rows: bool,
     ) -> Result<Outcome> {
         let def = &*plan.table;
+        // The embedded-column runner's switch covers its UPDATE only.
+        if !matches!(plan.op, Op::Update { .. } | Op::Select { .. }) {
+            crate::exec::embed_ddl::write::refuse("this statement")?;
+        }
         Ok(match &plan.op {
             Op::Select { out } => {
                 let mut o = Outcome::default();
@@ -810,6 +814,12 @@ impl Engine {
                 Box::pin(self.insert(sp, tx, plan, a, cols, rows, on_dup, found_rows)).await?
             }
             Op::Update { sets } => {
+                // The embedded-column runner's write sets only its column
+                // and hash (crate::exec::embed_ddl::write).
+                crate::exec::embed_ddl::write::check_sets(
+                    sets.iter().map(|(ci, _)| def.columns[*ci].name.as_str()),
+                )?;
+                let embed_write = crate::exec::embed_ddl::write::active();
                 let mut o = Outcome::default();
                 let matched = locked_rows(
                     sp,
@@ -848,9 +858,10 @@ impl Engine {
                             new[ci] = assign::store(&mut cx, c, v)?;
                         }
                     }
-                    if new != old {
+                    if new != old && !embed_write {
                         // `ON UPDATE CURRENT_TIMESTAMP` columns the
-                        // statement didn't set follow a row that changes.
+                        // statement didn't set follow a row that changes
+                        // (not a vector the runner fills).
                         for (ci, c) in def.columns.iter().enumerate() {
                             if c.on_update_now && !sets.iter().any(|(s, _)| *s == ci) {
                                 new[ci] = now_value(c, a)?;

@@ -38,11 +38,12 @@ async fn ids(c: &Collection<Document>, f: Document) -> Vec<i32> {
     out
 }
 
+#[ignore = "live: needs SPRIG_TEST_MONGO_URI, SPRIG_TEST_MONGO_URI_2; tools/live/README.md"]
 #[tokio::test]
 async fn new_array_paths_are_seen_by_every_gateway() {
     let (Some(u1), Some(u2)) = (uri("SPRIG_TEST_MONGO_URI"), uri("SPRIG_TEST_MONGO_URI_2")) else {
         eprintln!("SPRIG_TEST_MONGO_URI or SPRIG_TEST_MONGO_URI_2 not set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let rounds: usize = std::env::var("SPRIG_TEST_PUBLISH_ROUNDS")
         .ok()

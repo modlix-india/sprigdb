@@ -93,11 +93,12 @@ async fn highest_tenant(pools: &[Pool]) -> u64 {
     top
 }
 
+#[ignore = "live: needs SPRIG_TEST_MOVER_LIVE; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_moved_shard_schema_takes_coordinated_writes() {
     if std::env::var("SPRIG_TEST_MOVER_LIVE").is_err() {
         eprintln!("skipped: set SPRIG_TEST_MOVER_LIVE=1 with the Compose stack up");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     }
     let pools: Vec<Pool> = URLS.iter().map(|u| pool(u)).collect();
     // Rule 8f: above every id present and clear of the range of the agent

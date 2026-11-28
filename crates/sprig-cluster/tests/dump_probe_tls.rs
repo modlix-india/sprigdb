@@ -51,6 +51,7 @@ fn endpoint(url: &str, tls: Option<Option<&str>>) -> NodeEndpoint {
     }
 }
 
+#[ignore = "live: needs SPRIG_TEST_BINLOG_TLS, SPRIG_TEST_BINLOG_TLS_ROOT, SPRIG_TEST_BINLOG_TLS_CA; tools/live/README.md"]
 #[tokio::test]
 async fn tls_sources_pass_the_dump_probe_and_derive_feed_source() {
     let (Some(repl), Some(root), Some(ca)) = (
@@ -59,7 +60,7 @@ async fn tls_sources_pass_the_dump_probe_and_derive_feed_source() {
         var("SPRIG_TEST_BINLOG_TLS_CA"),
     ) else {
         eprintln!("skipped: SPRIG_TEST_BINLOG_TLS, _ROOT and _CA are not set");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let t = Duration::from_secs(5);
     // Verified against the CA: passes.

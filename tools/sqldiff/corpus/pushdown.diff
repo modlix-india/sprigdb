@@ -1,0 +1,67 @@
+# Conditions moved into derived tables: WITH bodies, UNION ALL parts, LEFT JOIN overlays, a CTE named twice; nothing past LIMIT, windows, aggregates, unstable functions.
+x:DROP TABLE IF EXISTS pd_p
+x:DROP TABLE IF EXISTS pd_l
+x:DROP TABLE IF EXISTS pd_s
+q:CREATE TABLE pd_p (id INT PRIMARY KEY, name VARCHAR(20) NOT NULL, price DECIMAL(8,2), grp INT, KEY (grp))
+q:CREATE TABLE pd_l (sp INT NOT NULL, id INT NOT NULL, st VARCHAR(8) NOT NULL, ovr INT NOT NULL DEFAULT 0, name VARCHAR(20), price DECIMAL(8,2), grp INT, PRIMARY KEY (sp, id))
+q:CREATE TABLE pd_s (id INT PRIMARY KEY, v VARCHAR(10) COLLATE utf8mb4_bin, n BIGINT UNSIGNED)
+q:INSERT INTO pd_p VALUES (1,'a',1.50,1),(2,'b',2.50,1),(3,'c',NULL,2),(4,'d',4.00,2),(5,'e',5.25,3),(6,'f',6.00,NULL)
+q:INSERT INTO pd_l VALUES (7,2,'ovr',1,'B',NULL,NULL),(7,3,'hide',0,NULL,NULL,NULL),(7,10,'own',0,'own10',10.00,3),(7,11,'own',0,'own11',11.00,1),(8,4,'ovr',2,NULL,40.00,NULL),(8,12,'own',0,'own12',12.00,2)
+q:INSERT INTO pd_s VALUES (1,'A',1),(2,'a',2),(3,'b',18446744073709551615),(4,NULL,NULL)
+q:SELECT x.name FROM (WITH c AS (SELECT id, name FROM pd_p) SELECT id, name FROM c) x WHERE x.id = 3
+q:SELECT x.id, x.name FROM (WITH c AS (SELECT id, name FROM pd_p WHERE price > 2) SELECT c.id, c.name FROM c LEFT JOIN pd_s s ON s.id = c.id) x WHERE x.id IN (2, 4, 6) ORDER BY 1
+q:SELECT u.id, u.name FROM (SELECT id, name FROM pd_p UNION ALL SELECT id, name FROM pd_l) u WHERE u.id = 2 ORDER BY u.name COLLATE utf8mb4_bin
+q:SELECT u.id FROM (SELECT id FROM pd_p UNION ALL SELECT id FROM pd_l UNION ALL SELECT id FROM pd_s) u WHERE u.id BETWEEN 2 AND 4 ORDER BY 1
+q:SELECT u.id FROM (SELECT id FROM pd_p UNION SELECT id FROM pd_l) u WHERE u.id > 5 ORDER BY 1
+q:SELECT u.id FROM (SELECT id FROM pd_p INTERSECT SELECT id FROM pd_l) u WHERE u.id < 4 ORDER BY 1
+q:SELECT u.id FROM (SELECT id FROM pd_p EXCEPT SELECT id FROM pd_l) u WHERE u.id < 4 ORDER BY 1
+q:SELECT u.id FROM ((SELECT id FROM pd_p ORDER BY id LIMIT 2) UNION ALL (SELECT id FROM pd_l ORDER BY id LIMIT 1)) u WHERE u.id IN (2, 3) ORDER BY 1
+q:SELECT u.id FROM (SELECT id FROM pd_p UNION ALL SELECT id FROM pd_l ORDER BY id LIMIT 3) u WHERE u.id = 3
+q:SELECT u.id FROM (SELECT id FROM pd_p UNION ALL SELECT id FROM pd_l ORDER BY id LIMIT 3) u WHERE u.id = 4
+q:SELECT u.id FROM (SELECT id FROM pd_p UNION ALL SELECT id FROM pd_l ORDER BY id DESC LIMIT 2, 3) u WHERE u.id > 0 ORDER BY 1
+q:SELECT u.v FROM (SELECT name AS v FROM pd_p UNION ALL SELECT id FROM pd_s) u WHERE u.v = '2' ORDER BY 1
+q:SELECT u.v FROM (SELECT v FROM pd_s UNION ALL SELECT name FROM pd_p) u WHERE u.v = 'a' ORDER BY 1
+q:SELECT u.v FROM (SELECT v FROM pd_s UNION ALL SELECT v FROM pd_s) u WHERE u.v = 'a' ORDER BY 1
+q:SELECT u.n FROM (SELECT n FROM pd_s UNION ALL SELECT id FROM pd_p) u WHERE u.n > 5 ORDER BY 1
+q:SELECT u.n FROM (SELECT n FROM pd_s UNION ALL SELECT -id FROM pd_p) u WHERE u.n < 0 ORDER BY 1
+q:SELECT u.p FROM (SELECT price AS p FROM pd_p UNION ALL SELECT 2.5) u WHERE u.p = 2.5 ORDER BY 1
+q:SELECT u.p FROM (SELECT price AS p FROM pd_p UNION ALL SELECT 1e0) u WHERE u.p = 1 ORDER BY 1
+q:SELECT u.x FROM (SELECT NULL AS x UNION ALL SELECT id FROM pd_p) u WHERE u.x = 3
+q:SELECT x.id, x.rn FROM (SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS rn FROM pd_p) x WHERE x.id = 3
+q:SELECT x.id, x.rn FROM (WITH c AS (SELECT id FROM pd_p) SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS rn FROM c) x WHERE x.id = 3
+q:SELECT x.id, x.s FROM (SELECT id, SUM(price) OVER (ORDER BY id) AS s FROM pd_p UNION ALL SELECT 99, 0) x WHERE x.id = 4
+q:SELECT x.g, x.n FROM (WITH c AS (SELECT grp, id FROM pd_p) SELECT grp AS g, COUNT(*) AS n FROM c GROUP BY grp) x WHERE x.g = 2
+q:SELECT x.g, x.n FROM (WITH c AS (SELECT grp, id FROM pd_p) SELECT grp AS g, COUNT(*) AS n FROM c GROUP BY grp) x WHERE x.n = 2 ORDER BY 1
+q:SELECT x.g, x.n FROM (SELECT grp AS g, COUNT(*) AS n FROM pd_p GROUP BY grp WITH ROLLUP UNION ALL SELECT 9, 9) x WHERE x.g IS NULL ORDER BY 2
+q:SELECT x.n FROM (SELECT COUNT(*) AS n FROM pd_p UNION ALL SELECT 0) x WHERE x.n = 0
+q:SELECT x.k FROM (SELECT 1 AS k, COUNT(*) AS n FROM pd_p WHERE id > 100 UNION ALL SELECT 2, 0) x WHERE x.k = 1
+q:SELECT x.id, x.d FROM (SELECT DISTINCT id % 2 AS id, 'x' AS d FROM pd_p UNION ALL SELECT 5, 'y') x WHERE x.id = 1
+q:SELECT x.id FROM (SELECT id FROM pd_p WHERE RAND() >= 0 UNION ALL SELECT 50) x WHERE x.id = 50
+q:SELECT x.r FROM (SELECT id, RAND(3) AS r FROM pd_p UNION ALL SELECT 0, 0) x WHERE x.id = 0
+q:SELECT ROUND(x.r, 6) FROM (SELECT id, RAND(3) AS r FROM pd_p UNION ALL SELECT 0, 0) x WHERE x.id = 3
+q:SELECT COUNT(*) FROM (SELECT id, UUID() AS u FROM pd_p UNION ALL SELECT 0, 'z') x WHERE x.id = 2
+q:SELECT x.i, x.c FROM (SELECT id AS i, @pd := id AS c FROM pd_p UNION ALL SELECT 0, 0) x WHERE x.i = 3
+q:WITH c AS (SELECT id, name FROM pd_p) SELECT a.id, b.name FROM c a JOIN c b ON b.id = a.id WHERE a.id = 4
+q:WITH c AS (SELECT id, name FROM pd_p) SELECT a.id, b.name FROM c a JOIN c b ON b.id = a.id + 1 ORDER BY 1
+q:WITH c AS (SELECT id, name FROM pd_p) SELECT a.id FROM c a WHERE a.id = 2 UNION ALL SELECT b.id FROM c b WHERE b.id = 3 ORDER BY 1
+q:WITH c AS (SELECT id, name FROM pd_p) SELECT id FROM c WHERE NOT EXISTS (SELECT 1 FROM c d WHERE d.id = c.id + 1) ORDER BY 1
+q:WITH c AS (SELECT id FROM pd_p) SELECT (SELECT COUNT(*) FROM c), (SELECT MAX(id) FROM c)
+q:WITH c AS (SELECT id, RAND(7) AS r FROM pd_p) SELECT COUNT(*) FROM c a JOIN c b ON a.id = b.id AND a.r = b.r
+q:SELECT s.id FROM pd_s s WHERE s.id = 2 AND NOT EXISTS (SELECT 1 FROM (SELECT id FROM pd_p UNION ALL SELECT 2) p WHERE p.id = s.id)
+q:SELECT s.id FROM pd_s s WHERE s.id IN (1, 4) AND EXISTS (SELECT 1 FROM (SELECT id FROM pd_p UNION ALL SELECT 4) p WHERE p.id = s.id) ORDER BY 1
+q:SELECT s.v FROM pd_s s WHERE s.v = 'a' AND NOT EXISTS (SELECT 1 FROM (SELECT name FROM pd_p UNION ALL SELECT 'zz') p WHERE p.name = s.v)
+q:SELECT s.v FROM pd_s s WHERE s.v = 'A' COLLATE utf8mb4_general_ci AND NOT EXISTS (SELECT 1 FROM (SELECT v FROM pd_s UNION ALL SELECT 'zz') p WHERE p.v = s.v) ORDER BY 1
+q:SELECT v.id, v.name, v.price FROM (WITH p0 AS (SELECT id, name, price, grp FROM pd_p), l0 AS (SELECT p.id, IF(c.ovr & 1, c.name, p.name) AS name, IF(c.ovr & 2, c.price, p.price) AS price, p.grp FROM p0 p LEFT JOIN pd_l c ON c.id = p.id AND c.sp = 7 WHERE c.st IS NULL OR c.st <> 'hide' UNION ALL SELECT c.id, c.name, c.price, c.grp FROM pd_l c WHERE c.sp = 7 AND c.st IN ('own', 'orphan') AND NOT EXISTS (SELECT 1 FROM p0 p WHERE c.id = p.id)), p1 AS (SELECT id, name, price, grp FROM l0 WHERE TRUE), l1 AS (SELECT p.id, IF(c.ovr & 1, c.name, p.name) AS name, IF(c.ovr & 2, c.price, p.price) AS price, p.grp FROM p1 p LEFT JOIN pd_l c ON c.id = p.id AND c.sp = 8 WHERE c.st IS NULL OR c.st <> 'hide' UNION ALL SELECT c.id, c.name, c.price, c.grp FROM pd_l c WHERE c.sp = 8 AND c.st IN ('own', 'orphan') AND NOT EXISTS (SELECT 1 FROM p1 p WHERE c.id = p.id)) SELECT id, name, price FROM l1) v WHERE v.id = 4
+q:SELECT v.id, v.name, v.price FROM (WITH p0 AS (SELECT id, name, price, grp FROM pd_p), l0 AS (SELECT p.id, IF(c.ovr & 1, c.name, p.name) AS name, IF(c.ovr & 2, c.price, p.price) AS price, p.grp FROM p0 p LEFT JOIN pd_l c ON c.id = p.id AND c.sp = 7 WHERE c.st IS NULL OR c.st <> 'hide' UNION ALL SELECT c.id, c.name, c.price, c.grp FROM pd_l c WHERE c.sp = 7 AND c.st IN ('own', 'orphan') AND NOT EXISTS (SELECT 1 FROM p0 p WHERE c.id = p.id)), p1 AS (SELECT id, name, price, grp FROM l0 WHERE TRUE), l1 AS (SELECT p.id, IF(c.ovr & 1, c.name, p.name) AS name, IF(c.ovr & 2, c.price, p.price) AS price, p.grp FROM p1 p LEFT JOIN pd_l c ON c.id = p.id AND c.sp = 8 WHERE c.st IS NULL OR c.st <> 'hide' UNION ALL SELECT c.id, c.name, c.price, c.grp FROM pd_l c WHERE c.sp = 8 AND c.st IN ('own', 'orphan') AND NOT EXISTS (SELECT 1 FROM p1 p WHERE c.id = p.id)) SELECT id, name, price FROM l1) v WHERE v.id IN (2, 3, 10, 12, 99) ORDER BY 1
+q:SELECT v.id, v.name, v.price FROM (WITH p0 AS (SELECT id, name, price, grp FROM pd_p), l0 AS (SELECT p.id, IF(c.ovr & 1, c.name, p.name) AS name, IF(c.ovr & 2, c.price, p.price) AS price, p.grp FROM p0 p LEFT JOIN pd_l c ON c.id = p.id AND c.sp = 7 WHERE c.st IS NULL OR c.st <> 'hide' UNION ALL SELECT c.id, c.name, c.price, c.grp FROM pd_l c WHERE c.sp = 7 AND c.st IN ('own', 'orphan') AND NOT EXISTS (SELECT 1 FROM p0 p WHERE c.id = p.id)), p1 AS (SELECT id, name, price, grp FROM l0 WHERE TRUE), l1 AS (SELECT p.id, IF(c.ovr & 1, c.name, p.name) AS name, IF(c.ovr & 2, c.price, p.price) AS price, p.grp FROM p1 p LEFT JOIN pd_l c ON c.id = p.id AND c.sp = 8 WHERE c.st IS NULL OR c.st <> 'hide' UNION ALL SELECT c.id, c.name, c.price, c.grp FROM pd_l c WHERE c.sp = 8 AND c.st IN ('own', 'orphan') AND NOT EXISTS (SELECT 1 FROM p1 p WHERE c.id = p.id)) SELECT id, name, price FROM l1) v ORDER BY 1
+q:SELECT v.grp, COUNT(*), SUM(v.price) FROM (WITH p0 AS (SELECT id, name, price, grp FROM pd_p), l0 AS (SELECT p.id, IF(c.ovr & 1, c.name, p.name) AS name, IF(c.ovr & 2, c.price, p.price) AS price, p.grp FROM p0 p LEFT JOIN pd_l c ON c.id = p.id AND c.sp = 7 WHERE c.st IS NULL OR c.st <> 'hide' UNION ALL SELECT c.id, c.name, c.price, c.grp FROM pd_l c WHERE c.sp = 7 AND c.st IN ('own', 'orphan') AND NOT EXISTS (SELECT 1 FROM p0 p WHERE c.id = p.id)) SELECT id, name, price, grp FROM l0) v WHERE v.grp = 1 OR v.name = 'own10' GROUP BY v.grp ORDER BY 1
+q:SELECT v.name FROM (WITH p0 AS (SELECT id, name FROM pd_p), l0 AS (SELECT p.id, IF(c.ovr & 1, c.name, p.name) AS name FROM p0 p LEFT JOIN pd_l c ON c.id = p.id AND c.sp = 7 WHERE c.st IS NULL OR c.st <> 'hide' UNION ALL SELECT c.id, c.name FROM pd_l c WHERE c.sp = 7 AND c.st IN ('own', 'orphan') AND NOT EXISTS (SELECT 1 FROM p0 p WHERE c.id = p.id)) SELECT id, name FROM l0) v WHERE v.name = 'B'
+q:PREPARE pd_st FROM 'SELECT u.id, u.name FROM (WITH c AS (SELECT id, name FROM pd_p) SELECT id, name FROM c UNION ALL SELECT id, name FROM pd_l) u WHERE u.id = ? ORDER BY 2'
+q:SET @pd_k = 2
+q:EXECUTE pd_st USING @pd_k
+q:SET @pd_k = 12
+q:EXECUTE pd_st USING @pd_k
+q:DEALLOCATE PREPARE pd_st
+x:DROP TABLE IF EXISTS pd_p
+x:DROP TABLE IF EXISTS pd_l
+x:DROP TABLE IF EXISTS pd_s

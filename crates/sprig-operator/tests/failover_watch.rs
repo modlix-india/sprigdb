@@ -379,11 +379,12 @@ async fn operator_driven_and_unregistered_clusters_are_not_watched() {
 /// The real SQL seam against a live replica (on kind):
 /// `SPRIG_R2OPFIX_REPLICA=<host:port>,<root password>`. Reads its state,
 /// and drains it.
+#[ignore = "live: needs SPRIG_R2OPFIX_REPLICA; tools/live/README.md"]
 #[tokio::test]
 async fn live_view_and_drain() {
     use sprig_operator::failover::MysqlReplication;
     let Some(v) = std::env::var("SPRIG_R2OPFIX_REPLICA").ok() else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let (addr, pw) = v.split_once(',').unwrap();
     let ops = MysqlReplication::new(None);

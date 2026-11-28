@@ -1228,7 +1228,7 @@ fn zscan<B: Batch>(cx: &mut Cx<'_, B>, a: &[Bytes]) -> Out {
             continue;
         }
         out.push(Frame::Bulk(m));
-        out.push(Frame::bulk(sprig_proto_redis::num::d2string(s)));
+        out.push(Frame::bulk(sprig_proto_redis::num::reply_double_text(s)));
     }
     Ok(Frame::Array(vec![
         Frame::Bulk(Bytes::from(next.to_string())),

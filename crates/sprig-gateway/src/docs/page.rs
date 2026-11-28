@@ -1,4 +1,6 @@
 //! One docs page, rebuilt from its chunks: `GET /v1/docs/pages/{page}`.
+//! From the local pack when this gateway has one ([`local_page`]); else
+//! on a cluster:
 //!
 //! ```text
 //! rows  := SELECT chunk_id, title, heading_path, audience, text, seq
@@ -19,6 +21,7 @@ use serde::Serialize;
 use sprig_common::ids::TenantId;
 use sprig_common::{Result, SprigCode, SprigError};
 use sprig_docs::chunk::{PATH_SEP, rebuild};
+use sprig_docs::index::DocsIndex;
 use sprig_docs::pack::{chunk_id, hex};
 use sprig_docs::table::{self, MAX_PAGE};
 
@@ -147,6 +150,55 @@ async fn fetch(conn: &mut Conn, version: &str, page: &str) -> Result<Vec<Fetched
     }
 }
 
+/// Page `page` (normalized) of the local pack.
+///
+/// # Errors
+/// 39792 when the release has no such page.
+pub fn local_page(ix: &DocsIndex, page: String) -> Result<PageReply> {
+    let Some(members) = ix.page(&page).filter(|m| !m.is_empty()) else {
+        return Err(invalid(format!(
+            "release {} has no docs page {page}",
+            ix.version()
+        )));
+    };
+    let first = &ix.chunks()[members[0]];
+    let (title, audience) = (first.title.clone(), first.audience.clone());
+    let (rows, ordered) = order(
+        ix.version(),
+        &page,
+        members
+            .iter()
+            .map(|&i| {
+                let c = &ix.chunks()[i];
+                (
+                    c.chunk_id.to_vec(),
+                    c.heading_path.clone(),
+                    c.text.clone(),
+                    c.seq,
+                )
+            })
+            .collect(),
+    );
+    let markdown = rebuild(rows.iter().map(|r| (r.1.as_str(), r.2.as_str())));
+    Ok(PageReply {
+        version: ix.version().to_owned(),
+        page,
+        title,
+        audience,
+        ordered,
+        markdown,
+        chunks: rows
+            .into_iter()
+            .map(|(id, heading_path, text, seq)| PageChunk {
+                chunk_id: hex(&id),
+                heading_path,
+                text,
+                seq,
+            })
+            .collect(),
+    })
+}
+
 impl DocsService {
     /// The page `path` (see the module docs) of `version`, or of the
     /// release a search would read.
@@ -161,6 +213,9 @@ impl DocsService {
         version: Option<&str>,
     ) -> Result<PageReply> {
         let page = normalize(path)?;
+        if let Some(ix) = self.local_for(version) {
+            return local_page(&ix, page);
+        }
         let mut t = self.target(tenant, version).await?;
         let rows = fetch(&mut t.conn, &t.version, &page).await?;
         let Some(first) = rows.first() else {

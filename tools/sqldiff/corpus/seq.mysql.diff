@@ -1,0 +1,5 @@
+# MySQL has no sequences: the same statements fail as MySQL fails them.
+q:CREATE SEQUENCE sq_a
+q:SELECT NEXTVAL(sq_a)
+q:SELECT NEXT VALUE FOR sq_a
+q:DROP SEQUENCE sq_a

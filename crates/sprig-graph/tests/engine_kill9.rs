@@ -15,7 +15,11 @@
 //! Rounds: `SPRIG_GRAPH_KILL9_ROUNDS` (default 6). The child is this test
 //! binary, run with `SPRIG_GRAPH_KILL9_CHILD=<dir>`.
 
-#![allow(clippy::unwrap_used, clippy::too_many_lines, clippy::many_single_char_names)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::too_many_lines,
+    clippy::many_single_char_names
+)]
 
 use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader, Write};

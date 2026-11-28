@@ -55,6 +55,7 @@ pub mod logstore;
 pub mod node;
 pub mod slot;
 pub mod sm;
+mod snapfile;
 mod storage;
 pub mod toy;
 pub mod transport;
@@ -76,7 +77,7 @@ pub use node::{GroupStatus, Node, NodeOptions, NodeStats, Observer, Waiter};
 pub use raft::eraftpb;
 pub use raft::prelude::{ConfChangeSingle, ConfChangeTransition, ConfChangeType, ConfChangeV2};
 pub use slot::Slot;
-pub use sm::{StateMachine, StateMachineFactory};
+pub use sm::{SnapshotExporter, StateMachine, StateMachineFactory};
 pub use transport::{MemNetwork, MemTransport, Transport, tcp};
 
 /// The index and term every group's log starts after: a new group's

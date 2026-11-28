@@ -137,11 +137,12 @@ fn docker(args: &[&str]) -> String {
     String::from_utf8_lossy(&o.stdout).into_owned() + &String::from_utf8_lossy(&o.stderr)
 }
 
+#[ignore = "live: needs SPRIG_TEST_MOVER_GATEWAY; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_tenant_moves_under_sysbench_through_the_gateway() {
     if std::env::var("SPRIG_TEST_MOVER_GATEWAY").is_err() {
         eprintln!("skipped: set SPRIG_TEST_MOVER_GATEWAY=1 after deploy/compose/mover/run.sh up");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     }
     let _ = tracing_subscriber::fmt()
         .with_env_filter(

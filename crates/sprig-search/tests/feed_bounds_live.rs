@@ -107,11 +107,12 @@ async fn until_found(c: &mut Conn, word: &str, want: &[&str], secs: u64) -> Dura
 const CREATE: &str = "CREATE TABLE docs (id VARCHAR(64) PRIMARY KEY, title TEXT, body MEDIUMTEXT, \
      FULLTEXT KEY ft (title, body))";
 
+#[ignore = "live: needs SPRIG_TEST_SEARCH, SPRIG_TEST_SEARCH_METRICS; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn search_copies_follow_recreated_tables_and_large_transactions() {
     let Some(pool) = pool() else {
         eprintln!("SPRIG_TEST_SEARCH not set; skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let mut c = pool.get_conn().await.unwrap();
     for s in [

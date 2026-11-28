@@ -2584,11 +2584,12 @@ async fn members_in_ams1(d: &Deployment, c: &mut Checks, pa: &str, ma: &str, m: 
     }
 }
 
+#[ignore = "live: needs SPRIG_TEST_DOCKER; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bins_two_data_centres() {
     if skip::var(skip::DOCKER).is_none() {
         skip::report_missing(skip::DOCKER, "two_dc_bins");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     }
     let Some(d) = deploy().await else {
         eprintln!("two_dc_bins: build sprigdb and sprigctl first");

@@ -172,6 +172,13 @@ impl Gate for GatewayGate {
     async fn limits(&self, p: &Principal) -> sprig_proto_kafka::broker::data::Limits {
         self.data.limits(p).await
     }
+
+    async fn fan_in(&self, p: &Principal) -> Vec<sprig_streams::seg::kafka::FanInTopic> {
+        match self.data.catalog_res(p).await {
+            Ok(cat) => (*self.data.fan_in_topics(p, &cat).await).clone(),
+            Err(_) => Vec::new(),
+        }
+    }
 }
 
 /// The grant a stream need asks for.

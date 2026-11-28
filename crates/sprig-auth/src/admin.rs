@@ -225,9 +225,7 @@ async fn scram_salts(
 ) -> Vec<ScramSalt> {
     let read = async {
         let mut tx = cat.backend().store().begin(tenant).await?;
-        AuthStore
-            .verifiers_of(&mut *tx, &[user])
-            .await
+        AuthStore.verifiers_of(&mut *tx, &[user]).await
     };
     match read.await {
         Ok(rows) => rows
@@ -501,9 +499,7 @@ pub async fn backfill_scram(
 ) -> Result<Option<(Changed, Vec<ScramKind>)>> {
     let rows = {
         let mut tx = cat.backend().store().begin(tenant).await?;
-        AuthStore
-            .verifiers_of(&mut *tx, &[user])
-            .await?
+        AuthStore.verifiers_of(&mut *tx, &[user]).await?
     };
     let Some((slot, generation)) = rows
         .iter()

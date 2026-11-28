@@ -335,6 +335,18 @@ impl RedisFrontend {
         // Tenants whose Redis databases live on the storage engine.
         let node = Arc::new(engine::NodeEngine::from_env(env.config().databases));
         env.set_engine(Arc::clone(&node) as Arc<dyn sprig_redis::engine::EngineBackend>);
+        // `sprig_redis_commands_total`, from the connection loop's counts,
+        // while this front end exists.
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            let alive = Arc::downgrade(&env);
+            rt.spawn(async move {
+                let mut every = tokio::time::interval(COMMAND_COUNTS_EVERY);
+                while alive.strong_count() > 0 {
+                    every.tick().await;
+                    publish_command_counts();
+                }
+            });
+        }
         Self {
             d: Arc::new(d),
             env,
@@ -346,6 +358,18 @@ impl RedisFrontend {
     #[must_use]
     pub fn env(&self) -> &Arc<sprig_redis::Env> {
         &self.env
+    }
+}
+
+/// How often the Redis commands answered are published.
+const COMMAND_COUNTS_EVERY: Duration = Duration::from_secs(5);
+
+/// Publishes `sprig_redis_commands_total` (`command`, `result`) from the
+/// counts every Redis connection keeps ([`sprig_redis::stats`]).
+fn publish_command_counts() {
+    for (command, result, n) in sprig_redis::stats::snapshot() {
+        metrics::counter!("sprig_redis_commands_total", "command" => command, "result" => result)
+            .absolute(n);
     }
 }
 

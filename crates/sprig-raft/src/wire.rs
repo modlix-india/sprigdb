@@ -39,6 +39,15 @@ pub(crate) enum Item {
         term: u64,
         index: u64,
     },
+    /// Bytes of a snapshot file sent ahead of its `MsgSnapshot`: `data`
+    /// goes at `offset` of snapshot `id` of `group`, `total` bytes in all.
+    SnapChunk {
+        group: GroupId,
+        id: u64,
+        offset: u64,
+        total: u64,
+        data: Vec<u8>,
+    },
 }
 
 /// A decoded frame.
@@ -88,6 +97,21 @@ impl Frame {
                     put_u64(&mut b, *term);
                     put_u64(&mut b, *index);
                 }
+                Item::SnapChunk {
+                    group,
+                    id,
+                    offset,
+                    total,
+                    data,
+                } => {
+                    b.push(2);
+                    put_u64(&mut b, *group);
+                    b.extend_from_slice(&u32::try_from(data.len() + 24).unwrap_or(0).to_le_bytes());
+                    put_u64(&mut b, *id);
+                    put_u64(&mut b, *offset);
+                    put_u64(&mut b, *total);
+                    b.extend_from_slice(data);
+                }
             }
         }
         b
@@ -130,6 +154,17 @@ impl Frame {
                         group,
                         term: br.u64()?,
                         index: br.u64()?,
+                    });
+                }
+                2 => {
+                    let mut br = Reader { b: body, at: 0 };
+                    let (id, offset, total) = (br.u64()?, br.u64()?, br.u64()?);
+                    f.items.push(Item::SnapChunk {
+                        group,
+                        id,
+                        offset,
+                        total,
+                        data: body.get(24..)?.to_vec(),
                     });
                 }
                 _ => return None,
@@ -299,7 +334,7 @@ mod tests {
                 assert_eq!((*g, *applied), (42, 77));
                 assert_eq!(dm, &msg);
             }
-            Item::Quiesce { .. } => panic!("wrong item"),
+            Item::Quiesce { .. } | Item::SnapChunk { .. } => panic!("wrong item"),
         }
         assert!(matches!(
             got.items[1],
@@ -309,6 +344,34 @@ mod tests {
                 index: 9
             }
         ));
+        // A snapshot chunk round-trips.
+        let chunk = Frame {
+            from: 1,
+            to: 2,
+            items: vec![Item::SnapChunk {
+                group: 44,
+                id: 3,
+                offset: 1 << 20,
+                total: 5 << 20,
+                data: vec![7; 1000],
+            }],
+            ..Frame::default()
+        };
+        match &Frame::decode(&chunk.encode()).expect("decodes").items[..] {
+            [
+                Item::SnapChunk {
+                    group: 44,
+                    id: 3,
+                    offset,
+                    total,
+                    data,
+                },
+            ] => {
+                assert_eq!((*offset, *total), (1 << 20, 5 << 20));
+                assert_eq!(data, &vec![7u8; 1000]);
+            }
+            other => panic!("{other:?}"),
+        }
         // Truncated or padded frames are refused.
         assert!(Frame::decode(&b[..b.len() - 1]).is_none());
         let mut longer = b.clone();

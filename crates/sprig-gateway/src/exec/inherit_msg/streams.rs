@@ -105,6 +105,14 @@ pub(crate) async fn ensure_instance(
     let made = make_instance(svc, eng, member, def, lex).await?;
     if made {
         join_fan_ins(svc, eng, member, def).await?;
+        // Overrides made before the instance.
+        apply_settings(svc, eng, member, def, lex).await?;
+        // inherit.broadcast_replay: the broadcasts still in the log.
+        tokio::spawn(super::bcast::replay(
+            Arc::clone(svc),
+            Arc::new(def.clone()),
+            member,
+        ));
     }
     // Its inherited triggers, before a record goes in (they start at the
     // instance's end).
@@ -400,6 +408,7 @@ impl PassSession {
                         it.name
                     )));
                 }
+                strict_residency(svc, cat, me, t).await?;
                 vec![t]
             }
             Target::All {
@@ -612,6 +621,7 @@ impl PassSession {
         {
             return Err(refused);
         }
+        strict_residency(svc, cat, me, anc).await?;
         // The owner's consent, where the stream is.
         let acat = inherited::catalog(svc, anc).await?;
         let Some(adb) = acat
@@ -672,6 +682,117 @@ impl PassSession {
         tracing::debug!(tenant = %me, into = %anc, stream = %it.name, records = n, "published into an ancestor's stream");
         Ok(Reply::Ok(n, Vec::new()))
     }
+}
+
+/// Under `residency.cross_tenant_messaging_strict = on`: 39949 for a
+/// publish of `publisher`'s into `owner`'s stream when `publisher`'s
+/// residency doesn't allow `owner`'s home data center (checked before
+/// anything is stored).
+async fn strict_residency(
+    svc: &TenantServices,
+    cat: &TenantCatalog,
+    publisher: TenantId,
+    owner: TenantId,
+) -> Result<()> {
+    if publisher == owner
+        || svc.settings.get(
+            &s::CROSS_TENANT_MESSAGING_STRICT,
+            &cat.setting_ctx(&svc.dc),
+            Some(&cat.settings),
+        ) != "on"
+    {
+        return Ok(());
+    }
+    inherited::check_residency(svc, publisher, owner, SprigCode::StreamResidency).await
+}
+
+/// The settings a member may set on its instance of an inherited stream
+/// (`ALTER INHERITED STREAM s SPRIG SET (...)`); partitions and cleanup
+/// are the definition's.
+pub(super) const STREAM_OVERRIDABLE: &[&str] = &[
+    "stream.retention_hours",
+    "stream.retention_bytes",
+    "stream.max_message_bytes",
+];
+
+/// Member `member`'s instance of stream definition `def` with the
+/// definition's settings overlaid by the nearest overrides
+/// ([`STREAM_OVERRIDABLE`]); `true` when its record changed.
+///
+/// # Errors
+/// The catalog's, the stream records'.
+pub(crate) async fn apply_settings(
+    svc: &Arc<TenantServices>,
+    eng: &EngineStreams,
+    member: TenantId,
+    def: &Definition,
+    lex: &LexOptions,
+) -> Result<bool> {
+    let full = format!("{}.{}", def.db_name, def.name);
+    let Some(have) = eng.topic(member.0, &full)? else {
+        return Ok(false);
+    };
+    let sql = def
+        .definition
+        .get("create")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let host = MemberHost {
+        tenant: member.0,
+        db: def.db_name.clone(),
+    };
+    let Some(ssql::Plan::Create { rec: tmpl, .. }) = ssql::plan(eng, sql, lex, &host)? else {
+        return Ok(false);
+    };
+    let mcat = inherited::catalog(svc, member).await?;
+    let chain = inherited::chain(svc, &mcat).await?;
+    let eff = |k: &str| {
+        chain
+            .effective(def.key(), sprig_inherit::msg::What::Settings, Some(k))
+            .map(|(v, _)| v)
+            .and_then(|v| v.as_i64().or_else(|| v.as_str()?.trim().parse().ok()))
+    };
+    let mut r = have.clone();
+    r.retention_ms = eff("stream.retention_hours")
+        .map(|h| h.saturating_mul(3_600_000))
+        .or(tmpl.retention_ms);
+    r.retention_bytes = eff("stream.retention_bytes").or(tmpl.retention_bytes);
+    r.max_message_bytes = eff("stream.max_message_bytes")
+        .and_then(|n| i32::try_from(n).ok())
+        .or(tmpl.max_message_bytes);
+    if r == have {
+        return Ok(false);
+    }
+    eng.update(member.0, &r).await?;
+    Ok(true)
+}
+
+/// After an override of stream definition `def` for `target` (`subtree`:
+/// and its descendants): each instance it reaches gets its settings now.
+/// How many changed.
+///
+/// # Errors
+/// The instance index's, the catalog's.
+pub(super) async fn apply_override(
+    svc: &Arc<TenantServices>,
+    def: &Definition,
+    target: TenantId,
+    subtree: bool,
+) -> Result<usize> {
+    let eng = streams()?;
+    let lex = LexOptions::mariadb();
+    let mut n = 0;
+    for e in inherited::instances_of(svc, def.key()).await? {
+        let hit = e.tenant == target
+            || (subtree
+                && inherited::dir_entry(svc, e.tenant)
+                    .await?
+                    .is_some_and(|d| d.path_ids().contains(&target.0)));
+        if hit && apply_settings(svc, &eng, e.tenant, def, &lex).await? {
+            n += 1;
+        }
+    }
+    Ok(n)
 }
 
 /// The member a record was published for (server-stamped).

@@ -33,9 +33,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
 use sprig_ai::UsageToday;
-use sprig_ai::audit::{AuditStore as _, CatalogAudit};
 use sprig_ai::functions::{
-    self, AiFn, CatalogFnCache, FnCache, FnEnv, FnSettings, LOCAL_MODEL, Output,
+    self, AiFn, FnCache, FnEnv, FnSettings, LOCAL_MODEL, Output, RecordFnCache,
 };
 use sprig_ai::provider::{Provider, Usage};
 use sprig_ai::settings::Lookup;
@@ -46,7 +45,6 @@ use sprig_proto_mysql::resultset::{ColumnFlags, column_type as ct};
 use sprig_proto_mysql::{ColumnDef, Persona, StatusFlags};
 use sprig_settings::{Setting, SettingCtx};
 use sprig_sql::ai_fn::{self, Plan};
-use tokio::sync::OnceCell;
 
 use super::PassSession;
 use super::tenant::Step;
@@ -104,30 +102,28 @@ impl Lookup for ExecLookup<'_> {
     }
 }
 
-/// The gateway's surroundings for [`functions::evaluate`].
+/// The tenant catalog records the AI features write (the function cache,
+/// token counts, embedded columns' records): on this node when it leads
+/// the tenant's unit (or the engine doesn't replicate), else on the
+/// unit's leader through its peer service. One per process.
+pub(crate) fn writers(svc: &TenantServices) -> Arc<dyn sprig_catalog::records::RecordStore> {
+    static W: std::sync::OnceLock<Arc<dyn sprig_catalog::records::RecordStore>> =
+        std::sync::OnceLock::new();
+    Arc::clone(W.get_or_init(|| {
+        Arc::new(crate::tenant::catalog_records::LeaderRecords::new(
+            Arc::clone(&svc.records),
+            svc.locator.dc_store(),
+        ))
+    }))
+}
+
+/// The gateway's surroundings for [`functions::evaluate`]: the cache and
+/// the token counts are the tenant's catalog records (on the engine node,
+/// or reached through its peer service).
 struct GatewayEnv {
     svc: Arc<TenantServices>,
     tenant: TenantId,
     user: UserId,
-    /// The tenant's catalog writer and schema, found once.
-    catalog: OnceCell<(mysql_async::Pool, String)>,
-}
-
-impl GatewayEnv {
-    async fn catalog(&self) -> Result<&(mysql_async::Pool, String)> {
-        self.catalog
-            .get_or_try_init(|| async {
-                let ep =
-                    sprig_catalog::CatalogLocator::writer(&*self.svc.locator, self.tenant).await?;
-                Ok::<_, SprigError>((ep.pool.clone(), ep.store.schema().to_owned()))
-            })
-            .await
-    }
-
-    async fn audit(&self) -> Result<CatalogAudit> {
-        let (pool, schema) = self.catalog().await?;
-        Ok(CatalogAudit::new(pool.clone(), schema.clone()))
-    }
 }
 
 #[async_trait]
@@ -168,16 +164,18 @@ impl FnEnv for GatewayEnv {
     }
 
     async fn cache(&self) -> Result<Arc<dyn FnCache>> {
-        let (pool, schema) = self.catalog().await?;
-        Ok(Arc::new(CatalogFnCache::new(pool.clone(), schema.clone())))
+        Ok(Arc::new(RecordFnCache::new(
+            writers(&self.svc),
+            self.tenant,
+        )))
     }
 
     async fn usage_today(&self) -> Result<UsageToday> {
-        self.audit().await?.usage_today(self.user).await
+        functions::cache::usage_today(&*writers(&self.svc), self.tenant, self.user).await
     }
 
     async fn add_usage(&self, usage: &Usage) -> Result<()> {
-        functions::cache::add_usage(&self.audit().await?, self.user, usage).await
+        functions::cache::add_usage(&*writers(&self.svc), self.tenant, self.user, usage).await
     }
 }
 
@@ -333,7 +331,6 @@ impl PassSession {
             svc: Arc::clone(&svc),
             tenant,
             user,
-            catalog: OnceCell::new(),
         };
         let nbe = lex.no_backslash_escapes;
         let mut warnings: Vec<LocalWarning> = Vec::new();

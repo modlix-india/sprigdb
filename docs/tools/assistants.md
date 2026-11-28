@@ -10,7 +10,7 @@ sidebar:
 SprigDB has two assistants for a tenant's users, reached through one chat API:
 
 - **The data specialist** (`data`) explains your data, writes and runs read-only queries, and proposes charts and glossary terms.
-- **The DBA assistant** (`dba`) helps with plans, indexes, workload, settings, shards, row-level security and logic.
+- **The DBA assistant** (`dba`) helps with plans, indexes, workload, settings, row-level security and logic.
 
 Operators also have an **administration assistant** (`admin`), which sees no tenant data. It also advises on SprigDB's own errors, through the approvals inbox: see [AI incident advice](../operate/ai-incident-advice.md).
 
@@ -50,6 +50,7 @@ sprigctl ai provider remove ollama
 - **The key** is read from `--key-file` (`-` reads standard input), or asked for on the terminal without echo. The controller seals it with the master key file (`[controller] workload_key_file`) and stores it in the global tier. No command or API ever shows it again: listings show only whether a key is set. Replacing a provider with `--keep-key` keeps its key.
 - **Gateways** open the key with the same master key file (`[gateway] workload_key_file`), only when they call the provider.
 - **`test`** makes one tiny call (at most 16 output tokens) and prints the answer, or the error that says why the call failed.
+- **Which addresses.** Provider base URLs are set by operators only (global records, through the Admin API), like the identity provider and SMTP settings, so they aren't held to the internal-address rules for URLs a tenant sets: a model server on the same machine or network works as configured.
 - **Other options:** `--key-header api_key` for Azure OpenAI, `--query api-version=…` for a query string on every call, and `--provider-ca-file` for a TLS-inspecting proxy.
 - **The output limit:** for OpenAI itself, `add` names it `max_completion_tokens`, because `api.openai.com` refuses `max_tokens` on its current models; every other `openai` server gets `max_tokens`. `--max-tokens-field` chooses either.
 - **Who:** changing providers needs a platform operator. Every change is audited on the platform audit stream, without the key.
@@ -167,7 +168,7 @@ The tools each assistant may call, all as you:
 
 - **Both:** search these docs; list databases and tables; describe a table (columns, indexes, foreign keys in and out, definition); how a database's tables join (`relationships`: declared foreign keys, and joins inferred from a column such as `customer_id` or `customerId` that matches another table's single-column primary key by type); plans (`EXPLAIN FORMAT=JSON`, inside a read-only transaction for reads); column statistics over at most 100,000 rows; the approvals inbox.
 - **Data specialist:** run one `SELECT` in a read-only transaction that is rolled back, capped at its limit (1 to 1,000 rows) and at `studio.statement_timeout_ms`.
-- **DBA assistant:** workload fingerprints, indexes and automatic indexes, settings as they resolve for the tenant, a database or a table (`SHOW SPRIG SETTINGS … FOR`), shards and advisor runs, the row-level security tester (counts only), logic compiles (dry runs), SprigDB's decisions about your tenant, two schema checks, and the sensitive-data scanner (below).
+- **DBA assistant:** workload fingerprints, indexes and automatic indexes, settings as they resolve for the tenant, a database or a table (`SHOW SPRIG SETTINGS … FOR`), the row-level security tester (counts only), logic compiles (dry runs), SprigDB's decisions about your tenant, two schema checks, and the sensitive-data scanner (below). Its `shards` and `advisor_runs` tools answer that they aren't available in this release: table groups and the sharding advisor belonged to MariaDB shards, and the storage engine places data itself.
 
 A tool call outside the assistant's role, or with invalid input, is refused; three refusals in one turn stop it with 39996.
 
@@ -317,7 +318,7 @@ To run an answer, copy the query, or use [`sprig ask --run`](sprig.md#sprig-ask)
 
 ## Conversations and what was sent
 
-`dba` and `data` conversations are kept in your tenant's catalog, and only you can read yours:
+`dba` and `data` conversations are kept in your tenant's catalog records, and only you can read yours:
 
 - `GET /v1/ai/conversations` lists them, newest first (`?limit=`, 50 by default).
 - In Studio, the dock's history button lists them and **What was sent** shows the payloads; in the TUI, `?` on a proposal shows them.
@@ -327,13 +328,12 @@ To run an answer, copy the query, or use [`sprig ask --run`](sprig.md#sprig-ask)
 
 ### Administration conversations
 
-`admin` conversations belong to no tenant, so they are kept at the system level: in the `__sprig_ai` schema on the data center's system cluster, which is its lowest-numbered cluster that is active, draining or drained. The controller creates the schema. No tenant account can read it.
+`admin` conversations belong to no tenant, so they are kept at the system level: in the data center's system catalog records, kept by the engine like every tenant's catalog (under the reserved tenant id 0, which no tenant has). No schema, cluster or grant is needed, and no tenant account or client statement can read them.
 
 - **Who sees them.** Only the operator who had them, and only while their login is a platform operator (in `studio.operator_logins`, with operator mode on). Operators are told apart by login (`tenant.user`).
 - **The same routes.** For an operator, `GET /v1/ai/conversations` lists their tenant conversations and their administration conversations together, newest first. Administration ids start with `a` (`a12`), as do their message ids, so `GET /v1/ai/conversations/a12` opens one with what was sent, `"conversation": "a12"` continues it, and `{"message_id": "a40", "vote": "up"}` rates an answer in it.
 - **Retention.** The global `ai.audit_payload_days`; the controller purges them hourly like the tenants' payloads. Each turn also writes its `ai.turn` event to the platform audit stream.
-- **The grant.** `sprig_ctl` needs ``GRANT ALL ON `__sprig_ai`.* TO 'sprig_ctl'@'%'`` on the system cluster; registration lists it as an advisory when it is missing. Until it is given, or while the system cluster can't be reached, `admin` turns still run but aren't stored, and the listing says why in `admin_unavailable`.
-- **Moving.** If the system cluster is retired, the next one in service takes over with an empty history.
+- **When the store can't be reached** (the gateway serves no tenants), `admin` turns still run but aren't stored, and the listing says why in `admin_unavailable`.
 
 ## Budgets
 
@@ -380,11 +380,10 @@ The data center's leading controller looks at each tenant once an hour. When the
 
 1. **The facts, measured by SprigDB:**
    - schema changes in the period (the object and the statement's verb, never its text);
-   - table sizes (approximate rows and bytes, over all shards), compared with the previous digest;
+   - table sizes (approximate rows and bytes), compared with the previous digest, when they can be read (engine tables' sizes aren't read yet; the digest lists them under what is missing);
    - the five statements that took the most time (their normalized text, runs, mean and longest time, failures);
-   - automatic indexes created, activated or dropped;
    - your tenant's statements, failures and mean time against the period before;
-   - recommendations waiting for review (kind, target, age).
+   - recommendations waiting for review (kind, target, age), automatic index proposals among them.
 
    Notable movements are picked by fixed thresholds: statements up or down 25% (from 1,000), failures doubled (from 10), mean time up or down 25%, a table's rows or size up or down 20% (and by 10,000 rows or 64 MB).
 2. **No values.** The facts hold names, counts and sizes, never a row. With `ai.share_data` off, every literal left in a statement's text or a recommendation's target becomes `?` as well.

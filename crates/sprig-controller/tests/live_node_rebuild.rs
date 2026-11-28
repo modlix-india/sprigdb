@@ -748,6 +748,7 @@ fn writer(
 
 static ONE_AT_A_TIME: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+#[ignore = "live: needs SPRIG_TEST_DOCKER; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn bins_diverged_writer_is_extracted_and_rebuilt() {
     if !skip::flag(skip::DOCKER) {
@@ -755,7 +756,7 @@ async fn bins_diverged_writer_is_extracted_and_rebuilt() {
             skip::DOCKER,
             "bins_diverged_writer_is_extracted_and_rebuilt",
         );
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     }
     let _one = ONE_AT_A_TIME.lock().await;
     let Some(mut d) = deploy().await else {

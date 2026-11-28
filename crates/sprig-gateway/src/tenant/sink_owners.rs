@@ -92,7 +92,7 @@ pub async fn after_grants(svc: &Arc<TenantServices>, cat: &TenantCatalog, lctn: 
             return Err(e);
         }
         let v = c.commit().await?;
-        let store = sprig_sinks::store::SinksStore::new(Arc::clone(&svc.records), tenant);
+        let store = sprig_sinks::store::SinksStore::new(Arc::clone(&svc.writers), tenant);
         for (id, state, reason) in &todo {
             let ch = Change::State(*id, *state, reason.clone());
             sprig_sinks::sql::after_commit(&store, &ch).await?;

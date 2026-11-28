@@ -1013,18 +1013,20 @@ async fn run(addr: &str, tag: &str) {
     e.close().await;
 }
 
+#[ignore = "live: needs SPRIG_TEST_HL_GATEWAY, SPRIG_TEST_HL_TENANT, SPRIG_TEST_HL_STEPS, ...; tools/live/README.md"]
 #[tokio::test]
 async fn hierarchies_across_spaces_mysql() {
     let Some(eps) = endpoints("hierarchies_across_spaces_mysql") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     run(&eps[0], "my").await;
 }
 
+#[ignore = "live: needs SPRIG_TEST_HL_GATEWAY, SPRIG_TEST_HL_TENANT, SPRIG_TEST_HL_STEPS, ...; tools/live/README.md"]
 #[tokio::test]
 async fn hierarchies_across_spaces_mariadb() {
     let Some(eps) = endpoints("hierarchies_across_spaces_mariadb") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let Some(addr) = eps.get(1) else {
         eprintln!("hierarchies_across_spaces_mariadb: no second endpoint");
@@ -1805,19 +1807,21 @@ async fn run_tenants(addr: &str, tag: &str) {
     m.close().await;
 }
 
+#[ignore = "live: needs SPRIG_TEST_HL_GATEWAY, SPRIG_TEST_HL_TENANT, SPRIG_TEST_HL_STEPS, ...; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn hierarchies_across_tenants_mysql() {
     let Some(eps) = endpoints("hierarchies_across_tenants_mysql") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let tag = if materialized() { "mym" } else { "myr" };
     run_tenants(&eps[0], tag).await;
 }
 
+#[ignore = "live: needs SPRIG_TEST_HL_GATEWAY, SPRIG_TEST_HL_TENANT, SPRIG_TEST_HL_STEPS, ...; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn hierarchies_across_tenants_mariadb() {
     let Some(eps) = endpoints("hierarchies_across_tenants_mariadb") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let Some(addr) = eps.get(1) else {
         eprintln!("hierarchies_across_tenants_mariadb: no second endpoint");
@@ -1853,18 +1857,20 @@ async fn run_restart(addr: &str, tag: &str) {
     m.close().await;
 }
 
+#[ignore = "live: needs SPRIG_TEST_HL_GATEWAY, SPRIG_TEST_HL_TENANT, SPRIG_TEST_HL_STEPS, ...; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn hierarchies_across_tenants_restart_mysql() {
     let Some(eps) = endpoints("hierarchies_across_tenants_restart_mysql") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     run_restart(&eps[0], "myk").await;
 }
 
+#[ignore = "live: needs SPRIG_TEST_HL_GATEWAY, SPRIG_TEST_HL_TENANT, SPRIG_TEST_HL_STEPS, ...; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn hierarchies_across_tenants_restart_mariadb() {
     let Some(eps) = endpoints("hierarchies_across_tenants_restart_mariadb") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let Some(addr) = eps.get(1) else {
         eprintln!("hierarchies_across_tenants_restart_mariadb: no second endpoint");

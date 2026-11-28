@@ -35,6 +35,7 @@ use axum::response::Response;
 use axum::routing::get;
 use serde_json::{Value, json};
 use sprig_ai::audit::AuditStore;
+use sprig_ai::audit::rec::RecAudit;
 use sprig_ai::egress::NameKind;
 use sprig_ai::incidents::advise::Model;
 use sprig_ai::incidents::{
@@ -45,7 +46,7 @@ use sprig_ai::keys::AiKeyring;
 use sprig_ai::providers::ProviderStore;
 use sprig_ai::settings::{AdminSettings, Lookup, TurnSettings};
 use sprig_ai::tools::{Source, ToolBody, ToolHost, ToolOutput, ToolSpec};
-use sprig_ai::{MemoryAudit, Provider, Role, SystemAudit};
+use sprig_ai::{MemoryAudit, Provider, Role};
 use sprig_approvals::gate::Approvals;
 use sprig_approvals::model::{
     Action, Level, Mode, Proposal, RecId, Recommendation, State as RecState, Subject,
@@ -61,7 +62,6 @@ use sprig_settings::{LiveSettings, SettingCtx};
 use crate::admin::http::respond;
 use crate::admin::invalid;
 use crate::approvals::Applier;
-use crate::catalogs::{ClusterPools, RegistryPools};
 use crate::operators::http::principal;
 use crate::runtime::{LoopCx, LoopTier, MetaEvent, Outcome, Reconciler, WatchSpec};
 use crate::tree::Directory;
@@ -104,7 +104,6 @@ pub struct ControllerEnv {
     providers: ProviderStore,
     keys: Arc<dyn AiKeyring>,
     registry: ClusterRegistry,
-    pools: RegistryPools,
     docs: Arc<DocsHost>,
 }
 
@@ -140,7 +139,6 @@ impl ControllerEnv {
         dc_store: Arc<dyn MetaStore>,
         global: Arc<dyn MetaStore>,
         key_file: Option<&std::path::Path>,
-        pools: RegistryPools,
         live: Option<(LiveSettings, DcId)>,
     ) -> Result<Self> {
         let keys: Arc<dyn AiKeyring> = match key_file {
@@ -154,7 +152,6 @@ impl ControllerEnv {
             dc_store,
             global,
             keys,
-            pools,
             docs: Arc::new(DocsHost::new(live)),
         })
     }
@@ -193,14 +190,11 @@ impl IncidentEnv for ControllerEnv {
     }
 
     async fn audit(&self) -> Result<Arc<dyn AuditStore>> {
-        let cluster = self.registry.system_cluster().await?.ok_or_else(|| {
-            SprigError::new(
-                SprigCode::CatalogUnavailable,
-                "administration conversations: the data center has no cluster in service yet",
-            )
-        })?;
-        let pool = self.pools.writer(&cluster).await?;
-        Ok(Arc::new(SystemAudit::new(pool, INCIDENTS)))
+        // The DC's system catalog records, on the engine node.
+        Ok(Arc::new(RecAudit::system(
+            crate::catalog_records(),
+            INCIDENTS,
+        )))
     }
 
     async fn topology(&self) -> Result<(Topology, Names)> {

@@ -94,7 +94,7 @@ sprigctl ai incident show 3f09a1c2b7de
 sprigctl ai incident show 3f09a1c2b7de --payload
 ```
 
-`show` prints the counts, the intake text exactly as sent, triage's verdict, the advice and the SHA-256 of every payload. `--payload` adds each exact payload, from the incident's conversation in the system store (`__sprig_ai`, kept for the global `ai.audit_payload_days`; see [AI assistants](../tools/assistants.md#administration-conversations)). The Admin API serves the same as `GET /admin/v1/ai/incidents` and `GET /admin/v1/ai/incidents/{fingerprint}?payloads=true`.
+`show` prints the counts, the intake text exactly as sent, triage's verdict, the advice and the SHA-256 of every payload. `--payload` adds each exact payload, from the incident's conversation in the system store (the data center's system catalog records, kept for the global `ai.audit_payload_days`; see [AI assistants](../tools/assistants.md#administration-conversations)). The Admin API serves the same as `GET /admin/v1/ai/incidents` and `GET /admin/v1/ai/incidents/{fingerprint}?payloads=true`.
 
 ## Budgets
 
@@ -133,4 +133,4 @@ Model calls also count in `sprig_ai_requests_total` and `sprig_ai_tokens_total` 
 | Held `budget` | A daily token budget is spent; it resumes at 00:00 UTC |
 | Held `advice_cap` or `triage_cap` | The hourly limits; it goes in a later hour |
 | Status `failed` with an error | The provider failed or refused; the incident can go again after six hours |
-| The conversation is `unavailable` | `sprig_ctl` lacks its grant on `__sprig_ai`, or the system cluster is unreachable; advice still works, but the payloads weren't kept |
+| The conversation is `unavailable` | The engine node holding the system records couldn't be reached; advice still works, but the payloads weren't kept |

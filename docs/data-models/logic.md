@@ -592,6 +592,7 @@ A Lua `pcall` around the loop wouldn't help: once a budget trips, `pcall`, `xpca
 | `logic.outbound_allowlist` | `[]` | tenant, global | Hosts code may call: a JSON list or comma-separated |
 | `logic.outbound_timeout_ms` | `2000` | tenant, global | Time for the whole call |
 | `logic.outbound_max_bytes` | `1048576` | tenant, global | Largest response body |
+| `logic.outbound_internal_allowlist` | `[]` | tenant, dc, global (operator only) | Internal addresses `fetch` may reach when the allowlist also names them |
 
 An entry is `host`, `host:port`, `*.domain` (any subdomain, not the domain itself) or an IP address, with an optional port. Without a port it allows 80 and 443 only. For example:
 
@@ -599,7 +600,9 @@ An entry is `host`, `host:port`, `*.domain` (any subdomain, not the domain itsel
 ALTER TENANT SPRIG SET (logic.outbound_allowlist = '["api.example.com", "*.svc.example.org:8443"]');
 ```
 
-The call must be `http` or `https`; `https` checks the server's certificate against the public web roots. A name that resolves to a private, loopback, link-local, shared (CGNAT), unspecified or multicast address is refused unless the allowlist names that address literally, and the call connects to the address it checked, so a second DNS answer can't redirect it. A refused call fails with 39867 `ER_SPRIG_LOGIC_OUTBOUND_DENIED`; a slow or large one with 39864. Each call counts against `logic.max_data_ops`. A function that calls `fetch` always runs in the engine tier.
+The call must be `http` or `https`; `https` checks the server's certificate against the public web roots.
+
+Internal addresses are blocked: loopback, link-local (cloud instance metadata included), private, shared (CGNAT), unspecified and multicast. The check runs on every address a name resolves to and on a literal IP in the URL, and the call connects to the address it checked, so a second DNS answer can't redirect it. Listing an internal address in `logic.outbound_allowlist` isn't enough: it is reached only when the operator also names it in `logic.outbound_internal_allowlist` (addresses or CIDR ranges with an optional port, set at the global, DC or tenant scope by an operator, never by the tenant). Instance metadata (`169.254.169.254` and the like) is never reached, whatever the settings say. A refused call fails with 39867 `ER_SPRIG_LOGIC_OUTBOUND_DENIED`; a slow or large one with 39864. Each call counts against `logic.max_data_ops`. A function that calls `fetch` always runs in the engine tier.
 
 ```sql test
 CREATE FUNCTION ping() RETURNS INT LANGUAGE javascript

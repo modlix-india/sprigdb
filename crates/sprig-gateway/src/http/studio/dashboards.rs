@@ -26,7 +26,7 @@ use async_trait::async_trait;
 use hyper::body::Incoming;
 use hyper::{Request, Response};
 use serde_json::{Value, json};
-use sprig_ai::dashboards::{self as dash, CatalogDashboards, TileRunner, Who};
+use sprig_ai::dashboards::{self as dash, RecordsDashboards, TileRunner, Who};
 use sprig_ai::tools::ResultSet;
 use sprig_common::{Result, SprigCode, SprigError};
 use tonic::body::Body;
@@ -48,19 +48,18 @@ pub fn is_dashboards_path(path: &str) -> bool {
         || path.starts_with("/v1/dashboards:")
 }
 
-/// The caller's tenant's dashboards.
+/// The caller's tenant's dashboards, in its catalog records.
 ///
 /// # Errors
-/// Not a tenant login; the catalog unreachable.
-pub async fn store(core: &Arc<Core>, caller: &Caller) -> Result<CatalogDashboards> {
+/// Not a tenant login.
+// Async, as the catalog's was: the assistant's proposal route awaits it.
+#[allow(clippy::unused_async)]
+pub async fn store(core: &Arc<Core>, caller: &Caller) -> Result<RecordsDashboards> {
     let (Some(svc), Some(tid)) = (&core.studio.tenants, caller.principal.tenant) else {
         return Err(invalid("dashboards need a tenant login"));
     };
-    let ep = sprig_catalog::CatalogLocator::writer(&*svc.locator, tid).await?;
-    Ok(CatalogDashboards::new(
-        ep.pool.clone(),
-        ep.store.schema().to_owned(),
-    ))
+    // Through the tenant unit's leader, so any node can write.
+    Ok(RecordsDashboards::new(Arc::clone(&svc.writers), tid))
 }
 
 /// The caller as dashboards see them; `admin` asks `SHOW GRANTS` only
@@ -231,6 +230,28 @@ mod tests {
         assert!(is_dashboards_path("/v1/dashboards/4/tiles/9:run"));
         assert!(!is_dashboards_path("/v1/dashboardsx"));
         assert!(id("12").is_ok() && id("x").is_err());
+    }
+
+    /// Dashboards and the library write from any node: their record
+    /// transactions go through the tenant unit's leader (`writers`), never
+    /// this node's own records, whose commits fail on a replica that
+    /// doesn't lead the tenant.
+    #[test]
+    fn writes_go_through_the_leader_store() {
+        for (name, src) in [
+            ("dashboards.rs", include_str!("dashboards.rs")),
+            ("library.rs", include_str!("library.rs")),
+        ] {
+            let code = src.split("#[cfg(test)]").next().unwrap_or("");
+            assert!(
+                !code.contains("svc.records"),
+                "{name} uses this node's records"
+            );
+            assert!(
+                code.contains("svc.writers"),
+                "{name} doesn't use the leader's"
+            );
+        }
     }
 
     /// The `OpenAPI` document's chart marks are the tile check's.

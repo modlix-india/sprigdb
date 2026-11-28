@@ -78,6 +78,7 @@ fn crash(step: DdlStep) -> DdlFailpoint {
     })
 }
 
+#[ignore = "live: needs SPRIG_TEST_MARIADB_SINGLE, SPRIG_TEST_RECONCILE_TENANT, SPRIG_TEST_ETCD, ...; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_reconciler_repairs_crashes_and_outside_changes() {
     let Some(url) = std::env::var(MARIADB_ENV)
@@ -85,7 +86,7 @@ async fn live_reconciler_repairs_crashes_and_outside_changes() {
         .filter(|v| !v.trim().is_empty())
     else {
         eprintln!("skipped live_reconciler_repairs_crashes_and_outside_changes: set {MARIADB_ENV}");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let pool = Pool::new(Opts::from_url(&url).unwrap());
     let (tenant, catalog) = unique();
@@ -323,7 +324,7 @@ async fn pass_one_live_tenant() {
         .map(TenantId)
     else {
         eprintln!("set SPRIG_TEST_RECONCILE_TENANT");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let meta = sprig_common::config::MetaConfig {
         dc_seeds: vec![

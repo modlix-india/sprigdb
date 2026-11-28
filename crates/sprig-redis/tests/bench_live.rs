@@ -106,11 +106,12 @@ async fn measure(url: &str, name: &str, clients: usize, secs: u64) -> (f64, f64,
     (all.len() as f64 / wall, pick(0.5), pick(0.99))
 }
 
+#[ignore = "live: needs SPRIG_BENCH_TARGETS; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn throughput() {
     let Some(targets) = var("SPRIG_BENCH_TARGETS") else {
         eprintln!("SPRIG_BENCH_TARGETS not set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let clients: Vec<usize> = var("SPRIG_BENCH_CLIENTS")
         .unwrap_or_else(|| "8,64".into())

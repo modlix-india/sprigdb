@@ -239,13 +239,14 @@ async fn digest(pool: &Pool, schema: &str) -> (u64, String, BTreeMap<u64, (u64, 
     )
 }
 
+#[ignore = "live: needs SPRIG_TEST_BALANCER_LIVE; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn skewed_fleet_evens_out_without_oscillating() {
     if std::env::var("SPRIG_TEST_BALANCER_LIVE").is_err() {
         eprintln!(
             "skipped: run deploy/compose/balancer/run.sh up, then set SPRIG_TEST_BALANCER_LIVE=1"
         );
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     }
     let ids: BTreeMap<String, u64> = tenants()
         .into_iter()

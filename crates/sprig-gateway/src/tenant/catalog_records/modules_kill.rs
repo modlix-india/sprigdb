@@ -464,11 +464,12 @@ fn policy() -> sprig_approvals::policy::Policy {
     )
 }
 
+#[ignore = "live: needs SPRIG_TEST_MARIADB_SINGLE; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn live_module_catalogs_survive_kill_9() {
     let Ok(url) = std::env::var("SPRIG_TEST_MARIADB_SINGLE") else {
         eprintln!("skipped: set SPRIG_TEST_MARIADB_SINGLE to run it");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     if let Ok(c) = std::env::var(CHILD) {
         let (schema, dir) = c.split_once('|').unwrap();

@@ -1,0 +1,21 @@
+# Row comparisons: keyset pagination, IN of rows, nested rows, NULLs, shape errors.
+x:DROP TABLE IF EXISTS rc_a
+q:CREATE TABLE rc_a (id INT PRIMARY KEY, created DATE, k INT, v VARCHAR(10), KEY (created, id))
+q:INSERT INTO rc_a VALUES (1,'2024-01-01',1,'a'),(2,'2024-01-01',2,'b'),(3,'2024-01-02',NULL,'c'),(4,'2024-01-02',4,'d'),(5,'2024-01-03',5,NULL),(6,NULL,6,'f')
+q:SELECT id FROM rc_a WHERE (created, id) < ('2024-01-02', 4) ORDER BY created DESC, id DESC
+q:SELECT id FROM rc_a WHERE (created, id) > ('2024-01-01', 2) ORDER BY created, id LIMIT 2
+q:SELECT id FROM rc_a WHERE (created, id) >= ('2024-01-02', 3) ORDER BY id
+q:SELECT id FROM rc_a WHERE (created, id) <= ('2024-01-01', 9) ORDER BY id
+q:SELECT id, (k, v) < (4, 'z'), (k, v) <=> (5, NULL), (k, v) <> (1, 'a') FROM rc_a ORDER BY id
+q:SELECT id FROM rc_a WHERE (k, v) IN ((1, 'a'), (4, 'd'), (5, NULL)) ORDER BY id
+q:SELECT id FROM rc_a WHERE (k, v) NOT IN ((1, 'a'), (4, 'd')) ORDER BY id
+q:SELECT id FROM rc_a WHERE ((k, id), v) = ((2, 2), 'b')
+q:SELECT (1,2)<(1,3), (1,NULL)<(2,0), (NULL,1)<(1,2), (1,NULL)<(1,2), (2,NULL)>(1,5), (1,2)<=>(1,2), (1,NULL)<=>(1,NULL), (1,2)<>(1,NULL), (1,2)>=(1,2), ((1,2),3)<((1,3),0) FROM rc_a WHERE id = 1
+q:SELECT (1,2) IN ((1,2),(3,4)), (1,NULL) IN ((1,2),(3,4)), (1,NULL) NOT IN ((2,2)), (1,2) IN ((1,NULL),(1,2)) FROM rc_a WHERE id = 1
+q:SELECT id FROM rc_a WHERE (id, k) = 1
+q:SELECT id FROM rc_a WHERE 1 = (id, k)
+q:SELECT id FROM rc_a WHERE (id, k) < (1, 2, 3)
+q:SELECT id FROM rc_a WHERE (id, k) IN (1, 2)
+q:SELECT (id, k) FROM rc_a
+q:SELECT id FROM rc_a WHERE (id, k) BETWEEN (0, 0) AND (3, 3)
+x:DROP TABLE IF EXISTS rc_a

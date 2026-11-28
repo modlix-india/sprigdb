@@ -42,6 +42,7 @@ fn env(n: &str) -> Option<String> {
     std::env::var(n).ok().filter(|v| !v.is_empty())
 }
 
+#[ignore = "live: needs SPRIG_TEST_ETCD, SPRIG_TEST_MARIADB_SINGLE, SPRIG_TEST_MARIADB_REPLICATION; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread")]
 async fn live_two_shard_tenant_routes() {
     let (Some(etcd), Some(single), Some(repl)) = (
@@ -50,7 +51,7 @@ async fn live_two_shard_tenant_routes() {
         env("SPRIG_TEST_MARIADB_REPLICATION"),
     ) else {
         eprintln!("skipped: needs SPRIG_TEST_ETCD, _MARIADB_SINGLE, _MARIADB_REPLICATION");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let primary = repl.split(',').next().unwrap().trim().to_owned();
     let tier = Tier::Dc(DcId::new("r1shard-dc").unwrap());
@@ -294,6 +295,7 @@ async fn live_two_shard_tenant_routes() {
 
 /// The `sharding` catalog module on a real catalog schema: migrate twice
 /// (idempotent), write a group and members, read them back.
+#[ignore = "live: needs SPRIG_TEST_MARIADB_SINGLE; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread")]
 async fn live_catalog_module() {
     use sprig_common::ids::ObjectId;
@@ -301,7 +303,7 @@ async fn live_catalog_module() {
     use sprig_shard::{GroupKind, MemberRouting};
     let Some(single) = env("SPRIG_TEST_MARIADB_SINGLE") else {
         eprintln!("skipped: SPRIG_TEST_MARIADB_SINGLE not set");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let schema = "t7310005_sprig"; // the test's catalog, dropped by name below
     let pool = mysql_async::Pool::new(single.as_str());

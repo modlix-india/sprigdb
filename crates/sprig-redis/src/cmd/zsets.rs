@@ -8,7 +8,7 @@ use bytes::Bytes;
 use sprig_kv::layout::KeyType;
 use sprig_kv::sql::{cell_f64, cell_i64, cell_u64, lit};
 use sprig_proto_redis::Frame;
-use sprig_proto_redis::num::{d2string, parse_f64, parse_i64};
+use sprig_proto_redis::num::{parse_f64, parse_i64, reply_double_text};
 
 use crate::cmd::hashes::{members, pick};
 use crate::cmd::keys::scan_opts;
@@ -1137,7 +1137,7 @@ pub async fn zscan(cx: &mut Ctx<'_>, a: &[Bytes]) -> R<Frame> {
             continue;
         }
         out.push(Frame::Bulk(m.into()));
-        out.push(Frame::bulk(d2string(s)));
+        out.push(Frame::bulk(reply_double_text(s)));
     }
     Ok(Frame::Array(vec![
         Frame::bulk(next.to_string()),

@@ -558,11 +558,12 @@ async fn append_until_done(url: &str, c: &Live, tag: &str) -> (u32, u32) {
 /// the commit point releases its held rows; another writer's append lands
 /// first; the resolver's replay then writes the held branch's value over
 /// it. The other writer's committed append is lost: the window the fence closes.
+#[ignore = "live: needs SPRIG_TEST_RELAY_FENCE; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread")]
 async fn without_the_fence_a_replay_overwrites_a_later_write() {
     let Some(cs) = clusters() else {
         eprintln!("live_relay_fence: set SPRIG_TEST_RELAY_FENCE to run");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     setup(&cs).await;
     let gw = gateway(&cs, None);
@@ -596,11 +597,12 @@ async fn without_the_fence_a_replay_overwrites_a_later_write() {
 /// With the fence: the holder's backend stays open when its gateway dies,
 /// the relay ends the waiting writer, the agent replays the held branch,
 /// and only then admits the tenant again: both appends survive.
+#[ignore = "live: needs SPRIG_TEST_RELAY_FENCE; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread")]
 async fn the_fence_keeps_held_rows_until_they_are_replayed() {
     let Some(cs) = clusters() else {
         eprintln!("live_relay_fence: set SPRIG_TEST_RELAY_FENCE to run");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     setup(&cs).await;
     let run = start_relay(&cs, None).await;
@@ -645,11 +647,12 @@ async fn the_fence_keeps_held_rows_until_they_are_replayed() {
 /// admits anyone. Also measures what MariaDB does with an autocommit
 /// statement that was waiting for the held rows when its client vanished
 /// (a case the fence leaves open): it runs on and commits.
+#[ignore = "live: needs SPRIG_TEST_RELAY_FENCE; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_relay_crash_recovers_before_admitting() {
     let Some(cs) = clusters() else {
         eprintln!("live_relay_fence: set SPRIG_TEST_RELAY_FENCE to run");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     setup(&cs).await;
     let run = start_relay(&cs, None).await;
@@ -706,11 +709,12 @@ async fn a_relay_crash_recovers_before_admitting() {
 /// `COMMIT` waits behind `FLUSH TABLES WITH READ LOCK`); `COMMIT` answers
 /// OK with a straggler. A plain read misses the row; the session's next
 /// statement on that cluster settles the straggler first and sees it.
+#[ignore = "live: needs SPRIG_TEST_RELAY_FENCE; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_phase2_straggler_is_settled_before_the_sessions_next_read() {
     let Some(cs) = clusters() else {
         eprintln!("live_relay_fence: set SPRIG_TEST_RELAY_FENCE to run");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     setup(&cs).await;
     let gw = gateway(&cs, None);

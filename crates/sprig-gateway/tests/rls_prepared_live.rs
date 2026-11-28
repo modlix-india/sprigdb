@@ -337,11 +337,12 @@ async fn unfiltered(ck: &mut Checks, p: &mut Prepared, tag: &str) {
     });
 }
 
+#[ignore = "live: needs SPRIG_TEST_RLS, SPRIG_TEST_RLS_TENANT; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn statements_prepared_before_a_policy_change() {
     let Some(addrs) = skip::var(GATEWAY) else {
         skip::report_missing(GATEWAY, "statements_prepared_before_a_policy_change");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let addrs = skip::urls(&addrs);
     let mut ck = Checks {

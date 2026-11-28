@@ -757,11 +757,12 @@ fn live_db() -> Option<Arc<dyn ReadOnlyDb>> {
     Some(Arc::new(MysqlReadOnly::new(mysql_async::Pool::new(opts))))
 }
 
+#[ignore = "live: needs SPRIG_SINKS_SCRIPT_LIVE, SPRIG_SINKS_SCRIPT_DB; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_db_handle_reads_as_the_owner_and_only_reads() {
     let Some(db) = live_db() else {
         eprintln!("skipped: SPRIG_SINKS_SCRIPT_LIVE is not 1");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let st = Arc::new(Srv::default());
     let addr = serve(Arc::clone(&st)).await;

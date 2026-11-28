@@ -148,11 +148,12 @@ async fn count(c: &Collection<Document>, f: Document) -> u64 {
     c.count_documents(f).await.unwrap()
 }
 
+#[ignore = "live: needs SPRIG_TEST_MONGO_URI, SPRIG_TEST_MONGO_URI_2; tools/live/README.md"]
 #[tokio::test]
 async fn commits_are_recovered_on_another_gateway() {
     let (Some(u1), Some(u2)) = (uri("SPRIG_TEST_MONGO_URI"), uri("SPRIG_TEST_MONGO_URI_2")) else {
         eprintln!("SPRIG_TEST_MONGO_URI or SPRIG_TEST_MONGO_URI_2 not set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let h1 = ClientOptions::parse(&u1).await.unwrap().hosts[0].to_string();
     let h2 = ClientOptions::parse(&u2).await.unwrap().hosts[0].to_string();

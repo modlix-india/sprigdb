@@ -603,7 +603,9 @@ async fn rollup_batches_cover_every_key_once() {
         let n = if i == 0 { fps.len() } else { 300 };
         for g in [1, 2] {
             let rows: Vec<FlushRow> = fps[..n].iter().map(|f| row(*f, *b, 0, 1, 1000)).collect();
-            tx!(st, |t| WorkloadTables::replace_stats(t, g, &rows).await.unwrap());
+            tx!(st, |t| WorkloadTables::replace_stats(t, g, &rows)
+                .await
+                .unwrap());
         }
     }
     let total = |m: &BTreeMap<u64, Stats>| m.values().map(|s| s.exec_count).sum::<u64>();

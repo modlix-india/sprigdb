@@ -426,10 +426,11 @@ async fn clients() -> Option<(Database, Database)> {
     Some((g, r))
 }
 
+#[ignore = "live: needs SPRIG_TEST_MONGO_URI, SPRIG_TEST_MONGO_REF_URI, SPRIG_TEST_TTL_RATE, ...; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ttl_matches_mongodb() {
     let Some((g, r)) = clients().await else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let (cg, cr) = (checks(&g).await, checks(&r).await);
     let mut same = 0;
@@ -511,11 +512,12 @@ async fn ttl_matches_mongodb() {
     let _ = r.drop().await;
 }
 
+#[ignore = "live: needs SPRIG_TEST_MONGO_URI; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ttl_deletes_are_batched_and_paced() {
     let Some(gw) = var("SPRIG_TEST_MONGO_URI") else {
         eprintln!("SPRIG_TEST_MONGO_URI not set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let db = Client::with_uri_str(&gw)
         .await
@@ -563,11 +565,12 @@ async fn ttl_deletes_are_batched_and_paced() {
     let _ = db.drop().await;
 }
 
+#[ignore = "live: needs SPRIG_TEST_MONGO_URI, SPRIG_TEST_MOVE_CMDS; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ttl_through_a_move() {
     let (Some(gw), Some(cmds)) = (var("SPRIG_TEST_MONGO_URI"), var("SPRIG_TEST_MOVE_CMDS")) else {
         eprintln!("SPRIG_TEST_MONGO_URI or SPRIG_TEST_MOVE_CMDS not set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let span_ms: i64 = var("SPRIG_TEST_TTL_SPAN_MS")
         .and_then(|s| s.parse().ok())

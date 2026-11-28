@@ -368,6 +368,53 @@ pub fn start_placement(
             stop.clone(),
         ));
         tokio::spawn(dir.follow(dc, stop));
+    } else {
+        // Every node holds every unit: no descriptor tells it a tenant
+        // went, the directory does (`tenant::close_deleted_tenants` drops
+        // the units when the entry goes). This catches the tenants deleted
+        // while this node was down.
+        tokio::spawn(sweep_deleted_unplaced(global, stop));
+    }
+}
+
+/// [`sweep_deleted`] for a cluster whose nodes hold every unit: once
+/// replication runs, drops the units this node holds whose tenant has no
+/// directory entry (read linearizably; a tenant's entry is written before
+/// anything of its unit).
+async fn sweep_deleted_unplaced(
+    global: Arc<dyn sprig_meta::MetaStore>,
+    stop: sprig_common::CancellationToken,
+) {
+    let raft = loop {
+        if let Some(r) = RAFT.get() {
+            break r;
+        }
+        tokio::select! {
+            () = stop.cancelled() => return,
+            () = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
+        }
+    };
+    let tenants: std::collections::BTreeSet<u64> = raft
+        .node
+        .node()
+        .groups()
+        .into_iter()
+        .filter(|g| *g < sprig_engine::NODE_UNIT.0)
+        .map(tenant_of_unit)
+        .filter(|t| *t != 0)
+        .collect();
+    for t in tenants {
+        let Ok(key) = global.tier().key(&format!("tenants/{t}")) else {
+            continue;
+        };
+        if matches!(
+            global
+                .get(&key, sprig_meta::Consistency::Linearizable)
+                .await,
+            Ok(None)
+        ) {
+            let _ = tokio::task::spawn_blocking(move || drop_tenant_units(t)).await;
+        }
     }
 }
 
@@ -381,7 +428,7 @@ pub fn raft_node() -> Option<sprig_raft::Node> {
 /// partition groups), whose descriptor was deleted with the tenant: each
 /// group leaves this node with a tombstone, and the unit's keys here are
 /// cleared. Returns how many it dropped.
-fn drop_tenant_units(tenant: u64) -> usize {
+pub(crate) fn drop_tenant_units(tenant: u64) -> usize {
     let (Some(raft), Ok(engine)) = (RAFT.get(), engine()) else {
         return 0;
     };
@@ -389,6 +436,7 @@ fn drop_tenant_units(tenant: u64) -> usize {
         return 0;
     }
     let node = raft.node.node();
+    let idx = engine.data_dir().join("idx").join(format!("u{tenant}"));
     let snaps = sprig_raft::EngineSnapshots::new(engine);
     let mut n = 0;
     for g in node.groups() {
@@ -412,6 +460,19 @@ fn drop_tenant_units(tenant: u64) -> usize {
         }
     }
     if n > 0 {
+        // Its full-text indexes' files (built on every replica as entries
+        // apply) go too; nothing reopens them.
+        match crate::engine::fulltext::manager() {
+            Some(m) => m.forget_tenant(tenant),
+            // Not started yet (the sweep at start): only the files.
+            None => {
+                if let Err(e) = std::fs::remove_dir_all(&idx)
+                    && e.kind() != std::io::ErrorKind::NotFound
+                {
+                    tracing::warn!(dir = %idx.display(), error = %e, "a deleted tenant's full-text index files weren't removed");
+                }
+            }
+        }
         tracing::info!(
             tenant,
             units = n,
@@ -951,6 +1012,7 @@ fn start_raft(engine: &Engine, r: &RaftSetup, dir: PathBuf) -> Result<()> {
         transport.set_peer(*pid, *addr);
     }
     let notes_dir = dir.with_file_name("raft-notes");
+    let snapshots_dir = dir.with_file_name("raft-snapshots");
     let store = sprig_raft::EngineLogStore::open(dir, SyncMode::Full, None)
         .map_err(|e| raft_err(e.to_string()))?;
     store.set_sync_pipeline(
@@ -998,6 +1060,11 @@ fn start_raft(engine: &Engine, r: &RaftSetup, dir: PathBuf) -> Result<()> {
                 },
                 log_writer_thread: !std::env::var(RAFT_LOG_THREAD_VAR)
                     .is_ok_and(|v| v.trim().eq_ignore_ascii_case("false")),
+                // Unit snapshots built, sent and received as files beside
+                // the Raft log; paced by `replication.snapshot_mb_per_second`
+                // (its default until the ops loop reads the setting).
+                snapshot_dir: Some(snapshots_dir),
+                snapshot_bytes_per_second: crate::ops::report::SNAPSHOT_MB_PER_SECOND.default << 20,
                 ..sprig_raft::RaftConfig::default()
             },
             store,
@@ -1211,6 +1278,34 @@ pub(crate) fn engine_raft() -> Option<&'static sprig_raft::EngineNode> {
 /// Whether units are placed per tenant on this replicated node.
 pub(crate) fn raft_placed() -> bool {
     RAFT.get().is_some_and(|r| r.placed)
+}
+
+/// The tenants whose unit this replicated node leads now, by the engine's
+/// leadership (the check a local record write passes), in id order;
+/// `None` on an engine that doesn't replicate, where every unit is led
+/// here. Partition groups, tenant 0 and the node's own unit aren't
+/// tenants' units and are left out. Empty while replication is starting.
+pub(crate) fn led_tenants() -> Option<Vec<u64>> {
+    let Some(raft) = RAFT.get() else {
+        return replicated_from_env().then(Vec::new);
+    };
+    let Ok(eng) = engine() else {
+        return Some(Vec::new());
+    };
+    let mut out: Vec<u64> = raft
+        .node
+        .node()
+        .groups()
+        .into_iter()
+        .filter(|u| {
+            *u != 0
+                && *u < sprig_engine::NODE_UNIT.0
+                && tenant_of_unit(*u) == *u
+                && eng.leader_epoch(sprig_engine::UnitId(*u)) > 0
+        })
+        .collect();
+    out.sort_unstable();
+    Some(out)
 }
 
 static NOTE_BLOBS: OnceLock<Arc<sprig_engine::log::blobs::NoteBlobs>> = OnceLock::new();

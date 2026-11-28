@@ -27,11 +27,12 @@ async fn api(base: &str, path: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+#[ignore = "live: needs SPRIG_SMTP_LIVE_URL; tools/live/README.md"]
 #[tokio::test]
 async fn approval_mail_over_tls_reaches_mailpit() {
     let Ok(url) = std::env::var("SPRIG_SMTP_LIVE_URL") else {
         println!("skipped: SPRIG_SMTP_LIVE_URL is not set");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let ca = std::fs::read_to_string(std::env::var("SPRIG_SMTP_LIVE_CA").unwrap()).unwrap();
     let api_base = std::env::var("SPRIG_SMTP_LIVE_API").unwrap();

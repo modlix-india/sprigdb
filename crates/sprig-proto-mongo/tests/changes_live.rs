@@ -62,11 +62,12 @@ fn ids(evs: &[Document]) -> Vec<Bson> {
         .collect()
 }
 
+#[ignore = "live: needs SPRIG_TEST_MONGO_URI; tools/live/README.md"]
 #[tokio::test]
 async fn change_stream_events_and_resume() {
     let Some(u) = uri("SPRIG_TEST_MONGO_URI") else {
         eprintln!("SPRIG_TEST_MONGO_URI not set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let db = client(&u).await.database("r5mongo2_cs");
     let _ = db.drop().await;
@@ -206,11 +207,12 @@ async fn change_stream_events_and_resume() {
 /// with the new document and no update description, as MongoDB sends
 /// them; operator updates stay `update`, and an upserting replacement
 /// that inserts is an `insert`.
+#[ignore = "live: needs SPRIG_TEST_MONGO_URI; tools/live/README.md"]
 #[tokio::test]
 async fn replacements_are_replace_events() {
     let Some(u) = uri("SPRIG_TEST_MONGO_URI") else {
         eprintln!("SPRIG_TEST_MONGO_URI not set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let db = client(&u).await.database("r5mongo3_cs_replace");
     let _ = db.drop().await;
@@ -258,11 +260,12 @@ async fn replacements_are_replace_events() {
     db.drop().await.unwrap();
 }
 
+#[ignore = "live: needs SPRIG_TEST_MONGO_URI, SPRIG_TEST_MOVE_CMDS; tools/live/README.md"]
 #[tokio::test]
 async fn change_stream_survives_shard_moves() {
     let (Some(u), Some(cmds)) = (uri("SPRIG_TEST_MONGO_URI"), uri("SPRIG_TEST_MOVE_CMDS")) else {
         eprintln!("SPRIG_TEST_MONGO_URI or SPRIG_TEST_MOVE_CMDS not set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let cl = client(&u).await;
     let db = cl.database("r5mongo2_cs_move");

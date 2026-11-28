@@ -1,0 +1,26 @@
+# JSON_TABLE, part 2: ON EMPTY / ON ERROR with ERROR and DEFAULT, conversions, nesting with ordinality, errors, correlated use.
+x:DROP TABLE IF EXISTS jt_b
+q:CREATE TABLE jt_b (id INT PRIMARY KEY, doc JSON)
+q:INSERT INTO jt_b VALUES (1, '{"t":[{"k":1},{"k":2}]}'), (2, '{"t":[]}'), (3, '{"t":[{"k":"z"}]}')
+q:SELECT * FROM JSON_TABLE('[{"a":"x"}]', '$[*]' COLUMNS (a INT PATH '$.a' ERROR ON ERROR)) jt
+q:SELECT * FROM JSON_TABLE('[{"b":1}]', '$[*]' COLUMNS (a INT PATH '$.a' ERROR ON EMPTY)) jt
+q:SELECT * FROM JSON_TABLE('[{"a":"x"}]', '$[*]' COLUMNS (a INT PATH '$.a' DEFAULT '7' ON ERROR)) jt
+q:SELECT * FROM JSON_TABLE('[{"a":[1]}]', '$[*]' COLUMNS (a INT PATH '$.a' DEFAULT '7' ON EMPTY DEFAULT '8' ON ERROR)) jt
+q:SELECT * FROM JSON_TABLE('[{"b":1}]', '$[*]' COLUMNS (a INT PATH '$.a' DEFAULT '7' ON EMPTY DEFAULT '8' ON ERROR)) jt
+q:SELECT * FROM JSON_TABLE('[1,', '$[*]' COLUMNS (a INT PATH '$')) jt
+q:SELECT * FROM JSON_TABLE('[1]', '$[*]' COLUMNS (a VARCHAR(5) CHARACTER SET utf8mb4 PATH '$', j JSON PATH '$')) jt
+q:SELECT * FROM JSON_TABLE('[{"a":{"k":1}}]', '$[*]' COLUMNS (j JSON PATH '$.a', e VARCHAR(3) EXISTS PATH '$.a.k')) jt
+q:SELECT * FROM JSON_TABLE('{"o":[{"p":[1,2]},{"p":[3]}]}', '$.o[*]' COLUMNS (i FOR ORDINALITY, NESTED PATH '$.p[*]' COLUMNS (j FOR ORDINALITY, v INT PATH '$'))) jt
+q:SELECT * FROM JSON_TABLE('{"o":[{"p":[{"q":[7,8]}]}]}', '$.o[*]' COLUMNS (NESTED PATH '$.p[*]' COLUMNS (NESTED PATH '$.q[*]' COLUMNS (v INT PATH '$')))) jt
+q:SELECT * FROM JSON_TABLE('["abcdefgh"]', '$[*]' COLUMNS (a VARCHAR(3) PATH '$')) jt
+q:SELECT * FROM JSON_TABLE('[300, -5]', '$[*]' COLUMNS (a TINYINT PATH '$', u INT UNSIGNED PATH '$')) jt
+q:SELECT * FROM JSON_TABLE('[true, null, 1e2]', '$[*]' COLUMNS (a INT PATH '$', s VARCHAR(10) PATH '$')) jt
+q:SELECT * FROM JSON_TABLE('[1]', 'x' COLUMNS (a INT PATH '$')) jt
+q:SELECT * FROM JSON_TABLE('[1]', '$[*]' COLUMNS (a INT PATH 'x')) jt
+q:SELECT * FROM JSON_TABLE('[1]', '$[*]' COLUMNS (NESTED '$' COLUMNS (a INT PATH '$'))) jt
+q:SELECT b.id, (SELECT COUNT(*) FROM JSON_TABLE(b.doc, '$.t[*]' COLUMNS (k INT PATH '$.k')) j) AS n FROM jt_b b ORDER BY b.id
+q:SELECT b.id, j.k FROM jt_b b JOIN JSON_TABLE(b.doc, '$.t[*]' COLUMNS (k VARCHAR(3) PATH '$.k')) j ON j.k <> '2' ORDER BY b.id, j.k
+q:SELECT j.k, COUNT(*) FROM jt_b b, JSON_TABLE(b.doc, '$.t[*]' COLUMNS (k INT PATH '$.k' NULL ON ERROR)) j GROUP BY j.k ORDER BY j.k
+q:WITH c AS (SELECT doc FROM jt_b WHERE id = 1) SELECT j.* FROM c, JSON_TABLE(c.doc, '$.t[*]' COLUMNS (r FOR ORDINALITY, k INT PATH '$.k')) j
+q:SELECT * FROM JSON_TABLE(CONCAT('[', '1,2', ']'), '$[*]' COLUMNS (a INT PATH '$')) jt ORDER BY a DESC LIMIT 1
+x:DROP TABLE IF EXISTS jt_b

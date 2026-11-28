@@ -116,11 +116,22 @@ impl Engine {
         // leadership of this node left pending are gone (each is applied
         // already, or was replaced in the log).
         self.forget_unit_state(unit, "took");
+        let replicated = self.is_replicated_unit(unit);
+        if replicated {
+            // Commits across units prepared here under earlier leaders, or
+            // anchored here: read back (their keys locked again) before the
+            // unit counts as led, so nothing reads or writes past them.
+            self.txn_shared().cross_taking(unit.0, true);
+            self.txn_shared().load_cross_led(self, unit.0);
+        }
         let l = self.leaders();
         l.next.fetch_max(epoch.saturating_add(1), Ordering::AcqRel);
         l.set(unit, epoch);
-        if self.is_replicated_unit(unit) {
+        if replicated {
+            self.txn_shared().cross_taking(unit.0, false);
             self.txn_shared().load_xa_of(self, Some(unit.0));
+            // The resolver finishes them from the anchors' records (not
+            // from here: this may run inside the log's own turn).
         }
     }
 
@@ -133,6 +144,8 @@ impl Engine {
     pub fn step_down(&self, unit: UnitId) {
         self.leaders().set(unit, 0);
         self.forget_unit_state(unit, "lost");
+        // Commits across units this node was finishing for the unit are
+        // its next leader's: the resolver drops what is kept of them here.
     }
 
     /// Dooms the unit's lock holders and drops its pending versions.

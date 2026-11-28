@@ -15,8 +15,8 @@
 //!    is cached.
 //! 4. **Provider models** need `ai.share_data` on every database the
 //!    statement reads (39995 otherwise, before anything is sent). Answers
-//!    come from the function cache first (`t<id>_sprig.ai_fn_cache`, keyed
-//!    by the SHA-256 of function, model, arguments and input, kept
+//!    come from the function cache first (the tenant's catalog records,
+//!    keyed by the SHA-256 of function, model, arguments and input, kept
 //!    `ai.functions.cache_days`); the rest go to the provider, a few calls
 //!    at a time, `AI_CLASSIFY` up to [`CLASSIFY_BATCH`] inputs a call.
 //!    The daily budgets (`ai.budget.*`, shared with the assistants) are
@@ -25,7 +25,7 @@
 //!    rows get `NULL`.
 //! 5. **Every statement is audited** (`ai.function`: the function, model,
 //!    counts, tokens and the SHA-256 of each payload sent) and its tokens
-//!    are counted in `ai_usage` under `functions`.
+//!    are counted in the assistants' usage records under `functions`.
 //!
 //! Inputs are data, never instructions: prompts wrap them in tags and say
 //! so, and a model's answer is only ever a value.
@@ -50,7 +50,7 @@ use crate::provider::{
 };
 use crate::settings::Lookup;
 
-pub use cache::{CatalogFnCache, FnCache, MemoryFnCache};
+pub use cache::{FnCache, MemoryFnCache, RecordFnCache};
 
 type Text = std::borrow::Cow<'static, str>;
 
@@ -938,8 +938,17 @@ async fn provider_answers(
                     report.usage.add(&got.usage);
                     this_statement += got.usage.billable();
                     report.sent.extend(got.sent);
+                    // Tokens that weren't counted would slip past the
+                    // budgets, so a failed count fails the statement. Only
+                    // a lock conflict (39071: nothing was written) is
+                    // tried again; after any other error the write may
+                    // have committed, and a second one would count twice.
                     if let Err(e) = env.add_usage(&got.usage).await {
-                        tracing::warn!(error = %e, "AI function usage wasn't counted");
+                        if e.code() != Some(SprigCode::CatalogConflict) {
+                            return Err(e);
+                        }
+                        tracing::warn!(error = %e, "AI function usage wasn't counted; trying again");
+                        env.add_usage(&got.usage).await?;
                     }
                     for (&i, a) in unit.iter().zip(got.answers) {
                         match a {

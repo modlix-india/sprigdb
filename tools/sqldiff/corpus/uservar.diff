@@ -1,0 +1,29 @@
+# User variables in statements on engine tables: reads, assignments per row.
+x:DROP TABLE IF EXISTS uv_a
+q:CREATE TABLE uv_a (id INT PRIMARY KEY, v INT, s VARCHAR(10))
+q:INSERT INTO uv_a VALUES (1,10,'a'),(2,20,'b'),(3,30,'c'),(4,40,NULL)
+q:SET @x = 2, @t = 'b', @d = 1.5
+q:SELECT id FROM uv_a WHERE id = @x
+q:SELECT id FROM uv_a WHERE s = @t
+q:SELECT COUNT(*) FROM uv_a WHERE s = @t OR v > @x * 10
+q:SELECT id, v * @d FROM uv_a ORDER BY id
+q:SET @r = 0
+q:SELECT id, @r := @r + 1 AS rn FROM uv_a ORDER BY id
+q:SELECT @r
+q:SELECT @s := v FROM uv_a WHERE id = 2
+q:SELECT @s, @never
+q:SELECT id FROM uv_a WHERE (@m := v) > 15 ORDER BY id
+q:SELECT @m
+q:SELECT @r := 'x', @r
+q:SELECT @r
+q:SET @tot = 0
+q:SELECT id, @tot := @tot + v AS running FROM uv_a ORDER BY id
+q:SELECT @tot
+q:SELECT @c := COUNT(*) FROM uv_a
+q:SELECT @c
+q:SELECT id, @prev AS before_row, @prev := s AS now_row FROM uv_a ORDER BY id
+q:SELECT @prev
+q:UPDATE uv_a SET v = (@w := v + 1) WHERE id = 3
+q:SELECT @w
+q:SELECT id, v FROM uv_a WHERE id = 3
+x:DROP TABLE IF EXISTS uv_a

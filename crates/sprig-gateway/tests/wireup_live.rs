@@ -133,9 +133,12 @@ where
     false
 }
 
+#[ignore = "live: needs SPRIG_TEST_WIREUP_PORT, SPRIG_TEST_WIREUP_SET, SPRIG_TEST_SNI_SUFFIX, ...; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tenant_endpoints_by_sni() {
-    let Some(e) = env() else { return };
+    let Some(e) = env() else {
+        panic!("live test run without its environment: see tools/live/README.md")
+    };
     e.set("listener.tenant_sni_suffixes", &format!("\"{}\"", e.suffix));
     let acme = format!("acme.{}", e.suffix);
     let globex = format!("globex.{}", e.suffix);
@@ -243,9 +246,12 @@ fn client(ca: &Pki, cn: &str) -> (String, String) {
     (cert.pem(), key.serialize_pem())
 }
 
+#[ignore = "live: needs SPRIG_TEST_WIREUP_PORT, SPRIG_TEST_WIREUP_SET, SPRIG_TEST_SNI_SUFFIX, ...; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn client_certificates() {
-    let Some(e) = env() else { return };
+    let Some(e) = env() else {
+        panic!("live test run without its environment: see tools/live/README.md")
+    };
     let dir = std::env::temp_dir().join(format!("wireup-ca-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let good = ca("Wireup test CA");

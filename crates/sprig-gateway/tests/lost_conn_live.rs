@@ -140,11 +140,12 @@ async fn drop_schema(addr: &str, name: &str) {
 /// new connection, with the schema, user variables, character set and
 /// time zone replayed. The session's own time zone puts its connection in
 /// a pool bucket of its own, so its next statement meets the killed one.
+#[ignore = "live: needs SPRIG_TEST_GATEWAY, SPRIG_TEST_MARIADB_SINGLE; tools/live/README.md"]
 #[tokio::test]
 async fn statements_after_a_kill_run_on_a_new_connection() {
     let Some(Rig { eps, mut side }) = rig("statements_after_a_kill_run_on_a_new_connection").await
     else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     for (addr, persona) in &eps {
         let db = schema(addr, "gwfix_lost_safe").await;
@@ -228,12 +229,13 @@ async fn statements_after_a_kill_run_on_a_new_connection() {
 /// Unsafe cases, between statements: an open transaction is gone (1213,
 /// 40001, rolled back), and so are a temporary table and a `GET_LOCK()`
 /// lock (39033, 08S01). The session goes on, outside any transaction.
+#[ignore = "live: needs SPRIG_TEST_GATEWAY, SPRIG_TEST_MARIADB_SINGLE; tools/live/README.md"]
 #[tokio::test]
 async fn pinned_state_lost_between_statements_fails_cleanly() {
     let Some(Rig { eps, mut side }) =
         rig("pinned_state_lost_between_statements_fails_cleanly").await
     else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     for (addr, persona) in &eps {
         let db = schema(addr, "gwfix_lost_pinned").await;
@@ -280,10 +282,11 @@ async fn pinned_state_lost_between_statements_fails_cleanly() {
 /// Unsafe case, during a statement: an autocommit write whose connection
 /// dies while it runs may have taken effect, so it isn't retried: 39032
 /// (08S01, outcome unknown). The session goes on.
+#[ignore = "live: needs SPRIG_TEST_GATEWAY, SPRIG_TEST_MARIADB_SINGLE; tools/live/README.md"]
 #[tokio::test]
 async fn a_write_lost_while_running_is_not_retried() {
     let Some(Rig { eps, mut side }) = rig("a_write_lost_while_running_is_not_retried").await else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     for (addr, persona) in &eps {
         let db = schema(addr, "gwfix_lost_running").await;

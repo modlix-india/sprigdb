@@ -41,6 +41,7 @@ fn code_of(e: &mongodb::error::Error) -> i32 {
     }
 }
 
+#[ignore = "live: needs SPRIG_TEST_MONGO_URI; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn expressions_through_the_gateway() {
     let Some(uri) = std::env::var("SPRIG_TEST_MONGO_URI")
@@ -48,7 +49,7 @@ async fn expressions_through_the_gateway() {
         .filter(|s| !s.is_empty())
     else {
         eprintln!("SPRIG_TEST_MONGO_URI not set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../sprig-doc/tests/expr_diff");
     let text = std::fs::read_to_string(format!("{dir}/cases.json")).unwrap();

@@ -1,0 +1,7 @@
+# MySQL's MEMBER OF on engine tables.
+x:DROP TABLE IF EXISTS jo_t
+x:CREATE TABLE jo_t (id INT PRIMARY KEY, tags JSON)
+x:INSERT INTO jo_t VALUES (1, '["a", "b", 3]'), (2, '[]'), (3, NULL), (4, '"a"')
+q:SELECT id, 'a' MEMBER OF (tags), 3 MEMBER OF (tags), 'c' MEMBER OF (tags) FROM jo_t ORDER BY id
+q:SELECT id FROM jo_t WHERE 'b' MEMBER OF (tags) ORDER BY id
+x:DROP TABLE IF EXISTS jo_t

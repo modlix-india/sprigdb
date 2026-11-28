@@ -445,6 +445,7 @@ async fn privileges_are_checked() {
 /// Live only: privilege grants on a gateway. `SPRIG_AMQP_RO_USER` holds
 /// `SELECT, DELETE ON mq.*` only; `SPRIG_AMQP_NONE_USER` nothing (both
 /// with `SPRIG_AMQP_RO_PASSWORD`).
+#[ignore = "live: needs SPRIG_AMQP_RO_USER, SPRIG_AMQP_NONE_USER, SPRIG_AMQP_RO_PASSWORD; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn privileges_on_a_gateway() {
     let (Some(ro_user), Some(none_user), Some(pass)) = (
@@ -452,7 +453,7 @@ async fn privileges_on_a_gateway() {
         common::var("SPRIG_AMQP_NONE_USER"),
         common::var("SPRIG_AMQP_RO_PASSWORD"),
     ) else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let srv = server().await;
     // No right on the vhost's database: the vhost can't be opened.

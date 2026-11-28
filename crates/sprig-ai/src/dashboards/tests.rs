@@ -65,40 +65,49 @@ fn tile(sql: &str) -> Value {
     })
 }
 
+/// Each store the routes may use: in memory, and on catalog records.
+fn stores() -> Vec<Box<dyn DashStore>> {
+    vec![
+        Box::new(MemoryDashboards::default()),
+        Box::new(RecordsDashboards::new(
+            std::sync::Arc::new(sprig_catalog::records::mem::MemRecords::new()),
+            sprig_common::ids::TenantId(7),
+        )),
+    ]
+}
+
 fn code(e: &SprigError) -> u16 {
     e.protocol().mysql_errno
 }
 
-#[tokio::test]
-async fn private_dashboards_are_their_owners_and_shared_ones_everyones() {
-    let s = MemoryDashboards::default();
+async fn private_dashboards_are_their_owners_and_shared_ones_everyones_on(s: &dyn DashStore) {
     let alice = who(1, "alice", false);
     let bob = who(2, "bob", false);
     let admin = who(3, "carol", true);
-    let d = create(&s, &alice, &json!({"name": "Weekly sales"}))
+    let d = create(s, &alice, &json!({"name": "Weekly sales"}))
         .await
         .unwrap();
     let id = id_of(&d["id"]).unwrap();
     assert_eq!(d["mine"], true);
     assert_eq!(d["can_edit"], true);
-    add_tile(&s, &alice, id, &tile("SELECT region, revenue FROM sales"))
+    add_tile(s, &alice, id, &tile("SELECT region, revenue FROM sales"))
         .await
         .unwrap();
 
     // Private: nobody else sees it, not even an administrator.
     for w in [&bob, &admin] {
         assert!(
-            list(&s, w).await.unwrap()["shared"]
+            list(s, w).await.unwrap()["shared"]
                 .as_array()
                 .unwrap()
                 .is_empty()
         );
-        assert!(get(&s, w, id).await.is_err());
-        assert!(delete(&s, w, id).await.is_err());
+        assert!(get(s, w, id).await.is_err());
+        assert!(delete(s, w, id).await.is_err());
         let r = Runner::for_user(w);
-        let t = get(&s, &alice, id).await.unwrap()["tiles"][0]["id"].clone();
+        let t = get(s, &alice, id).await.unwrap()["tiles"][0]["id"].clone();
         assert!(
-            run_tile(&s, w, &r, id, id_of(&t).unwrap(), &json!({}))
+            run_tile(s, w, &r, id, id_of(&t).unwrap(), &json!({}))
                 .await
                 .is_err()
         );
@@ -106,32 +115,32 @@ async fn private_dashboards_are_their_owners_and_shared_ones_everyones() {
     }
 
     // Only the owner shares it.
-    assert_eq!(code(&share(&s, &admin, id, true).await.unwrap_err()), 39792);
-    let d = share(&s, &alice, id, true).await.unwrap();
+    assert_eq!(code(&share(s, &admin, id, true).await.unwrap_err()), 39792);
+    let d = share(s, &alice, id, true).await.unwrap();
     assert_eq!(d["shared"], true);
 
     // Shared: everyone sees it; bob can't change it, the administrator can.
-    let l = list(&s, &bob).await.unwrap();
+    let l = list(s, &bob).await.unwrap();
     assert_eq!(l["shared"][0]["name"], "Weekly sales");
     assert_eq!(l["shared"][0]["can_edit"], false);
     assert_eq!(l["shared"][0]["owner"], "alice");
-    assert_eq!(get(&s, &bob, id).await.unwrap()["can_edit"], false);
-    let e = update(&s, &bob, id, &json!({"name": "Mine now"}))
+    assert_eq!(get(s, &bob, id).await.unwrap()["can_edit"], false);
+    let e = update(s, &bob, id, &json!({"name": "Mine now"}))
         .await
         .unwrap_err();
     assert_eq!(code(&e), 1227);
     assert_eq!(
         code(
-            &add_tile(&s, &bob, id, &tile("SELECT region, revenue FROM t"))
+            &add_tile(s, &bob, id, &tile("SELECT region, revenue FROM t"))
                 .await
                 .unwrap_err()
         ),
         1227
     );
-    assert_eq!(code(&delete(&s, &bob, id).await.unwrap_err()), 1227);
-    assert_eq!(get(&s, &admin, id).await.unwrap()["can_edit"], true);
+    assert_eq!(code(&delete(s, &bob, id).await.unwrap_err()), 1227);
+    assert_eq!(get(s, &admin, id).await.unwrap()["can_edit"], true);
     update(
-        &s,
+        s,
         &admin,
         id,
         &json!({"name": "Weekly sales (all regions)"}),
@@ -139,34 +148,37 @@ async fn private_dashboards_are_their_owners_and_shared_ones_everyones() {
     .await
     .unwrap();
     // The administrator can't unshare it either: that is the owner's call.
-    assert_eq!(code(&share(&s, &admin, id, false).await.unwrap_err()), 1227);
+    assert_eq!(code(&share(s, &admin, id, false).await.unwrap_err()), 1227);
     // The owner unshares it, and it is hers alone again.
-    share(&s, &alice, id, false).await.unwrap();
-    assert!(get(&s, &bob, id).await.is_err());
+    share(s, &alice, id, false).await.unwrap();
+    assert!(get(s, &bob, id).await.is_err());
     // Shared again, the administrator may delete it.
-    share(&s, &alice, id, true).await.unwrap();
-    delete(&s, &admin, id).await.unwrap();
-    assert!(get(&s, &alice, id).await.is_err());
+    share(s, &alice, id, true).await.unwrap();
+    delete(s, &admin, id).await.unwrap();
+    assert!(get(s, &alice, id).await.is_err());
 }
 
 #[tokio::test]
-async fn a_viewer_runs_tiles_with_their_own_rights() {
-    let s = MemoryDashboards::default();
+async fn private_dashboards_are_their_owners_and_shared_ones_everyones() {
+    for s in stores() {
+        private_dashboards_are_their_owners_and_shared_ones_everyones_on(&*s).await;
+    }
+}
+
+async fn a_viewer_runs_tiles_with_their_own_rights_on(s: &dyn DashStore) {
     let alice = who(1, "alice", false);
     let bob = who(2, "bob", false);
-    let d = create(&s, &alice, &json!({"name": "Ops", "shared": true}))
+    let d = create(s, &alice, &json!({"name": "Ops", "shared": true}))
         .await
         .unwrap();
     let id = id_of(&d["id"]).unwrap();
-    let r = add_tile(&s, &alice, id, &tile("SELECT region, revenue FROM sales"))
+    let r = add_tile(s, &alice, id, &tile("SELECT region, revenue FROM sales"))
         .await
         .unwrap();
     let t = id_of(&r["tile"]).unwrap();
 
     let as_bob = Runner::for_user(&bob);
-    let out = run_tile(&s, &bob, &as_bob, id, t, &json!({}))
-        .await
-        .unwrap();
+    let out = run_tile(s, &bob, &as_bob, id, t, &json!({})).await.unwrap();
     // The runner is bob's: his rights, his rows.
     assert_eq!(out["rows"][0][0], "bob");
     assert_eq!(out["columns"][0]["name"], "seen_by");
@@ -178,10 +190,17 @@ async fn a_viewer_runs_tiles_with_their_own_rights() {
         )]
     );
     let as_alice = Runner::for_user(&alice);
-    let out = run_tile(&s, &alice, &as_alice, id, t, &json!({}))
+    let out = run_tile(s, &alice, &as_alice, id, t, &json!({}))
         .await
         .unwrap();
     assert_eq!(out["rows"][0][0], "alice");
+}
+
+#[tokio::test]
+async fn a_viewer_runs_tiles_with_their_own_rights() {
+    for s in stores() {
+        a_viewer_runs_tiles_with_their_own_rights_on(&*s).await;
+    }
 }
 
 #[test]
@@ -289,14 +308,10 @@ fn filter_values_become_literals_never_sql() {
     );
 }
 
-#[tokio::test]
 #[allow(clippy::many_single_char_names)]
-async fn tiles_and_filters_are_checked_when_saved() {
-    let s = MemoryDashboards::default();
+async fn tiles_and_filters_are_checked_when_saved_on(s: &dyn DashStore) {
     let alice = who(1, "alice", false);
-    let d = create(&s, &alice, &json!({"name": "Checks"}))
-        .await
-        .unwrap();
+    let d = create(s, &alice, &json!({"name": "Checks"})).await.unwrap();
     let id = id_of(&d["id"]).unwrap();
     // Writes, two statements, a chart naming a column the query lacks, a
     // mark that doesn't fit, a bad refresh or place.
@@ -315,26 +330,26 @@ async fn tiles_and_filters_are_checked_when_saved() {
         if let Some(c) = chart {
             t["chart"] = c;
         }
-        assert!(add_tile(&s, &alice, id, &t).await.is_err(), "{sql}");
+        assert!(add_tile(s, &alice, id, &t).await.is_err(), "{sql}");
     }
     let mut t = tile("SELECT region, revenue FROM sales");
     t["refresh_seconds"] = json!(5);
-    assert!(add_tile(&s, &alice, id, &t).await.is_err());
+    assert!(add_tile(s, &alice, id, &t).await.is_err());
     t["refresh_seconds"] = json!(300);
     t["pos"] = json!({"x": 8, "y": 0, "w": 6, "h": 4});
-    assert!(add_tile(&s, &alice, id, &t).await.is_err());
+    assert!(add_tile(s, &alice, id, &t).await.is_err());
     // A filter the dashboard doesn't have yet.
     let f = tile("SELECT region, revenue FROM sales WHERE day >= {{from}}");
-    assert!(add_tile(&s, &alice, id, &f).await.is_err());
+    assert!(add_tile(s, &alice, id, &f).await.is_err());
     update(
-        &s,
+        s,
         &alice,
         id,
         &json!({"filters": [{"name": "from", "label": "From", "kind": "date", "value": "2026-07-01"}]}),
     )
     .await
     .unwrap();
-    let r = add_tile(&s, &alice, id, &f).await.unwrap();
+    let r = add_tile(s, &alice, id, &f).await.unwrap();
     assert_eq!(
         r["dashboard"]["tiles"][0]["pos"],
         json!({"x": 0, "y": 0, "w": 6, "h": 4})
@@ -342,7 +357,7 @@ async fn tiles_and_filters_are_checked_when_saved() {
     // The chart spec may come as JSON text, as the assistant writes it.
     let mut t2 = tile("SELECT region, revenue FROM sales");
     t2["chart"] = json!(t2["chart"].to_string());
-    let r = add_tile(&s, &alice, id, &t2).await.unwrap();
+    let r = add_tile(s, &alice, id, &t2).await.unwrap();
     // The second tile goes beside the first.
     assert_eq!(
         r["dashboard"]["tiles"][1]["pos"],
@@ -356,7 +371,7 @@ async fn tiles_and_filters_are_checked_when_saved() {
         json!([{"name": "a", "kind": "number", "value": "ten"}]),
     ] {
         assert!(
-            update(&s, &alice, id, &json!({"filters": fl}))
+            update(s, &alice, id, &json!({"filters": fl}))
                 .await
                 .is_err(),
             "{fl}"
@@ -365,7 +380,7 @@ async fn tiles_and_filters_are_checked_when_saved() {
     // Moving tiles.
     let t1 = r["dashboard"]["tiles"][0]["id"].clone();
     let d = update(
-        &s,
+        s,
         &alice,
         id,
         &json!({"positions": [{"tile": t1, "pos": {"x": 0, "y": 4, "w": 12, "h": 6}}]}),
@@ -401,8 +416,13 @@ async fn tiles_and_filters_are_checked_when_saved() {
 }
 
 #[tokio::test]
-async fn the_assistants_tiles_are_accepted_into_a_dashboard() {
-    let s = MemoryDashboards::default();
+async fn tiles_and_filters_are_checked_when_saved() {
+    for s in stores() {
+        tiles_and_filters_are_checked_when_saved_on(&*s).await;
+    }
+}
+
+async fn the_assistants_tiles_are_accepted_into_a_dashboard_on(s: &dyn DashStore) {
     let alice = who(1, "alice", false);
     let bob = who(2, "bob", false);
     let proposal = json!({
@@ -411,22 +431,18 @@ async fn the_assistants_tiles_are_accepted_into_a_dashboard() {
         "chart": r#"{"mark": "bar", "columns": ["region"], "rows": ["aov"]}"#,
     });
     // No choice: the dashboard the assistant named, made for the caller.
-    let (d1, t1) = accept_tile(&s, &alice, &proposal, &json!({}))
-        .await
-        .unwrap();
-    let d = get(&s, &alice, d1).await.unwrap();
+    let (d1, t1) = accept_tile(s, &alice, &proposal, &json!({})).await.unwrap();
+    let d = get(s, &alice, d1).await.unwrap();
     assert_eq!(d["name"], "Weekly sales");
     assert_eq!(d["shared"], false);
     assert_eq!(d["tiles"][0]["id"], t1.to_string());
     assert_eq!(d["tiles"][0]["chart"]["mark"], "bar");
     // Again: the same dashboard, found by name.
-    let (d2, _) = accept_tile(&s, &alice, &proposal, &json!({}))
-        .await
-        .unwrap();
+    let (d2, _) = accept_tile(s, &alice, &proposal, &json!({})).await.unwrap();
     assert_eq!(d1, d2);
     // Into a new one, with the user's own title.
     let (d3, _) = accept_tile(
-        &s,
+        s,
         &alice,
         &proposal,
         &json!({"new_dashboard": "Board", "title": "AOV"}),
@@ -435,19 +451,19 @@ async fn the_assistants_tiles_are_accepted_into_a_dashboard() {
     .unwrap();
     assert_ne!(d3, d1);
     assert_eq!(
-        get(&s, &alice, d3).await.unwrap()["tiles"][0]["title"],
+        get(s, &alice, d3).await.unwrap()["tiles"][0]["title"],
         "AOV"
     );
     // Into someone else's shared dashboard: refused for bob.
-    share(&s, &alice, d1, true).await.unwrap();
-    let e = accept_tile(&s, &bob, &proposal, &json!({"dashboard": d1.to_string()}))
+    share(s, &alice, d1, true).await.unwrap();
+    let e = accept_tile(s, &bob, &proposal, &json!({"dashboard": d1.to_string()}))
         .await
         .unwrap_err();
     assert_eq!(code(&e), 1227);
     // A chart the user changed to one that doesn't fit is refused.
     assert!(
         accept_tile(
-            &s,
+            s,
             &alice,
             &proposal,
             &json!({"dashboard": d1, "chart": {"mark": "sankey", "columns": [{"field": "region"}], "rows": [{"field": "aov", "agg": "avg"}]}})
@@ -459,12 +475,51 @@ async fn the_assistants_tiles_are_accepted_into_a_dashboard() {
     // default dashboard, made the first time.
     let mut bare = proposal.clone();
     bare.as_object_mut().unwrap().remove("dashboard");
-    let (d4, _) = accept_tile(&s, &bob, &bare, &json!({})).await.unwrap();
-    let (d5, _) = accept_tile(&s, &bob, &bare, &json!({})).await.unwrap();
+    let (d4, _) = accept_tile(s, &bob, &bare, &json!({})).await.unwrap();
+    let (d5, _) = accept_tile(s, &bob, &bare, &json!({})).await.unwrap();
     assert_eq!(d4, d5);
-    let d = get(&s, &bob, d4).await.unwrap();
+    let d = get(s, &bob, d4).await.unwrap();
     assert_eq!(
         (d["name"].as_str(), d["mine"].as_bool()),
         (Some(DEFAULT_DASHBOARD), Some(true))
     );
+}
+
+#[tokio::test]
+async fn the_assistants_tiles_are_accepted_into_a_dashboard() {
+    for s in stores() {
+        the_assistants_tiles_are_accepted_into_a_dashboard_on(&*s).await;
+    }
+}
+
+/// The store checks a tile change with the dashboard held: a replaced tile
+/// must still be there (a delete in between isn't undone), and the tile cap
+/// holds for callers that checked an older copy of the dashboard.
+#[tokio::test]
+async fn the_store_checks_tiles_with_the_dashboard_held() {
+    for s in stores() {
+        let s = &*s;
+        let id = s
+            .create(UserId(1), "alice", "Race", false, &[])
+            .await
+            .unwrap();
+        let t = TileReq::from_json(&tile("SELECT region, revenue FROM sales")).unwrap();
+        let pos = Pos {
+            x: 0,
+            y: 0,
+            w: 6,
+            h: 4,
+        };
+        let tid = s.put_tile(id, None, &t, pos).await.unwrap();
+        assert!(s.delete_tile(id, tid).await.unwrap());
+        let e = s.put_tile(id, Some(tid), &t, pos).await.unwrap_err();
+        assert!(format!("{e}").contains("has no tile"), "{e}");
+        assert!(s.get(id).await.unwrap().unwrap().tiles.is_empty());
+        for _ in 0..MAX_TILES {
+            s.put_tile(id, None, &t, pos).await.unwrap();
+        }
+        let e = s.put_tile(id, None, &t, pos).await.unwrap_err();
+        assert!(format!("{e}").contains("at most"), "{e}");
+        assert_eq!(s.get(id).await.unwrap().unwrap().tiles.len(), MAX_TILES);
+    }
 }

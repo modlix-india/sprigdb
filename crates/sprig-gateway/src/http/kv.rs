@@ -104,7 +104,7 @@ pub fn frame_json(f: &Frame) -> Value {
         Frame::Null(_) => Value::Null,
         Frame::Boolean(b) => json!(b),
         Frame::Double(d) => serde_json::Number::from_f64(*d).map_or_else(
-            || Value::String(sprig_proto_redis::num::d2string(*d)),
+            || Value::String(sprig_proto_redis::num::reply_double_text(*d)),
             Value::Number,
         ),
         Frame::DoubleText(t) => std::str::from_utf8(t)

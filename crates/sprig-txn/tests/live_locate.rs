@@ -67,11 +67,12 @@ async fn prepared(url: &str, x: &Xid, schema: &str, k: i64) {
     drop(c);
 }
 
+#[ignore = "live: needs SPRIG_TEST_MARIADB_SINGLE; tools/live/README.md"]
 #[tokio::test]
 async fn the_resolver_finds_anchors_through_the_shard_maps() {
     let Ok(url) = std::env::var("SPRIG_TEST_MARIADB_SINGLE") else {
         eprintln!("skipped: set SPRIG_TEST_MARIADB_SINGLE to run it");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let url = url.split(',').next().unwrap().trim().to_owned();
     let p = pool(&url);

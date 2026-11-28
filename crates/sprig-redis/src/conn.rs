@@ -141,6 +141,7 @@ where
                         rest.extend_from_slice(&inbuf);
                         return Ok(Some((h, rest)));
                     }
+                    crate::stats::count(&cmds[at..], &replies);
                     at += replies.len().max(1);
                     for f in replies.iter().flatten() {
                         encode(f, sess.proto, &mut out);

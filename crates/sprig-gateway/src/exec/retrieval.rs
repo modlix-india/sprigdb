@@ -99,6 +99,9 @@ use crate::pipeline::{EndOfRows, ExecCtx, ResultSink, RowFormat, RowValues, Wire
 use crate::tenant::TenantServices;
 use crate::tenant::session::LocalWarning;
 
+mod engine;
+pub(crate) mod sync;
+
 /// The comment that asks for the key as one JSON column `key` (the REST
 /// route's statements; honoured only for the gateway's own).
 pub(crate) const KEY_JSON_HINT: &str = "/* sprig-retrieve:key-json */";
@@ -199,6 +202,23 @@ pub(crate) struct Found {
     /// keyword matches than it ranks ([`MAX_CANDIDATES`]); any makes the
     /// search skip its keyword list.
     keyword_skipped: usize,
+    /// An engine index with more chunks than `ai.retrieval.max_scan_chunks`
+    /// (the number): its vector list was left out.
+    vector_skipped: Option<u64>,
+}
+
+/// Warning 39827 for a search that skipped its vector list.
+fn vector_warning(f: &Found) -> Option<LocalWarning> {
+    f.vector_skipped.map(|cap| LocalWarning {
+        level: "Warning",
+        code: SprigCode::SearchWindowExceeded.number(),
+        message: format!(
+            "RETRIEVE({}.{}): no vector list: the index has more than {cap} chunks, more than a \
+             search compares one by one (ai.retrieval.max_scan_chunks); the hits come from the \
+             keyword list alone",
+            f.db, f.index.name
+        ),
+    })
 }
 
 /// Warning 39827 for a search that skipped its keyword list.
@@ -437,7 +457,7 @@ fn derived_table(found: &Found, alias: Option<&str>, key_as_json: bool, nbe: boo
             ]
             .map(str::to_owned),
         );
-        format!("SELECT {} FROM DUAL WHERE 0 = 1", cols.join(", "))
+        format!("SELECT {} LIMIT 0", cols.join(", "))
     } else {
         rows.join(" UNION ALL ")
     };
@@ -569,7 +589,9 @@ impl PassSession {
                 db,
                 name,
                 if_exists,
-            } => self.rx_drop(db, &name, if_exists).await.map(|()| None),
+            } => Box::pin(self.rx_drop(cx, wire, db, &name, if_exists))
+                .await
+                .map(|()| None),
             Stmt::ShowCreate { db, name } => self.rx_show_create(db, &name).await.map(Some),
             Stmt::Show { db } => self.rx_show(db).await.map(Some),
         };
@@ -747,25 +769,25 @@ impl PassSession {
                 c.name, c.table
             )));
         }
+        let new = NewIndex {
+            db_id: db_id.0,
+            name: c.name.clone(),
+            object_id: object,
+            text_column,
+            title_column,
+            filters,
+            key_columns,
+            chunking: c.chunking.as_catalog(),
+            model,
+            progress: json!({}),
+            created_by: user,
+        };
+        if engine::engine_db(&cat, db_id) {
+            return Box::pin(self.rx_create_engine(cx, wire, &db, &c.table, new, c.if_not_exists))
+                .await;
+        }
         let (mut conn, store) = self.rx_store().await?;
-        let id = store
-            .insert(
-                &mut conn,
-                &NewIndex {
-                    db_id: db_id.0,
-                    name: c.name.clone(),
-                    object_id: object,
-                    text_column,
-                    title_column,
-                    filters,
-                    key_columns,
-                    chunking: c.chunking.as_catalog(),
-                    model,
-                    progress: json!({}),
-                    created_by: user,
-                },
-            )
-            .await?;
+        let id = store.insert(&mut conn, &new).await?;
         let Some(id) = id else {
             if c.if_not_exists {
                 return Ok(());
@@ -799,6 +821,13 @@ impl PassSession {
             return Ok((None, db, cat, lctn));
         };
         let db_id = d.db_id.0;
+        if engine::engine_db(&cat, d.db_id) {
+            let mut tx = self.rx_records().await?;
+            let ix = sprig_ai::retrieval::rec::by_name(tx.as_mut(), db_id, name)
+                .await?
+                .filter(|ix| !sprig_ai::retrieval::rec::dropping(ix));
+            return Ok((ix, db, cat, lctn));
+        }
         let (mut conn, store) = self.rx_store().await?;
         let ix = store.by_name(&mut conn, db_id, name).await?;
         Ok((ix, db, cat, lctn))
@@ -810,7 +839,14 @@ impl PassSession {
             .map_or_else(|| format!("#{}", ix.object_id), |o| o.name.clone())
     }
 
-    async fn rx_drop(&mut self, db: Option<String>, name: &str, if_exists: bool) -> Result<()> {
+    async fn rx_drop(
+        &mut self,
+        cx: &mut ExecCtx<'_>,
+        wire: Wire,
+        db: Option<String>,
+        name: &str,
+        if_exists: bool,
+    ) -> Result<()> {
         let (ix, db, cat, lctn) = self.rx_find(db, name).await?;
         let Some(ix) = ix else {
             if if_exists {
@@ -821,6 +857,9 @@ impl PassSession {
         let table = Self::rx_table_name(&cat, &ix);
         if !self.rx_allowed(&cat, lctn, &db, DbId(ix.db_id), ix.object_id, Action::Index) {
             return Err(self.rx_denied("INDEX", &db, &table));
+        }
+        if engine::engine_db(&cat, DbId(ix.db_id)) {
+            return Box::pin(self.rx_drop_engine(cx, wire, &db, &ix)).await;
         }
         let (mut conn, store) = self.rx_store().await?;
         store.delete(&mut conn, ix.id).await?;
@@ -895,8 +934,17 @@ impl PassSession {
             ));
         };
         let db_id = d.db_id;
-        let (mut conn, store) = self.rx_store().await?;
-        let all = store.of_db(&mut conn, db_id.0).await?;
+        let all = if engine::engine_db(&cat, db_id) {
+            let mut tx = self.rx_records().await?;
+            sprig_ai::retrieval::rec::of_db(tx.as_mut(), db_id.0)
+                .await?
+                .into_iter()
+                .filter(|ix| !sprig_ai::retrieval::rec::dropping(ix))
+                .collect()
+        } else {
+            let (mut conn, store) = self.rx_store().await?;
+            store.of_db(&mut conn, db_id.0).await?
+        };
         let (lex, _) = self.lex_opts();
         let nbe = lex.no_backslash_escapes;
         let l = |s: &str| string_literal(s, nbe);
@@ -915,7 +963,11 @@ impl PassSession {
                 l(&ix.model.alias),
                 l(ix.state.as_str()),
                 ix.rows_indexed,
-                ix.shards().len(),
+                if engine::engine_db(&cat, db_id) {
+                    1
+                } else {
+                    ix.shards().len()
+                },
                 ix.last_error.as_deref().map_or_else(|| "CAST(NULL AS CHAR)".to_owned(), l)
             ));
         }
@@ -923,7 +975,7 @@ impl PassSession {
             return Ok(
                 "SELECT '' AS `Index`, '' AS `Table`, '' AS `Column`, '' AS `Model`, \
                        '' AS `State`, 0 AS `Rows`, 0 AS `Shards`, CAST(NULL AS CHAR) AS `Error` \
-                       FROM DUAL WHERE 0 = 1"
+                       LIMIT 0"
                     .to_owned(),
             );
         }
@@ -974,10 +1026,13 @@ impl PassSession {
                 Err(e) => return Ok(Some(self.fail(out, &e).await?)),
             };
             // Once per index the statement searches.
-            if let Some(w) = skipped_warning(&found)
-                && !warnings.iter().any(|x| x.message == w.message)
+            for w in [skipped_warning(&found), vector_warning(&found)]
+                .into_iter()
+                .flatten()
             {
-                warnings.push(w);
+                if !warnings.iter().any(|x| x.message == w.message) {
+                    warnings.push(w);
+                }
             }
             let alias = (!c.aliased).then_some("retrieve");
             edits.push((
@@ -1041,7 +1096,9 @@ impl PassSession {
         let table = cat
             .objects
             .get(ObjectId(ix.object_id))
-            .filter(|o| o.state == ObjectState::Active)
+            // A table renamed into another database isn't this index's
+            // any more.
+            .filter(|o| o.state == ObjectState::Active && o.db_id.0 == ix.db_id)
             .map(|o| o.name.clone())
             .ok_or_else(|| no_index(&db, &call.index))?;
         let (svc, tenant, _) = self.rx_services()?;
@@ -1093,6 +1150,31 @@ impl PassSession {
                 })
             }
         };
+        if engine::engine_db(&cat, DbId(ix.db_id)) {
+            let candidates = svc.settings.get(
+                &rx::CANDIDATES,
+                &cat.setting_ctx(&svc.dc),
+                Some(&cat.settings),
+            );
+            let bound =
+                crate::pipeline::SessionExec::row_policy_binds(self, ix.object_id) != Some(false);
+            let s = engine::EngineSearch {
+                chunk_filter: shard_filter,
+                table_filter,
+                q_vec,
+                per_list: usize::try_from(candidates).unwrap_or(40).max(1),
+                bound,
+                limit: usize::try_from(call.limit).unwrap_or(10),
+                weight: sprig_docs::search::keyword_weight(&call.query),
+                nbe,
+                max_scan: svc.settings.get(
+                    &rx::MAX_SCAN_CHUNKS,
+                    &cat.setting_ctx(&svc.dc),
+                    Some(&cat.settings),
+                ),
+            };
+            return Box::pin(self.rx_search_engine(cx, wire, call, ix, db, table, s)).await;
+        }
         // The index's shards and their clusters: a data group's are those
         // its map holds now (a split's, merge's or move's new shards from
         // their cutover, with the chunk tables the move carried); a
@@ -1276,59 +1358,18 @@ impl PassSession {
                     rows.push(c.key.clone());
                 }
             }
-            let mut visible: HashSet<Vec<Option<String>>> = HashSet::new();
-            for part in rows.chunks(200) {
-                let pred: Vec<String> = part
-                    .iter()
-                    .map(|k| {
-                        let eq: Vec<String> = keys
-                            .iter()
-                            .zip(k)
-                            .map(|(c, v)| {
-                                format!(
-                                    "{} = {}",
-                                    quote(&c.name),
-                                    key_literal(c, v.as_deref(), nbe)
-                                )
-                            })
-                            .collect();
-                        format!("({})", eq.join(" AND "))
-                    })
-                    .collect();
-                let sel: Vec<String> = keys
-                    .iter()
-                    .map(|k| {
-                        if k.binary {
-                            format!("LOWER(HEX({}))", quote(&k.name))
-                        } else {
-                            quote(&k.name)
-                        }
-                    })
-                    .collect();
-                let mut readable = vec![format!("{} IS NULL", quote(&ix.text_column))];
-                if let Some(t) = &ix.title_column {
-                    readable.push(format!("{} IS NULL", quote(t)));
-                }
-                let sql = format!(
-                    "SELECT {}, {} FROM {}.{} WHERE ({}){}",
-                    sel.join(", "),
-                    readable.join(", "),
-                    quote(&db),
-                    quote(&table),
-                    pred.join(" OR "),
-                    table_filter
-                        .as_deref()
-                        .map_or_else(String::new, |f| format!(" AND ({f})"))
-                );
-                for r in self.sub_rows(cx, wire, &sql).await? {
-                    visible.insert(
-                        r.iter()
-                            .take(nk)
-                            .map(|v| v.as_ref().map(|b| String::from_utf8_lossy(b).into_owned()))
-                            .collect(),
-                    );
-                }
-            }
+            let visible = self
+                .rx_visible(
+                    cx,
+                    wire,
+                    &ix,
+                    &db,
+                    &table,
+                    &rows,
+                    table_filter.as_deref(),
+                    nbe,
+                )
+                .await?;
             if bound {
                 let kw = rank_visible(
                     &call.query,
@@ -1357,6 +1398,7 @@ impl PassSession {
                         hits: fuse(&kw, &vecs, weight, limit),
                         shards: shards.len(),
                         keyword_skipped: over,
+                        vector_skipped: None,
                     },
                     if q_vec.is_some() { "hybrid" } else { "keyword" },
                 ));
@@ -1382,12 +1424,83 @@ impl PassSession {
                         hits,
                         shards: shards.len(),
                         keyword_skipped: 0,
+                        vector_skipped: None,
                     },
                     if q_vec.is_some() { "hybrid" } else { "keyword" },
                 ));
             }
             per_list = (per_list * 4).min(MAX_CANDIDATES);
         }
+    }
+}
+
+impl PassSession {
+    /// The keys of `rows` (source rows, as key text) whose rows the
+    /// session reads now: privileges, column grants on the text and title,
+    /// row-level security and `table_filter` apply, and a deleted row is
+    /// gone.
+    #[allow(clippy::too_many_arguments)] // the search's parts
+    pub(super) async fn rx_visible(
+        &mut self,
+        cx: &mut ExecCtx<'_>,
+        wire: Wire,
+        ix: &RetrievalIndex,
+        db: &str,
+        table: &str,
+        rows: &[Vec<Option<String>>],
+        table_filter: Option<&str>,
+        nbe: bool,
+    ) -> Result<HashSet<Vec<Option<String>>>> {
+        let keys = &ix.key_columns;
+        let nk = keys.len();
+        let mut visible: HashSet<Vec<Option<String>>> = HashSet::new();
+        for part in rows.chunks(200) {
+            let pred: Vec<String> = part
+                .iter()
+                .map(|k| {
+                    let eq: Vec<String> = keys
+                        .iter()
+                        .zip(k)
+                        .map(|(c, v)| {
+                            format!("{} = {}", quote(&c.name), key_literal(c, v.as_deref(), nbe))
+                        })
+                        .collect();
+                    format!("({})", eq.join(" AND "))
+                })
+                .collect();
+            let sel: Vec<String> = keys
+                .iter()
+                .map(|k| {
+                    if k.binary {
+                        format!("LOWER(HEX({}))", quote(&k.name))
+                    } else {
+                        quote(&k.name)
+                    }
+                })
+                .collect();
+            let mut readable = vec![format!("{} IS NULL", quote(&ix.text_column))];
+            if let Some(t) = &ix.title_column {
+                readable.push(format!("{} IS NULL", quote(t)));
+            }
+            let sql = format!(
+                "SELECT {}, {} FROM {}.{} WHERE ({}){}",
+                sel.join(", "),
+                readable.join(", "),
+                quote(db),
+                quote(table),
+                pred.join(" OR "),
+                table_filter.map_or_else(String::new, |f| format!(" AND ({f})"))
+            );
+            for r in self.sub_rows(cx, wire, &sql).await? {
+                visible.insert(
+                    r.iter()
+                        .take(nk)
+                        .map(|v| v.as_ref().map(|b| String::from_utf8_lossy(b).into_owned()))
+                        .collect(),
+                );
+            }
+        }
+        Ok(visible)
     }
 }
 
@@ -1550,6 +1663,7 @@ mod tests {
             table: "t".into(),
             shards: 1,
             keyword_skipped: 0,
+            vector_skipped: None,
             hits: vec![Hit {
                 key: vec![Some("7".into())],
                 chunk_no: 0,
@@ -1566,7 +1680,7 @@ mod tests {
         let js = derived_table(&found, None, true, false);
         assert!(js.contains(r#"'{"id":7}' AS `key`"#), "{js}");
         found.hits.clear();
-        assert!(derived_table(&found, None, false, false).contains("WHERE 0 = 1"));
+        assert!(derived_table(&found, None, false, false).contains("LIMIT 0"));
         // Keys as literals.
         assert_eq!(key_literal(&keys[0], Some("1 OR 1"), false), "'1 OR 1'");
         assert_eq!(key_literal(&keys[0], Some("-3"), false), "-3");
@@ -1574,6 +1688,11 @@ mod tests {
         // A search that kept its keyword list has no warning; one that
         // skipped it, 39827 naming the index and the shards.
         assert!(skipped_warning(&found).is_none());
+        assert!(vector_warning(&found).is_none());
+        found.vector_skipped = Some(50_000);
+        let w = vector_warning(&found).unwrap();
+        assert!(w.message.contains("no vector list"), "{}", w.message);
+        found.vector_skipped = None;
         found.keyword_skipped = 1;
         let w = skipped_warning(&found).unwrap();
         assert_eq!((w.level, w.code), ("Warning", 39827));

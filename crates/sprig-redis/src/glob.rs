@@ -1,4 +1,4 @@
-//! Redis's glob matcher (`stringmatchlen`), for `KEYS`, `SCAN MATCH`,
+//! Glob patterns as Redis clients use them, for `KEYS`, `SCAN MATCH`,
 //! `PSUBSCRIBE` and the like: `*`, `?`, `[...]` with `^` and ranges, `\`
 //! escapes; bytes compared exactly.
 
@@ -31,7 +31,8 @@ fn eq(a: u8, b: u8, nocase: bool) -> bool {
 
 #[allow(clippy::too_many_lines)]
 fn m(mut p: &[u8], mut s: &[u8], nocase: bool, skip: &mut u32, nesting: u32) -> bool {
-    // Redis bounds recursion the same way (stringmatchlen_impl).
+    // Nesting is bounded: past 1,000 levels a pattern matches nothing, so a
+    // hostile pattern can't exhaust the stack.
     if nesting > 1000 {
         return false;
     }

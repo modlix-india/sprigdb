@@ -8,6 +8,9 @@ license: Apache-2.0
 home: https://github.com/modlix-india/sprigdb
 kubeVersion: ">=1.27.0-0"
 annotations:
-  # Needs mariadb-operator (k8s.mariadb.com/v1alpha1) and cert-manager in the
-  # cluster; this chart installs neither.
-  sprigdb.io/requires: "mariadb-operator, cert-manager, trust-manager"
+  # Storage engine nodes (node.enabled, templates/node.yaml) need cert-manager
+  # and trust-manager. mariadb-operator (k8s.mariadb.com/v1alpha1) is needed
+  # only for values.pools, the MariaDB-backed clusters from before the
+  # storage engine; set `pools: []` to install without it. This chart installs
+  # none of them.
+  sprigdb.io/requires: "cert-manager, trust-manager; mariadb-operator only with values.pools"

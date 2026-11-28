@@ -117,7 +117,9 @@ pub(crate) async fn refs(
 ) -> Result<RawRows> {
     let schema = SchemaName::catalog(root).to_string();
     if sprig_catalog::migrate::records_catalog(&schema).await? {
-        let mut tx = svc.records.begin(root).await?;
+        // The root's records: on its unit's leader (another tenant's unit,
+        // led elsewhere or not held here at all).
+        let mut tx = svc.writers.begin(root).await?;
         let rows = match sprig_inherit::refs::run(&mut *tx, op).await {
             Ok(rows) => rows,
             Err(e) => {
@@ -796,7 +798,8 @@ pub(crate) async fn engine_copy_states(
     svc: &TenantServices,
     t: TenantId,
 ) -> Result<Vec<(sprig_inherit::copy::CopyKey, CopyRow)>> {
-    let mut tx = svc.records.begin(t).await?;
+    // Another tenant's records: on its unit's leader.
+    let mut tx = svc.writers.begin(t).await?;
     let rows = COPIES
         .scan::<CopyRow>(&mut *tx, &sprig_catalog::records::Pk::new())
         .await;
@@ -890,7 +893,8 @@ pub(crate) async fn set_engine_copy_state(
     k: sprig_inherit::copy::CopyKey,
     row: Option<&CopyRow>,
 ) -> Result<()> {
-    let mut tx = svc.records.begin(k.tenant).await?;
+    // The copy's tenant's records: on its unit's leader.
+    let mut tx = svc.writers.begin(k.tenant).await?;
     let pk = copy_pk(k.object, k.share);
     let r = match row {
         Some(row) => COPIES.put(&mut *tx, &pk, row).await,
@@ -988,7 +992,8 @@ impl TreeSource {
     #[allow(clippy::unused_async)] // as when it looked the catalog's pool up
     async fn catalog(&self) -> Result<RecordSequences> {
         Ok(
-            RecordSequences::new(Arc::clone(&self.svc.records), self.root)
+            // The root's counters: on its unit's leader.
+            RecordSequences::new(Arc::clone(&self.svc.writers), self.root)
                 .held_by(self.holder.clone(), BLOCK_LEASE),
         )
     }

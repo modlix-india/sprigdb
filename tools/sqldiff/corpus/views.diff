@@ -1,0 +1,66 @@
+# SQL views on engine databases: CREATE / ALTER / DROP VIEW, reads through views (merged), nested views,
+# column lists, TEMPTABLE, WITH CHECK OPTION refusals, SHOW CREATE VIEW, SHOW FULL TABLES, information_schema.
+x:DROP VIEW IF EXISTS vw_a, vw_b, vw_c, vw_d, vw_e, vw_f, vw_g, vw_h, vw_w
+x:DROP TABLE IF EXISTS vw_t, vw_u
+x:CREATE TABLE vw_t (id INT PRIMARY KEY, a INT, b VARCHAR(10), d DATE, KEY (a))
+x:CREATE TABLE vw_u (k INT PRIMARY KEY, id INT, n VARCHAR(5))
+x:INSERT INTO vw_t VALUES (1, 10, 'x', '2024-01-01'), (2, 20, 'y', '2024-02-01'), (3, NULL, 'x', NULL), (4, 40, NULL, '2024-04-04'), (5, 5, 'z', '2024-05-05')
+x:INSERT INTO vw_u VALUES (1, 1, 'p'), (2, 1, 'q'), (3, 2, 'r'), (4, 9, 's')
+q:CREATE VIEW vw_a AS SELECT id, a + 1 AS a1, b FROM vw_t WHERE a > 5
+q:SELECT * FROM vw_a ORDER BY id
+q:SELECT a1, b FROM vw_a WHERE a1 > 15 ORDER BY a1 DESC
+q:SELECT v.id, u.n FROM vw_a v JOIN vw_u u ON u.id = v.id ORDER BY v.id, u.n
+q:SELECT COUNT(*), SUM(a1) FROM vw_a
+q:CREATE VIEW vw_b (x, y) AS SELECT id, b FROM vw_t
+q:SELECT * FROM vw_b WHERE y = 'x' ORDER BY x
+q:SELECT x FROM vw_b WHERE x IN (SELECT id FROM vw_a) ORDER BY x
+q:CREATE ALGORITHM=TEMPTABLE SQL SECURITY INVOKER VIEW vw_c AS SELECT b, COUNT(*) AS n, MAX(a) AS m FROM vw_t GROUP BY b
+q:SELECT * FROM vw_c ORDER BY b
+q:CREATE VIEW vw_d AS SELECT c.b, c.n, a.a1 FROM vw_c c LEFT JOIN vw_a a ON a.b = c.b
+q:SELECT * FROM vw_d ORDER BY b, a1
+q:CREATE VIEW vw_e AS SELECT a FROM vw_t UNION SELECT k FROM vw_u
+q:SELECT * FROM vw_e ORDER BY a
+q:CREATE VIEW vw_f AS SELECT id, (SELECT MAX(k) FROM vw_u WHERE vw_u.id = vw_t.id) AS m, CONCAT(b, '!'), IF(a IS NULL, 0, a) FROM vw_t WHERE id IN (1, 2, 3) AND NOT a = 20
+q:SELECT * FROM vw_f ORDER BY id
+q:CREATE VIEW vw_g AS SELECT DISTINCT b FROM vw_t WITH CHECK OPTION
+q:CREATE VIEW vw_g (p, q) AS SELECT id FROM vw_t
+q:CREATE VIEW vw_g AS SELECT id, id FROM vw_t
+q:CREATE VIEW vw_g AS SELECT nope FROM vw_t
+q:CREATE VIEW vw_g AS SELECT id FROM vw_nothere
+q:CREATE VIEW vw_a AS SELECT 1
+q:CREATE VIEW vw_t AS SELECT 1
+q:CREATE VIEW vw_g AS SELECT id, b FROM vw_t WHERE a > 1 WITH LOCAL CHECK OPTION
+q:CREATE OR REPLACE VIEW vw_h AS SELECT 1 AS one, 'two' AS two
+q:SELECT * FROM vw_h
+q:ALTER VIEW vw_h AS SELECT id FROM vw_t WHERE id < 3
+q:SELECT * FROM vw_h ORDER BY id
+q:CREATE VIEW vw_w AS SELECT id, a, a + 1 AS a1 FROM vw_t WHERE a > 5 WITH CHECK OPTION
+q:INSERT INTO vw_w (id, a) VALUES (11, 1)
+q:INSERT INTO vw_w (id, a) VALUES (12, 30)
+q:UPDATE vw_w SET a = 2 WHERE id = 1
+q:UPDATE vw_w SET a1 = 2 WHERE id = 1
+q:UPDATE vw_w SET a = a + 100 WHERE a1 > 20
+q:DELETE FROM vw_w WHERE a1 = 105
+q:SELECT * FROM vw_t ORDER BY id
+q:UPDATE vw_c SET n = 1
+q:DELETE FROM vw_c
+q:INSERT INTO vw_c VALUES ('q', 1, 2)
+q:INSERT INTO vw_w VALUES (9, 9, 9)
+q:UPDATE vw_b SET y = 'w' WHERE x = 3
+q:DELETE FROM vw_b WHERE x = 5
+q:INSERT INTO vw_b VALUES (21, 'new')
+q:SELECT * FROM vw_t ORDER BY id
+q:SHOW FULL TABLES
+q:SHOW TABLES LIKE 'vw_%'
+q:SELECT TABLE_NAME, VIEW_DEFINITION, CHECK_OPTION, IS_UPDATABLE, SECURITY_TYPE FROM information_schema.VIEWS WHERE TABLE_SCHEMA = 'rg_a' ORDER BY TABLE_NAME
+q:SELECT TABLE_NAME, TABLE_TYPE, ENGINE, TABLE_COMMENT FROM information_schema.TABLES WHERE TABLE_SCHEMA = 'rg_a' AND TABLE_NAME LIKE 'vw%' ORDER BY TABLE_NAME
+q:SHOW CREATE VIEW vw_t
+q:SHOW CREATE VIEW vw_nothere
+q:DROP VIEW vw_t
+q:DROP TABLE vw_a
+q:DROP VIEW vw_nothere
+q:DROP VIEW IF EXISTS vw_nothere
+q:DROP VIEW vw_h
+q:SELECT * FROM vw_h
+x:DROP VIEW IF EXISTS vw_a, vw_b, vw_c, vw_d, vw_e, vw_f, vw_g, vw_h, vw_w
+x:DROP TABLE IF EXISTS vw_t, vw_u

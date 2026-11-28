@@ -605,7 +605,10 @@ impl PassSession {
         let Some(eng) = catalog::of(cat) else {
             return Ok(None);
         };
-        if top_is_raw() {
+        // The statement's own one-row changes, and the embedded-column
+        // runner's writes of its column (crate::exec::embed_ddl::write):
+        // no trigger, no validation.
+        if top_is_raw() || crate::exec::embed_ddl::write::active() {
             return Ok(None);
         }
         let text = match logical.or(self.eng.entry.as_deref()) {
@@ -835,7 +838,17 @@ impl PassSession {
     /// A one-row change or read of the statement's own: fires nothing.
     async fn trg_raw(&mut self, cx: &mut ExecCtx<'_>, sql: &str) -> Result<Ran> {
         let _ = STACK.try_with(|s| s.borrow_mut().push(RAW.to_owned()));
+        // The layer's own one-row statements name every stored column,
+        // the hidden `_sprig_` ones too (embedded columns' sources, MySQL
+        // functional key parts), which a client's statement may not name.
+        let was = self
+            .tenant
+            .as_deref_mut()
+            .map(|ts| std::mem::replace(&mut ts.types.internal, true));
         let r = self.sp_statement(cx, sql, None, true).await;
+        if let (Some(ts), Some(w)) = (self.tenant.as_deref_mut(), was) {
+            ts.types.internal = w;
+        }
         let _ = STACK.try_with(|s| s.borrow_mut().pop());
         r.map_err(|e| e.to_error())
     }
@@ -1035,7 +1048,7 @@ impl PassSession {
         new: &mut [Datum],
         old: &[Datum],
     ) -> Result<()> {
-        let names: Vec<String> = def.columns.iter().map(|c| c.name.clone()).collect();
+        let names = trigger_names(def);
         let n = def.columns.len();
         for t in trigs {
             self.trg_rights(t, db, def)?;
@@ -2030,9 +2043,54 @@ impl PassSession {
     }
 }
 
+/// The column names a trigger's `NEW` and `OLD` read, in the table's
+/// order: a hidden `_sprig_` column (an embedded column's source or hash,
+/// a MySQL functional key part) keeps its place under a name no statement
+/// can write, so the trigger's code can't see it.
+fn trigger_names(def: &TableDef) -> Vec<String> {
+    visible_names(def.columns.iter().map(|c| c.name.as_str()))
+}
+
+/// [`trigger_names`] over the columns' names.
+fn visible_names<'a>(names: impl Iterator<Item = &'a str>) -> Vec<String> {
+    names
+        .enumerate()
+        .map(|(i, n)| {
+            if sprig_common::names::is_internal_column(n) {
+                format!("\u{0}hidden{i}")
+            } else {
+                n.to_owned()
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::cols_subst;
+    use super::{cols_subst, visible_names};
+
+    #[test]
+    fn hidden_columns_are_out_of_a_triggers_reach() {
+        // An embedded column's source and hash, and a MySQL functional key
+        // part's column, keep their places under names no statement writes.
+        let names = visible_names(
+            [
+                "id",
+                "body",
+                "emb",
+                "_sprig_emb_emb_src",
+                "_SPRIG_EMB_emb_hash",
+                "_sprig_fx_k1",
+            ]
+            .into_iter(),
+        );
+        assert_eq!(&names[..3], ["id", "body", "emb"]);
+        assert_eq!(names.len(), 6);
+        for (i, n) in names.iter().enumerate().skip(3) {
+            assert_eq!(n, &format!("\u{0}hidden{i}"));
+            assert!(!sprig_common::names::is_internal_column(n));
+        }
+    }
 
     #[test]
     fn column_references_are_replaced_but_not_names_of_other_things() {

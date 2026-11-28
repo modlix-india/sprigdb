@@ -27,7 +27,7 @@ use sprig_proto_redis::Frame;
 use sprig_redis_engine::layout::{KIND_ELEM, KIND_EXPIRY, Space};
 use sprig_redis_engine::mem::MemUnit;
 use sprig_redis_engine::store::Ticket;
-use sprig_redis_engine::{Backend, Batch, EngineDb, EngineUnit, Tenants, Unit};
+use sprig_redis_engine::{Backend, Batch, EngineDb, EngineUnit, Tenants, Unit, Walled};
 
 const T: u64 = 42;
 
@@ -132,7 +132,7 @@ three!(
 );
 three!(index_mem, index_path, index_rocks, scan_index_and_uids);
 
-fn db<U: Unit>(unit: &Arc<U>) -> Arc<EngineDb<U>> {
+fn db<U: Unit>(unit: &Arc<U>) -> Arc<EngineDb<Walled<U>>> {
     Backend::new(Arc::clone(unit), Tenants::All, 16)
         .db(T, 0)
         .unwrap()

@@ -12,6 +12,14 @@
 //! Produce stores the batch as the producer sent it
 //! ([`StreamData::append_batch`]); fetch returns stored batches as they
 //! are ([`StreamData::read_batches`]).
+//!
+//! **Fan-in topics.** A tenant that declares a `FOR EACH TENANT` stream
+//! and holds `SPRIG_FAN_IN` and `SELECT` on it also sees
+//! `__t.<member>.<db>.<stream>` for each member's instance
+//! ([`Gate::fan_in`] lists them): read-only topics whose id is a fan-in
+//! id of the reader's records ([`super::records::FIRST_FANIN_ID`]), so a
+//! group's offsets on one are the reader's records like any other's;
+//! fetch, list offsets and leader epochs read the member's partitions.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -36,7 +44,7 @@ use uuid::Uuid;
 
 use super::batch::{self, Head};
 use super::part::Outcome;
-use super::records::{StreamRecords, TopicRecord};
+use super::records::{StreamRecords, TopicRecord, is_fan_in};
 use super::{Key, OutOfRange, Pending, Policy, SegConfig, SegLog};
 
 /// The first id of an engine-stored stream.
@@ -98,6 +106,37 @@ pub trait Gate: Send + Sync + 'static {
         let _ = p;
         Limits::default()
     }
+    /// The fan-in topics `p` may read now (see the module docs): none by
+    /// default.
+    async fn fan_in(&self, p: &Principal) -> Vec<FanInTopic> {
+        let _ = p;
+        Vec::new()
+    }
+}
+
+/// A fan-in topic: `name` (`__t.<member>.<db>.<stream>`) reads member
+/// `member`'s stream `stream` (`<db>.<stream>`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FanInTopic {
+    /// The topic's name.
+    pub name: String,
+    /// The member.
+    pub member: u64,
+    /// The member's stream, `<db>.<stream>`.
+    pub stream: String,
+}
+
+/// Whether `name` is a fan-in topic's name.
+#[must_use]
+pub fn is_fan_in_name(name: &str) -> bool {
+    name.starts_with("__t.")
+}
+
+fn read_only(name: &str) -> TopicError {
+    terr(
+        err::TOPIC_AUTHORIZATION_FAILED,
+        format!("1142 fan-in topic {name} is read-only: publish into a member with FOR TENANT"),
+    )
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -266,7 +305,12 @@ impl EngineStreams {
             defaults,
         };
         for t in s.log.tenants() {
-            s.load(t)?;
+            // A tenant whose records can't be read now (its unit has no
+            // leader yet, or its replica is leaving this node) loads at
+            // its first use instead: the log itself is open.
+            if let Err(e) = s.load(t) {
+                tracing::warn!(tenant = t, error = %e, "streams: a tenant's topics weren't loaded at open; they load at first use");
+            }
         }
         Ok(s)
     }
@@ -524,6 +568,42 @@ impl EngineStreams {
         }
     }
 
+    /// The fan-in topic `f` of reader `reader`: its member's topic record
+    /// under the fan-in id and name; `None` when the instance is gone.
+    async fn fan_in_record(&self, reader: u64, f: &FanInTopic) -> Result<Option<TopicRecord>> {
+        let Some(r) = self.topic(f.member, &f.stream)? else {
+            return Ok(None);
+        };
+        let id = self
+            .records
+            .fan_in_id(reader, f.member, r.stream_id)
+            .await?;
+        Ok(Some(TopicRecord {
+            name: f.name.clone(),
+            stream_id: id,
+            ..r
+        }))
+    }
+
+    /// The log key of partition `partition` of `stream` as `reader` names
+    /// it: a fan-in id's member and stream, else `reader`'s own.
+    fn key_of(
+        &self,
+        reader: u64,
+        stream: u64,
+        partition: i32,
+    ) -> std::result::Result<Key, TopicError> {
+        if !is_fan_in(stream) {
+            return Ok(key(reader, stream, partition));
+        }
+        let (member, real) = self
+            .records
+            .fan_in_target(reader, stream)
+            .map_err(|e| internal(&e))?
+            .ok_or_else(|| terr(err::UNKNOWN_TOPIC_ID, format!("no fan-in topic {stream}")))?;
+        Ok(key(member, real, partition))
+    }
+
     fn data_topic(&self, tenant: u64, r: &TopicRecord) -> DataTopic {
         DataTopic {
             name: r.name.clone(),
@@ -567,7 +647,7 @@ impl EngineStreams {
         match self.log.outcome(p, deadline).await {
             None => Err(terr(
                 err::REQUEST_TIMED_OUT,
-                "39946 ER_SPRIG_STREAM_SEQUENCE_TIMEOUT: the append was not applied in time; \
+                "39946 ER_SPRIG_STREAM_SEQUENCING_TIMEOUT: the append was not applied in time; \
                  retry",
             )),
             Some(Outcome::Appended { base, .. } | Outcome::Duplicate { base, .. }) => Ok(base),
@@ -786,6 +866,16 @@ impl Topics for RoutedTopics {
                 out.push(EngineStreams::info(p.tenant_id, &r, d));
             }
         }
+        for f in self.gate.fan_in(p).await {
+            if let Some(r) = self
+                .eng
+                .fan_in_record(p.tenant_id, &f)
+                .await
+                .map_err(|e| internal(&e))?
+            {
+                out.push(EngineStreams::info(p.tenant_id, &r, self.eng.defaults));
+            }
+        }
         out.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(out)
     }
@@ -795,6 +885,23 @@ impl Topics for RoutedTopics {
         p: &Principal,
         name: &str,
     ) -> std::result::Result<Option<TopicInfo>, TopicError> {
+        if is_fan_in_name(name) {
+            let Some(f) = self
+                .gate
+                .fan_in(p)
+                .await
+                .into_iter()
+                .find(|f| f.name == name)
+            else {
+                return Ok(None);
+            };
+            return Ok(self
+                .eng
+                .fan_in_record(p.tenant_id, &f)
+                .await
+                .map_err(|e| internal(&e))?
+                .map(|r| EngineStreams::info(p.tenant_id, &r, self.eng.defaults)));
+        }
         if !self.engine_name(p, name).await {
             return self.inner.get(p, name).await;
         }
@@ -1144,6 +1251,35 @@ impl RoutedData {
         })
     }
 
+    /// Fan-in topic `name` for `p`: read-only; the gate's list decides
+    /// whether `p` sees it.
+    async fn fan_in_topic(
+        &self,
+        p: &Principal,
+        name: &str,
+        access: Access,
+    ) -> std::result::Result<DataTopic, TopicError> {
+        let Some(f) = self
+            .gate
+            .fan_in(p)
+            .await
+            .into_iter()
+            .find(|f| f.name == name)
+        else {
+            return Err(unknown(name));
+        };
+        if access == Access::Write {
+            return Err(read_only(name));
+        }
+        let r = self
+            .eng
+            .fan_in_record(p.tenant_id, &f)
+            .await
+            .map_err(|e| data_err(&e))?
+            .ok_or_else(|| unknown(name))?;
+        Ok(self.eng.data_topic(p.tenant_id, &r))
+    }
+
     async fn resolve(
         &self,
         p: &Principal,
@@ -1192,6 +1328,9 @@ impl StreamData for RoutedData {
         name: &str,
         access: Access,
     ) -> std::result::Result<DataTopic, TopicError> {
+        if is_fan_in_name(name) {
+            return self.fan_in_topic(p, name, access).await;
+        }
         let on = match split(name) {
             Ok((db, _)) => self.gate.on_engine(p, db).await,
             Err(_) => false,
@@ -1219,6 +1358,31 @@ impl StreamData for RoutedData {
         let unknown_id = || terr(err::UNKNOWN_TOPIC_ID, format!("no topic with id {id}"));
         if tenant != p.tenant_id {
             return Err(unknown_id());
+        }
+        if is_fan_in(stream) {
+            let (member, real) = self
+                .eng
+                .records
+                .fan_in_target(tenant, stream)
+                .map_err(|e| data_err(&e))?
+                .ok_or_else(unknown_id)?;
+            let name = self
+                .gate
+                .fan_in(p)
+                .await
+                .into_iter()
+                .find(|f| {
+                    f.member == member
+                        && self
+                            .eng
+                            .topic(member, &f.stream)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|r| r.stream_id == real)
+                })
+                .map(|f| f.name)
+                .ok_or_else(unknown_id)?;
+            return self.fan_in_topic(p, &name, access).await;
         }
         let r = self
             .eng
@@ -1262,9 +1426,11 @@ impl StreamData for RoutedData {
             .outcome(
                 pending_of(
                     ticket,
-                    self.eng
-                        .log()
-                        .unit_of_part(key(p.tenant_id, t.stream_id, ticket.partition)),
+                    self.eng.log().unit_of_part(self.eng.key_of(
+                        p.tenant_id,
+                        t.stream_id,
+                        ticket.partition,
+                    )?),
                 ),
                 deadline,
             )
@@ -1280,11 +1446,9 @@ impl StreamData for RoutedData {
         if !is_engine_stream(t.stream_id) {
             return self.inner()?.bounds(p, t, partition).await;
         }
-        Ok(EngineStreams::bounds_of(self.eng.log.bounds(key(
-            p.tenant_id,
-            t.stream_id,
-            partition,
-        ))))
+        Ok(EngineStreams::bounds_of(self.eng.log.bounds(
+            self.eng.key_of(p.tenant_id, t.stream_id, partition)?,
+        )))
     }
 
     async fn read(
@@ -1298,9 +1462,11 @@ impl StreamData for RoutedData {
         if !is_engine_stream(t.stream_id) {
             return self.inner()?.read(p, t, partition, offset, max_bytes).await;
         }
-        let (b, bytes) =
-            self.eng
-                .read_raw(key(p.tenant_id, t.stream_id, partition), offset, max_bytes)?;
+        let (b, bytes) = self.eng.read_raw(
+            self.eng.key_of(p.tenant_id, t.stream_id, partition)?,
+            offset,
+            max_bytes,
+        )?;
         let recs = decode_stored(&bytes, offset).map_err(|e| internal(&e))?;
         Ok((b, recs))
     }
@@ -1310,7 +1476,7 @@ impl StreamData for RoutedData {
             beyond.iter().partition(|(s, _, _)| is_engine_stream(*s));
         let keys: Vec<(Key, i64)> = mine
             .iter()
-            .map(|(s, part, o)| (key(p.tenant_id, *s, *part), *o))
+            .filter_map(|(s, part, o)| Some((self.eng.key_of(p.tenant_id, *s, *part).ok()?, *o)))
             .collect();
         match (&self.inner, keys.is_empty(), theirs.is_empty()) {
             (_, true, true) | (None, true, false) => tokio::time::sleep_until(deadline).await,
@@ -1337,7 +1503,7 @@ impl StreamData for RoutedData {
         }
         self.eng
             .log
-            .offset_for_time(key(p.tenant_id, t.stream_id, partition), ts)
+            .offset_for_time(self.eng.key_of(p.tenant_id, t.stream_id, partition)?, ts)
             .map_err(|e| terr(err::KAFKA_STORAGE_ERROR, e.to_string()))
     }
 
@@ -1354,7 +1520,7 @@ impl StreamData for RoutedData {
         Ok(self
             .eng
             .log
-            .epoch_end(key(p.tenant_id, t.stream_id, partition), epoch))
+            .epoch_end(self.eng.key_of(p.tenant_id, t.stream_id, partition)?, epoch))
     }
 
     async fn leader_epoch(&self, p: &Principal, stream_id: u64, partition: i32) -> i32 {
@@ -1366,7 +1532,11 @@ impl StreamData for RoutedData {
         }
         self.eng
             .log
-            .bounds(key(p.tenant_id, stream_id, partition))
+            .bounds(
+                self.eng
+                    .key_of(p.tenant_id, stream_id, partition)
+                    .unwrap_or_else(|_| key(p.tenant_id, stream_id, partition)),
+            )
             .epoch
     }
 
@@ -1399,6 +1569,9 @@ impl StreamData for RoutedData {
                 .append_batch(p, t, partition, batch, records, producer)
                 .await;
         }
+        if is_fan_in(t.stream_id) {
+            return Err(read_only(&t.name));
+        }
         for r in records {
             let (key, size) = record_size(r);
             if let Err(e) = crate::publish::check_size(key, size, t.max_message_bytes as u64) {
@@ -1430,9 +1603,11 @@ impl StreamData for RoutedData {
                 .read_batches(p, t, partition, offset, max_bytes)
                 .await;
         }
-        let (b, bytes) =
-            self.eng
-                .read_raw(key(p.tenant_id, t.stream_id, partition), offset, max_bytes)?;
+        let (b, bytes) = self.eng.read_raw(
+            self.eng.key_of(p.tenant_id, t.stream_id, partition)?,
+            offset,
+            max_bytes,
+        )?;
         let next = end_of(&bytes).unwrap_or(offset);
         Ok((b, bytes, next))
     }

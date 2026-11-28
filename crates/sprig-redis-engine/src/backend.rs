@@ -10,6 +10,7 @@ use crate::db::{EngineDb, Uids, Versions, Waiters};
 use crate::layout::Space;
 use crate::notify::{Notifier, Sink};
 use crate::store::Unit;
+use crate::wall::Walled;
 
 /// Which tenants are on the engine.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,10 +50,10 @@ impl Tenants {
 }
 
 /// The databases opened so far, by tenant and index, and each tenant's
-/// collection uids.
+/// collection uids. Each tenant's are on a unit walled to its own keys.
 struct Open<U: Unit> {
-    dbs: HashMap<(u64, u32), Arc<EngineDb<U>>>,
-    uids: HashMap<u64, Arc<Uids<U>>>,
+    dbs: HashMap<(u64, u32), Arc<EngineDb<Walled<U>>>>,
+    uids: HashMap<u64, Arc<Uids<Walled<U>>>>,
     waiters: HashMap<u64, Arc<Waiters>>,
     notify: HashMap<u64, Arc<Notifier>>,
 }
@@ -127,11 +128,11 @@ impl<U: Unit> Backend<U> {
     }
 
     /// Database `db` of `tenant`, when the backend holds the tenant.
-    pub fn db(&self, tenant: u64, db: u32) -> Option<Arc<EngineDb<U>>> {
+    pub fn db(&self, tenant: u64, db: u32) -> Option<Arc<EngineDb<Walled<U>>>> {
         self.placed_db(tenant, db, false)
     }
 
-    fn open_db(&self, tenant: u64, db: u32) -> Option<Arc<EngineDb<U>>> {
+    fn open_db(&self, tenant: u64, db: u32) -> Option<Arc<EngineDb<Walled<U>>>> {
         if db >= self.databases {
             return None;
         }
@@ -140,7 +141,7 @@ impl<U: Unit> Backend<U> {
         let uids = open
             .uids
             .entry(tenant)
-            .or_insert_with(|| Uids::new(Arc::clone(&self.unit), tenant));
+            .or_insert_with(|| Uids::new(self.walled(tenant), tenant));
         let waiters = open.waiters.entry(tenant).or_default();
         let notifier = open
             .notify
@@ -151,7 +152,7 @@ impl<U: Unit> Backend<U> {
                 .map(|i| Space::redis(tenant, i))
                 .collect();
             let d = EngineDb::new(
-                Arc::clone(&self.unit),
+                self.walled(tenant),
                 Space::redis(tenant, db),
                 all,
                 Arc::clone(uids),
@@ -162,6 +163,11 @@ impl<U: Unit> Backend<U> {
             d
         });
         Some(Arc::clone(d))
+    }
+
+    /// The node's unit, for `tenant`'s keys alone.
+    fn walled(&self, tenant: u64) -> Arc<Walled<U>> {
+        Arc::new(Walled::new(Arc::clone(&self.unit), tenant))
     }
 
     /// The databases opened so far, with their tenants' notifications.
@@ -195,7 +201,7 @@ impl<U: Unit> Backend<U> {
                 };
                 for (s, n) in me.spaces() {
                     if let Err(e) = crate::sweep::pass_notifying(
-                        &*me.unit,
+                        &Walled::new(Arc::clone(&me.unit), s.tenant),
                         s,
                         crate::sweep::PASS_LIMIT,
                         &n.flags,
@@ -213,7 +219,12 @@ impl<U: Unit> Backend<U> {
 impl<U: Unit> Backend<U> {
     /// Database `db` of `tenant` when the tenant's Redis databases are
     /// `placed` on the engine or the backend holds the whole tenant.
-    pub fn placed_db(&self, tenant: u64, db: u32, placed: bool) -> Option<Arc<EngineDb<U>>> {
+    pub fn placed_db(
+        &self,
+        tenant: u64,
+        db: u32,
+        placed: bool,
+    ) -> Option<Arc<EngineDb<Walled<U>>>> {
         if !placed && !self.tenants.has(tenant) {
             return None;
         }

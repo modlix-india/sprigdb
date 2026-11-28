@@ -1,35 +1,46 @@
 # CI stages:
 #
-#   S0  every push to main            rustfmt, clippy, unit tests, cargo deny,
-#                                     Compose files validated
-#   S1  main and on demand            integration tests against Compose (all
-#                                     single-DC profiles, plus toxiproxy,
-#                                     faultd and elle-cli), SPRIG_TEST_* set;
-#                                     simulations, 200 seeds per suite
-#                                     (5,000 nightly), tokio's RNG seeded
-#   S2  weekly and on demand          the three-DC layout with netem latency;
-#                                     the same suites against it, on MariaDB
-#                                     11.8 and 12.3
+#   S0  every push, every branch,     rustfmt, no design-book references,
+#       and every pull request        clippy -D warnings, the workspace tests
+#                                     (live tests are #[ignore]d and counted
+#                                     as skipped), the generated reference
+#                                     pages, cargo deny, Compose files, alert
+#                                     rules and dashboards, Studio's checks
+#   S1  pull requests, main, weekly   simulations, 200 seeds per suite
+#       and on demand                 (5,000 weekly), tokio's RNG seeded; a
+#                                     short fuzz run of every target
+#   S1  on demand and weekly          the live suites: the engine-only stack
+#                                     (tools/live) and, from before the
+#                                     engine, the MariaDB Compose stack
+#   S2  weekly and on demand          the three-DC MariaDB layout with netem
+#                                     latency
 #
-# Integration tests skip themselves when their SPRIG_TEST_* variable is
-# unset (sprig-testkit's `require_env!`). S1 and S2 set SPRIG_TEST_STRICT=1,
-# which turns a skip into a failure, so a suite can't silently stop running.
-# Later stages (S3 nightly suites, S4 release candidates) come with the
-# suites they run.
+# A test that needs a running stack or a reference server is marked
+# #[ignore = "live: ..."], so a plain run reports it as skipped instead of
+# passing it silently, and it fails when it is run without its environment.
+# The live jobs run them with --run-ignored; tools/live/README.md says which
+# suite needs what. Later stages (S3 nightly suites, S4 release candidates)
+# come with the suites they run.
 name: ci
 
 # Runs:
-# - pushes to main only; branches and pull requests don't run CI;
-# - docs, the website, brand assets and Markdown don't run it either;
-# - by hand (Actions → ci → Run workflow), for any branch;
-# - S2 weekly (Sunday) while minutes are billed.
+# - every push to every branch, and every pull request (S0, plus S1's
+#   simulations and fuzz smoke on pull requests and main);
+# - the website, brand assets and Markdown don't run it;
+# - by hand (Actions → ci → Run workflow), for any branch: everything,
+#   the live suites included;
+# - weekly (Sunday) while minutes are billed: everything.
+# Jobs that need secrets or paid services are in their own workflows and run
+# only by hand or on their schedule (ai-evals, heavy-*).
 on:
   push:
-    branches: [main]
-    paths-ignore: ["docs/**", "site/**", "brand/**", "**/*.md"]
+    branches: ["**"]
+    paths-ignore: ["site/**", "brand/**", "**/*.md"]
+  pull_request:
+    paths-ignore: ["site/**", "brand/**", "**/*.md"]
   workflow_dispatch:
   schedule:
-    - cron: "17 2 * * 0" # S2, weekly (Sunday 02:17 UTC)
+    - cron: "17 2 * * 0" # S1 live and S2, weekly (Sunday 02:17 UTC)
 
 permissions:
   contents: read
@@ -62,47 +73,71 @@ jobs:
   clippy:
     name: S0 clippy
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+      # The runner image's preinstalled SDKs we never use: about 25 GB back
+      # for the engine's build (RocksDB, a gateway linked into every test).
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
       - run: rustup toolchain install
-      # etcd-client and tonic build scripts need protoc.
-      - run: sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler
+      # etcd-client and tonic build scripts need protoc; rust-rocksdb's
+      # bindgen needs libclang.
+      - run: sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler libclang-dev
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: clippy
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: ${{ github.event_name != 'pull_request' }}
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   test:
-    name: S0 unit tests
+    name: S0 workspace tests
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: rustup toolchain install
-      # etcd-client and tonic build scripts need protoc.
-      - run: sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: debug
-          cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: nextest
+    timeout-minutes: 120
+    env:
+      # No debug info in this job: about 370 test binaries each link the
+      # crates they test, and with line tables they don't fit on the
+      # runner's disk. A failure still names the test and its assertion.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
       # No Studio build here; without SPRIG_STUDIO_DIST=none sprig-studio's
       # build script watches a missing studio/dist, reruns on every cargo
       # call and rebuilds the gateway for nextest.
+      SPRIG_STUDIO_DIST: none
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+      - run: rustup toolchain install
+      # etcd-client and tonic build scripts need protoc; rust-rocksdb's
+      # bindgen needs libclang.
+      - run: sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler libclang-dev
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: debug-nodebuginfo
+          cache-on-failure: true
+          save-if: ${{ github.event_name != 'pull_request' }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
       - run: cargo build --workspace --locked
-        env:
-          SPRIG_STUDIO_DIST: none
-      # No SPRIG_TEST_* variables: integration tests skip themselves.
+      # The generated reference pages (docs/reference) match the code:
+      # sprig-docs-gen's pages and sprigdb's settings page.
+      - name: Reference pages are current
+        run: |
+          cargo run --locked -q -p sprig-docs-gen -- --check
+          cargo test --locked -p sprigdb --test docs_settings
+      # No SPRIG_TEST_* variables: tests that need a stack are #[ignore]d
+      # and nextest lists them as skipped; the summary line counts them.
       - run: cargo nextest run --workspace --locked --no-fail-fast --no-tests=pass
-        env:
-          SPRIG_STUDIO_DIST: none
       - run: cargo test --workspace --locked --doc
-        env:
-          SPRIG_STUDIO_DIST: none
+      - if: always()
+        run: df -h /
 
   studio:
     # Studio's type check, lint, unit tests, licence and
@@ -125,14 +160,15 @@ jobs:
       - run: pnpm check
       - run: pnpm build
       - run: rustup toolchain install
-      # etcd-client and tonic build scripts need protoc.
-      - run: sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler
+      # etcd-client and tonic build scripts need protoc; rust-rocksdb's bindgen
+      # needs libclang.
+      - run: sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler libclang-dev
         working-directory: .
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: debug
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: ${{ github.event_name != 'pull_request' }}
       - run: SPRIG_STUDIO_DIST=$PWD/studio/dist cargo test --locked -p sprig-studio
         working-directory: .
       - uses: actions/upload-artifact@v4
@@ -149,10 +185,8 @@ jobs:
   studio-e2e:
     name: S1 Studio end to end
     needs: [studio]
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      github.event_name == 'schedule' ||
-      github.ref == 'refs/heads/main'
+    # The MariaDB stack from before the engine: on demand and weekly only.
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -168,13 +202,14 @@ jobs:
           name: studio-dist
           path: studio/dist
       - run: rustup toolchain install
-      # etcd-client and tonic build scripts need protoc.
-      - run: sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler
+      # etcd-client and tonic build scripts need protoc; rust-rocksdb's bindgen
+      # needs libclang.
+      - run: sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler libclang-dev
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: debug
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: ${{ github.event_name != 'pull_request' }}
       - name: Start Compose (etcd + one node)
         working-directory: deploy/compose
         run: docker compose --profile single up -d --wait --wait-timeout 300
@@ -249,6 +284,7 @@ jobs:
     name: S1 fuzz smoke
     needs: [fmt, clippy, test]
     if: >-
+      github.event_name == 'pull_request' ||
       github.event_name == 'workflow_dispatch' ||
       github.event_name == 'schedule' ||
       github.ref == 'refs/heads/main'
@@ -259,8 +295,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install nightly --profile minimal
-      # etcd-client and tonic build scripts need protoc.
-      - run: sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler
+      # etcd-client and tonic build scripts need protoc; rust-rocksdb's bindgen
+      # needs libclang.
+      - run: sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler libclang-dev
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
@@ -290,13 +327,63 @@ jobs:
           name: fuzz-artifacts
           path: crates/*/fuzz/artifacts/
 
-  integration:
-    name: S1 integration (Compose, one DC)
-    needs: [fmt, clippy, test, compose]
+  # The engine's live suites through tools/live (README there). redis-engine
+  # needs only Docker: the engine runs in the test process against a
+  # reference Redis 7.4.11. redis and mongo start the engine-only stack
+  # (etcd in a container, a controller and a gateway built here) and a
+  # reference server; they run on demand and weekly while they bed in.
+  live-engine:
+    name: S1 live suites (engine)
+    needs: [fmt, clippy, test]
     if: >-
+      github.event_name == 'pull_request' ||
       github.event_name == 'workflow_dispatch' ||
       github.event_name == 'schedule' ||
       github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      SPRIG_STUDIO_DIST: none
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+      - run: rustup toolchain install
+      # etcd-client and tonic build scripts need protoc; rust-rocksdb's
+      # bindgen needs libclang.
+      - run: sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler libclang-dev
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: debug-nodebuginfo
+          cache-on-failure: true
+          save-if: false
+      - name: redis-engine (reference Redis, engine in process)
+        run: tools/live/run.sh redis-engine
+      - name: Build the stack's binaries
+        if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+        run: cargo build --locked -p sprigdb -p sprigctl
+      - name: redis (the gateway's Redis port)
+        if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+        run: tools/live/run.sh redis
+      - name: mongo (the gateway's MongoDB port)
+        if: ${{ !cancelled() && (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') }}
+        run: tools/live/run.sh mongo
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: live-engine-logs
+          path: target/live-stack/*.log
+          if-no-files-found: ignore
+
+  integration:
+    name: S1 integration (Compose, one DC)
+    needs: [fmt, clippy, test, compose]
+    # The MariaDB stack from before the engine: on demand and weekly only.
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
     runs-on: ubuntu-latest
     # 60, not 40: the first run took 38 minutes with no deployment and every
     # gateway test failing at once. The build is about 12 minutes, the tests
@@ -326,13 +413,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install
-      # etcd-client and tonic build scripts need protoc.
-      - run: sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler
+      # etcd-client and tonic build scripts need protoc; rust-rocksdb's bindgen
+      # needs libclang.
+      - run: sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler libclang-dev
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: debug
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: ${{ github.event_name != 'pull_request' }}
       - uses: taiki-e/install-action@v2
         with:
           tool: nextest
@@ -369,15 +457,16 @@ jobs:
         run: |
           deploy/compose/integration.sh up
           cat deploy/compose/.gateway-dev/test-env >> "$GITHUB_ENV"
+      # --run-ignored all: the live tests are #[ignore]d for plain runs.
       - name: Tests
         id: tests
-        run: cargo nextest run --workspace --locked --no-tests=pass --profile ci-s1
+        run: cargo nextest run --workspace --locked --no-tests=pass --run-ignored all --profile ci-s1
       # Tests that disturb the shared servers for everyone (a Galera node
       # cut off, a desynced node) or measure timings: alone, afterwards,
       # also when the first pass failed.
       - name: Exclusive tests, one at a time
         if: ${{ !cancelled() && (steps.tests.outcome == 'success' || steps.tests.outcome == 'failure') }}
-        run: cargo nextest run --workspace --locked --no-tests=pass --profile ci-s1-exclusive
+        run: cargo nextest run --workspace --locked --no-tests=pass --run-ignored all --profile ci-s1-exclusive
       - name: Collect Compose and deployment logs
         if: failure()
         working-directory: deploy/compose
@@ -405,6 +494,7 @@ jobs:
     name: S1 simulation (seeded)
     needs: [fmt, clippy, test]
     if: >-
+      github.event_name == 'pull_request' ||
       github.event_name == 'workflow_dispatch' ||
       github.event_name == 'schedule' ||
       github.ref == 'refs/heads/main'
@@ -419,13 +509,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install
-      # etcd-client and tonic build scripts need protoc.
-      - run: sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler
+      # etcd-client and tonic build scripts need protoc; rust-rocksdb's bindgen
+      # needs libclang.
+      - run: sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler libclang-dev
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: sim-tokio-unstable
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: ${{ github.event_name != 'pull_request' }}
       - uses: taiki-e/install-action@v2
         with:
           tool: nextest
@@ -476,13 +567,14 @@ jobs:
             sudo modprobe sch_netem
           }
       - run: rustup toolchain install
-      # etcd-client and tonic build scripts need protoc.
-      - run: sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler
+      # etcd-client and tonic build scripts need protoc; rust-rocksdb's bindgen
+      # needs libclang.
+      - run: sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler libclang-dev
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: debug
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: ${{ github.event_name != 'pull_request' }}
       - uses: taiki-e/install-action@v2
         with:
           tool: nextest
@@ -507,7 +599,7 @@ jobs:
                  if ($4 == "?" || $4 < $2 * 0.95 || $4 > $2 + 50) {
                    print "latency out of range: " $0; bad = 1 } }
                END { exit bad }' target-latency.txt
-      - run: cargo nextest run --workspace --locked --no-fail-fast --no-tests=pass
+      - run: cargo nextest run --workspace --locked --no-fail-fast --no-tests=pass --run-ignored all --profile ci-s1
       - name: Collect Compose logs
         if: failure()
         run: |
@@ -554,13 +646,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install
-      # etcd-client and tonic build scripts need protoc.
-      - run: sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler
+      # etcd-client and tonic build scripts need protoc; rust-rocksdb's bindgen
+      # needs libclang.
+      - run: sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler libclang-dev
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: debug
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: ${{ github.event_name != 'pull_request' }}
       - name: Start Compose (one node) and build the connector images
         working-directory: deploy/compose
         run: |
@@ -608,14 +701,13 @@ jobs:
   # different grants in both tenants, every crossing refused with the
   # persona's error number, MariaDB's grant tables audited, and a REVOKE
   # timed on a second gateway (deploy/compose/m05, README there). Both suites
-  # are security controls: they run on pull requests and on main.
+  # are security controls of the MariaDB-backed gateway; with the rest of
+# that stack they run on demand and weekly.
   m03:
     name: Tenants, names, settings and isolation (gateway)
     needs: [integration]
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      github.event_name == 'schedule' ||
-      github.ref == 'refs/heads/main'
+    # The MariaDB stack from before the engine: on demand and weekly only.
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 40
     env:
@@ -623,13 +715,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install
-      # etcd-client and tonic build scripts need protoc.
-      - run: sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler
+      # etcd-client and tonic build scripts need protoc; rust-rocksdb's bindgen
+      # needs libclang.
+      - run: sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler libclang-dev
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: debug
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: ${{ github.event_name != 'pull_request' }}
       - name: Start Compose (etcd + one node) and build the m03 images
         working-directory: deploy/compose
         run: |
@@ -691,13 +784,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install
-      # etcd-client and tonic build scripts need protoc.
-      - run: sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler
+      # etcd-client and tonic build scripts need protoc; rust-rocksdb's bindgen
+      # needs libclang.
+      - run: sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler libclang-dev
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: debug
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: ${{ github.event_name != 'pull_request' }}
       - name: Start Compose (etcd and every topology) and build the m03 images
         working-directory: deploy/compose
         run: |

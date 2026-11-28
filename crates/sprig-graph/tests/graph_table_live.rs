@@ -158,6 +158,7 @@ fn email(i: i64) -> String {
     format!("p{i}@example.com")
 }
 
+#[ignore = "live: needs SPRIG_TEST_SQL_ADDR, SPRIG_TEST_BOLT_ADDR, SPRIG_TEST_GT_USER, ...; tools/live/README.md"]
 #[tokio::test]
 async fn graph_table_joins_sharded_tables_on_two_clusters() {
     let (Some(sql), Some(baddr), Some(user), Some(pw), Some(ctl), Some(reference)) = (
@@ -172,7 +173,7 @@ async fn graph_table_joins_sharded_tables_on_two_clusters() {
             "skipped: SPRIG_TEST_SQL_ADDR / SPRIG_TEST_BOLT_ADDR / SPRIG_TEST_GT_USER / \
              SPRIG_TEST_BOLT_PASSWORD / SPRIG_TEST_SPRIGCTL / SPRIG_TEST_MARIADB_SINGLE not set"
         );
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let tenant = env("SPRIG_TEST_GT_TENANT").unwrap_or_else(|| "globex".into());
     let move_to = env("SPRIG_TEST_GT_MOVE_TO").unwrap_or_else(|| "dc-a-c2".into());
@@ -599,6 +600,7 @@ async fn graph_table_joins_sharded_tables_on_two_clusters() {
 /// A `GRAPH_TABLE` statement that reads no
 /// distributed table takes rows past the 16 MB inline limit from session
 /// temporary tables instead of failing with 39903.
+#[ignore = "live: needs SPRIG_TEST_SQL_ADDR, SPRIG_TEST_BOLT_ADDR, SPRIG_TEST_GT_USER, ...; tools/live/README.md"]
 #[tokio::test]
 async fn graph_table_rows_past_the_inline_limit() {
     const N: i64 = 2600;
@@ -612,7 +614,7 @@ async fn graph_table_rows_past_the_inline_limit() {
         eprintln!(
             "skipped: SPRIG_TEST_SQL_ADDR / SPRIG_TEST_BOLT_ADDR / SPRIG_TEST_GT_USER not set"
         );
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let mut g = gateway(&sql, &user, &pw).await;
     g.query_drop("CREATE DATABASE IF NOT EXISTS r8seven_big")

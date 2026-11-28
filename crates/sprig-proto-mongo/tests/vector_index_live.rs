@@ -136,11 +136,12 @@ fn ids(d: &[Document]) -> Vec<i64> {
 /// An index on 30,000 vectors: `BUILDING` and not queryable until its side
 /// table is built; eight readers and a writer meanwhile, none failing;
 /// then approximate results agree with exact ones, and follow writes.
+#[ignore = "live: needs SPRIG_TEST_MONGO_URI; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_index_is_built_before_it_is_queryable_and_reads_never_conflict() {
     let Some(s_uri) = uri("SPRIG_TEST_MONGO_URI") else {
         eprintln!("SPRIG_TEST_MONGO_URI not set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let client = Client::with_uri_str(&s_uri).await.unwrap();
     let db = client.database("vxlive_build");
@@ -262,11 +263,12 @@ async fn an_index_is_built_before_it_is_queryable_and_reads_never_conflict() {
 
 /// Dropping a collection drops its search indexes: the same name can be
 /// created again with another definition, and searches use the new one.
+#[ignore = "live: needs SPRIG_TEST_MONGO_URI; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dropping_a_collection_drops_its_search_indexes() {
     let Some(s_uri) = uri("SPRIG_TEST_MONGO_URI") else {
         eprintln!("SPRIG_TEST_MONGO_URI not set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let client = Client::with_uri_str(&s_uri).await.unwrap();
     let db = client.database("vxlive_drop");
@@ -315,12 +317,13 @@ async fn dropping_a_collection_drops_its_search_indexes() {
 
 /// recall@10 and queries per second (8 clients) at several
 /// `numCandidates`, with `SPRIG_TEST_VEC_BENCH=<vectors>x<dims>`.
+#[ignore = "live: needs SPRIG_TEST_MONGO_URI, SPRIG_TEST_VEC_BENCH; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn vector_ann_numbers() {
     let (Some(s_uri), Some(spec)) = (uri("SPRIG_TEST_MONGO_URI"), uri("SPRIG_TEST_VEC_BENCH"))
     else {
         eprintln!("SPRIG_TEST_MONGO_URI or SPRIG_TEST_VEC_BENCH not set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let (n, dims) = spec.split_once('x').unwrap();
     let (n, dims): (usize, usize) = (n.parse().unwrap(), dims.parse().unwrap());

@@ -96,13 +96,14 @@ fn generate_test_pki() {
     );
 }
 
+#[ignore = "live: needs SPRIG_TEST_ETCD_TLS; tools/live/README.md"]
 #[tokio::test]
 async fn etcd_mutual_tls() {
     let (Ok(endpoint), Some(dir)) = (std::env::var("SPRIG_TEST_ETCD_TLS"), pki_dir()) else {
         eprintln!(
             "skipping etcd_mutual_tls: set SPRIG_TEST_ETCD_TLS and SPRIG_TEST_ETCD_TLS_DIR (see the file's header)"
         );
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let files = |cert: &str| TlsConfig {
         ca: dir.join("ca.pem"),

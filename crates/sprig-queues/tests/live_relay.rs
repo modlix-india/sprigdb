@@ -174,9 +174,12 @@ fn newest_owner() -> Option<String> {
     Some(j.get("gateway_id")?.as_str()?.to_owned())
 }
 
+#[ignore = "live: needs SPRIG_AMQP_ADDR, SPRIG_AMQP_ADDR2, SPRIG_AMQP_USER, ...; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn publish_on_one_gateway_consume_on_the_other() {
-    let Some([a, b]) = addrs() else { return };
+    let Some([a, b]) = addrs() else {
+        panic!("live test run without its environment: see tools/live/README.md")
+    };
     let ca = connect(&a).await;
     let cb = connect(&b).await;
     let pa = ca.create_channel().await.unwrap();
@@ -247,9 +250,12 @@ async fn publish_on_one_gateway_consume_on_the_other() {
     let _ = cb.close(200, "bye".into()).await;
 }
 
+#[ignore = "live: needs SPRIG_AMQP_ADDR, SPRIG_AMQP_ADDR2, SPRIG_AMQP_USER, ...; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rpc_across_gateways() {
-    let Some([a, b]) = addrs() else { return };
+    let Some([a, b]) = addrs() else {
+        panic!("live test run without its environment: see tools/live/README.md")
+    };
     let ca = connect(&a).await;
     let cb = connect(&b).await;
     let rpc = uniq("rpc");
@@ -405,9 +411,12 @@ async fn publisher(addr: String, q: String, n: u32) -> HashSet<u32> {
     confirmed
 }
 
+#[ignore = "live: needs SPRIG_AMQP_ADDR, SPRIG_AMQP_ADDR2, SPRIG_AMQP_USER, ...; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kill_the_owner_mid_stream_clients_on_the_other_gateway_lose_nothing() {
-    let Some([a, b]) = addrs() else { return };
+    let Some([a, b]) = addrs() else {
+        panic!("live test run without its environment: see tools/live/README.md")
+    };
     let (Some(kill1), Some(start1), Some(kill2), Some(start2)) = (
         var("SPRIG_KILL_GW1"),
         var("SPRIG_START_GW1"),
@@ -512,9 +521,12 @@ async fn kill_the_owner_mid_stream_clients_on_the_other_gateway_lose_nothing() {
     let _ = c.close(200, "bye".into()).await;
 }
 
+#[ignore = "live: needs SPRIG_AMQP_ADDR, SPRIG_AMQP_ADDR2, SPRIG_AMQP_USER, ...; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn throughput_through_the_gateway_without_the_owner() {
-    let Some([a, b]) = addrs() else { return };
+    let Some([a, b]) = addrs() else {
+        panic!("live test run without its environment: see tools/live/README.md")
+    };
     let Some(n) = var("SPRIG_THROUGHPUT").and_then(|v| v.parse::<u32>().ok()) else {
         eprintln!("skipped: SPRIG_THROUGHPUT not set");
         return;
@@ -615,13 +627,14 @@ async fn throughput_through_the_gateway_without_the_owner() {
 /// `SPRIG_MYSQL_URL` (gateway 1), `SPRIG_METRICS` (both gateways'
 /// telemetry addresses, comma-separated); the vhost `mq2` must exist as a
 /// database.
+#[ignore = "live: needs SPRIG_MYSQL_URL, SPRIG_METRICS; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sql_vhost_argument_and_the_commit_hook() {
     use mysql_async::prelude::Queryable;
     let (Some([_, b]), Some(url), Some(metrics)) =
         (addrs(), var("SPRIG_MYSQL_URL"), var("SPRIG_METRICS"))
     else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let acked = || -> f64 {
         metrics

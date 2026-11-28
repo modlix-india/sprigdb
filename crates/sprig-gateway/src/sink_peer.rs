@@ -33,6 +33,9 @@
 //!                       SELECT of the stream as the user (its SELECT
 //!                       privilege applies), waiting a little when none
 //!                       is there
+//! FanInStreamRead {def, member, db, stream, from, ...}
+//!                       a FROM STREAM ... FAN IN sink's records of one
+//!                       member's instance (crate::inherited::fanin_sink)
 //! StreamPublish {db, stream, key, value, headers}
 //!                       a dead letter: INSERT INTO the stream as the user
 //! ```
@@ -324,6 +327,35 @@ async fn serve_inner(
                 &db,
                 &stream,
                 &from,
+                max_records,
+                wait_ms,
+            ))
+            .await
+        }
+        SqlOp::FanInStreamRead {
+            def_tenant,
+            def_object,
+            member,
+            db,
+            stream,
+            from,
+            from_ms,
+            max_records,
+            wait_ms,
+        } => {
+            let svc = engine
+                .tenants
+                .clone()
+                .ok_or_else(|| SprigError::internal("this gateway serves no tenant catalogs"))?;
+            Box::pin(crate::inherited::fanin_sink::stream_read(
+                &svc,
+                &caller,
+                (def_tenant, def_object),
+                member,
+                &db,
+                &stream,
+                &from,
+                from_ms,
                 max_records,
                 wait_ms,
             ))

@@ -75,12 +75,13 @@ async fn all(e: &Engine, s: &mut Direct, ns: &Ns, spec: FindSpec) -> Vec<Documen
     }
 }
 
+#[ignore = "live: needs SPRIG_TEST_DOC_MARIADB; tools/live/README.md"]
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn live_engine_on_mariadb() {
     let Ok(url) = std::env::var("SPRIG_TEST_DOC_MARIADB") else {
         eprintln!("SPRIG_TEST_DOC_MARIADB not set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let conn = mysql_async::Conn::new(mysql_async::Opts::from_url(&url).unwrap())
         .await
@@ -366,6 +367,7 @@ async fn live_engine_on_mariadb() {
 /// Approximate `$vectorSearch` from the side table's HNSW index,
 /// validated by recall against the exact search, and kept in step with
 /// inserts, updates and deletes. Uses `r5search_vxtest`, dropped at the end.
+#[ignore = "live: needs SPRIG_TEST_DOC_MARIADB; tools/live/README.md"]
 #[tokio::test]
 #[allow(
     clippy::cast_precision_loss,
@@ -377,7 +379,7 @@ async fn live_engine_on_mariadb() {
 async fn live_vector_ann_recall() {
     let Ok(url) = std::env::var("SPRIG_TEST_DOC_MARIADB") else {
         eprintln!("SPRIG_TEST_DOC_MARIADB not set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let conn = mysql_async::Conn::new(mysql_async::Opts::from_url(&url).unwrap())
         .await

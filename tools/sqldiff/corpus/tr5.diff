@@ -1,0 +1,21 @@
+# SQL triggers fired by prepared (binary-protocol) INSERT, UPDATE and DELETE.
+x:DROP TABLE IF EXISTS tp_t
+x:DROP TABLE IF EXISTS tp_log
+x:CREATE TABLE tp_t (id INT PRIMARY KEY, v VARCHAR(20), n INT)
+x:CREATE TABLE tp_log (k INT AUTO_INCREMENT PRIMARY KEY, msg VARCHAR(120))
+q:CREATE TRIGGER tp_bi BEFORE INSERT ON tp_t FOR EACH ROW SET NEW.v = UPPER(NEW.v)
+q:CREATE TRIGGER tp_ai AFTER INSERT ON tp_t FOR EACH ROW INSERT INTO tp_log (msg) VALUES (CONCAT('ai ', NEW.id, ' ', NEW.v, ' ', IFNULL(NEW.n, 'null')))
+q:CREATE TRIGGER tp_au AFTER UPDATE ON tp_t FOR EACH ROW INSERT INTO tp_log (msg) VALUES (CONCAT('au ', OLD.n, '->', NEW.n))
+q:CREATE TRIGGER tp_ad AFTER DELETE ON tp_t FOR EACH ROW INSERT INTO tp_log (msg) VALUES (CONCAT('ad ', OLD.id))
+p:INSERT INTO tp_t (id, v, n) VALUES (?, ?, ?)
+e:1:i=1,s=it's,i=10
+e:1:i=2,s=b?c,n=
+e:1:i=1,s=dup,i=3
+p:UPDATE tp_t SET n = ? WHERE id = ?
+e:2:i=77,i=2
+p:DELETE FROM tp_t WHERE id = ?
+e:3:i=1
+q:SELECT * FROM tp_t ORDER BY id
+q:SELECT msg FROM tp_log ORDER BY k
+x:DROP TABLE IF EXISTS tp_t
+x:DROP TABLE IF EXISTS tp_log

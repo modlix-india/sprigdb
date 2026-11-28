@@ -4,8 +4,8 @@
 //! `START_ENCRYPTION` event; the same file read directly is refused, since
 //! only the server holds the key.
 //!
-//! Runs with `SPRIG_TEST_DOCKER=1` (skips otherwise, fails under
-//! `SPRIG_TEST_STRICT=1`). The container, `sprigdb-binlog-enc-<pid>-<n>`,
+//! Runs with `SPRIG_TEST_DOCKER=1`; it is `#[ignore]`d, and run without
+//! the variable it fails. The container, `sprigdb-binlog-enc-<pid>-<n>`,
 //! runs with `--rm` on a random local port, loads `file_key_management`
 //! with a key generated inside it from `/dev/urandom`, and is removed when
 //! the test ends, pass or fail. `SPRIG_TEST_MARIADB_IMAGE` overrides the
@@ -59,19 +59,17 @@ fn docker(args: &[&str]) -> Vec<u8> {
     out.stdout
 }
 
-/// Whether docker tests may run; reports a skip otherwise.
+/// Whether docker tests may run; a live test run without
+/// `SPRIG_TEST_DOCKER=1` fails (it is `#[ignore]`d, so it runs only when
+/// asked for).
 fn docker_allowed(test: &str) -> bool {
     let on =
         |v: &str| std::env::var(v).is_ok_and(|s| matches!(s.trim(), "1" | "true" | "yes" | "on"));
-    if on("SPRIG_TEST_DOCKER") {
-        return true;
-    }
     assert!(
-        !on("SPRIG_TEST_STRICT"),
-        "{test}: SPRIG_TEST_DOCKER is not set and SPRIG_TEST_STRICT is on"
+        on("SPRIG_TEST_DOCKER"),
+        "{test}: SPRIG_TEST_DOCKER is not set; a live test needs its environment (see tools/live/README.md)"
     );
-    eprintln!("skipped {test}: set SPRIG_TEST_DOCKER=1 to run it");
-    false
+    true
 }
 
 /// Starts the encrypted-binlog server and returns it with its root URL once
@@ -144,6 +142,7 @@ async fn start() -> (Container, String) {
 
 /// Inserts, updates and deletes through the encrypted binlog arrive over a
 /// dump, decrypted, in order; the binlog file itself is refused.
+#[ignore = "live: needs SPRIG_TEST_DOCKER; tools/live/README.md"]
 #[tokio::test]
 async fn rows_stream_through_an_encrypted_binlog() {
     if !docker_allowed(module_path!()) {

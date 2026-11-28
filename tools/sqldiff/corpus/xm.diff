@@ -1,0 +1,16 @@
+# r-xmodel's two MySQL-port gaps: multi-table UPDATE assignment order; JSON arithmetic is a double on MySQL.
+x:DROP TABLE IF EXISTS xm_a
+x:DROP TABLE IF EXISTS xm_b
+q:CREATE TABLE xm_a (id INT PRIMARY KEY, n INT, k INT)
+q:CREATE TABLE xm_b (id INT PRIMARY KEY, m INT)
+q:INSERT INTO xm_a VALUES (1,10,0),(2,20,0)
+q:INSERT INTO xm_b VALUES (1,0),(2,0)
+q:UPDATE xm_a SET n = n + 1, k = n
+q:SELECT * FROM xm_a ORDER BY id
+q:UPDATE xm_a JOIN xm_b ON xm_b.id = xm_a.id SET xm_a.n = xm_a.n + 1, xm_b.m = xm_a.n, xm_a.k = n * 2
+q:SELECT * FROM xm_a JOIN xm_b USING (id) ORDER BY id
+q:UPDATE xm_a a, xm_b b SET b.m = a.n, a.n = b.m + 100 WHERE a.id = b.id
+q:SELECT * FROM xm_a JOIN xm_b USING (id) ORDER BY id
+q:SELECT JSON_EXTRACT('{"a":2}','$.a') + JSON_EXTRACT('{"a":3}','$.a'), JSON_SET('{"n":1}','$.n', JSON_EXTRACT('{"a":2}','$.a') + JSON_EXTRACT('{"a":3}','$.a')), JSON_ARRAY(1e20, 2.0e0, 0.5e0, 1e-7), JSON_OBJECT('d', 3e0)
+q:DROP TABLE xm_a
+q:DROP TABLE xm_b

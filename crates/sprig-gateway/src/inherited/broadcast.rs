@@ -706,7 +706,7 @@ async fn deliver_local(
 }
 
 /// `m` with one more 0-9-1 header (or 1.0 application property).
-fn with_header(
+pub(crate) fn with_header(
     m: &sprig_proto_amqp::message::Message,
     k: &str,
     v: &str,

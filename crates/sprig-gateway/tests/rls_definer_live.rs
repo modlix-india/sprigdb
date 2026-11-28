@@ -83,11 +83,12 @@ async fn call(c: &mut mysql_async::Conn, q: &str) -> Result<i64, String> {
     Ok(rows.first().copied().unwrap_or(-1))
 }
 
+#[ignore = "live: needs SPRIG_TEST_RLS_SQL; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn definer_routines_apply_their_definers_policies() {
     let Ok(addr) = std::env::var("SPRIG_TEST_RLS_SQL") else {
         eprintln!("skipped: set SPRIG_TEST_RLS_SQL");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let mut ck = Checks {
         n: 0,
@@ -362,6 +363,7 @@ async fn ids(c: &mut mysql_async::Conn, q: &str) -> Result<Vec<i64>, String> {
 /// `SPRIG_TEST_RLS_CTL`, `SPRIG_TEST_RLS_TENANT_ID` and a child tenant's id
 /// in `SPRIG_TEST_RLS_SUBTREE_CHILD`; `SPRIG_TEST_RLS_DIRECT` adds the
 /// MariaDB-side checks.
+#[ignore = "live: needs SPRIG_TEST_RLS_SQL, SPRIG_TEST_RLS_CTL, SPRIG_TEST_RLS_TENANT_ID, ...; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn large_subtrees_read_the_subtree_table() {
     let (Ok(addr), Ok(ctl), Ok(tid), Ok(child)) = (
@@ -373,7 +375,7 @@ async fn large_subtrees_read_the_subtree_table() {
         eprintln!(
             "skipped: set SPRIG_TEST_RLS_SQL, SPRIG_TEST_RLS_CTL, SPRIG_TEST_RLS_TENANT_ID and SPRIG_TEST_RLS_SUBTREE_CHILD"
         );
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let mut ck = Checks {
         n: 0,
@@ -576,12 +578,13 @@ async fn large_subtrees_read_the_subtree_table() {
 /// to `triggers` (grants widened at database level) its reads failed with
 /// 1142 until it reconnected; now the gateway sends `USE` on the pinned
 /// connection after a reconcile that changed the account's grants.
+#[ignore = "live: needs SPRIG_TEST_RLS_SQL; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pinned_session_follows_an_enforcement_change() {
     const PDB: &str = "rlsp_suite";
     let Ok(addr) = std::env::var("SPRIG_TEST_RLS_SQL") else {
         eprintln!("skipped: set SPRIG_TEST_RLS_SQL");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let mut ck = Checks {
         n: 0,

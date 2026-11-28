@@ -1,0 +1,30 @@
+# Upserts on engine tables: INSERT IGNORE, REPLACE, INSERT ... ON DUPLICATE KEY UPDATE.
+x:DROP TABLE IF EXISTS up_a
+q:CREATE TABLE up_a (id INT PRIMARY KEY, email VARCHAR(20) UNIQUE, n INT NOT NULL DEFAULT 0, v VARCHAR(5))
+q:INSERT INTO up_a VALUES (1,'a@x',1,'one'),(2,'b@x',2,'two')
+q:INSERT IGNORE INTO up_a VALUES (1,'c@x',9,'dup')
+q:SHOW WARNINGS
+q:INSERT IGNORE INTO up_a VALUES (3,'a@x',9,'dupmail'),(4,'d@x',4,'four')
+q:SHOW WARNINGS
+q:INSERT IGNORE INTO up_a VALUES (5,'e@x',5,'toolongvalue')
+q:SHOW WARNINGS
+q:SELECT * FROM up_a ORDER BY id
+q:REPLACE INTO up_a VALUES (1,'a@x',10,'rep')
+q:REPLACE INTO up_a VALUES (6,'b@x',6,'six')
+q:REPLACE INTO up_a (id, email) VALUES (7,'g@x'),(4,'d@x')
+q:SELECT * FROM up_a ORDER BY id
+q:INSERT INTO up_a VALUES (1,'a@x',1,'x') ON DUPLICATE KEY UPDATE n = n + 1
+q:INSERT INTO up_a VALUES (1,'a@x',1,'x') ON DUPLICATE KEY UPDATE n = n
+q:INSERT INTO up_a VALUES (8,'h@x',8,'new') ON DUPLICATE KEY UPDATE n = n + 1
+q:INSERT INTO up_a (id, email, n, v) VALUES (9,'a@x',5,'m'),(10,'j@x',10,'ten') ON DUPLICATE KEY UPDATE n = VALUES(n) * 100, v = VALUES(v)
+q:SHOW WARNINGS
+q:SELECT * FROM up_a ORDER BY id
+q:INSERT INTO up_a VALUES (1,'b2@x',1,'x') ON DUPLICATE KEY UPDATE email = 'g@x'
+q:INSERT INTO up_a VALUES (2,NULL,1,'x') ON DUPLICATE KEY UPDATE v = 'toolongvalue'
+q:INSERT IGNORE INTO up_a SELECT id + 100, NULL, n, v FROM up_a WHERE id < 3
+q:SELECT * FROM up_a ORDER BY id
+q:BEGIN
+q:INSERT INTO up_a VALUES (1,'a@x',1,'x') ON DUPLICATE KEY UPDATE n = 777
+q:ROLLBACK
+q:SELECT n FROM up_a WHERE id = 1
+x:DROP TABLE IF EXISTS up_a

@@ -456,6 +456,7 @@ fn sh(cmd: &str) {
     eprintln!("     $ {cmd}: {st}");
 }
 
+#[ignore = "live: needs SPRIG_TEST_AIR_SQL, SPRIG_TEST_AIR_TENANT, SPRIG_TEST_AIR_TENANT_ID, SPRIG_TEST_AIR_NODES, SPRIG_EMBED_MODEL_DIR; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ai_writers_go_through_the_relay_and_survive_a_relay_kill() {
     let (Some(addr), Some(tenant), Some(tid), Some(nodes_v)) = (
@@ -467,7 +468,7 @@ async fn ai_writers_go_through_the_relay_and_survive_a_relay_kill() {
         eprintln!(
             "skipped: set SPRIG_TEST_AIR_SQL, SPRIG_TEST_AIR_TENANT, SPRIG_TEST_AIR_TENANT_ID and SPRIG_TEST_AIR_NODES"
         );
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let dir = var("SPRIG_EMBED_MODEL_DIR").expect("SPRIG_EMBED_MODEL_DIR");
     let model = sprig_embed::Embedder::load(std::path::Path::new(&dir)).unwrap();

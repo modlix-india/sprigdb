@@ -97,11 +97,12 @@ async fn nearest(c: &Collection<Document>, i: i32) -> Vec<Bson> {
         .collect()
 }
 
+#[ignore = "live: needs SPRIG_TEST_MONGO_URI, SPRIG_TEST_MOVE_CMDS; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mongo_databases_move_with_their_tenant() {
     let (Some(u), Some(cmds)) = (uri("SPRIG_TEST_MONGO_URI"), uri("SPRIG_TEST_MOVE_CMDS")) else {
         eprintln!("SPRIG_TEST_MONGO_URI or SPRIG_TEST_MOVE_CMDS not set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let mut o = ClientOptions::parse(&u).await.unwrap();
     o.app_name = Some("r5six-move~dc-a".into());

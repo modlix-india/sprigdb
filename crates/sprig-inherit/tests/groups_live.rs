@@ -200,10 +200,11 @@ async fn cleanup(c: &mut [Conn], t: &[String], db: &str, shares: &[(usize, &str)
     }
 }
 
+#[ignore = "live: needs SPRIG_TEST_IG_GATEWAY, SPRIG_TEST_IG_GATEWAY2, SPRIG_TEST_IG_TENANTS, ...; tools/live/README.md"]
 #[tokio::test]
 async fn kirans_example() {
     let Some(eps) = endpoints("kirans_example") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let t = tenants();
     let mode = mode();
@@ -519,10 +520,11 @@ async fn kirans_example() {
     }
 }
 
+#[ignore = "live: needs SPRIG_TEST_IG_GATEWAY, SPRIG_TEST_IG_GATEWAY2, SPRIG_TEST_IG_TENANTS, ...; tools/live/README.md"]
 #[tokio::test]
 async fn spaces_inside_one_tenant() {
     let Some(eps) = endpoints("spaces_inside_one_tenant") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let t = tenants();
     let ep = &eps[0];
@@ -582,10 +584,11 @@ async fn spaces_inside_one_tenant() {
     exec(&mut a, &format!("DROP DATABASE {db}")).await;
 }
 
+#[ignore = "live: needs SPRIG_TEST_IG_GATEWAY, SPRIG_TEST_IG_GATEWAY2, SPRIG_TEST_IG_TENANTS, ...; tools/live/README.md"]
 #[tokio::test]
 async fn migration_reports_collisions() {
     let Some(eps) = endpoints("migration_reports_collisions") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let t = tenants();
     let ep = &eps[0];
@@ -698,10 +701,11 @@ async fn passes_after(c: &mut Conn, sql: &str, code: u16) -> u64 {
 /// until the worker has done that, the parent's delete hands the references
 /// over. `SPRIG RESET` of an orphan is checked like a delete. Needs the
 /// deployment's worker process (it orphans across tenants).
+#[ignore = "live: needs SPRIG_TEST_IG_GATEWAY, SPRIG_TEST_IG_GATEWAY2, SPRIG_TEST_IG_TENANTS, ...; tools/live/README.md"]
 #[tokio::test]
 async fn orphans_keep_their_references() {
     let Some(eps) = endpoints("orphans_keep_their_references") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let t = tenants();
     let mode = mode();
@@ -914,10 +918,11 @@ async fn orphans_keep_their_references() {
 /// reaches its children and grandchildren at their next statement, so their
 /// overrides and own rows can hold the longer values (before: 1406 in the
 /// child).
+#[ignore = "live: needs SPRIG_TEST_IG_GATEWAY, SPRIG_TEST_IG_GATEWAY2, SPRIG_TEST_IG_TENANTS, ...; tools/live/README.md"]
 #[tokio::test]
 async fn widened_types_reach_children() {
     let Some(eps) = endpoints("widened_types_reach_children") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let t = tenants();
     let mode = mode();
@@ -1060,10 +1065,11 @@ async fn names_become(c: &mut Conn, sql: &str, want: &[&str]) {
 /// subtype `smalltruck` and so sees `b`'s row as a smalltruck (and a truck),
 /// which `a` and `b` don't; ids come from the tree's sequence; `c`'s trip
 /// referencing `a`'s truck refuses `a`'s delete (1451) until it is gone.
+#[ignore = "live: needs SPRIG_TEST_IG_GATEWAY, SPRIG_TEST_IG_GATEWAY2, SPRIG_TEST_IG_TENANTS, ...; tools/live/README.md"]
 #[tokio::test]
 async fn typed_tables_in_groups() {
     let Some(eps) = endpoints("typed_tables_in_groups") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let t = tenants();
     let mode = mode();
@@ -1405,6 +1411,7 @@ async fn typed_tables_in_groups() {
 /// changed since last read"), which a single MariaDB statement never
 /// gives. `b` overrides, deletes and resets `a`'s records while `a`
 /// updates them: no statement may fail with 1020.
+#[ignore = "live: needs SPRIG_TEST_IG_GATEWAY, SPRIG_TEST_IG_GATEWAY2, SPRIG_TEST_IG_TENANTS, ...; tools/live/README.md"]
 #[tokio::test]
 async fn concurrent_parent_writes_never_1020() {
     race_never_1020("concurrent_parent_writes_never_1020", false).await;
@@ -1417,6 +1424,7 @@ async fn concurrent_parent_writes_never_1020() {
 /// the MariaDB persona the 1020 had already rolled back the client's whole
 /// transaction. No statement may fail with 1020, and every transaction
 /// commits.
+#[ignore = "live: needs SPRIG_TEST_IG_GATEWAY, SPRIG_TEST_IG_GATEWAY2, SPRIG_TEST_IG_TENANTS, ...; tools/live/README.md"]
 #[tokio::test]
 async fn concurrent_parent_writes_in_transactions_never_1020() {
     race_never_1020("concurrent_parent_writes_in_transactions_never_1020", true).await;
@@ -1424,7 +1432,7 @@ async fn concurrent_parent_writes_in_transactions_never_1020() {
 
 async fn race_never_1020(test: &str, in_txn: bool) {
     let Some(eps) = endpoints(test) else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let t = tenants();
     let mode = mode();
@@ -1559,10 +1567,11 @@ async fn race_never_1020(test: &str, in_txn: bool) {
 /// once the shares are gone it may, and the rows stay as vehicles. Inside one
 /// tenant, a drop changes every space's rows (a `_type` tree in joined
 /// storage).
+#[ignore = "live: needs SPRIG_TEST_IG_GATEWAY, SPRIG_TEST_IG_GATEWAY2, SPRIG_TEST_IG_TENANTS, ...; tools/live/README.md"]
 #[tokio::test]
 async fn drops_on_inheritable_type_trees() {
     let Some(eps) = endpoints("drops_on_inheritable_type_trees") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let t = tenants();
     let mode = mode();
@@ -1771,10 +1780,11 @@ async fn drops_on_inheritable_type_trees() {
 /// type at every level. Below the top only the parent's discriminator counts
 /// (39897). `a`'s `DROP DISCRIMINATOR` goes back the same way, every row
 /// keeping its type.
+#[ignore = "live: needs SPRIG_TEST_IG_GATEWAY, SPRIG_TEST_IG_GATEWAY2, SPRIG_TEST_IG_TENANTS, ...; tools/live/README.md"]
 #[tokio::test]
 async fn discriminators_on_inheritable_type_trees() {
     let Some(eps) = endpoints("discriminators_on_inheritable_type_trees") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let t = tenants();
     let mode = mode();

@@ -28,5 +28,5 @@ export SPRIG_SOAK_CERTS=$PWD/$state/certs
 SPRIG_SOAK_PID=$(cat "$state/gateway-1.pid")
 export SPRIG_SOAK_PID
 export SPRIG_SOAK_SECONDS=$seconds
-cargo test ${SPRIG_SOAK_RELEASE:+--release} -p sprig-gateway --test soak_live -- --nocapture 2>&1 |
+cargo test ${SPRIG_SOAK_RELEASE:+--release} -p sprig-gateway --test soak_live -- --ignored --nocapture 2>&1 |
     tee "$state/soak-$seconds.log"

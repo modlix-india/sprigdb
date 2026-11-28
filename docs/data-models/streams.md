@@ -477,7 +477,7 @@ Sharding:
 | `listener.kafka.bind` | `0.0.0.0:9092` | dc, global | Address and port |
 | `listener.kafka.tls` | required | dc, global | `required`, `optional` or `off` |
 
-See [Settings](../reference/settings.md) for bounds. The `sprig_stream_*` and `sprig_kafka_*` metrics, such as `sprig_stream_sequencing_lag_seconds` and `sprig_kafka_produce_wait_seconds`, are listed in [Metrics](../reference/metrics.md).
+See [Settings](../reference/settings.md) for bounds. The `sprig_kafka_*` metrics, such as `sprig_kafka_produce_wait_seconds`, are listed in [Metrics](../reference/metrics.md).
 
 ## Errors
 

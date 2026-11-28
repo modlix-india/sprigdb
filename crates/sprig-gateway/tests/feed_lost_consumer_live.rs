@@ -182,11 +182,12 @@ async fn b_flows(c: &mut Conn, from: u32, batches: u32, limit: Duration) -> Opti
     Some(worst)
 }
 
+#[ignore = "live: needs SPRIG_TEST_LOGIC_GATEWAY, SPRIG_TEST_LOGIC_ROOT, SPRIG_TEST_LOGIC_USER, ...; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_consumer_with_purged_history_fails_alone() {
     let Some((mut c, mut nodes)) = connect("a_consumer_with_purged_history_fails_alone").await
     else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let Some(restart_cmd) = skip::var("SPRIG_TEST_FEED_RESTART") else {
         skip::report_missing(

@@ -251,6 +251,7 @@ async fn keys_left(store: &dyn MetaStore, t: TenantId, name: &str) -> Vec<String
     }
 }
 
+#[ignore = "live: needs a running stack or reference server; tools/live/README.md"]
 #[tokio::test]
 async fn deleting_a_tenant_leaves_nothing_behind() {
     let (Some(bin), Some(admin), Some(gw), Some(backends)) = (
@@ -260,7 +261,7 @@ async fn deleting_a_tenant_leaves_nothing_behind() {
         env("BACKENDS"),
     ) else {
         eprintln!("skipped: set {PREFIX}SPRIGCTL, ADMIN, GATEWAY and BACKENDS to run it");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let backends: Vec<String> = backends.split(',').map(str::to_owned).collect();
     let ctl = Ctl { bin, admin };
@@ -447,6 +448,7 @@ async fn wait_job(ctl: &Ctl, name: &str, want: &str) -> Vec<String> {
     }
 }
 
+#[ignore = "live: needs a running stack or reference server; tools/live/README.md"]
 #[tokio::test]
 async fn a_tenant_moved_twice_and_spread_over_clusters_is_deleted_within_seconds() {
     let (Some(bin), Some(admin), Some(gw), Some(backends)) = (
@@ -456,7 +458,7 @@ async fn a_tenant_moved_twice_and_spread_over_clusters_is_deleted_within_seconds
         env("BACKENDS"),
     ) else {
         eprintln!("skipped: set {PREFIX}SPRIGCTL, ADMIN, GATEWAY and BACKENDS to run it");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let backends: Vec<String> = backends.split(',').map(str::to_owned).collect();
     assert!(backends.len() >= 3, "needs dc-a-c1, dc-a-c2 and dc-a-c3");

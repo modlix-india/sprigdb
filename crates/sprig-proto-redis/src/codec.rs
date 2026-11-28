@@ -2,14 +2,14 @@
 //!
 //! Requests are RESP arrays of bulk strings ("multibulk") or inline
 //! commands (a line of space-separated words, as `telnet` and
-//! `redis-cli` pipes send). The decoder follows Redis 7.2's
-//! `processMultibulkBuffer` and `processInlineBuffer`, with the same
-//! protocol-error texts, and enforces `redis.max_bulk_bytes` and
-//! `redis.max_command_bytes` before buffering.
+//! `redis-cli` pipes send). The decoder accepts and refuses what Redis 7.2
+//! accepts and refuses, with the same protocol-error texts as a client sees
+//! them, and enforces `redis.max_bulk_bytes` and `redis.max_command_bytes`
+//! before buffering.
 
 use bytes::{Buf, Bytes, BytesMut};
 
-use crate::num::d2string;
+use crate::num::reply_double_text;
 
 /// Longest inline request or multibulk header line Redis accepts
 /// (`PROTO_INLINE_MAX_SIZE`).
@@ -347,12 +347,13 @@ fn hex_val(c: u8) -> Option<u8> {
     }
 }
 
-/// Redis's `sdssplitargs`: words split on spaces, `"..."` with `\n \r \t
-/// \b \a \\ \" \xHH` escapes, `'...'` with `\'`; a closing quote must be
-/// followed by a space or the end. `None` for unbalanced quotes.
+/// Splits an inline command into words as Redis does: on spaces, `"..."`
+/// with `\n \r \t \b \a \\ \" \xHH` escapes, `'...'` with `\'`; a closing
+/// quote must be followed by a space or the end. `None` for unbalanced
+/// quotes.
 #[must_use]
 pub fn split_args(line: &[u8]) -> Option<Vec<Vec<u8>>> {
-    // Redis works on C strings: a NUL ends the line.
+    // A NUL ends the line, as it does for Redis.
     let line = &line[..line.iter().position(|b| *b == 0).unwrap_or(line.len())];
     let mut out = Vec::new();
     let mut i = 0;
@@ -478,7 +479,7 @@ pub fn encode(f: &Frame, proto: Proto, out: &mut BytesMut) {
             }
         }
         Frame::Double(d) => {
-            let t = d2string(*d);
+            let t = reply_double_text(*d);
             if r3 {
                 line(out, b',', t.as_bytes());
             } else {

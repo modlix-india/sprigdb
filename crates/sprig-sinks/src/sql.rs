@@ -214,6 +214,21 @@ pub trait Host: Send {
     ) -> Result<Option<FanInDef>> {
         Ok(None)
     }
+
+    /// The `FOR EACH TENANT` stream definition `db.name` a fan-in sink of
+    /// this tenant may read (`SPRIG_FAN_IN` checked), its partitions and
+    /// `UNDER t`'s id.
+    ///
+    /// # Errors
+    /// `UNDER` names no tenant below this one; the catalog's.
+    async fn fan_in_stream(
+        &mut self,
+        _db: &str,
+        _name: &str,
+        _under: Option<&str>,
+    ) -> Result<Option<FanInDef>> {
+        Ok(None)
+    }
 }
 
 /// An inherited queue definition a fan-in sink reads.
@@ -1255,12 +1270,49 @@ async fn sink_def(h: &mut dyn Host, c: grammar::CreateSink) -> Result<SinkDef> {
                 partitions: partitions.max(1),
             }
         }
-        grammar::SourceAst::FanIn { .. } => {
-            return Err(err(
-                SprigCode::SinkOptionInvalid,
-                "FAN IN sinks read FOR EACH TENANT streams, which aren't stored on the SprigDB \
-                 engine yet",
-            ));
+        grammar::SourceAst::FanIn { stream: st, under } => {
+            // Every member's instance of a FOR EACH TENANT stream, read as
+            // the owner, who needs SPRIG_FAN_IN and SELECT on it.
+            let sdbname = st.db.clone().unwrap_or_else(|| dbname.clone());
+            if !h.fan_in() {
+                return Err(err(
+                    SprigCode::SinkPrivilege,
+                    "Access denied; you need (at least one of) the SPRIG_FAN_IN privilege(s) for a fan-in sink",
+                ));
+            }
+            if !h.can_select(&sdbname, &st.name) {
+                return Err(err(
+                    SprigCode::SinkPrivilege,
+                    format!("you need SELECT on stream {}", st.name),
+                ));
+            }
+            if c.start_at == StartAt::Snapshot {
+                return Err(bad_option(
+                    "START AT SNAPSHOT is for tables' changes: a stream sink starts at LATEST, \
+                     EARLIEST or a TIMESTAMP",
+                ));
+            }
+            let d = h
+                .fan_in_stream(&sdbname, &st.name, under.as_deref())
+                .await?
+                .ok_or_else(|| {
+                    err(
+                        SprigCode::SinkOptionInvalid,
+                        format!(
+                            "no FOR EACH TENANT stream {sdbname}.{} in reach for FAN IN",
+                            st.name
+                        ),
+                    )
+                })?;
+            fan_in_guarantee(c.guarantee, &c.target)?;
+            SourceSpec::FanIn {
+                def_tenant: d.def_tenant,
+                def_object: d.def_object,
+                db: sdbname,
+                name: st.name.clone(),
+                partitions: d.partitions.max(1),
+                under: d.under,
+            }
         }
         grammar::SourceAst::Changes(ts) => {
             // Engine tables' changes, read from the change log as the

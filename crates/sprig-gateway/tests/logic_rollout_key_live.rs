@@ -149,10 +149,11 @@ fn want(key: &str, module: u64, pct: u32) -> &'static str {
     }
 }
 
+#[ignore = "live: needs SPRIG_TEST_LOGIC_GATEWAY, SPRIG_TEST_LOGIC_USER, SPRIG_TEST_LOGIC_PASSWORD, ...; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rollouts_pick_by_key() {
     let Some(mut c) = connect("rollouts_pick_by_key").await else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let mut ck = Checks {
         passed: 0,

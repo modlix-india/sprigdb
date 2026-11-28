@@ -3,7 +3,7 @@
 
 use bytes::Bytes;
 use sprig_proto_redis::Frame;
-use sprig_proto_redis::num::{ld2string_human, parse_f64, parse_i64};
+use sprig_proto_redis::num::{incr_float_text, parse_f64, parse_i64};
 use sprig_redis::{glob, reply};
 
 use super::keys::{cursor, rand_u64, scan_opts};
@@ -487,7 +487,7 @@ fn hincrbyfloat<B: Batch>(cx: &mut Cx<'_, B>, a: &[Bytes]) -> Out {
     if n.is_nan() || n.is_infinite() {
         return Ok(Frame::err("increment would produce NaN or Infinity"));
     }
-    let text = Bytes::from(ld2string_human(n));
+    let text = Bytes::from(incr_float_text(n));
     cx.hash_write(&a[1], &h, vec![Edit::Keep(a[2].clone(), text.clone())])?;
     Ok(Frame::Bulk(text))
 }

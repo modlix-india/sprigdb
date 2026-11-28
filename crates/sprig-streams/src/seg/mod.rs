@@ -508,6 +508,19 @@ impl sprig_engine::snapshot::UnitSnapshotPart for SnapshotPart {
             .ok_or_else(|| SprigError::internal("stream log: closed"))?;
         SegLog { inner }.ingest_unit(unit.0, index, input)
     }
+
+    fn forget(&self, unit: sprig_engine::UnitId) {
+        if let Some(inner) = self.0.upgrade() {
+            let n = SegLog { inner }.forget_unit(unit.0);
+            if n > 0 {
+                tracing::info!(
+                    unit = unit.0,
+                    partitions = n,
+                    "stream log: dropped a departed unit's partitions"
+                );
+            }
+        }
+    }
 }
 
 impl Inner {
@@ -620,6 +633,21 @@ impl SegLog {
         let head: UnitStreams = serde_json::from_slice(&body)
             .map_err(|e| SprigError::internal(format!("stream log: snapshot is corrupt: {e}")))?;
         let applied = head.applied.max(index);
+        {
+            // A snapshot older than what this log already holds of the unit
+            // (one handed over late, when the log registered after the
+            // engine restored it): the partitions here are newer; keep them.
+            let a = lock(&self.inner.apply);
+            if a.floored.contains(&unit) && a.applied.get(&unit).is_some_and(|x| *x > applied) {
+                tracing::info!(
+                    unit,
+                    snapshot = applied,
+                    held = a.applied.get(&unit).copied().unwrap_or(0),
+                    "stream log: a unit snapshot older than the partitions held here; kept them"
+                );
+                return Ok(());
+            }
+        }
         // What the unit had here goes first (a follower restoring).
         let old: Vec<PartKey> = self
             .inner
@@ -1148,6 +1176,11 @@ impl SegLog {
             a.dirty = true;
             gone
         };
+        // The manifest without them first (a restart must not find them
+        // listed with their files gone), then the files.
+        if let Err(e) = self.flush() {
+            tracing::warn!(unit, error = %e, "stream log: the manifest wasn't written after a unit left; the next flush writes it");
+        }
         for k in &gone {
             let _ = fs::remove_dir_all(part_dir(&self.inner.dir, k));
         }

@@ -1207,6 +1207,7 @@ fn dump(dir: &str, seed: u64, cases: usize) {
     }
 }
 
+#[ignore = "live: needs SPRIG_PLAN_DUMP_DIR, SPRIG_PLAN_ORACLE_SEED, SPRIG_PLAN_ORACLE_CASES; tools/live/README.md"]
 #[test]
 fn planner_matches_the_servers() {
     // The generated tables and statements as text, for another harness.
@@ -1227,7 +1228,7 @@ fn planner_matches_the_servers() {
     let oracles = Oracle::from_env();
     if oracles.is_empty() {
         eprintln!("no SPRIG_PLAN_ORACLE_* set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     }
     let seed: u64 = std::env::var("SPRIG_PLAN_ORACLE_SEED")
         .ok()

@@ -5,7 +5,7 @@
 #
 #   deploy/compose/integration.sh up     # gateway-dev.sh up, then the extras below
 #   source "$SPRIG_GATEWAY_DEV_STATE/test-env"   # (CI: appended to $GITHUB_ENV)
-#   cargo nextest run --workspace --profile ci-s1
+#   cargo nextest run --workspace --run-ignored all --profile ci-s1
 #   deploy/compose/integration.sh down
 #
 # up runs gateway-dev.sh up (catalog mode: tenants acme and globex on

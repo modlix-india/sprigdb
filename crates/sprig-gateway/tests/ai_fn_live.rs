@@ -218,6 +218,7 @@ fn vec_of(b: &[u8]) -> Vec<f32> {
         .collect()
 }
 
+#[ignore = "live: needs SPRIG_TEST_AIFN_GATEWAY, SPRIG_TEST_AIFN_TENANT, SPRIG_TEST_AIFN_USER, ...; tools/live/README.md"]
 #[tokio::test]
 async fn ai_functions_end_to_end() {
     let Some(addr) = skip::var(GATEWAY) else {

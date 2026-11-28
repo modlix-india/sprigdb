@@ -366,11 +366,12 @@ bootstrap_addr = "127.0.0.1:{tel}"
     )
 }
 
+#[ignore = "live: needs SPRIG_TEST_DOCKER; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bins_a_pinned_tenant_stays_in_its_jurisdiction() {
     if skip::var(skip::DOCKER).is_none() {
         skip::report_missing(skip::DOCKER, "live_residency_bins");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     }
     let Some((sprigdb, sprigctl)) = bins() else {
         eprintln!("live_residency_bins: build sprigdb and sprigctl first");

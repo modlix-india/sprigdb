@@ -806,12 +806,14 @@ async fn detect(
     None
 }
 
+#[ignore = "live: needs SPRIG_TEST_LA_TEXT, SPRIG_TEST_LA_NO_STATE_CHECK, SPRIG_TEST_GALERA_CONTAINERS, ...; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(clippy::too_many_lines)] // one scenario, start to end
 async fn primary_replicas_promote_with_after_sync() {
-    if !enabled("primary_replicas_promote_with_after_sync") {
-        return;
-    }
+    assert!(
+        enabled("primary_replicas_promote_with_after_sync"),
+        "live test run without its environment: see tools/live/README.md"
+    );
     let net = Net(format!("sprig-sim-r2fo-net-{}", std::process::id()));
     docker(&["network", "create", &net.0]).expect("network");
     let db1 = start_node(&net.0, "db1", 101, None);
@@ -1084,12 +1086,14 @@ async fn synced_3(urls: &[String]) -> bool {
     true
 }
 
+#[ignore = "live: needs SPRIG_TEST_LA_TEXT, SPRIG_TEST_LA_NO_STATE_CHECK, SPRIG_TEST_GALERA_CONTAINERS, ...; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(clippy::too_many_lines)] // one scenario, start to end
 async fn galera_repicks_writers_and_heals() {
-    if !enabled("galera_repicks_writers_and_heals") {
-        return;
-    }
+    assert!(
+        enabled("galera_repicks_writers_and_heals"),
+        "live test run without its environment: see tools/live/README.md"
+    );
     let Some(urls) = skip::var(skip::MARIADB_GALERA).map(|v| skip::urls(&v)) else {
         skip::report_missing(skip::MARIADB_GALERA, "galera_repicks_writers_and_heals");
         return;
@@ -1291,11 +1295,13 @@ const BF_SCHEMA: &str = "r2failover_bf";
 /// came while the session was idle or while its statement ran (`SLEEP`).
 /// The gateway relies on that; it catches only the silent case
 /// (`backend::session`).
+#[ignore = "live: needs SPRIG_TEST_LA_TEXT, SPRIG_TEST_LA_NO_STATE_CHECK, SPRIG_TEST_GALERA_CONTAINERS, ...; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn galera_aborts_report_1213() {
-    if !enabled("galera_aborts_report_1213") {
-        return;
-    }
+    assert!(
+        enabled("galera_aborts_report_1213"),
+        "live test run without its environment: see tools/live/README.md"
+    );
     let Some(urls) = skip::var(skip::MARIADB_GALERA).map(|v| skip::urls(&v)) else {
         skip::report_missing(skip::MARIADB_GALERA, "galera_aborts_report_1213");
         return;

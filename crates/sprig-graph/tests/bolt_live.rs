@@ -248,6 +248,7 @@ fn ordered(q: &str) -> bool {
     q.contains("ORDER BY")
 }
 
+#[ignore = "live: needs SPRIG_TEST_BOLT_ADDR, SPRIG_TEST_BOLT_USER, SPRIG_TEST_BOLT_PASSWORD, ...; tools/live/README.md"]
 #[tokio::test]
 #[allow(clippy::too_many_lines)] // one end-to-end walk
 async fn gateway_bolt_end_to_end() {
@@ -260,7 +261,7 @@ async fn gateway_bolt_end_to_end() {
         eprintln!(
             "skipped: SPRIG_TEST_BOLT_ADDR / _USER / _PASSWORD / SPRIG_TEST_SQL_ADDR not set"
         );
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     // The graph, through SQL.
     {
@@ -601,6 +602,7 @@ async fn gateway_bolt_end_to_end() {
         .expect("clean default");
 }
 
+#[ignore = "live: needs SPRIG_TEST_BOLT_ADDR, SPRIG_TEST_BOLT_USER, SPRIG_TEST_BOLT_PASSWORD, ...; tools/live/README.md"]
 #[tokio::test]
 async fn differential_against_neo4j() {
     let (Some(addr), Some(user), Some(pw), Some(neo), Some(neo_pw)) = (
@@ -611,7 +613,7 @@ async fn differential_against_neo4j() {
         env("SPRIG_TEST_NEO4J_PASSWORD"),
     ) else {
         eprintln!("skipped: SPRIG_TEST_BOLT_* and SPRIG_TEST_NEO4J_ADDR / _PASSWORD not set");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     // `SPRIG_TEST_BOLT_DIFF_DB` names another graph (for example one in a
     // database whose `sharding.min_shards` is 4).
@@ -701,6 +703,7 @@ fn plan_details(p: &PackValue, out: &mut Vec<String>) {
 /// `EXPLAIN` shows the router's group and
 /// every shard with its cluster, `PROFILE` the routes each step ran, and
 /// `sprig_router_graph_routes_total` counts them.
+#[ignore = "live: needs SPRIG_TEST_BOLT_ADDR, SPRIG_TEST_BOLT_USER, SPRIG_TEST_BOLT_PASSWORD, ...; tools/live/README.md"]
 #[tokio::test]
 async fn bolt_hops_are_router_routes() {
     let (Some(addr), Some(user), Some(pw), Some(diff_db)) = (
@@ -710,7 +713,7 @@ async fn bolt_hops_are_router_routes() {
         env("SPRIG_TEST_BOLT_DIFF_DB"),
     ) else {
         eprintln!("skipped: SPRIG_TEST_BOLT_* and SPRIG_TEST_BOLT_DIFF_DB not set");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let db = vec![("db", PackValue::String(diff_db.clone()))];
     let mut g = connect(&addr, &user, &pw).await.expect("gateway");
@@ -860,6 +863,7 @@ async fn run_pull(
 /// `REPORT STATUS`, the refusal inside an explicit transaction); byte
 /// arrays as parameters, properties and results; and a row error after
 /// the rows before it. Every answer is compared with the reference's.
+#[ignore = "live: needs SPRIG_TEST_BOLT_ADDR, SPRIG_TEST_BOLT_USER, SPRIG_TEST_BOLT_PASSWORD, ...; tools/live/README.md"]
 #[tokio::test]
 async fn round_eight_against_neo4j() {
     let (Some(addr), Some(user), Some(pw), Some(neo), Some(neo_pw), Some(diff_db)) = (
@@ -873,7 +877,7 @@ async fn round_eight_against_neo4j() {
         eprintln!(
             "skipped: SPRIG_TEST_BOLT_*, SPRIG_TEST_NEO4J_* and SPRIG_TEST_BOLT_DIFF_DB not set"
         );
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let db = vec![("db", PackValue::String(diff_db.clone()))];
     let mut g = connect_58(&addr, &user, &pw).await;
@@ -954,6 +958,7 @@ async fn round_eight_against_neo4j() {
 /// carries the value's type (a string equal to a byte array's base64, or
 /// to a date's text, is another key). Every answer, and every failure
 /// code, is compared with the reference's.
+#[ignore = "live: needs SPRIG_TEST_BOLT_ADDR, SPRIG_TEST_BOLT_USER, SPRIG_TEST_BOLT_PASSWORD, ...; tools/live/README.md"]
 #[tokio::test]
 async fn round_nine_against_neo4j() {
     let (Some(addr), Some(user), Some(pw), Some(neo), Some(neo_pw), Some(diff_db)) = (
@@ -967,7 +972,7 @@ async fn round_nine_against_neo4j() {
         eprintln!(
             "skipped: SPRIG_TEST_BOLT_*, SPRIG_TEST_NEO4J_* and SPRIG_TEST_BOLT_DIFF_DB not set"
         );
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let db = vec![("db", PackValue::String(diff_db.clone()))];
     let mut g = connect_58(&addr, &user, &pw).await;
@@ -1115,6 +1120,7 @@ async fn metric(url: &str, name: &str) -> f64 {
         .sum()
 }
 
+#[ignore = "live: needs SPRIG_TEST_BOLT_ADDR, SPRIG_TEST_BOLT_USER, SPRIG_TEST_BOLT_PASSWORD; tools/live/README.md"]
 #[tokio::test]
 #[allow(clippy::too_many_lines)] // one walk over many features
 async fn round_two_end_to_end() {
@@ -1124,7 +1130,7 @@ async fn round_two_end_to_end() {
         env("SPRIG_TEST_BOLT_PASSWORD"),
     ) else {
         eprintln!("skipped: SPRIG_TEST_BOLT_* not set");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let db = || vec![("db", PackValue::str("r8graphs_g.round2"))];
     if let Some(sql) = env("SPRIG_TEST_SQL_ADDR") {
@@ -1494,6 +1500,7 @@ fn graph_shards(bin: &str, tenant: &str, group: &str) -> (u64, Vec<(u64, String)
 ///
 /// Needs the end-to-end variables plus `SPRIG_TEST_SPRIGCTL` (a sprigctl
 /// binary) and `SPRIGCTL_ENDPOINT`; `SPRIG_TEST_TENANT` (default `acme`).
+#[ignore = "live: needs SPRIG_TEST_BOLT_ADDR, SPRIG_TEST_BOLT_USER, SPRIG_TEST_BOLT_PASSWORD, ...; tools/live/README.md"]
 #[tokio::test]
 #[allow(clippy::too_many_lines)] // load, split, split, move, move, check
 async fn sharded_graph_split_and_move() {
@@ -1505,7 +1512,7 @@ async fn sharded_graph_split_and_move() {
         env("SPRIG_TEST_SPRIGCTL"),
     ) else {
         eprintln!("skipped: SPRIG_TEST_BOLT_* / SPRIG_TEST_SQL_ADDR / SPRIG_TEST_SPRIGCTL not set");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let tenant = env("SPRIG_TEST_TENANT").unwrap_or_else(|| "acme".into());
     {
@@ -1691,6 +1698,7 @@ async fn sharded_graph_split_and_move() {
 /// read through Bolt and through `GRAPH_TABLE` in SQL; `GRAPH_TABLE` over a
 /// native graph; GQL's forms through Bolt. Answers are checked against the
 /// same question in plain SQL.
+#[ignore = "live: needs SPRIG_TEST_BOLT_ADDR, SPRIG_TEST_BOLT_USER, SPRIG_TEST_BOLT_PASSWORD, ...; tools/live/README.md"]
 #[tokio::test]
 #[allow(clippy::too_many_lines)] // tables, graph, Bolt, SQL
 async fn mapped_graphs_graph_table_and_gql() {
@@ -1701,7 +1709,7 @@ async fn mapped_graphs_graph_table_and_gql() {
         env("SPRIG_TEST_SQL_ADDR"),
     ) else {
         eprintln!("skipped: SPRIG_TEST_BOLT_* / SPRIG_TEST_SQL_ADDR not set");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let (host, port) = sql.split_once(':').expect("host:port");
     let opts = mysql_async::OptsBuilder::default()
@@ -1872,6 +1880,7 @@ async fn mapped_graphs_graph_table_and_gql() {
 /// A Bolt session shows in `SHOW PROCESSLIST` with its running
 /// statement; `KILL QUERY` stops the statement (`Terminated`) and the
 /// session carries on; `KILL` closes the connection.
+#[ignore = "live: needs SPRIG_TEST_BOLT_ADDR, SPRIG_TEST_BOLT_USER, SPRIG_TEST_BOLT_PASSWORD, ...; tools/live/README.md"]
 #[tokio::test]
 async fn bolt_sessions_in_processlist_and_kill() {
     let (Some(addr), Some(user), Some(pw), Some(sql)) = (
@@ -1881,7 +1890,7 @@ async fn bolt_sessions_in_processlist_and_kill() {
         env("SPRIG_TEST_SQL_ADDR"),
     ) else {
         eprintln!("skipped: SPRIG_TEST_BOLT_* / SPRIG_TEST_SQL_ADDR not set");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let (host, port) = sql.split_once(':').expect("host:port");
     let opts = mysql_async::OptsBuilder::default()
@@ -1992,6 +2001,7 @@ fn int0(r: &Rows) -> i64 {
 /// Needs the end-to-end variables plus `SPRIG_TEST_SPRIGCTL`;
 /// `SPRIG_TEST_TENANT` (default `acme`); `SPRIG_TEST_R4_MOVES=0` skips
 /// the two shard moves.
+#[ignore = "live: needs SPRIG_TEST_BOLT_ADDR, SPRIG_TEST_BOLT_USER, SPRIG_TEST_BOLT_PASSWORD, ...; tools/live/README.md"]
 #[tokio::test]
 #[allow(clippy::too_many_lines)] // one scenario, step by step
 async fn round_four_uniqueness_grants_and_sprigctl() {
@@ -2003,7 +2013,7 @@ async fn round_four_uniqueness_grants_and_sprigctl() {
         env("SPRIG_TEST_SPRIGCTL"),
     ) else {
         eprintln!("skipped: SPRIG_TEST_BOLT_* / SPRIG_TEST_SQL_ADDR / SPRIG_TEST_SPRIGCTL not set");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let tenant = env("SPRIG_TEST_TENANT").unwrap_or_else(|| "acme".into());
     let mut s = sql_conn(&sql, &user, &pw).await;
@@ -2330,6 +2340,7 @@ fn mirror_view(ctl: &str, tenant: &str, graph: &str) -> (String, u64, u64, usize
 ///
 /// Needs the end-to-end variables plus `SPRIG_TEST_SPRIGCTL`,
 /// `SPRIGCTL_ENDPOINT` and (for the wait counts) `SPRIG_TEST_GW_METRICS`.
+#[ignore = "live: needs SPRIG_TEST_BOLT_ADDR, SPRIG_TEST_BOLT_USER, SPRIG_TEST_BOLT_PASSWORD, ...; tools/live/README.md"]
 #[tokio::test]
 #[allow(clippy::too_many_lines)] // mode, load, write and check, split, moves, convergence
 async fn round_five_async_mirrors() {
@@ -2341,7 +2352,7 @@ async fn round_five_async_mirrors() {
         env("SPRIG_TEST_SPRIGCTL"),
     ) else {
         eprintln!("skipped: SPRIG_TEST_BOLT_* / SPRIG_TEST_SQL_ADDR / SPRIG_TEST_SPRIGCTL not set");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let tenant = env("SPRIG_TEST_TENANT").unwrap_or_else(|| "acme".into());
     let metrics = env("SPRIG_TEST_GW_METRICS");
@@ -2647,6 +2658,7 @@ async fn round_five_async_mirrors() {
 /// `REVOKE` the writes are refused again.
 ///
 /// Needs the end-to-end variables.
+#[ignore = "live: needs SPRIG_TEST_BOLT_ADDR, SPRIG_TEST_BOLT_USER, SPRIG_TEST_BOLT_PASSWORD, ...; tools/live/README.md"]
 #[tokio::test]
 #[allow(clippy::too_many_lines)] // grant, write, refuse, revoke
 async fn round_five_label_write_grants() {
@@ -2657,7 +2669,7 @@ async fn round_five_label_write_grants() {
         env("SPRIG_TEST_SQL_ADDR"),
     ) else {
         eprintln!("skipped: SPRIG_TEST_BOLT_* / SPRIG_TEST_SQL_ADDR not set");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let tenant = user.split('.').next().unwrap_or("acme").to_owned();
     let mut s = sql_conn(&sql, &user, &pw).await;
@@ -2822,6 +2834,7 @@ async fn round_five_label_write_grants() {
 /// Needs the end-to-end variables, `SPRIG_TEST_SPRIGCTL`, and
 /// `SPRIG_TEST_WORKER_CTL`: a command taking `kill` or `start` for this
 /// deployment's worker.
+#[ignore = "live: needs SPRIG_TEST_BOLT_ADDR, SPRIG_TEST_BOLT_USER, SPRIG_TEST_BOLT_PASSWORD, ...; tools/live/README.md"]
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn round_five_applier_kill() {
@@ -2836,7 +2849,7 @@ async fn round_five_applier_kill() {
         eprintln!(
             "skipped: SPRIG_TEST_BOLT_* / SPRIG_TEST_SPRIGCTL / SPRIG_TEST_WORKER_CTL not set"
         );
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let tenant = env("SPRIG_TEST_TENANT").unwrap_or_else(|| "acme".into());
     let gname = "r8five_ak.g";
@@ -2970,6 +2983,7 @@ async fn round_five_applier_kill() {
 /// `SPRIG_TEST_HEAVY_STATEMENTS` (default 8) sets how many run at once;
 /// the gateway should have fewer runtime workers
 /// (`SPRIGDB_GATEWAY_WORKER_THREADS`, 4 in the test deployment).
+#[ignore = "live: needs SPRIG_TEST_BOLT_ADDR, SPRIG_TEST_BOLT_USER, SPRIG_TEST_BOLT_PASSWORD, ...; tools/live/README.md"]
 #[tokio::test]
 async fn heavy_graph_statements_leave_the_runtime_free() {
     let (Some(addr), Some(user), Some(pw), Some(sql)) = (
@@ -2979,7 +2993,7 @@ async fn heavy_graph_statements_leave_the_runtime_free() {
         env("SPRIG_TEST_SQL_ADDR"),
     ) else {
         eprintln!("skipped: SPRIG_TEST_BOLT_* / SPRIG_TEST_SQL_ADDR not set");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let heavy: usize =
         env("SPRIG_TEST_HEAVY_STATEMENTS").map_or(8, |v| v.parse().expect("a count"));

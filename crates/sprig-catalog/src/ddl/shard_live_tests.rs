@@ -250,6 +250,7 @@ async fn cleanup(single: &Pool, primary: &Pool) {
     }
 }
 
+#[ignore = "live: needs SPRIG_TEST_MARIADB_SINGLE, SPRIG_TEST_MARIADB_REPLICATION; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread")]
 async fn live_schema_changes_across_four_shards() {
     let (Some(_), Some(repl)) = (
@@ -257,7 +258,7 @@ async fn live_schema_changes_across_four_shards() {
         env("SPRIG_TEST_MARIADB_REPLICATION"),
     ) else {
         eprintln!("skipped: needs SPRIG_TEST_MARIADB_SINGLE and SPRIG_TEST_MARIADB_REPLICATION");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let single_url = env("SPRIG_TEST_MARIADB_SINGLE").unwrap();
     let primary_url = repl.split(',').next().unwrap().trim().to_owned();

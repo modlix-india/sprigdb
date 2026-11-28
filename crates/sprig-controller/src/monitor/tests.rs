@@ -524,10 +524,11 @@ fn single_node() -> Option<(String, String, String)> {
 /// failing one turns the feed off on every deep pass, rather than only at
 /// registration (the published profile would otherwise lapse to the feed
 /// settings' verdict after the upgrade sustain period).
+#[ignore = "live: needs SPRIG_TEST_MARIADB_SINGLE; tools/live/README.md"]
 #[tokio::test]
 async fn deep_passes_run_the_binlog_dump_probe() {
     let Some((user, pass, addr)) = single_node() else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let creds = CredsFile::new((&user, &pass), (&user, &pass));
     let f = fixture("mon-dump").await;

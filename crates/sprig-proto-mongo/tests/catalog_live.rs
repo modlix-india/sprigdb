@@ -46,12 +46,13 @@ async fn sorted_ids(c: &mongodb::Collection<Document>, f: Document) -> Vec<Bson>
         .collect()
 }
 
+#[ignore = "live: needs SPRIG_TEST_MONGO_URI, SPRIG_TEST_LEGACY_PHASE; tools/live/README.md"]
 #[tokio::test]
 async fn legacy_metadata_moves_to_the_catalog() {
     let (Some(u), Some(phase)) = (uri("SPRIG_TEST_MONGO_URI"), uri("SPRIG_TEST_LEGACY_PHASE"))
     else {
         eprintln!("SPRIG_TEST_MONGO_URI or SPRIG_TEST_LEGACY_PHASE not set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let db = client(&u).await.database("r5mongo2_legacy");
     let c = db.collection::<Document>("people");
@@ -113,11 +114,12 @@ async fn legacy_metadata_moves_to_the_catalog() {
     db.drop().await.unwrap();
 }
 
+#[ignore = "live: needs SPRIG_TEST_MONGO_URI, SPRIG_TEST_MONGO_URI2; tools/live/README.md"]
 #[tokio::test]
 async fn two_gateways_share_collections() {
     let (Some(u1), Some(u2)) = (uri("SPRIG_TEST_MONGO_URI"), uri("SPRIG_TEST_MONGO_URI2")) else {
         eprintln!("SPRIG_TEST_MONGO_URI2 not set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let a = client(&u1).await.database("r5mongo2_two");
     let b = client(&u2).await.database("r5mongo2_two");

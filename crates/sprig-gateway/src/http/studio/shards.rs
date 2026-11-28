@@ -16,7 +16,9 @@
 //! actions (`sprigctl shard`, `sprigctl advisor`, operator mode).
 //!
 //! Shard maps come over the gateway's internal credential; without it the
-//! groups still show, with `maps_error` saying why.
+//! groups still show, with `maps_error` saying why. A tenant whose catalog
+//! is engine records only (made without a MariaDB schema) has none of
+//! these: the view answers no groups and no runs, `maps_error` saying why.
 
 use sprig_catalog::pool_wait::Bounded as _;
 use std::collections::BTreeMap;
@@ -33,6 +35,10 @@ use tonic::body::Body;
 use super::super::Core;
 use super::super::sql::Caller;
 use super::{invalid, json_response, passthrough, workload};
+
+/// Why a tenant on engine records has no shards to show.
+const ENGINE_ONLY: &str = "this tenant's data is in the storage engine, which places it itself: \
+     there are no table groups, shard maps or advisor runs";
 
 /// Advisor runs listed.
 const RUNS: usize = 50;
@@ -328,6 +334,20 @@ pub(super) async fn route(
     let rest = path
         .trim_start_matches("/v1/shards")
         .trim_start_matches('/');
+    // A tenant whose catalog is engine records only has no table groups,
+    // shard maps or advisor runs (those were MariaDB's): the view is empty.
+    if let Some(tid) = caller.principal.tenant
+        && sprig_catalog::migrate::lazy_schema(tid).await?.is_some()
+    {
+        return match rest {
+            "" => Ok(json_response(
+                200,
+                &json!({"groups": [], "maps_error": ENGINE_ONLY, "all_databases": true, "engine_only": true}),
+            )),
+            "advisor" => Ok(json_response(200, &json!({"runs": []}))),
+            _ => Err(invalid(ENGINE_ONLY)),
+        };
+    }
     match rest.split('/').collect::<Vec<_>>().as_slice() {
         [""] => Ok(json_response(200, &groups(core, caller, &tenant).await?)),
         ["advisor"] => Ok(json_response(200, &runs(core, caller).await?)),

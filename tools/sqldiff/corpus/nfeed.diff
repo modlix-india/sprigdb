@@ -1,0 +1,33 @@
+# Gaps found by change streams' inheritance probes: ENUM in set operations, FROM DUAL, JSON_TABLE lateral in subqueries and CHARACTER SET in its columns.
+x:DROP TABLE IF EXISTS nf_e
+x:DROP TABLE IF EXISTS nf_j
+q:CREATE TABLE nf_e (id INT PRIMARY KEY, st ENUM('a','b','it''s') NOT NULL, sn ENUM('x','y') NULL, s VARCHAR(5) COLLATE utf8mb4_bin)
+q:INSERT INTO nf_e VALUES (1,'a','x','p'),(2,'b',NULL,'q')
+q:SELECT st FROM nf_e UNION ALL SELECT st FROM nf_e ORDER BY 1
+q:SELECT st FROM nf_e UNION ALL SELECT 'c'
+q:SELECT 'c' AS st UNION ALL SELECT st FROM nf_e
+q:SELECT nf_e.st AS k, sn FROM nf_e UNION SELECT 'a', NULL ORDER BY k
+q:SELECT d.st FROM (SELECT st FROM nf_e WHERE id = 1 UNION ALL SELECT 'b' AS st) AS d ORDER BY d.st
+q:SELECT st FROM nf_e WHERE id = 1 UNION ALL SELECT st FROM nf_e WHERE id = 2 UNION ALL SELECT 'z'
+q:SELECT s FROM nf_e UNION ALL SELECT 'zz' ORDER BY 1
+q:SELECT 1 FROM DUAL
+q:SELECT id FROM nf_e UNION ALL SELECT 7 FROM DUAL ORDER BY 1
+q:SELECT id FROM nf_e WHERE id IN (SELECT 1 FROM DUAL)
+q:SELECT d.a FROM (SELECT id AS a FROM nf_e UNION ALL SELECT 9 AS a FROM DUAL WHERE FALSE) AS d ORDER BY 1
+q:SELECT * FROM (SELECT 1 AS a FROM DUAL WHERE FALSE) AS d
+q:CREATE TABLE nf_j (id INT PRIMARY KEY, doc JSON)
+q:INSERT INTO nf_j VALUES (1,'[{"a":1,"s":"Ab"},{"a":2,"s":"cd"}]'),(2,'[{"a":3,"s":"ab"}]'),(3,'[]')
+q:SELECT nf_j.id, t.a FROM nf_j, JSON_TABLE(nf_j.doc, '$[*]' COLUMNS (a INT PATH '$.a')) AS t ORDER BY nf_j.id, t.a
+q:SELECT id FROM nf_j WHERE EXISTS (SELECT 1 FROM JSON_TABLE(nf_j.doc, '$[*]' COLUMNS (a INT PATH '$.a')) AS t WHERE t.a = 3)
+q:SELECT id FROM nf_j WHERE NOT EXISTS (SELECT 1 FROM JSON_TABLE(nf_j.doc, '$[*]' COLUMNS (a INT PATH '$.a')) AS t) ORDER BY id
+q:SELECT id FROM nf_j WHERE id IN (SELECT t.a FROM JSON_TABLE(nf_j.doc, '$[*]' COLUMNS (a INT PATH '$.a')) AS t) ORDER BY id
+q:SELECT id, (SELECT SUM(t.a) FROM JSON_TABLE(nf_j.doc, '$[*]' COLUMNS (a INT PATH '$.a')) AS t) AS s FROM nf_j ORDER BY id
+q:SELECT t.s FROM JSON_TABLE('[{"s":"x"}]', '$[*]' COLUMNS (s VARCHAR(10) CHARACTER SET utf8mb4 PATH '$.s')) AS t
+q:SELECT t.s, COLLATION(t.s) FROM JSON_TABLE('[{"s":"x"}]', '$[*]' COLUMNS (s VARCHAR(10) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin PATH '$.s', n DECIMAL(5,2) PATH '$.n')) AS t
+q:SELECT nf_j.id, t.s FROM nf_j, JSON_TABLE(nf_j.doc, '$[*]' COLUMNS (s VARCHAR(10) COLLATE utf8mb4_bin PATH '$.s')) AS t WHERE t.s = 'ab' ORDER BY 1
+q:SELECT nf_j.id, t.s FROM nf_j, JSON_TABLE(nf_j.doc, '$[*]' COLUMNS (s VARCHAR(10) CHARSET utf8mb4 PATH '$.s')) AS t WHERE t.s = 'ab' ORDER BY 1, 2
+q:SELECT s FROM nf_e UNION ALL SELECT _utf8mb4'x' ORDER BY 1
+q:SELECT id FROM nf_e WHERE s = _utf8mb4'p'
+q:SELECT _utf8mb4'ab' = 'AB', COLLATION(_utf8mb4'a'), COERCIBILITY(_utf8mb4'a'), HEX(_binary'ab'), COLLATION(_binary'ab')
+x:DROP TABLE IF EXISTS nf_e
+x:DROP TABLE IF EXISTS nf_j

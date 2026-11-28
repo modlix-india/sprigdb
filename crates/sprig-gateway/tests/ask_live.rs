@@ -77,6 +77,7 @@ async fn setup(c: &mut Conn) {
         .unwrap();
 }
 
+#[ignore = "live: needs SPRIG_TEST_ASK_GATEWAY, SPRIG_TEST_ASK_USER, SPRIG_TEST_ASK_PASSWORD; tools/live/README.md"]
 #[tokio::test]
 async fn ask_proposes_and_runs_nothing() {
     let Some(mut c) = conn("ask_proposes_and_runs_nothing").await else {
@@ -128,6 +129,7 @@ async fn ask_proposes_and_runs_nothing() {
     c.query_drop("DROP DATABASE ask_live").await.unwrap();
 }
 
+#[ignore = "live: needs SPRIG_TEST_ASK_GATEWAY, SPRIG_TEST_ASK_USER, SPRIG_TEST_ASK_PASSWORD; tools/live/README.md"]
 #[tokio::test]
 async fn names_called_ask_still_work_and_mistakes_are_errors() {
     let Some(mut c) = conn("names_called_ask_still_work_and_mistakes_are_errors").await else {

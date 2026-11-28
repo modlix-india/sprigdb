@@ -101,31 +101,42 @@ fn forwarded_json(
         .map_err(|e| Status::internal(format!("forwarded reply: {e}")))
 }
 
-/// Forwards `rpc` when `transaction` names another gateway.
+/// Forwards `rpc` when `transaction` names another gateway, or, outside a
+/// transaction, when another node leads the caller's tenant unit (only
+/// the leader commits the tenant's writes; `space` goes with the call).
 async fn forward(
     core: &Core,
     caller: &Caller,
     rpc: &str,
     transaction: &str,
-    request: serde_json::Value,
+    mut request: serde_json::Value,
+    space: Option<&str>,
 ) -> std::result::Result<Option<serde_json::Value>, Status> {
-    if transaction.is_empty() {
-        return Ok(None);
-    }
-    let h = sprig_api::handle::TxnHandle::parse(transaction).map_err(|e| st(&e))?;
-    if h.gateway_id == core.engine.gateway_id {
-        return Ok(None);
-    }
+    let gateway = if transaction.is_empty() {
+        let Some(gw) = super::rest::leader_gateway(core, caller.principal.tenant) else {
+            return Ok(None);
+        };
+        if let Some(sp) = space {
+            request[super::rest::SPACE_KEY] = serde_json::Value::String(sp.to_owned());
+        }
+        gw
+    } else {
+        let h = sprig_api::handle::TxnHandle::parse(transaction).map_err(|e| st(&e))?;
+        if h.gateway_id == core.engine.gateway_id {
+            return Ok(None);
+        }
+        metrics::counter!("sprig_api_txn_forwarded_total").increment(1);
+        h.gateway_id
+    };
     let peers = core.engine.peers.as_ref().ok_or_else(|| {
         st(&SprigError::new(
             SprigCode::ForwardFailed,
             "this gateway has no peer service to reach the transaction's gateway",
         ))
     })?;
-    metrics::counter!("sprig_api_txn_forwarded_total").increment(1);
     let reply = peers
         .forward(
-            &h.gateway_id,
+            &gateway,
             ForwardRequest {
                 authorization: super::auth::forwarded_authorization(
                     caller.authorization.as_deref(),
@@ -177,7 +188,16 @@ impl Sql for SqlSvc {
         let c = caller(&self.0, &req).await?;
         let sp = space(&req);
         let r = req.into_inner();
-        if let Some(v) = forward(&self.0, &c, "Sql.Query", &r.transaction, query_json(&r)).await? {
+        if let Some(v) = forward(
+            &self.0,
+            &c,
+            "Sql.Query",
+            &r.transaction,
+            query_json(&r),
+            sp.as_deref(),
+        )
+        .await?
+        {
             let parts: Vec<_> = v
                 .as_array()
                 .map(|a| {
@@ -219,7 +239,15 @@ impl Sql for SqlSvc {
         let c = caller(&self.0, &req).await?;
         let sp = space(&req);
         let r = req.into_inner();
-        if let Some(v) = forward(&self.0, &c, "Sql.Execute", &r.transaction, query_json(&r)).await?
+        if let Some(v) = forward(
+            &self.0,
+            &c,
+            "Sql.Execute",
+            &r.transaction,
+            query_json(&r),
+            sp.as_deref(),
+        )
+        .await?
         {
             return sprig_api::results::execute_from_json(&v)
                 .map(Response::new)
@@ -260,7 +288,16 @@ impl Functions for FunctionsSvc {
         let sp = space(&req);
         let r = req.into_inner();
         let body = super::functions::request_json(&r);
-        if let Some(v) = forward(&self.0, &c, "Functions.Call", &r.transaction, body).await? {
+        if let Some(v) = forward(
+            &self.0,
+            &c,
+            "Functions.Call",
+            &r.transaction,
+            body,
+            sp.as_deref(),
+        )
+        .await?
+        {
             return Ok(Response::new(super::functions::response(&v)));
         }
         let args = r
@@ -516,6 +553,13 @@ impl Transactions for TxnSvc {
         let c = caller(&self.0, &req).await?;
         let sp = space(&req);
         let r = req.into_inner();
+        // Begun on the tenant's leader when another node leads it: the
+        // handle then names that gateway, and later calls follow it.
+        let body = serde_json::json!({ "database": r.database, "read_only": r.read_only });
+        if let Some(v) = forward(&self.0, &c, "Transactions.Begin", "", body, sp.as_deref()).await?
+        {
+            return Ok(Response::new(sprig_api::results::transaction_from_json(&v)));
+        }
         super::sql::SPACE
             .scope(sp, self.0.engine.begin(&c, &r.database, r.read_only))
             .await
@@ -552,7 +596,7 @@ impl TxnSvc {
             "Transactions.Rollback"
         };
         let body = serde_json::json!({ "transaction": r.transaction });
-        if forward(&self.0, &c, rpc, &r.transaction, body)
+        if forward(&self.0, &c, rpc, &r.transaction, body, None)
             .await?
             .is_some()
         {

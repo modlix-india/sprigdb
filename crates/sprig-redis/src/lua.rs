@@ -22,7 +22,7 @@ use sha1::{Digest, Sha1};
 use sprig_logic_js::budget::{Limits, RunState};
 use sprig_logic_js::lua::{Config as SandboxConfig, Sandbox};
 use sprig_proto_redis::Frame;
-use sprig_proto_redis::num::d2string;
+use sprig_proto_redis::num::reply_double_text;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 /// `SHA1` of a script, in lower-case hex.
@@ -132,7 +132,7 @@ fn num_arg(n: f64) -> String {
     if t.len() <= 16 { t } else { s }
 }
 
-/// Converts a reply to Lua (Redis 7.2's `redisProtocolToLuaType`).
+/// Converts a reply to a Lua value, as Redis 7.2 hands replies to scripts.
 fn to_lua(lua: &Lua, f: &Frame, resp3: bool) -> mlua::Result<LuaValue> {
     let table1 = |k: &str, v: LuaValue| -> mlua::Result<LuaValue> {
         let t = lua.create_table()?;
@@ -162,7 +162,7 @@ fn to_lua(lua: &Lua, f: &Frame, resp3: bool) -> mlua::Result<LuaValue> {
             if resp3 {
                 table1("double", LuaValue::Number(*d))?
             } else {
-                LuaValue::String(lua.create_string(d2string(*d))?)
+                LuaValue::String(lua.create_string(reply_double_text(*d))?)
             }
         }
         Frame::DoubleText(t) => {
@@ -234,8 +234,7 @@ fn to_lua(lua: &Lua, f: &Frame, resp3: bool) -> mlua::Result<LuaValue> {
     })
 }
 
-/// Converts a script's result to a reply (Redis 7.2's
-/// `luaReplyToRedisReply`).
+/// Converts a script's result to a reply, as Redis 7.2 converts it.
 fn from_lua(v: &LuaValue, resp3: bool, depth: usize) -> Frame {
     if depth > 1000 {
         return Frame::err("reached lua stack limit");

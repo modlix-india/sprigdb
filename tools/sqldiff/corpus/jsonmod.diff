@@ -1,0 +1,17 @@
+# JSON_SET / JSON_INSERT / JSON_REPLACE / JSON_REMOVE, in SELECT and UPDATE.
+x:DROP TABLE IF EXISTS jm_t
+x:CREATE TABLE jm_t (id INT PRIMARY KEY, doc JSON)
+x:INSERT INTO jm_t VALUES (1, '{"a": 1, "b": [1, 2], "c": {"d": "x"}}'), (2, '[1, 2]'), (3, NULL), (4, '"s"')
+q:SELECT id, JSON_SET(doc, '$.a', 10, '$.z', 'new'), JSON_INSERT(doc, '$.a', 10, '$.z', 'new'), JSON_REPLACE(doc, '$.a', 10, '$.z', 'new') FROM jm_t ORDER BY id
+q:SELECT id, JSON_SET(doc, '$.b[1]', 9, '$.b[5]', 7), JSON_SET(doc, '$[0]', 'zero', '$[3]', 3), JSON_REMOVE(doc, '$.c.d', '$.b[0]'), JSON_REMOVE(doc, '$[0]') FROM jm_t ORDER BY id
+q:SELECT JSON_SET(doc, '$.c', JSON_OBJECT('k', 1)) FROM jm_t WHERE id = 1
+q:SELECT JSON_SET(doc, '$.*', 1) FROM jm_t WHERE id = 1
+q:UPDATE jm_t SET doc = JSON_SET(doc, '$.a', 2) WHERE id = 1
+q:SELECT doc FROM jm_t WHERE id = 1
+x:DROP TABLE IF EXISTS jm_t
+x:DROP TABLE IF EXISTS jm_u
+x:CREATE TABLE jm_u (id INT PRIMARY KEY, doc JSON)
+x:INSERT INTO jm_u VALUES (1, '{"a": [1, 2], "b": {"c": 1, "d": 2}}'), (2, '[3, "x"]'), (3, NULL)
+q:SELECT id, JSON_ARRAY_APPEND(doc, '$.a', 3), JSON_ARRAY_APPEND(doc, '$.b', 'z'), JSON_ARRAY_APPEND(doc, '$', 9) FROM jm_u ORDER BY id
+q:SELECT id, JSON_MERGE_PATCH(doc, '{"b": {"c": null, "e": 5}, "f": 1}'), JSON_MERGE_PATCH('{"x": 1}', doc) FROM jm_u ORDER BY id
+x:DROP TABLE IF EXISTS jm_u

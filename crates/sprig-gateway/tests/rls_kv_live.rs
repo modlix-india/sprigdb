@@ -333,6 +333,7 @@ async fn direct_elements_value_policy(ck: &mut Checks) {
     );
 }
 
+#[ignore = "live: needs SPRIG_TEST_RLS_SQL, SPRIG_TEST_RLS_REDIS; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn row_level_security_on_kv_and_vectors() {
     let (Ok(sql_addr), Ok(redis_addr)) = (
@@ -340,7 +341,7 @@ async fn row_level_security_on_kv_and_vectors() {
         std::env::var("SPRIG_TEST_RLS_REDIS"),
     ) else {
         eprintln!("skipped: set SPRIG_TEST_RLS_SQL and SPRIG_TEST_RLS_REDIS");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let mut ck = Checks {
         n: 0,

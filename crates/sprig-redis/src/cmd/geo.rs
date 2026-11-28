@@ -43,7 +43,8 @@ fn squash(x: u64) -> u32 {
     u32::try_from(x).unwrap_or(u32::MAX)
 }
 
-/// Redis's `geohashEncode` over the given ranges: lat bits even, lon odd.
+/// The 52-bit geohash of a point over the given ranges, as Redis stores it:
+/// latitude bits even, longitude bits odd.
 fn encode(lon: f64, lat: f64, lat_min: f64, lat_max: f64) -> u64 {
     let scale = f64::from(1u32 << STEP);
     let lat_off = (lat - lat_min) / (lat_max - lat_min) * scale;
@@ -51,7 +52,7 @@ fn encode(lon: f64, lat: f64, lat_min: f64, lat_max: f64) -> u64 {
     spread(lat_off as u32) | (spread(lon_off as u32) << 1)
 }
 
-/// The cell centre of a 52-bit hash (`geohashDecodeToLongLatWGS84`).
+/// The cell centre of a 52-bit hash.
 fn decode(bits: u64) -> (f64, f64) {
     let ilat = f64::from(squash(bits));
     let ilon = f64::from(squash(bits >> 1));
@@ -71,7 +72,7 @@ fn rad(d: f64) -> f64 {
     d * (std::f64::consts::PI / 180.0)
 }
 
-/// Redis's haversine (`geohashGetDistance`).
+/// The haversine distance in metres, on the Earth radius Redis uses.
 fn distance(lon1: f64, lat1: f64, lon2: f64, lat2: f64) -> f64 {
     let (la1, lo1, la2, lo2) = (rad(lat1), rad(lon1), rad(lat2), rad(lon2));
     let u = ((la2 - la1) / 2.0).sin();
@@ -79,7 +80,8 @@ fn distance(lon1: f64, lat1: f64, lon2: f64, lat2: f64) -> f64 {
     2.0 * EARTH_RADIUS * (u * u + la1.cos() * la2.cos() * v * v).sqrt().asin()
 }
 
-/// `%.17Lf` with trailing zeros dropped (`addReplyHumanLongDouble`).
+/// A distance or coordinate as Redis replies with it: 17 decimals, trailing
+/// zeros dropped.
 fn human(d: f64) -> Frame {
     let mut s = format!("{d:.17}");
     if s.contains('.') {

@@ -2058,6 +2058,7 @@ async fn a_write_that_read_the_whole_table_says_so() {
 
 /// Column types: definitions, storage, assignment rules, keys.
 mod ddl;
+mod embedwrite;
 mod fk;
 mod hidden;
 mod online;

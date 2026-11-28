@@ -83,11 +83,12 @@ fn pct(v: &[u128], p: f64) -> u128 {
     s[i]
 }
 
+#[ignore = "live: needs SPRIG_TEST_SEARCH, SPRIG_TEST_SEARCH_ROWS, SPRIG_TEST_SEARCH_KEEP, ...; tools/live/README.md"]
 #[tokio::test]
 async fn a_freshness() {
     let Some(pool) = pool() else {
         eprintln!("{VAR} not set; skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let mut w = pool.get_conn().await.unwrap();
     setup(&mut w).await;
@@ -134,11 +135,12 @@ async fn a_freshness() {
     assert_eq!(over, 0, "rows found later than search.max_lag_ms");
 }
 
+#[ignore = "live: needs SPRIG_TEST_SEARCH, SPRIG_TEST_SEARCH_ROWS, SPRIG_TEST_SEARCH_KEEP, ...; tools/live/README.md"]
 #[tokio::test]
 async fn b_own_writes() {
     let Some(pool) = pool() else {
         eprintln!("{VAR} not set; skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let mut c = pool.get_conn().await.unwrap();
     setup(&mut c).await;
@@ -171,11 +173,12 @@ async fn b_own_writes() {
     assert_eq!(misses, 0);
 }
 
+#[ignore = "live: needs SPRIG_TEST_SEARCH, SPRIG_TEST_SEARCH_ROWS, SPRIG_TEST_SEARCH_KEEP, ...; tools/live/README.md"]
 #[tokio::test]
 async fn c_complete() {
     let Some(pool) = pool() else {
         eprintln!("{VAR} not set; skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let mut c = pool.get_conn().await.unwrap();
     setup(&mut c).await;
@@ -211,11 +214,12 @@ async fn c_complete() {
 /// (the other copy serves), every row is found within
 /// `search.max_lag_ms`, and once the lost copy is placed again (seeded
 /// from its surviving peer) the index still equals the table.
+#[ignore = "live: needs SPRIG_TEST_SEARCH_KILL; tools/live/README.md"]
 #[tokio::test]
 async fn d_worker_loss() {
     let (Some(pool), Ok(kill)) = (pool(), std::env::var("SPRIG_TEST_SEARCH_KILL")) else {
         eprintln!("{VAR} or SPRIG_TEST_SEARCH_KILL not set; skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let mut c = pool.get_conn().await.unwrap();
     setup(&mut c).await;

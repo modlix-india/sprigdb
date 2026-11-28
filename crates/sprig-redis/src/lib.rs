@@ -26,6 +26,8 @@
 //! - [`fabric`]: the hubs, carrying publishes and wake-ups of
 //!   blocked clients between gateways over the peer service.
 //! - [`glob`], [`reply`]: Redis's glob matcher and reply texts.
+//! - [`stats`]: commands answered, by command and result, for the
+//!   gateway's `sprig_redis_commands_total`.
 //!
 //! Most commands run as SQL statements computed in the gateway (lock the
 //! key row, read what the command needs, write); only the hottest writes
@@ -69,6 +71,7 @@ pub mod reply;
 pub mod search;
 pub mod session;
 pub mod spec;
+pub mod stats;
 
 pub use env::{Config, Env};
 pub use session::{Auth, HandOff, Login, Session};

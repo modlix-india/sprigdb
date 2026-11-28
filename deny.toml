@@ -38,6 +38,16 @@ ignore = [
     # vulnerable. It comes in through nix 0.26, which raft-engine 0.4.2 (approved by
     # Kiran, 18 Nov 2026) uses for file locking; no raft-engine release drops it yet.
     { id = "RUSTSEC-2026-0441", reason = "pin-utils: unmaintained, not vulnerable; via nix 0.26 under raft-engine" },
+    # fxhash (MIT OR Apache-2.0) is unmaintained, not vulnerable: a small
+    # non-cryptographic hasher raft 0.7.0 (approved by Kiran, 18 Nov 2026)
+    # uses for its in-memory maps. No raft release drops it yet.
+    { id = "RUSTSEC-2025-0057", reason = "fxhash: unmaintained, not vulnerable; via raft 0.7.0" },
+    # The advisory is about parquet's `encryption` feature (bloom filters
+    # left unencrypted in an encrypted file). sprig-sinks builds parquet
+    # without default features and with `zstd` only, so the encryption code
+    # isn't compiled (no crypto crate under parquet in Cargo.lock). Remove
+    # this entry when parquet moves to 60.2.0 or later.
+    { id = "RUSTSEC-2026-0595", reason = "parquet: only its encryption feature is affected, which sprig-sinks doesn't build" },
 ]
 
 [licenses]

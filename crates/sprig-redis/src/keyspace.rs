@@ -115,7 +115,8 @@ pub fn parse_flags(s: &[u8]) -> Option<u16> {
     Some(f)
 }
 
-/// The canonical text of flags (Redis's `keyspaceEventsFlagsToString`).
+/// The canonical text of flags, as `CONFIG GET notify-keyspace-events`
+/// shows it.
 #[must_use]
 pub fn flags_text(f: u16) -> String {
     let mut s = String::new();

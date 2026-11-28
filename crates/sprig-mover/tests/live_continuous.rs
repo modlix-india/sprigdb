@@ -159,11 +159,12 @@ async fn wait_state(
     }
 }
 
+#[ignore = "live: needs SPRIG_TEST_DOCKER; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_continuous_job_streams_survives_a_lost_source_and_stops_in_place() {
     if !skip::flag(skip::DOCKER) {
         skip::report_missing(skip::DOCKER, "live_continuous");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     }
     let _ = tracing_subscriber::fmt()
         .with_env_filter(

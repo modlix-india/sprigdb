@@ -3,7 +3,11 @@
 //! tombstones, verifier slots and history, login state, and incremental
 //! loads equal to full ones.
 
-#![allow(clippy::unwrap_used, clippy::too_many_lines, clippy::many_single_char_names)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::too_many_lines,
+    clippy::many_single_char_names
+)]
 
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
@@ -244,7 +248,10 @@ async fn users_and_passwords_through_auth_changes() {
     store.put_login_state(&mut *w, &ls).await.unwrap();
     w.commit().await.unwrap();
     let mut r = rd(&recs).await;
-    assert_eq!(store.login_state(&mut *r, UserId(4)).await.unwrap(), Some(ls));
+    assert_eq!(
+        store.login_state(&mut *r, UserId(4)).await.unwrap(),
+        Some(ls)
+    );
     assert_eq!(store.temp_locks(&mut *r).await.unwrap().len(), 1);
     assert_eq!(
         read_version(&mut *r, VersionKind::Auth).await.unwrap(),
@@ -256,7 +263,11 @@ async fn users_and_passwords_through_auth_changes() {
         .await
         .unwrap();
     let mut r = rd(&recs).await;
-    let ls = store.login_state(&mut *r, UserId(4)).await.unwrap().unwrap();
+    let ls = store
+        .login_state(&mut *r, UserId(4))
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(
         (ls.locked_until, ls.consecutive_failures),
         (None, 0),
@@ -270,7 +281,9 @@ async fn users_and_passwords_through_auth_changes() {
     admin::create_user(&cat, T, &lower, &clock).await.unwrap();
     let mut upper = NewUser::new("erin", b"y");
     upper.host = "DB.EXAMPLE.COM".into();
-    let e = admin::create_user(&cat, T, &upper, &clock).await.unwrap_err();
+    let e = admin::create_user(&cat, T, &upper, &clock)
+        .await
+        .unwrap_err();
     assert!(
         matches!(e.kind, sprig_common::ErrorKind::Backend { errno: 1396, .. }),
         "{e}"

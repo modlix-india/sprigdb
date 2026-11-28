@@ -3020,10 +3020,11 @@ async fn tls_stream(addr: &str) -> tokio_rustls::client::TlsStream<TcpStream> {
         .unwrap()
 }
 
+#[ignore = "live: needs SPRIG_AMQP_TLS_ADDR; tools/live/README.md"]
 #[tokio::test]
 async fn amqps_listener_serves_both_versions_over_tls() {
     let Some(addr) = var("SPRIG_AMQP_TLS_ADDR") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let (user, pass) = (
         var("SPRIG_AMQP_USER").unwrap(),
@@ -3100,10 +3101,11 @@ async fn amqps_listener_serves_both_versions_over_tls() {
 
 /// With `listener.amqp.tenant` set to the user's tenant, the plain user
 /// name logs in (`SPRIG_AMQP_PLAIN_USER`, for example `app`).
+#[ignore = "live: needs SPRIG_AMQP_ADDR, SPRIG_AMQP_PLAIN_USER; tools/live/README.md"]
 #[tokio::test]
 async fn listener_bound_tenant_takes_plain_names() {
     let (Some(addr), Some(user)) = (var("SPRIG_AMQP_ADDR"), var("SPRIG_AMQP_PLAIN_USER")) else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let pass = var("SPRIG_AMQP_PASSWORD").unwrap();
     let c = Client::connect(

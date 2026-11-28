@@ -39,6 +39,8 @@ struct Cluster {
     net: Arc<MemNetwork>,
     cfg: RaftConfig,
     members: BTreeMap<NodeId, Member>,
+    /// Each group's state machine (the toy one unless a test sets it).
+    machines: Arc<dyn StateMachineFactory>,
 }
 
 const WAIT: Duration = Duration::from_secs(10);
@@ -65,6 +67,7 @@ impl Cluster {
             net: MemNetwork::new(),
             cfg,
             members: BTreeMap::new(),
+            machines: Arc::new(KvMachine::factory()),
         };
         for id in ids {
             let store = MemLogStore::new();
@@ -81,7 +84,7 @@ impl Cluster {
             store: Arc::clone(&store) as Arc<dyn LogStore>,
             transport: self.net.transport(id),
             clock: Arc::new(SystemClock),
-            machines: Arc::new(KvMachine::factory()),
+            machines: Arc::clone(&self.machines),
             observer: None,
             seed: id * 7919,
         })
@@ -596,4 +599,88 @@ fn proposals_on_a_closed_node_fail_and_waiters_learn() {
         n.propose(1, toy::put(1, 2), Durability::Strict).err(),
         Some(RaftError::Closed)
     );
+}
+
+/// The toy machine, whose snapshot restores fail while `fail` counts down.
+struct Flaky {
+    inner: KvMachine,
+    fail: Arc<std::sync::atomic::AtomicU32>,
+}
+
+impl StateMachine for Flaky {
+    fn apply(&mut self, entries: &[Entry]) -> Result<(), RaftError> {
+        self.inner.apply(entries)
+    }
+    fn query(&self, q: &[u8]) -> Vec<u8> {
+        self.inner.query(q)
+    }
+    fn snapshot(&self) -> Result<Vec<u8>, RaftError> {
+        self.inner.snapshot()
+    }
+    fn restore(&mut self, index: u64, data: &[u8]) -> Result<(), RaftError> {
+        let left = self.fail.load(Ordering::Acquire);
+        if left > 0 && index > INIT_INDEX {
+            self.fail.store(left - 1, Ordering::Release);
+            // As a store that fails halfway: some state already replaced.
+            self.inner = KvMachine::new();
+            return Err(RaftError::Storage("restore failed (injected)".into()));
+        }
+        self.inner.restore(index, data)
+    }
+}
+
+/// A follower whose snapshot restore fails doesn't install the snapshot:
+/// it keeps needing one, the leader sends it again, and once a restore
+/// succeeds the follower holds what the others hold. The failures are
+/// counted. Before the fix the follower installed the snapshot anyway
+/// (its log said it held everything up to the snapshot's index while its
+/// state didn't) and never converged.
+#[test]
+fn a_snapshot_that_fails_to_restore_is_refused_and_sent_again() {
+    for threaded_writer in [false, true] {
+        let fail = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let cfg = RaftConfig {
+            compact_after: 10,
+            log_writer_thread: threaded_writer,
+            ..fast()
+        };
+        let f = Arc::clone(&fail);
+        let mut c = Cluster {
+            net: MemNetwork::new(),
+            cfg,
+            members: BTreeMap::new(),
+            machines: Arc::new(move |_| {
+                Box::new(Flaky {
+                    inner: KvMachine::new(),
+                    fail: Arc::clone(&f),
+                }) as Box<dyn StateMachine>
+            }),
+        };
+        for id in [1, 2, 3] {
+            c.start(id, MemLogStore::new());
+        }
+        c.create(3, &[1, 2, 3]);
+        c.put(3, 0, 0);
+        let l = c.leader(3);
+        let lagging = c.members.keys().copied().find(|id| *id != l).expect("f");
+        c.net.isolate(lagging, true);
+        for i in 1..60 {
+            c.put(3, i % 5, i);
+        }
+        fail.store(2, Ordering::Release);
+        c.net.isolate(lagging, false);
+        let s = c.converged(3);
+        assert_eq!(s.data()[&4].last(), Some(&59));
+        assert_eq!(fail.load(Ordering::Acquire), 0, "both failures were hit");
+        assert_eq!(
+            c.node(lagging).stats().snapshot_restore_failures,
+            2,
+            "writer thread {threaded_writer}"
+        );
+        // The group goes on replicating on the follower.
+        c.put(3, 9, 99);
+        let s = c.converged(3);
+        assert_eq!(s.data()[&9], vec![99]);
+        assert!(!c.node(lagging).is_closed());
+    }
 }

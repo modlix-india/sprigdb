@@ -1,0 +1,9 @@
+# MySQL's -> and ->> on engine tables.
+x:DROP TABLE IF EXISTS ja_t
+x:CREATE TABLE ja_t (id INT PRIMARY KEY, doc JSON)
+x:INSERT INTO ja_t VALUES (1, '{"name": "ann", "n": 3, "tags": ["a", "b"]}'), (2, '{"name": "bob", "n": 1}'), (3, NULL)
+q:SELECT id, doc->'$.name', doc->>'$.name', doc->'$.tags[1]' FROM ja_t ORDER BY id
+q:SELECT id FROM ja_t WHERE doc->>'$.name' = 'bob'
+q:SELECT id FROM ja_t WHERE doc->'$.n' > 2 ORDER BY id
+q:SELECT doc->>'$.name' AS nm, COUNT(*) FROM ja_t GROUP BY nm ORDER BY nm
+x:DROP TABLE IF EXISTS ja_t

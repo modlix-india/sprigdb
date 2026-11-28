@@ -477,6 +477,20 @@ pub fn allowed(
     db: &str,
     name: &str,
 ) -> bool {
+    allowed_to(svc, cat, principal, db, name, true)
+}
+
+/// Whether `principal` holds `SPRIG_FAN_IN` and `SELECT` on `db.name`
+/// (and `DELETE` when `delete`) in its tenant (its catalog `cat`).
+#[must_use]
+pub fn allowed_to(
+    svc: &TenantServices,
+    cat: &sprig_catalog::TenantCatalog,
+    principal: &Principal,
+    db: &str,
+    name: &str,
+    delete: bool,
+) -> bool {
     use sprig_auth::authz::{Action, Target};
     use sprig_catalog::ddl::{database_key, object_key};
     use sprig_catalog::store::ObjectKind;
@@ -511,7 +525,7 @@ pub fn allowed(
                 },
             )
     };
-    g.allows(Action::FanIn, Target::Tenant) && on(Action::Select) && on(Action::Delete)
+    g.allows(Action::FanIn, Target::Tenant) && on(Action::Select) && (!delete || on(Action::Delete))
 }
 
 /// Starts a fan-in consumer of `def` (a queue definition of database

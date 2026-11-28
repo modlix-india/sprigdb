@@ -64,6 +64,47 @@ impl UnitSnapshots for EngineSnapshots {
         }
         Ok(())
     }
+
+    fn drop_unit(&self, unit: UnitId) -> Result<(), RaftError> {
+        self.ingest(unit, 0, &[])?;
+        self.engine.forget_unit_parts(unit);
+        Ok(())
+    }
+
+    fn exports_off_driver(&self) -> bool {
+        true
+    }
+
+    fn export_to(
+        &self,
+        unit: UnitId,
+        fixed: &mut dyn FnMut(),
+        out: &mut dyn std::io::Write,
+    ) -> Result<(), RaftError> {
+        self.engine
+            .export_unit_fixed(unit, fixed, out)
+            .map(|_| ())
+            .map_err(|e| storage(&e))
+    }
+
+    fn ingest_from(
+        &self,
+        unit: UnitId,
+        index: u64,
+        input: &mut dyn std::io::Read,
+    ) -> Result<(), RaftError> {
+        let got = self
+            .engine
+            .replace_unit_durably(unit, input)
+            .map_err(|e| storage(&e))?;
+        if got > index {
+            return Err(RaftError::Storage(format!(
+                "a snapshot of unit {} holds index {got}, above {index}",
+                unit.0
+            )));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

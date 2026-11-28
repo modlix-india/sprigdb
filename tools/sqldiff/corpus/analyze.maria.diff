@@ -1,0 +1,11 @@
+# MariaDB's ANALYZE <query> on engine tables (times differ by nature; the tabular form has none).
+x:DROP TABLE IF EXISTS xa_a
+q:CREATE TABLE xa_a (id INT PRIMARY KEY, k INT, s VARCHAR(10), KEY (k))
+q:INSERT INTO xa_a VALUES (1,1,'a'),(2,2,'b'),(3,2,'c')
+q:ANALYZE SELECT * FROM xa_a
+q:ANALYZE SELECT * FROM xa_a WHERE k = 2
+q:ANALYZE SELECT a.id FROM xa_a a JOIN xa_a b ON b.id = a.k
+q:ANALYZE SELECT * FROM xa_a WHERE id = 1
+q:ANALYZE SELECT 1
+q:ANALYZE SELECT * FROM xa_a WHERE s = 'b'
+x:DROP TABLE xa_a

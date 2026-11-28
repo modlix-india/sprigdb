@@ -107,9 +107,12 @@ async fn insert_one(
     }
 }
 
+#[ignore = "live: needs SPRIG_TEST_MONGO_URI, SPRIG_TEST_M3_LIMITS; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn validation_corpus_through_the_gateway() {
-    let Some(uri) = uri() else { return };
+    let Some(uri) = uri() else {
+        panic!("live test run without its environment: see tools/live/README.md")
+    };
     let dir = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../sprig-doc/tests/validate_diff"
@@ -228,9 +231,12 @@ async fn validation_corpus_through_the_gateway() {
     assert!(fail.is_empty(), "mismatches: {fail:?}");
 }
 
+#[ignore = "live: needs SPRIG_TEST_MONGO_URI, SPRIG_TEST_M3_LIMITS; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn validation_on_every_write_path() {
-    let Some(uri) = uri() else { return };
+    let Some(uri) = uri() else {
+        panic!("live test run without its environment: see tools/live/README.md")
+    };
     let client = Client::with_uri_str(&uri).await.unwrap();
     let db = client.database("m3_paths");
     let _ = db.drop().await;
@@ -539,9 +545,12 @@ async fn validation_on_every_write_path() {
     db.drop().await.unwrap();
 }
 
+#[ignore = "live: needs SPRIG_TEST_MONGO_URI, SPRIG_TEST_M3_LIMITS; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn query_settings_and_stats() {
-    let Some(uri) = uri() else { return };
+    let Some(uri) = uri() else {
+        panic!("live test run without its environment: see tools/live/README.md")
+    };
     let client = Client::with_uri_str(&uri).await.unwrap();
     let db = client.database("m3_qs");
     let admin = client.database("admin");
@@ -713,9 +722,12 @@ async fn query_settings_and_stats() {
     db.drop().await.unwrap();
 }
 
+#[ignore = "live: needs SPRIG_TEST_MONGO_URI, SPRIG_TEST_M3_LIMITS; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn limits() {
-    let Some(uri) = uri() else { return };
+    let Some(uri) = uri() else {
+        panic!("live test run without its environment: see tools/live/README.md")
+    };
     if std::env::var("SPRIG_TEST_M3_LIMITS").ok().as_deref() != Some("1") {
         eprintln!("SPRIG_TEST_M3_LIMITS not set: skipped");
         return;

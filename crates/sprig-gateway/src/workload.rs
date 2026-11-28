@@ -994,8 +994,10 @@ pub fn start(
         Arc::clone(&clock),
         capture,
     );
+    // Every gateway flushes what it captured (reads on copies too): on the
+    // tenant unit's leader.
     let target = Arc::new(sprig_workload::flush::CatalogTarget::new(Arc::clone(
-        &tenants.records,
+        &tenants.writers,
     )));
     let flive = live.clone();
     let fdc = dc.clone();

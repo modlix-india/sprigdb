@@ -281,11 +281,12 @@ async fn write_all(txn: &mut TxnCoordinator<MyBackend>, cs: &[Live], k: i64, v: 
     }
 }
 
+#[ignore = "live: needs SPRIG_TEST_SPRIG2PC, SPRIG_TEST_SPRIG2PC_RESTART; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread")]
 async fn sprig_2pc_on_two_galera_clusters() {
     let Some(cs) = clusters() else {
         eprintln!("live_sprig2pc: set SPRIG_TEST_SPRIG2PC to run");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     setup(&cs).await;
     let b = backend(&cs);

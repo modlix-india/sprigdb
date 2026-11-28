@@ -23,6 +23,12 @@ use crate::session::{CloseReason, SessionTable};
 /// How often the watcher looks.
 const EVERY: Duration = Duration::from_millis(200);
 
+/// How long a replica may know no leader of a tenant's unit before the
+/// tenant's sessions here close too: longer than an election takes, so
+/// only a node cut off from the others (or a unit without a majority)
+/// sends its clients elsewhere.
+const LEADERLESS_CLOSE: Duration = Duration::from_secs(3);
+
 #[derive(Default)]
 struct Registry {
     next: AtomicU64,
@@ -91,6 +97,7 @@ pub fn start(sessions: Arc<SessionTable>, stop: CancellationToken) {
         return;
     };
     tokio::spawn(async move {
+        let mut leaderless: HashMap<u64, std::time::Instant> = HashMap::new();
         loop {
             tokio::select! {
                 () = stop.cancelled() => return,
@@ -106,8 +113,21 @@ pub fn start(sessions: Arc<SessionTable>, stop: CancellationToken) {
                 .cloned()
                 .collect();
             tenants.extend(open.iter().map(|(t, _)| *t));
+            leaderless.retain(|t, _| tenants.contains(t));
             for t in tenants {
-                if t == 0 || !led_elsewhere(t, me) {
+                if t == 0 {
+                    continue;
+                }
+                // Led elsewhere, or no leader known here for a while (this
+                // node is cut off): either way the sessions go.
+                let gone = if super::leaderless_here(t) {
+                    let since = *leaderless.entry(t).or_insert_with(std::time::Instant::now);
+                    since.elapsed() >= LEADERLESS_CLOSE
+                } else {
+                    leaderless.remove(&t);
+                    led_elsewhere(t, me)
+                };
+                if !gone {
                     continue;
                 }
                 let n = sessions.close_moved(TenantId(t));

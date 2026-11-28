@@ -193,6 +193,34 @@ pub enum SqlOp {
         #[serde(default)]
         wait_ms: u64,
     },
+    /// A fan-in stream sink's read of member `member`'s instance of
+    /// stream definition `(def_tenant, def_object)`: the request's user
+    /// needs `SPRIG_FAN_IN` and `SELECT` on `db.stream`, the definition
+    /// must reach its tenant and the member be below it (and not deny
+    /// remote access). Rows as [`SqlOp::StreamRead`]'s; a partition `from`
+    /// doesn't name is read from `from_ms` (0: its start).
+    FanInStreamRead {
+        /// The definition's declaring tenant.
+        def_tenant: u64,
+        /// The definition's object id there.
+        def_object: u64,
+        /// The member.
+        member: u64,
+        /// The instances' database.
+        db: String,
+        /// The stream's name.
+        stream: String,
+        /// Where each partition read so far goes on from.
+        from: Vec<StreamFrom>,
+        /// Where a partition not in `from` starts (ms since the epoch).
+        #[serde(default)]
+        from_ms: i64,
+        /// Records per partition at most.
+        max_records: u32,
+        /// How long to wait for a record when none is there.
+        #[serde(default)]
+        wait_ms: u64,
+    },
     /// A sink's dead letter published to an engine stream, as the
     /// request's user (who needs `INSERT` on the stream).
     StreamPublish {
@@ -764,6 +792,21 @@ mod tests {
                 db: "shop".into(),
                 queue: "jobs".into(),
                 tag: "sink/7/0/3".into(),
+            },
+            SqlOp::FanInStreamRead {
+                def_tenant: 1,
+                def_object: 2,
+                member: 3,
+                db: "shop".into(),
+                stream: "ev".into(),
+                from: vec![StreamFrom {
+                    partition: 1,
+                    offset: Some(7),
+                    from_ms: 0,
+                }],
+                from_ms: 5,
+                max_records: 10,
+                wait_ms: 100,
             },
             SqlOp::Publish {
                 statements: vec!["CALL sprig.mq_publish('x', 'k', '{}', NULL, 0, 'shop')".into()],

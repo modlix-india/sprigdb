@@ -1,7 +1,6 @@
 //! The tenant glossary: business terms ("revenue excludes refunds") that
-//! every tenant assistant's prompt carries, in the tenant's catalog
-//! (`t<id>_sprig`, module `ai_glossary`, created the first time a gateway
-//! needs it for a tenant).
+//! every tenant assistant's prompt carries, in the tenant's catalog records
+//! ([`rec`], module `ai_glossary`).
 //!
 //! - **Who writes.** Tenant administrators add, accept and delete terms;
 //!   everyone in the tenant reads them. An assistant's `propose_glossary`
@@ -15,23 +14,31 @@
 //!   the tenant's administrators wrote, so they go out like schema: with
 //!   `ai.share_data` on or off.
 
-use sprig_catalog::pool_wait::Bounded as _;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
-use mysql_async::prelude::Queryable as _;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sprig_catalog::migrate::{MigrateOpts, Migration, Migrator, Module, Phase};
 use sprig_common::ids::UserId;
-use sprig_common::names::quote;
 use sprig_common::{Result, SprigCode, SprigError};
-use tokio::sync::OnceCell;
 
-/// The catalog module.
-pub const MODULE: &str = "ai_glossary";
+pub mod rec;
+
+pub use rec::RecGlossary;
+
+pub use rec::MODULE;
+
+/// The module's MariaDB migrations: none, its rows are engine records
+/// ([`rec`]).
+pub static GLOSSARY_MIGRATIONS: &[sprig_catalog::migrate::Migration] = &[];
+
+/// The module, for the catalog's readers.
+pub const GLOSSARY_MODULE: sprig_catalog::migrate::Module = sprig_catalog::migrate::Module {
+    name: MODULE,
+    migrations: GLOSSARY_MIGRATIONS,
+};
 
 /// The longest term, in characters.
 pub const MAX_TERM: usize = 128;
@@ -41,36 +48,6 @@ pub const MAX_TEXT: usize = 4000;
 pub const MAX_TABLES: usize = 20;
 /// The most the glossary adds to a prompt, in bytes.
 pub const PROMPT_BYTES: usize = 16 * 1024;
-
-const DDL_GLOSSARY: &str = "CREATE TABLE IF NOT EXISTS ai_glossary (
-  entry_id    BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-  term        VARCHAR(128) COLLATE utf8mb4_unicode_ci NOT NULL,
-  status      ENUM('proposed','accepted') NOT NULL,
-  definition  TEXT NOT NULL,
-  sql_expr    TEXT NULL,
-  tables      JSON NULL,
-  author_id   INT UNSIGNED NOT NULL,
-  author      VARCHAR(64) NOT NULL,
-  accepted_by INT UNSIGNED NULL,
-  proposal_id VARCHAR(36) NULL,
-  created_at  DATETIME(3) NOT NULL,
-  updated_at  DATETIME(3) NOT NULL,
-  UNIQUE KEY by_term (term, status)
-) ENGINE=InnoDB";
-
-/// The module's migrations.
-pub static GLOSSARY_MIGRATIONS: &[Migration] = &[Migration {
-    format: 1,
-    phase: Phase::Expand,
-    name: "ai_glossary",
-    statements: &[DDL_GLOSSARY],
-}];
-
-/// The module, for migrators.
-pub const GLOSSARY_MODULE: Module = Module {
-    name: MODULE,
-    migrations: GLOSSARY_MIGRATIONS,
-};
 
 /// An entry's state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -378,263 +355,6 @@ impl GlossaryStore for MemoryGlossary {
         let a = m.remove(&(key(term), Status::Accepted)).is_some();
         let p = m.remove(&(key(term), Status::Proposed)).is_some();
         Ok(a || p)
-    }
-}
-
-// ---- the tenant catalog ----
-
-/// The glossary in a tenant's catalog schema.
-pub struct CatalogGlossary {
-    pool: mysql_async::Pool,
-    schema: String,
-    ready: OnceCell<()>,
-}
-
-impl std::fmt::Debug for CatalogGlossary {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CatalogGlossary")
-            .field("schema", &self.schema)
-            .finish_non_exhaustive()
-    }
-}
-
-fn unavailable(e: mysql_async::Error) -> SprigError {
-    SprigError::new(
-        SprigCode::CatalogUnavailable,
-        "the tenant's catalog is unreachable",
-    )
-    .with_source(e)
-}
-
-type EntryRow = (
-    String,
-    String,
-    String,
-    Option<String>,
-    Option<String>,
-    u32,
-    String,
-    Option<u32>,
-    Option<String>,
-    i64,
-);
-
-impl CatalogGlossary {
-    /// The glossary in `schema` (`t<id>_sprig`), reached through `pool`
-    /// (the catalog writer's).
-    #[must_use]
-    pub fn new(pool: mysql_async::Pool, schema: impl Into<String>) -> Self {
-        Self {
-            pool,
-            schema: schema.into(),
-            ready: OnceCell::new(),
-        }
-    }
-
-    fn t(&self) -> String {
-        format!("{}.{}", quote(&self.schema), quote("ai_glossary"))
-    }
-
-    async fn conn(&self) -> Result<mysql_async::Conn> {
-        let mut conn = self.pool.get_conn_bounded().await.map_err(unavailable)?;
-        self.ready
-            .get_or_try_init(|| async {
-                let have: Option<u64> = conn
-                    .exec_first(
-                        "SELECT COUNT(*) FROM information_schema.TABLES \
-                         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'ai_glossary'",
-                        (self.schema.as_str(),),
-                    )
-                    .await
-                    .map_err(unavailable)?;
-                if have.unwrap_or(0) == 0 {
-                    Migrator::new(&[GLOSSARY_MODULE])?
-                        .run(&mut conn, &self.schema, &MigrateOpts::default())
-                        .await?;
-                }
-                Ok::<(), SprigError>(())
-            })
-            .await?;
-        Ok(conn)
-    }
-
-    fn row(r: EntryRow) -> Option<Entry> {
-        Some(Entry {
-            term: r.0,
-            status: Status::parse(&r.1)?,
-            definition: r.2,
-            sql: r.3,
-            tables: r
-                .4
-                .and_then(|j| serde_json::from_str(&j).ok())
-                .unwrap_or_default(),
-            author_id: r.5,
-            author: r.6,
-            accepted_by: r.7,
-            proposal_id: r.8,
-            updated_ms: r.9,
-        })
-    }
-
-    async fn upsert(
-        &self,
-        c: &mut mysql_async::Conn,
-        t: &NewTerm,
-        status: Status,
-        author: UserId,
-        name: &str,
-        proposal_id: Option<&str>,
-    ) -> Result<()> {
-        let tables = (!t.tables.is_empty())
-            .then(|| serde_json::to_string(&t.tables).unwrap_or_else(|_| "[]".to_owned()));
-        let accepted_by = (status == Status::Accepted).then_some(author.0);
-        c.exec_drop(
-            format!(
-                "INSERT INTO {} (term, status, definition, sql_expr, tables, author_id, author, \
-                 accepted_by, proposal_id, created_at, updated_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3)) \
-                 ON DUPLICATE KEY UPDATE term = VALUES(term), definition = VALUES(definition), \
-                 sql_expr = VALUES(sql_expr), tables = VALUES(tables), author_id = VALUES(author_id), \
-                 author = VALUES(author), accepted_by = VALUES(accepted_by), \
-                 proposal_id = VALUES(proposal_id), updated_at = VALUES(updated_at)",
-                self.t()
-            ),
-            (
-                &t.term,
-                status.as_str(),
-                &t.definition,
-                &t.sql,
-                tables,
-                author.0,
-                name,
-                accepted_by,
-                proposal_id,
-            ),
-        )
-        .await
-        .map_err(unavailable)
-    }
-}
-
-#[async_trait]
-impl GlossaryStore for CatalogGlossary {
-    async fn list(&self, status: Option<Status>) -> Result<Vec<Entry>> {
-        let mut c = self.conn().await?;
-        let sql = format!(
-            "SELECT term, status, definition, sql_expr, CAST(tables AS CHAR), author_id, author, \
-             accepted_by, proposal_id, \
-             CAST(TIMESTAMPDIFF(MICROSECOND, '1970-01-01', updated_at) DIV 1000 AS SIGNED) \
-             FROM {} {} ORDER BY term, status",
-            self.t(),
-            if status.is_some() {
-                "WHERE status = ?"
-            } else {
-                ""
-            }
-        );
-        let rows: Vec<EntryRow> = match status {
-            Some(s) => c.exec(sql, (s.as_str(),)).await,
-            None => c.exec(sql, ()).await,
-        }
-        .map_err(unavailable)?;
-        Ok(rows.into_iter().filter_map(Self::row).collect())
-    }
-
-    async fn put(&self, t: &NewTerm, author: UserId, author_name: &str) -> Result<()> {
-        t.check()?;
-        let mut c = self.conn().await?;
-        self.upsert(&mut c, t, Status::Accepted, author, author_name, None)
-            .await?;
-        c.exec_drop(
-            format!(
-                "DELETE FROM {} WHERE term = ? AND status = 'proposed'",
-                self.t()
-            ),
-            (&t.term,),
-        )
-        .await
-        .map_err(unavailable)
-    }
-
-    async fn propose(
-        &self,
-        t: &NewTerm,
-        author: UserId,
-        author_name: &str,
-        proposal_id: Option<&str>,
-    ) -> Result<()> {
-        t.check()?;
-        let mut c = self.conn().await?;
-        self.upsert(
-            &mut c,
-            t,
-            Status::Proposed,
-            author,
-            author_name,
-            proposal_id,
-        )
-        .await
-    }
-
-    async fn accept(&self, term: &str, by: UserId) -> Result<bool> {
-        let mut c = self.conn().await?;
-        let t = self.t();
-        let mut tx = c
-            .start_transaction(mysql_async::TxOpts::default())
-            .await
-            .map_err(unavailable)?;
-        let have: Option<u64> = tx
-            .exec_first(
-                format!(
-                    "SELECT entry_id FROM {t} WHERE term = ? AND status = 'proposed' FOR UPDATE"
-                ),
-                (term,),
-            )
-            .await
-            .map_err(unavailable)?;
-        let Some(id) = have else {
-            tx.rollback().await.map_err(unavailable)?;
-            return Ok(false);
-        };
-        tx.exec_drop(
-            format!("DELETE FROM {t} WHERE term = ? AND status = 'accepted'"),
-            (term,),
-        )
-        .await
-        .map_err(unavailable)?;
-        tx.exec_drop(
-            format!(
-                "UPDATE {t} SET status = 'accepted', accepted_by = ?, updated_at = UTC_TIMESTAMP(3) \
-                 WHERE entry_id = ?"
-            ),
-            (by.0, id),
-        )
-        .await
-        .map_err(unavailable)?;
-        tx.commit().await.map_err(unavailable)?;
-        Ok(true)
-    }
-
-    async fn reject(&self, term: &str) -> Result<bool> {
-        let mut c = self.conn().await?;
-        c.exec_drop(
-            format!(
-                "DELETE FROM {} WHERE term = ? AND status = 'proposed'",
-                self.t()
-            ),
-            (term,),
-        )
-        .await
-        .map_err(unavailable)?;
-        Ok(c.affected_rows() > 0)
-    }
-
-    async fn delete(&self, term: &str) -> Result<bool> {
-        let mut c = self.conn().await?;
-        c.exec_drop(format!("DELETE FROM {} WHERE term = ?", self.t()), (term,))
-            .await
-            .map_err(unavailable)?;
-        Ok(c.affected_rows() > 0)
     }
 }
 

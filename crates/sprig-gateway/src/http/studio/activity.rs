@@ -15,21 +15,26 @@
 //!   now (so a dropped object's changes aren't listed). Grants are listed
 //!   only to users who may already read every account's grants with
 //!   `SHOW GRANTS FOR`.
-//! - **Where.** `schema_versions`, `objects`, `databases`, `privileges`,
-//!   `roles`, `users` and `login_state` in `t<tenant>_sprig`; every call
-//!   reads them, nothing is cached.
+//! - **Where.** The tenant's catalog records in the storage engine: the
+//!   core rows (databases, objects and their schema versions) and the
+//!   auth module's users, roles, privileges and login states. Every call
+//!   reads them in one read-only record transaction; nothing is cached.
 
-use std::collections::{HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
+
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use hyper::Request;
 use hyper::Response;
 use hyper::body::Incoming;
-use mysql_async::prelude::Queryable as _;
 use serde_json::{Value, json};
-use sprig_catalog::pool_wait::Bounded as _;
-use sprig_common::names::quote;
-use sprig_common::{SprigCode, SprigError};
+use sprig_auth::rec::{LOGIN_STATE, PRIVILEGES, ROLES};
+use sprig_auth::store::LoginStateRow;
+use sprig_catalog::store::rec::CoreRecords;
+use sprig_catalog::{DbState, ObjectState, Pk};
+use sprig_common::SprigError;
 use tonic::body::Body;
 
 use super::super::sql::Caller;
@@ -99,31 +104,22 @@ pub fn verb_of(ddl: &str) -> String {
     }
 }
 
-fn unavailable(e: mysql_async::Error) -> SprigError {
-    SprigError::new(
-        SprigCode::CatalogUnavailable,
-        "the tenant's catalog is unreachable",
-    )
-    .with_source(e)
-}
-
-/// A connection to the caller's tenant catalog and its schema.
-async fn catalog_conn(
+/// A transaction on the caller's tenant's catalog records (read only:
+/// dropped, so rolled back).
+async fn records(
     core: &Arc<Core>,
     caller: &Caller,
-) -> Result<(mysql_async::Conn, String), SprigError> {
+) -> Result<Box<dyn sprig_catalog::RecordTx>, SprigError> {
     let (Some(svc), Some(tid)) = (&core.studio.tenants, caller.principal.tenant) else {
         return Err(invalid("recent activity needs a tenant login"));
     };
-    let ep = sprig_catalog::CatalogLocator::writer(&*svc.locator, tid).await?;
-    let conn = ep.pool.get_conn_bounded().await.map_err(unavailable)?;
-    Ok((conn, ep.store.schema().to_owned()))
+    svc.records.begin(tid).await
 }
 
-const MS: &str = "CAST(TIMESTAMPDIFF(MICROSECOND, '1970-01-01', {}) DIV 1000 AS SIGNED)";
-
-fn ms_of(col: &str) -> String {
-    MS.replace("{}", col)
+/// Milliseconds since the epoch.
+fn ms(t: SystemTime) -> i64 {
+    t.duration_since(UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
 /// One login state, for `GET /v1/users`.
@@ -139,22 +135,13 @@ pub struct LoginState {
     pub locked_until_ms: Option<i64>,
 }
 
-type StateRow = (u32, u32, Option<i64>, Option<i64>, Option<i64>);
-
 /// Every account's login state in the caller's tenant, by user id. Empty
 /// when the catalog can't answer: the users list still shows.
 pub(super) async fn login_states(core: &Arc<Core>, caller: &Caller) -> HashMap<u32, LoginState> {
-    let Ok((mut conn, schema)) = catalog_conn(core, caller).await else {
+    let Ok(mut tx) = records(core, caller).await else {
         return HashMap::new();
     };
-    let sql = format!(
-        "SELECT user_id, consecutive_failures, {}, {}, {} FROM {}.login_state",
-        ms_of("last_success_at"),
-        ms_of("last_failure_at"),
-        ms_of("locked_until"),
-        quote(&schema)
-    );
-    let rows: Vec<StateRow> = match conn.query(sql).await {
+    let rows: Vec<LoginStateRow> = match LOGIN_STATE.rows(&mut *tx, &Pk::new()).await {
         Ok(r) => r,
         Err(e) => {
             tracing::debug!(error = %e, "users: login state wasn't read");
@@ -162,14 +149,14 @@ pub(super) async fn login_states(core: &Arc<Core>, caller: &Caller) -> HashMap<u
         }
     };
     rows.into_iter()
-        .map(|(id, failures, ok, bad, until)| {
+        .map(|r| {
             (
-                id,
+                r.user_id.0,
                 LoginState {
-                    last_login_ms: ok,
-                    last_failure_ms: bad,
-                    failures,
-                    locked_until_ms: until,
+                    last_login_ms: r.last_success_at.map(ms),
+                    last_failure_ms: r.last_failure_at.map(ms),
+                    failures: r.consecutive_failures,
+                    locked_until_ms: r.locked_until.map(ms),
                 },
             )
         })
@@ -205,7 +192,72 @@ async fn visible_objects(
     Ok(out)
 }
 
-type ChangeRow = (String, String, String, u64, String, i64, Option<String>);
+/// One schema change as listed: only what the page shows (the statement's
+/// verb, never its text).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Change {
+    at: SystemTime,
+    /// Breaks ties of `at` in arrival order.
+    seq: u64,
+    db: String,
+    object: String,
+    kind: &'static str,
+    version: u64,
+    statement: String,
+    by: Option<u32>,
+}
+
+impl Ord for Change {
+    fn cmp(&self, o: &Self) -> std::cmp::Ordering {
+        (self.at, self.seq).cmp(&(o.at, o.seq))
+    }
+}
+
+impl PartialOrd for Change {
+    fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(o))
+    }
+}
+
+/// The newest `cap` changes seen, in a min-heap: memory is `cap` entries
+/// whatever the catalog holds.
+struct Newest {
+    cap: usize,
+    seq: u64,
+    heap: BinaryHeap<Reverse<Change>>,
+}
+
+impl Newest {
+    fn new(cap: usize) -> Self {
+        Self {
+            cap: cap.max(1),
+            seq: 0,
+            heap: BinaryHeap::new(),
+        }
+    }
+
+    /// Whether a change made at `at` would be kept. False once `cap` newer
+    /// ones are held: an object's older versions can then be skipped.
+    fn takes(&self, at: SystemTime) -> bool {
+        self.heap.len() < self.cap || self.heap.peek().is_some_and(|Reverse(m)| at > m.at)
+    }
+
+    fn push(&mut self, mut c: Change) {
+        c.seq = self.seq;
+        self.seq += 1;
+        self.heap.push(Reverse(c));
+        if self.heap.len() > self.cap {
+            self.heap.pop();
+        }
+    }
+
+    /// Newest first.
+    fn into_sorted(self) -> Vec<Change> {
+        let mut v: Vec<Change> = self.heap.into_iter().map(|Reverse(c)| c).collect();
+        v.sort_by(|a, b| b.cmp(a));
+        v
+    }
+}
 
 async fn schema_changes(
     core: &Arc<Core>,
@@ -213,49 +265,114 @@ async fn schema_changes(
     limit: u64,
 ) -> Result<Value, SprigError> {
     let visible = visible_objects(core, caller).await?;
-    let (mut conn, schema) = catalog_conn(core, caller).await?;
-    let s = quote(&schema);
-    // Read more than asked: rows the caller can't see are skipped.
-    let sql = format!(
-        "SELECT d.name, o.name, o.kind, v.version, LEFT(v.ddl, 200), {}, u.name \
-         FROM {s}.schema_versions v \
-         JOIN {s}.objects o ON o.object_id = v.object_id \
-         JOIN {s}.`databases` d ON d.db_id = o.db_id \
-         LEFT JOIN {s}.users u ON u.user_id = v.applied_by \
-         WHERE o.state <> 'dropped' AND d.state <> 'dropped' \
-         ORDER BY v.applied_at DESC LIMIT ?",
-        ms_of("v.applied_at")
-    );
-    let rows: Vec<ChangeRow> = conn
-        .exec(sql, (limit.saturating_mul(5).min(2000),))
-        .await
-        .map_err(unavailable)?;
-    let changes: Vec<Value> = rows
+    let mut tx = records(core, caller).await?;
+    let dbs: HashMap<u32, String> = CoreRecords::databases_since(&mut *tx, None)
+        .await?
         .into_iter()
-        .filter(|(db, name, ..)| visible.contains(&(db.to_lowercase(), name.to_lowercase())))
-        .take(usize::try_from(limit).unwrap_or(usize::MAX))
-        .map(|(db, name, kind, version, ddl, at, by)| {
+        .filter(|d| d.state != DbState::Dropped)
+        .map(|d| (d.db_id.0, d.name))
+        .collect();
+    let cap = usize::try_from(limit).unwrap_or(usize::MAX);
+    let mut newest = Newest::new(cap);
+    for o in CoreRecords::objects_since(&mut *tx, None).await? {
+        if o.state == ObjectState::Dropped {
+            continue;
+        }
+        let Some(db) = dbs.get(&o.db_id.0) else {
+            continue;
+        };
+        if !visible.contains(&(db.to_lowercase(), o.name.to_lowercase())) {
+            continue;
+        }
+        // Each version by key, newest first; an object's versions are in
+        // time order, so stop at the first one too old to be kept (or a
+        // purged one). At most `limit` per object.
+        let mut v = o.schema_version;
+        let mut read = 0;
+        while v > 0 && read < cap {
+            let Some(row) = CoreRecords::schema_version(&mut *tx, o.object_id, v).await? else {
+                break;
+            };
+            if !newest.takes(row.applied_at) {
+                break;
+            }
+            newest.push(Change {
+                at: row.applied_at,
+                seq: 0,
+                db: db.clone(),
+                object: o.name.clone(),
+                kind: o.kind.as_str(),
+                version: row.version,
+                statement: verb_of(&row.ddl),
+                by: row.applied_by.map(|u| u.0),
+            });
+            v -= 1;
+            read += 1;
+        }
+    }
+    let users = user_names(&mut *tx).await?;
+    drop(tx);
+    let changes: Vec<Value> = newest
+        .into_sorted()
+        .into_iter()
+        .map(|c| {
             json!({
-                "database": db, "object": name, "kind": kind, "version": version,
-                "statement": verb_of(&ddl), "at_ms": at, "by": by,
+                "database": c.db, "object": c.object, "kind": c.kind, "version": c.version,
+                "statement": c.statement, "at_ms": ms(c.at),
+                "by": c.by.and_then(|u| users.get(&u).cloned()),
             })
         })
         .collect();
     Ok(json!({ "changes": changes }))
 }
 
-type GrantRow = (
-    String,
-    Option<String>,
-    String,
-    Option<String>,
-    Option<String>,
-    String,
-    u64,
-    bool,
-    i64,
-    Option<String>,
-);
+/// Every user's name, by id, tombstones included (a change keeps its
+/// author's name after the account is dropped).
+async fn user_names(
+    tx: &mut dyn sprig_catalog::RecordTx,
+) -> Result<HashMap<u32, String>, SprigError> {
+    Ok(sprig_auth::store::AuthStore
+        .users_since(tx, None)
+        .await?
+        .into_iter()
+        .map(|u| (u.user_id.0, u.name))
+        .collect())
+}
+
+/// A `privileges` record, the fields the listing shows (the auth module
+/// owns the row; unknown fields are ignored).
+#[derive(Debug, serde::Deserialize)]
+struct GrantRec {
+    grantee_tenant_id: u64,
+    grantee_kind: String,
+    grantee_id: u32,
+    level: String,
+    db_id: u32,
+    object_id: u64,
+    #[serde(default)]
+    column_name: String,
+    actions: u64,
+    restriction: u8,
+    granted_by: Option<u32>,
+    granted_by_tenant_id: u64,
+    /// Microseconds since the epoch.
+    granted_at: i64,
+}
+
+/// A `roles` record's id and name.
+#[derive(Debug, serde::Deserialize)]
+struct RoleName {
+    role_id: u32,
+    name: String,
+}
+
+/// Each object's name by id.
+fn object_names(objects: Vec<sprig_catalog::ObjectRow>) -> HashMap<u64, String> {
+    objects
+        .into_iter()
+        .map(|o| (o.object_id.0, o.name))
+        .collect()
+}
 
 async fn recent_grants(core: &Arc<Core>, caller: &Caller, limit: u64) -> Result<Value, SprigError> {
     let grants = run_sql(core, caller, "-", "SHOW GRANTS".to_owned()).await?;
@@ -271,41 +388,62 @@ async fn recent_grants(core: &Arc<Core>, caller: &Caller, limit: u64) -> Result<
             "Access denied; you need (at least one of) the CREATE USER privilege(s) for this operation (recent grants)",
         ));
     }
-    let (mut conn, schema) = catalog_conn(core, caller).await?;
-    let s = quote(&schema);
+    let mut tx = records(core, caller).await?;
     // Grants made in this tenant to its own users and roles (grants from
     // ancestors to other tenants' grantees aren't this tenant's to show).
-    let sql = format!(
-        "SELECT p.grantee_kind, COALESCE(u.name, r.name), p.level, d.name, o.name, \
-         p.column_name, p.actions, p.restriction, {}, g.name \
-         FROM {s}.privileges p \
-         LEFT JOIN {s}.users u ON p.grantee_kind = 'user' AND u.user_id = p.grantee_id \
-         LEFT JOIN {s}.roles r ON p.grantee_kind = 'role' AND r.role_id = p.grantee_id \
-         LEFT JOIN {s}.`databases` d ON d.db_id = p.db_id AND p.db_id <> 0 \
-         LEFT JOIN {s}.objects o ON o.object_id = p.object_id AND p.object_id <> 0 \
-         LEFT JOIN {s}.users g ON g.user_id = p.granted_by AND p.granted_by_tenant_id = 0 \
-         WHERE p.grantee_tenant_id = 0 \
-         ORDER BY p.granted_at DESC LIMIT ?",
-        ms_of("p.granted_at")
-    );
-    let rows: Vec<GrantRow> = conn.exec(sql, (limit,)).await.map_err(unavailable)?;
+    let mut rows: Vec<GrantRec> = PRIVILEGES
+        .rows::<GrantRec>(&mut *tx, &Pk::new())
+        .await?
+        .into_iter()
+        .filter(|p| p.grantee_tenant_id == 0)
+        .collect();
+    rows.sort_by(|a, b| b.granted_at.cmp(&a.granted_at));
+    rows.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+    let users = user_names(&mut *tx).await?;
+    let roles: HashMap<u32, String> = ROLES
+        .rows::<RoleName>(&mut *tx, &Pk::new())
+        .await?
+        .into_iter()
+        .map(|r| (r.role_id, r.name))
+        .collect();
+    let dbs: HashMap<u32, String> = CoreRecords::databases_since(&mut *tx, None)
+        .await?
+        .into_iter()
+        .map(|d| (d.db_id.0, d.name))
+        .collect();
+    let mut ids: Vec<sprig_common::ids::ObjectId> = rows
+        .iter()
+        .filter(|p| p.object_id != 0)
+        .map(|p| sprig_common::ids::ObjectId(p.object_id))
+        .collect();
+    ids.dedup();
+    let objects = object_names(CoreRecords::objects_by_ids(&mut *tx, &ids).await?);
+    drop(tx);
     let out: Vec<Value> = rows
         .into_iter()
-        .map(
-            |(kind, grantee, level, db, obj, column, actions, restriction, at, by)| {
-                let privileges: Vec<&str> = sprig_auth::authz::ActionSet(actions)
-                    .iter()
-                    .map(sprig_auth::authz::Action::command)
-                    .collect();
-                json!({
-                    "grantee_kind": kind, "grantee": grantee, "level": level,
-                    "database": db, "object": obj,
-                    "column": (!column.is_empty()).then_some(column),
-                    "privileges": privileges, "restriction": restriction,
-                    "at_ms": at, "by": by,
-                })
-            },
-        )
+        .map(|p| {
+            let privileges: Vec<&str> = sprig_auth::authz::ActionSet(p.actions)
+                .iter()
+                .map(sprig_auth::authz::Action::command)
+                .collect();
+            let grantee = match p.grantee_kind.as_str() {
+                "user" => users.get(&p.grantee_id).cloned(),
+                "role" => roles.get(&p.grantee_id).cloned(),
+                _ => None,
+            };
+            let by = p
+                .granted_by
+                .filter(|_| p.granted_by_tenant_id == 0)
+                .and_then(|u| users.get(&u).cloned());
+            json!({
+                "grantee_kind": p.grantee_kind, "grantee": grantee, "level": p.level,
+                "database": (p.db_id != 0).then(|| dbs.get(&p.db_id).cloned()).flatten(),
+                "object": (p.object_id != 0).then(|| objects.get(&p.object_id).cloned()).flatten(),
+                "column": (!p.column_name.is_empty()).then_some(p.column_name),
+                "privileges": privileges, "restriction": p.restriction,
+                "at_ms": p.granted_at / 1000, "by": by,
+            })
+        })
         .collect();
     Ok(json!({ "grants": out }))
 }
@@ -361,6 +499,32 @@ mod tests {
         );
         assert_eq!(verb_of(""), "");
         assert_eq!(verb_of("ANALYZE TABLE t"), "ANALYZE");
+    }
+
+    #[test]
+    fn only_the_newest_changes_are_kept() {
+        let at = |s: u64| UNIX_EPOCH + std::time::Duration::from_secs(s);
+        let change = |s: u64| Change {
+            at: at(s),
+            seq: 0,
+            db: "d".into(),
+            object: format!("t{s}"),
+            kind: "table",
+            version: 1,
+            statement: "CREATE TABLE".into(),
+            by: None,
+        };
+        let mut n = Newest::new(3);
+        for s in [5, 1, 9, 3, 7, 8] {
+            if n.takes(at(s)) {
+                n.push(change(s));
+            }
+        }
+        assert_eq!(n.heap.len(), 3);
+        assert!(!n.takes(at(6)));
+        assert!(n.takes(at(10)));
+        let kept: Vec<String> = n.into_sorted().into_iter().map(|c| c.object).collect();
+        assert_eq!(kept, ["t9", "t8", "t7"]);
     }
 
     #[test]

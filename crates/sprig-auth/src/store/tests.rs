@@ -80,7 +80,10 @@ fn rows_round_trip_through_their_records() {
     u.require_subject = Some("/CN=x".into());
     let back: UserRow = serde_json::from_slice(&serde_json::to_vec(&u).unwrap()).unwrap();
     // Times keep microseconds, as DATETIME(6) did.
-    assert_eq!(back.created_at, UNIX_EPOCH + Duration::from_micros(1_762_560_000_123_456));
+    assert_eq!(
+        back.created_at,
+        UNIX_EPOCH + Duration::from_micros(1_762_560_000_123_456)
+    );
     let mut want = u.clone();
     want.created_at = back.created_at;
     assert_eq!(back, want);

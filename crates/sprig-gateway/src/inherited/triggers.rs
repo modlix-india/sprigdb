@@ -286,7 +286,7 @@ async fn ensure_for(
     let t = src.tenant;
     let cat = catalog(svc, t).await?;
     let st = super::state_of(&cat);
-    let mstore = MsgStore::new(Arc::clone(&svc.records), t);
+    let mstore = MsgStore::new(Arc::clone(&svc.writers), t);
     let dc = svc.locator.dc_store();
     let mut settled = true;
     for g in triggers {
@@ -310,7 +310,7 @@ async fn ensure_for(
             // The job ends at its next check (a module that isn't active),
             // keeping its position; ENABLE resumes there.
             if let (Some(b), Some(m)) = (binding, module) {
-                set_module_state(&svc.records, t, m, false).await?;
+                set_module_state(&svc.writers, t, m, false).await?;
                 messages::delete_index(dc.as_ref(), t, b).await?;
             }
             continue;
@@ -328,7 +328,7 @@ async fn ensure_for(
         {
             // Up to date; make sure it runs (ENABLE after a DISABLE).
             if let Some(m) = module {
-                set_module_state(&svc.records, t, m, true).await?;
+                set_module_state(&svc.writers, t, m, true).await?;
             }
             if !messages::indexed(dc.as_ref(), t, b).await? {
                 messages::put_index(
@@ -424,7 +424,7 @@ async fn ensure_for(
         if src.kind == SourceKind::Stream {
             start_positions(t, deployed.binding_id, src.object_id).await?;
         }
-        set_module_state(&svc.records, t, deployed.module_id, true).await?;
+        set_module_state(&svc.writers, t, deployed.module_id, true).await?;
         mstore
             .set_instance(
                 key,
@@ -496,7 +496,7 @@ async fn deploy(
         .cloned()
         .ok_or_else(|| SprigError::internal("an instance without its database"))?;
     let ep = svc.locator.writer(t).await?;
-    let mut conn = svc.records.begin(t).await?;
+    let mut conn = svc.writers.begin(t).await?;
     // A member's own trigger of the name shadows the inherited one.
     let store = sprig_logic::LogicStore::default();
     if let Some(m) = store
@@ -817,7 +817,7 @@ pub async fn on_run(
 /// Sets (or clears) `blocked` in the instance row of the trigger whose
 /// binding is `binding`.
 async fn mark_blocked(svc: &TenantServices, t: TenantId, binding: u64, why: Option<&str>) {
-    let r = MsgStore::new(Arc::clone(&svc.records), t)
+    let r = MsgStore::new(Arc::clone(&svc.writers), t)
         .mark_blocked(binding, why)
         .await;
     if let Err(e) = r {

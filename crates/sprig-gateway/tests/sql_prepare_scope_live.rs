@@ -91,10 +91,11 @@ async fn records(c: &mut Conn, n: usize) -> Vec<(String, String)> {
     }
 }
 
+#[ignore = "live: needs SPRIG_TEST_LOGIC_GATEWAY, SPRIG_TEST_LOGIC_USER, SPRIG_TEST_LOGIC_PASSWORD; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sql_prepare_publishes_into_a_stream() {
     let Some(mut c) = connect("sql_prepare_publishes_into_a_stream").await else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let mut ck = Checks { failed: Vec::new() };
     must(&mut c, "DROP DATABASE IF EXISTS sps_pub").await;
@@ -192,10 +193,11 @@ async fn sql_prepare_publishes_into_a_stream() {
     assert!(ck.failed.is_empty(), "{:#?}", ck.failed);
 }
 
+#[ignore = "live: needs SPRIG_TEST_LOGIC_GATEWAY, SPRIG_TEST_LOGIC_USER, SPRIG_TEST_LOGIC_PASSWORD; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn metadata_refusals_reach_only_protected_tables() {
     let Some(mut c) = connect("metadata_refusals_reach_only_protected_tables").await else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let mut ck = Checks { failed: Vec::new() };
     for q in [

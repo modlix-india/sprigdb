@@ -63,11 +63,12 @@ async fn index_names(c: &mut Conn) -> Vec<String> {
     .unwrap()
 }
 
+#[ignore = "live: needs SPRIG_TEST_FX_URL; tools/live/README.md"]
 #[tokio::test]
 async fn functional_indexes_as_mysql_answers_them() {
     let Ok(url) = std::env::var("SPRIG_TEST_FX_URL") else {
         eprintln!("skipped: SPRIG_TEST_FX_URL is not set");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let mut c = Conn::new(Opts::from_url(&url).expect("url"))
         .await
@@ -197,11 +198,12 @@ fn truncated(index: &str) -> (u16, String, String) {
     )
 }
 
+#[ignore = "live: needs SPRIG_TEST_FX_URL; tools/live/README.md"]
 #[tokio::test]
 async fn casts_mysql_refuses_are_refused() {
     let Ok(url) = std::env::var("SPRIG_TEST_FX_URL") else {
         eprintln!("skipped: SPRIG_TEST_FX_URL is not set");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let db = "fx_live_cast";
     let mut c = Conn::new(Opts::from_url(&url).expect("url"))

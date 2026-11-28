@@ -124,6 +124,7 @@ fn summary(evs: &[serde_json::Value]) -> Vec<String> {
         .collect()
 }
 
+#[ignore = "live: needs SPRIG_TEST_ICS_SQL, SPRIG_TEST_ICS_HTTP, SPRIG_TEST_ICS_TENANTS; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn change_streams_carry_merged_records() {
     let (Ok(sql_addr), Ok(http_addr), Ok(tenants)) = (
@@ -134,7 +135,7 @@ async fn change_streams_carry_merged_records() {
         eprintln!(
             "skipped: set SPRIG_TEST_ICS_SQL, SPRIG_TEST_ICS_HTTP and SPRIG_TEST_ICS_TENANTS"
         );
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let t: Vec<&str> = tenants.split(',').map(str::trim).collect();
     let (a, b) = (t[0], t[1]);

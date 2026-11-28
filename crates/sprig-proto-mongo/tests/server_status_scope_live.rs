@@ -75,11 +75,12 @@ fn values(d: &Document) -> Vec<i64> {
     PATHS.iter().map(|p| at(d, p)).collect()
 }
 
+#[ignore = "live: needs SPRIG_TEST_MONGO_URI, SPRIG_TEST_MONGO_URI2; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn server_status_shows_each_tenant_its_own_numbers() {
     let (Some(ua), Some(ub)) = (uri("SPRIG_TEST_MONGO_URI"), uri("SPRIG_TEST_MONGO_URI2")) else {
         eprintln!("SPRIG_TEST_MONGO_URI or SPRIG_TEST_MONGO_URI2 not set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let a = Client::with_uri_str(&ua).await.unwrap();
     let b = Client::with_uri_str(&ub).await.unwrap();

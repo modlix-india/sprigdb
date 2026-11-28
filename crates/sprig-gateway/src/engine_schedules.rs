@@ -4,11 +4,14 @@
 //! spawn(services, login, engine): one task per process, beside the SQL
 //! events scheduler
 //!   every tick (1 s; SPRIGDB_SQL_EVENTS_TICK_MS), for each tenant whose
-//!   catalog this process has loaded and whose unit is led here (or has
-//!   no single leader):
+//!   unit this node leads (crate::led; every tenant on an engine that
+//!   doesn't replicate), whether or not a client of it reached this
+//!   process:
 //!     the tenant's schedules of engine databases, read from the logic
-//!     records again when its catalog version moves or every 10 s, with
-//!     each one's next fire time
+//!     records again every 10 s, or at once when its cached catalog's
+//!     version moves or the catalog load feed lagged, with each one's next
+//!     fire time (the catalog, for the databases' names, is loaded only
+//!     for a tenant that has schedules)
 //!     each one due (next fire time passed, or a run of it live here):
 //!       one record transaction: sprig_logic::schedule::tick, the
 //!       compare-and-set of the controller's loop (a run another process
@@ -26,7 +29,7 @@
 //! for MariaDB databases. The target is called by name, so it may be a
 //! logic procedure or an SQL stored procedure of the database.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -39,7 +42,6 @@ use sprig_logic::schedule::Tick;
 use tokio::sync::mpsc;
 
 use crate::http::sql::{Caller, SqlCall, SqlEngine, collect};
-use crate::node_engine::{self, UnitLeader};
 use crate::tenant::TenantServices;
 
 /// Late fires within this still run (`logic.schedule_misfire_seconds`'s
@@ -88,9 +90,8 @@ pub(crate) fn spawn(
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .map_or(Duration::from_secs(1), Duration::from_millis);
-    let mut loads = svc.cache.loads();
+    let mut led = crate::led::Led::new(&svc);
     tokio::spawn(async move {
-        let mut tenants: BTreeSet<u64> = BTreeSet::new();
         let mut known: HashMap<u64, Known> = HashMap::new();
         let running: Running = Arc::new(Mutex::new(HashSet::new()));
         let mut timer = tokio::time::interval(tick);
@@ -98,42 +99,32 @@ pub(crate) fn spawn(
         loop {
             tokio::select! {
                 () = stop.cancelled() => return,
-                l = loads.recv() => {
-                    if let Ok(l) = l {
-                        tenants.insert(l.tenant.0);
-                    }
-                    continue;
-                }
+                _ = led.changed() => continue,
                 _ = timer.tick() => {}
             }
-            for &t in &tenants {
-                if !matches!(
-                    node_engine::tenant_leader(t),
-                    UnitLeader::Here | UnitLeader::Any
-                ) {
-                    known.remove(&t);
-                    continue;
-                }
-                let Some(cat) = svc.cache.cached(TenantId(t)) else {
-                    continue;
-                };
-                let Some(eng) = crate::engine::catalog::of(&cat) else {
-                    continue;
-                };
-                if eng.dbs.is_empty() {
-                    continue;
-                }
-                let stale = known
-                    .get(&t)
-                    .is_none_or(|k| k.catalog_version != cat.version || k.at.elapsed() >= FRESH);
+            if led.take_lagged() {
+                known.clear();
+            }
+            let tenants = led.tenants(&svc).await;
+            let led_now: HashSet<u64> = tenants.iter().copied().collect();
+            known.retain(|t, _| led_now.contains(t));
+            for t in tenants {
+                let cached = svc.cache.cached(TenantId(t)).map(|c| c.version);
+                let stale = known.get(&t).is_none_or(|k| {
+                    k.at.elapsed() >= FRESH || cached.is_some_and(|v| v != k.catalog_version)
+                });
                 if stale {
-                    match read(&svc, TenantId(t), &cat, &eng.dbs).await {
-                        Ok(list) => {
+                    match read(&svc, TenantId(t)).await {
+                        Ok((catalog_version, list)) => {
                             known.insert(
                                 t,
                                 Known {
                                     at: Instant::now(),
-                                    catalog_version: cat.version,
+                                    catalog_version: if catalog_version > 0 {
+                                        catalog_version
+                                    } else {
+                                        cached.unwrap_or(0)
+                                    },
                                     list,
                                 },
                             );
@@ -186,21 +177,17 @@ pub(crate) fn spawn(
                     }
                 }
             }
-            known.retain(|t, _| tenants.contains(t));
         }
     })
 }
 
-/// The tenant's live schedules of engine databases.
-async fn read(
-    svc: &TenantServices,
-    tenant: TenantId,
-    cat: &sprig_catalog::TenantCatalog,
-    dbs: &HashSet<sprig_common::ids::DbId>,
-) -> sprig_common::Result<Vec<Sched>> {
+/// The tenant's live schedules of engine databases, with the catalog
+/// version they were matched against (0 when the tenant has no schedule:
+/// its catalog isn't loaded for nothing).
+async fn read(svc: &TenantServices, tenant: TenantId) -> sprig_common::Result<(u64, Vec<Sched>)> {
     let store = LogicStore::default();
     let mut c = svc.records.begin(tenant).await?;
-    let mut out = Vec::new();
+    let mut found = Vec::new();
     for m in store.modules(&mut *c, None).await? {
         let Some(version) = m.active_version else {
             continue;
@@ -208,14 +195,29 @@ async fn read(
         if m.kind != "schedule" || m.state != "active" {
             continue;
         }
+        let Some(row) = store.schedule(&mut *c, m.module_id).await? else {
+            continue;
+        };
+        found.push((m, version, row.next_fire_ms));
+    }
+    c.commit().await?;
+    if found.is_empty() {
+        return Ok((0, Vec::new()));
+    }
+    let cat = svc
+        .cache
+        .get(tenant, sprig_catalog::Freshness::Latest)
+        .await?;
+    let Some(dbs) = crate::engine::catalog::of(&cat).map(|e| e.dbs.clone()) else {
+        return Ok((cat.version, Vec::new()));
+    };
+    let mut out = Vec::new();
+    for (m, version, next_fire_ms) in found {
         let db = sprig_common::ids::DbId(m.db_id);
         if !dbs.contains(&db) {
             continue;
         }
         let Some(db_name) = cat.databases.get(db).map(|d| d.name.clone()) else {
-            continue;
-        };
-        let Some(row) = store.schedule(&mut *c, m.module_id).await? else {
             continue;
         };
         out.push(Sched {
@@ -225,11 +227,10 @@ async fn read(
             db: db_name,
             definer: m.created_by,
             version,
-            next_fire_ms: row.next_fire_ms,
+            next_fire_ms,
         });
     }
-    c.commit().await?;
-    Ok(out)
+    Ok((cat.version, out))
 }
 
 /// One tick of `s` in a record transaction.
@@ -300,7 +301,8 @@ impl Run {
         started: Instant,
     ) -> sprig_common::Result<()> {
         let store = LogicStore::default();
-        let mut tx = self.svc.records.begin(self.tenant).await?;
+        // On the unit's leader: the run may end after the leadership moved.
+        let mut tx = self.svc.writers.begin(self.tenant).await?;
         let id = self.job.to_bytes();
         store
             .run_ended(&mut *tx, self.sched.module_id, &id, outcome)
@@ -337,9 +339,11 @@ impl Run {
 
     /// `CALL target(args)` as the definer, under `logic.job_budget_ms`.
     async fn call(&self) -> sprig_common::Result<()> {
-        let cat = self.svc.cache.cached(self.tenant).ok_or_else(|| {
-            sprig_common::SprigError::internal("the tenant's catalog isn't loaded")
-        })?;
+        let cat = self
+            .svc
+            .cache
+            .get(self.tenant, sprig_catalog::Freshness::Latest)
+            .await?;
         let (target, args, budget) = {
             let store = LogicStore::default();
             let mut c = self.svc.records.begin(self.tenant).await?;

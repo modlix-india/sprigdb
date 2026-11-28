@@ -905,7 +905,7 @@ async fn raw_handshake_refusals() {
 async fn live_failed_login_matrix() {
     let Ok(addrs) = std::env::var("SPRIG_TEST_LOGIN_MATRIX") else {
         eprintln!("SPRIG_TEST_LOGIN_MATRIX not set");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let nopw = std::env::var("SPRIG_TEST_LOGIN_NOPW").ok();
     let mut cases: Vec<(String, &str, Option<bool>)> = vec![

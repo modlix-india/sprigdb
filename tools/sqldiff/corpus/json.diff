@@ -1,0 +1,21 @@
+# JSON functions on engine tables: JSON_EXTRACT, JSON_UNQUOTE, JSON_VALUE, JSON_TYPE, JSON_VALID, JSON_LENGTH, JSON_KEYS,
+# JSON_OBJECT, JSON_ARRAY, JSON_QUOTE, JSON_CONTAINS, over JSON columns and text.
+x:DROP TABLE IF EXISTS js_t
+x:CREATE TABLE js_t (id INT PRIMARY KEY, doc JSON, s VARCHAR(100))
+x:INSERT INTO js_t VALUES (1, '{"name": "ann", "age": 31, "tags": ["a", "b"], "addr": {"city": "Pune", "zip": "411001"}}', '{"k": 1}'), (2, '{"name": "bob", "age": 25.5, "tags": [], "addr": null}', '[1, 2, 3]'), (3, NULL, NULL), (4, '[1, {"a": true}, "x"]', 'not json'), (5, '"just a string"', '42')
+q:SELECT id, JSON_EXTRACT(doc, '$.name'), JSON_UNQUOTE(JSON_EXTRACT(doc, '$.name')), JSON_EXTRACT(doc, '$.age') FROM js_t ORDER BY id
+q:SELECT id, JSON_EXTRACT(doc, '$.tags'), JSON_EXTRACT(doc, '$.tags[0]'), JSON_EXTRACT(doc, '$.addr.city'), JSON_EXTRACT(doc, '$.tags[*]') FROM js_t ORDER BY id
+q:SELECT id, JSON_EXTRACT(doc, '$[1].a'), JSON_EXTRACT(doc, '$[last]'), JSON_EXTRACT(doc, '$.name', '$.age') FROM js_t ORDER BY id
+q:SELECT id, JSON_TYPE(doc), JSON_VALID(doc), JSON_VALID(s), JSON_LENGTH(doc), JSON_LENGTH(doc, '$.tags') FROM js_t ORDER BY id
+q:SELECT id, JSON_KEYS(doc), JSON_KEYS(doc, '$.addr') FROM js_t ORDER BY id
+q:SELECT id, JSON_VALUE(doc, '$.name'), JSON_VALUE(doc, '$.addr.zip'), JSON_VALUE(doc, '$.tags') FROM js_t ORDER BY id
+q:SELECT id FROM js_t WHERE JSON_UNQUOTE(JSON_EXTRACT(doc, '$.addr.city')) = 'Pune'
+q:SELECT id FROM js_t WHERE JSON_EXTRACT(doc, '$.age') > 30
+q:SELECT id, JSON_CONTAINS(doc, '"a"', '$.tags'), JSON_CONTAINS(s, '2') FROM js_t WHERE id IN (1, 2) ORDER BY id
+q:SELECT id, JSON_OBJECT('id', id, 'name', JSON_EXTRACT(doc, '$.name'), 'n', NULL), JSON_ARRAY(id, 'x', JSON_EXTRACT(doc, '$.tags')) FROM js_t WHERE id < 3 ORDER BY id
+q:SELECT JSON_QUOTE('a"b\\c'), JSON_UNQUOTE('"h\\u00e9"'), JSON_UNQUOTE('plain'), JSON_TYPE('1.5'), JSON_TYPE('true') FROM js_t WHERE id = 1
+q:SELECT JSON_EXTRACT('{"b":1,"a":{"x":[1, 2.50,"s"]}}', '$.a'), JSON_EXTRACT('{"b":1,"a":2}', '$.*'), JSON_KEYS('{"b":1,"a":2}') FROM js_t WHERE id = 1
+q:SELECT JSON_EXTRACT(s, '$.k') FROM js_t WHERE id = 4
+q:SELECT JSON_EXTRACT(doc, 'bad path') FROM js_t WHERE id = 1
+q:SELECT JSON_LENGTH(s) FROM js_t WHERE id = 4
+x:DROP TABLE IF EXISTS js_t

@@ -55,11 +55,12 @@ async fn idle_pos(src: &mut BinlogTxns) -> GtidPos {
     }
 }
 
+#[ignore = "live: needs SPRIG_TEST_FEED_GALERA_NODE; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_purged_local_domain_is_added_and_a_purged_shared_one_is_a_loss() {
     let Ok(url) = std::env::var("SPRIG_TEST_FEED_GALERA_NODE") else {
         eprintln!("skipped: set SPRIG_TEST_FEED_GALERA_NODE");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let mut n = mysql_async::Conn::new(mysql_async::Opts::from_url(&url).unwrap())
         .await

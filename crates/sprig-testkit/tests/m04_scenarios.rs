@@ -569,7 +569,9 @@ fn built(r: &AutoRow) -> bool {
 #[tokio::test]
 #[ignore = "needs the dev gateway and controller (deploy/compose/m04/run.sh)"]
 async fn chapter_13_scenarios_on_one_topology() {
-    let Some(c) = cfg() else { return };
+    let Some(c) = cfg() else {
+        panic!("live test run without its environment: see tools/live/README.md")
+    };
     let db = unique_ident("m04");
     let n = c.rows;
     let small = (n * 3 / 10).max(10_000);
@@ -1067,7 +1069,9 @@ fn sprigctl(c: &Cfg, args: &[&str]) -> (bool, String) {
 #[tokio::test]
 #[ignore = "needs the dev gateway and a controller with usage-based index removal (deploy/compose/m04/run.sh o1)"]
 async fn usage_based_removal_on_one_topology() {
-    let Some(c) = cfg() else { return };
+    let Some(c) = cfg() else {
+        panic!("live test run without its environment: see tools/live/README.md")
+    };
     let db = unique_ident("o1");
     println!(
         "[setup] topology {} tenant {} db {db}",

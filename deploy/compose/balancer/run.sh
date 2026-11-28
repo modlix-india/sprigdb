@@ -24,7 +24,7 @@
 #   deploy/compose/balancer/run.sh ctl …  # sprigctl against this deployment
 #
 # Then: SPRIG_TEST_BALANCER_LIVE=1 SPRIGCTL=$CARGO_TARGET_DIR/debug/sprigctl \
-#   cargo test -p sprig-controller --test live_balance -- --nocapture
+#   cargo test -p sprig-controller --test live_balance -- --ignored --nocapture
 #
 # Listeners: MySQL persona 18306, MariaDB persona 18307 (TLS optional);
 # Admin API 18480. Tenants bl-01 … bl-10 (8 on dc-bl-c1, one each on c2

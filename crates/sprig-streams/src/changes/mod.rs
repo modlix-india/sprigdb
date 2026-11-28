@@ -1609,6 +1609,18 @@ impl sprig_engine::snapshot::UnitSnapshotPart for SnapshotPart {
         let n = u64_of(input)?;
         let st = inner.unit(unit.0);
         let mut s = lock(&st);
+        if s.applied > index && !s.segs.is_empty() {
+            // Older than what the files here hold (a snapshot handed over
+            // late, when the log registered after the engine restored it):
+            // keep the newer segments.
+            tracing::info!(
+                unit = unit.0,
+                snapshot = index,
+                held = s.applied,
+                "change log: a unit snapshot older than the segments held here; kept them"
+            );
+            return Ok(());
+        }
         let _ = fs::remove_dir_all(&s.dir);
         s.segs.clear();
         s.fresh = false;

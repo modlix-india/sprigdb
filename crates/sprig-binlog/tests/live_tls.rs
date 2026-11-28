@@ -65,10 +65,11 @@ async fn read_all(
     }
 }
 
+#[ignore = "live: needs SPRIG_TEST_BINLOG_TLS, SPRIG_TEST_BINLOG_TLS_ROOT, SPRIG_TEST_BINLOG_TLS_CA, ...; tools/live/README.md"]
 #[tokio::test]
 async fn reads_rows_over_verified_tls() {
     let Some(e) = env("reads_rows_over_verified_tls") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let mut root = root_conn(&e).await;
     let from = common::gtid_pos(&mut root).await;
@@ -119,10 +120,11 @@ async fn reads_rows_over_verified_tls() {
         .unwrap();
 }
 
+#[ignore = "live: needs SPRIG_TEST_BINLOG_TLS, SPRIG_TEST_BINLOG_TLS_ROOT, SPRIG_TEST_BINLOG_TLS_CA, ...; tools/live/README.md"]
 #[tokio::test]
 async fn refuses_wrong_ca_wrong_name_and_plain_text() {
     let Some(e) = env("refuses_wrong_ca_wrong_name_and_plain_text") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let from = GtidPos::default();
     // A CA that didn't sign the server's certificate.

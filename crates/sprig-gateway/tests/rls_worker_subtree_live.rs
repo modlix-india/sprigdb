@@ -133,6 +133,7 @@ async fn read(c: &mut mysql_async::Conn) -> Vec<String> {
         .unwrap_or_default()
 }
 
+#[ignore = "live: needs SPRIG_TEST_RWS_SQL, SPRIG_TEST_RWS_TENANT_ID, SPRIG_TEST_RWS_CTL; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn worker_run_code_reads_a_subtree_above_the_inline_limit() {
     let (Ok(sql_addr), Ok(tid), Ok(_)) = (
@@ -143,7 +144,7 @@ async fn worker_run_code_reads_a_subtree_above_the_inline_limit() {
         eprintln!(
             "skipped: set SPRIG_TEST_RWS_SQL, SPRIG_TEST_RWS_TENANT_ID and SPRIG_TEST_RWS_CTL"
         );
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let tid: u64 = tid.parse().unwrap();
     let mut ck = Checks {

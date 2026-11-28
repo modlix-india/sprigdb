@@ -108,6 +108,7 @@ async fn cmd(
     q.query_async::<Value>(c).await
 }
 
+#[ignore = "live: needs SPRIG_TEST_REDIS_SPRIG, SPRIG_TEST_REDIS_SPRIG2; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn logins_isolation_api_and_sql() {
     let (Some(u1), Some(u2)) = (
@@ -115,7 +116,7 @@ async fn logins_isolation_api_and_sql() {
         var("SPRIG_TEST_REDIS_SPRIG2"),
     ) else {
         eprintln!("SPRIG_TEST_REDIS_SPRIG(2) not set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let host = u1.rsplit('@').next().unwrap().to_owned();
     // Logins: NOAUTH, WRONGPASS, one-argument AUTH without a default user.
@@ -343,11 +344,12 @@ async fn logins_isolation_api_and_sql() {
 /// Small throughput and latency sample (not a benchmark: a debug build on a
 /// shared laptop). `SPRIG_TEST_REDIS_BENCH=1` with `SPRIG_TEST_REDIS_SPRIG`
 /// (and `SPRIG_TEST_REDIS_REF` for the reference).
+#[ignore = "live: needs SPRIG_TEST_REDIS_BENCH; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn throughput_sample() {
     if var("SPRIG_TEST_REDIS_BENCH").is_none() {
         eprintln!("SPRIG_TEST_REDIS_BENCH not set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     }
     let mut targets = Vec::new();
     if let Some(u) = var("SPRIG_TEST_REDIS_SPRIG") {
@@ -428,12 +430,13 @@ async fn throughput_sample() {
 /// Key locations and `KeyValue.GeoSearch` over REST: 400 keys with locations (and 20 without), then circles,
 /// boxes, polygons and nearest-k searches, each against brute force with
 /// WGS 84 distances (Karney). Uses database `r6three_kvgeo`.
+#[ignore = "live: needs SPRIG_TEST_REDIS_SPRIG, SPRIG_TEST_KV_HTTP; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kv_geo_search() {
     let (Some(u1), Some(http_addr)) = (var("SPRIG_TEST_REDIS_SPRIG"), var("SPRIG_TEST_KV_HTTP"))
     else {
         eprintln!("SPRIG_TEST_REDIS_SPRIG or SPRIG_TEST_KV_HTTP not set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let (user, pass) = creds(&u1);
     let auth = format!("{user}:{pass}");

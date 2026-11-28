@@ -36,6 +36,32 @@
 //! pending overlay at the commit timestamp, tied to the commit point's
 //! entry, until their own entries replace them.
 //!
+//! **Units with leaders (a replicated log).** There each unit's entries are
+//! proposed by the node that leads it, leaderships move, and an entry a
+//! node proposed can be lost to the next leader. So:
+//!
+//! - The outcome is what the anchor's log says. Only the anchor's leader
+//!   may decide a transaction nobody finished: it writes `ABORTED` through
+//!   the anchor's log, in the term in which it read the record
+//!   ([`CommitPath::propose_led`]), and only when no coordinator on it is
+//!   still running the transaction. Nobody infers an abort from a record
+//!   it cannot find.
+//! - A participant is finished by its own leader: the coordinator while it
+//!   leads the unit, otherwise whichever node leads it next. A node that
+//!   takes a unit's leadership reads the unit's prepare records back
+//!   ([`TxnShared::load_cross_led`]), takes their locks again, and finishes
+//!   each once its own copy of the anchor's record says `COMMITTED` or
+//!   `ABORTED` (a final record never changes, so a copy that lags is only
+//!   late). The finishing entry deletes the prepare record with the same
+//!   write, and is proposed only while the prepare record is still there
+//!   and in the term in which that was read: a participant is applied
+//!   exactly once.
+//! - A participant counts as finished once its finishing entry is applied,
+//!   not once it is proposed: a lost entry is proposed again.
+//! - The record goes once the anchor's leader knows every participant
+//!   finished (it applied their finishing entries itself, or it leads them
+//!   and their prepare records are gone). Otherwise it stays.
+//!
 //! **Stale transactions.** A `PENDING` transaction whose coordinator is gone,
 //! or silent for too long, is aborted by compare-and-set on its record,
 //! under the anchor unit's commit latch, where the coordinator's own
@@ -55,7 +81,7 @@ use super::{TxnShared, lock_or_recover};
 use crate::keys::{self, KeyRange};
 use crate::locks::TxnId;
 use crate::log::{Durability, Payload};
-use crate::store::{Cf, IterOpts};
+use crate::store::{Cf, IterOpts, ReadTier};
 use crate::txn::CommitPath;
 use crate::txn::durable::DurableTicket;
 use crate::txn::hlc::Ts;
@@ -66,8 +92,15 @@ use crate::txn::transaction::Extra;
 /// point before a resolver aborts it (unless the stale time is set).
 const STALE_MS: u64 = 30_000;
 
+/// How long a prepared transaction may stay without an outcome in this
+/// node's copy of the anchor's log, where another node leads the anchor,
+/// before this node asks for the anchor's leadership to decide it.
+const ASK_ANCHOR_MS: u64 = 2_000;
+
 const RECORD: &[u8] = b"tr:";
-const PREPARE: &[u8] = b"tp:";
+/// The field of a unit's bookkeeping under which its prepare records are
+/// kept (the store's apply path watches them: see `Engine::follower_read`).
+pub(crate) const PREPARE: &[u8] = b"tp:";
 const FORMAT: u8 = 1;
 
 /// A point in the protocol where a test can stop the coordinator.
@@ -91,7 +124,9 @@ pub enum CrossFault {
     /// recovery.
     CoordinatorLost,
     /// The participant's resolution is lost on the way (only at
-    /// [`CrossStage::Resolve`]); a resolver redoes it later.
+    /// [`CrossStage::Resolve`]); a resolver redoes it later. On a unit
+    /// with a leader this node's resolver loses it too while the fault is
+    /// set (another node that takes the unit finishes it).
     Drop,
 }
 
@@ -159,6 +194,7 @@ impl Share {
 /// A commit across units the node knows of: its coordinator's, or one
 /// recovery found unfinished.
 #[derive(Debug)]
+#[allow(clippy::struct_excessive_bools)]
 struct Cross {
     /// The lock owner.
     txn: TxnId,
@@ -182,6 +218,23 @@ struct Cross {
     /// Whether its locks were released.
     released: bool,
     durability: Option<Durability>,
+    /// Participants whose finishing entry (the resolution or, after an
+    /// abort, the deletion of the prepare record) is proposed and not yet
+    /// known applied: the share, to propose again if the entry is lost,
+    /// and the entry.
+    resolving: BTreeMap<u64, (Share, DurableTicket)>,
+    /// Participants this node saw finished: its own finishing entry for
+    /// them was applied, or it leads them and their prepare record is gone.
+    done: std::collections::BTreeSet<u64>,
+    /// Units with leaders only. Its outcome is taken from the anchor's
+    /// record rather than from this node's memory: it was read back from
+    /// the store (a unit's leadership taken here, a restart), or its
+    /// coordinator stopped before it knew the outcome.
+    loaded: bool,
+    /// Units with leaders only. The outcome is final and known here.
+    sure: bool,
+    /// When this node last asked for the anchor's leadership to decide it.
+    asked_ms: u64,
 }
 
 /// The node's commits across units in progress, and the test switches.
@@ -193,6 +246,10 @@ pub(crate) struct CrossTable {
     wait: AtomicBool,
     stale_ms: AtomicU64,
     faults: Mutex<Option<CrossFaults>>,
+    /// Units whose leadership this node is taking right now: their
+    /// prepare records are read back, and they count as led here for the
+    /// resolver, before the unit's leader epoch is set.
+    taking: Mutex<Vec<u64>>,
 }
 
 impl Default for CrossTable {
@@ -203,6 +260,7 @@ impl Default for CrossTable {
             wait: AtomicBool::new(false),
             stale_ms: AtomicU64::new(STALE_MS),
             faults: Mutex::new(None),
+            taking: Mutex::new(Vec::new()),
         }
     }
 }
@@ -485,6 +543,42 @@ fn propose_one(
         .ok_or_else(|| SprigError::internal("the log returned no ticket"))
 }
 
+/// Proposes `payload` to `unit` alone, only if this node still leads the
+/// unit under `epoch` (see [`CommitPath::propose_led`]).
+fn propose_led(
+    path: &dyn CommitPath,
+    unit: u64,
+    epoch: u64,
+    payload: Vec<u8>,
+    durability: Option<Durability>,
+) -> Result<DurableTicket> {
+    path.propose_led(unit, epoch, payload, durability)
+}
+
+/// Whether the units of `path`'s log have leaders that change (a
+/// replicated log): see the module docs.
+fn has_leaders(path: &dyn CommitPath, unit: u64) -> bool {
+    path.unit_has_leader(unit)
+}
+
+/// The anchor's record of `key` as this node's store holds it.
+fn read_record(path: &dyn CommitPath, key: (u64, u64)) -> Result<Option<RecordBody>> {
+    let raw = path
+        .store()
+        .get(Cf::Data, &record_key(key.0, key.1), ReadTier::All)?
+        .expect_ready()?;
+    raw.map(|r| decode_record(&r)).transpose()
+}
+
+/// Whether `unit`'s prepare record of `key` is in this node's store.
+fn has_prepare(path: &dyn CommitPath, unit: u64, key: (u64, u64)) -> Result<bool> {
+    Ok(path
+        .store()
+        .get(Cf::Data, &prepare_key(unit, key.0, key.1), ReadTier::All)?
+        .expect_ready()?
+        .is_some())
+}
+
 fn put_entry(key: &[u8], value: &[u8]) -> Vec<u8> {
     let mut p = Payload::with_capacity(key.len() + value.len() + 16);
     p.put(Cf::Data, key, value);
@@ -604,11 +698,35 @@ impl TxnShared {
         // A reserved key the commit deletes (an XA transaction's record)
         // goes with the commit point, so a crash can't leave it behind a
         // commit: its unit anchors. Otherwise the unit with most writes.
-        let anchor = shares
+        let mut anchor = shares
             .iter()
             .find(|(_, s)| s.delete.is_some())
             .map_or_else(|| anchor_of(&shares), |(u, _)| *u);
+        // The outcome must be readable by whichever node leads a
+        // participant next: when some units have leaders and others are
+        // this node's own, a unit with a leader anchors.
+        if !ordered && !has_leaders(path, anchor) && shares.keys().any(|u| has_leaders(path, *u)) {
+            if shares.get(&anchor).is_some_and(|s| s.delete.is_some()) {
+                return Err(SprigError::new(
+                    sprig_common::SprigCode::ShardMoved,
+                    "a prepared transaction recorded on this node can't finish together with \
+                     writes to replicated units; retry",
+                ));
+            }
+            let led: BTreeMap<u64, Share> = shares
+                .iter()
+                .filter(|(u, _)| has_leaders(path, **u))
+                .map(|(u, s)| (*u, s.clone()))
+                .collect();
+            anchor = anchor_of(&led);
+        }
         let units: Vec<u64> = shares.keys().copied().collect();
+        // The epochs the commit starts under: it reaches its commit point
+        // only if this node led every unit without a break until then.
+        let epochs: Vec<(u64, u64)> = units
+            .iter()
+            .map(|u| (*u, path.leader_epoch_of(*u)))
+            .collect();
         // Every other key the transaction holds exclusively goes into its
         // unit's prepare record, so a participant that learns the outcome
         // late keeps blocking writers of those keys too.
@@ -644,6 +762,11 @@ impl TxnShared {
                 has_record: !ordered,
                 released: false,
                 durability,
+                resolving: BTreeMap::new(),
+                done: std::collections::BTreeSet::new(),
+                loaded: false,
+                sure: false,
+                asked_ms: 0,
             },
         );
         self.cross.open.fetch_add(1, Ordering::AcqRel);
@@ -651,7 +774,7 @@ impl TxnShared {
         let done = if ordered {
             self.across_ordered(path, key, &mine, &others, durability, first)
         } else {
-            self.across_waiting(path, key, &mine, &others, durability, dep)
+            self.across_waiting(path, key, &mine, &others, durability, dep, &epochs)
         }?;
         // Waiters for its locks must open views that see it.
         self.wait_visible(done.cts);
@@ -696,7 +819,7 @@ impl TxnShared {
             drop(held);
             return Err(self.lose(key));
         }
-        let (cts, point) = match self.commit_point(path, key, mine, others, durability) {
+        let (cts, point) = match self.commit_point(path, key, mine, others, durability, None) {
             Ok(x) => x,
             Err(e) => {
                 drop(held);
@@ -706,7 +829,16 @@ impl TxnShared {
         let mut tickets = vec![(anchor, point.clone())];
         let mut lost = self.fault(CrossStage::CommitPoint) == CrossFault::CoordinatorLost;
         if !lost {
-            lost = self.resolve_all(path, key, cts, &point, others, durability, &mut tickets);
+            lost = self.resolve_all(
+                path,
+                key,
+                cts,
+                &point,
+                others,
+                durability,
+                &mut tickets,
+                &[],
+            );
         }
         self.commit_seq.fetch_add(1, Ordering::AcqRel);
         self.publish_commit_ts(cts);
@@ -729,7 +861,9 @@ impl TxnShared {
     }
 
     /// The steps with waits (a log whose units become durable
-    /// independently).
+    /// independently). `epochs`: the leader epochs of the transaction's
+    /// units when the commit began.
+    #[allow(clippy::too_many_arguments)]
     fn across_waiting(
         &self,
         path: &dyn CommitPath,
@@ -738,12 +872,15 @@ impl TxnShared {
         others: &BTreeMap<u64, Share>,
         durability: Option<Durability>,
         dep: &DurableTicket,
+        epochs: &[(u64, u64)],
     ) -> Result<Committed> {
         let (anchor, txid) = key;
         let units = self.cross_units(key);
-        let mut waits = match propose_one(
+        let epoch_of = |u: u64| epochs.iter().find(|(x, _)| *x == u).map_or(0, |(_, e)| *e);
+        let mut waits = match propose_led(
             path,
             anchor,
+            epoch_of(anchor),
             put_entry(
                 &record_key(anchor, txid),
                 &encode_record(Outcome::Pending, &units),
@@ -754,9 +891,10 @@ impl TxnShared {
             Err(e) => return Err(self.abort_own(path, key, e)),
         };
         for (u, s) in others {
-            match propose_one(
+            match propose_led(
                 path,
                 *u,
+                epoch_of(*u),
                 put_entry(&prepare_key(*u, anchor, txid), &encode_prepare(s)),
                 durability,
             ) {
@@ -780,7 +918,25 @@ impl TxnShared {
             if !self.cross_is(key, Outcome::Pending) {
                 return Err(self.abort_own(path, key, super::super::errors::deadlock()));
             }
-            let (cts, point) = match self.commit_point(path, key, mine, others, durability) {
+            // A unit whose leadership left this node (even if it came
+            // back) no longer holds this transaction's locks: it must not
+            // commit. The commit point itself is taken only in the term
+            // the anchor was led under when the commit began.
+            if let Some((u, _)) = epochs.iter().find(|(u, e)| path.leader_epoch_of(*u) != *e) {
+                let e = SprigError::new(
+                    sprig_common::SprigCode::ShardMoved,
+                    format!("unit {u}'s leader changed while the transaction committed; retry"),
+                );
+                return Err(self.abort_own(path, key, e));
+            }
+            let (cts, point) = match self.commit_point(
+                path,
+                key,
+                mine,
+                others,
+                durability,
+                Some(epoch_of(anchor)),
+            ) {
                 Ok(x) => x,
                 Err(e) => return Err(self.abort_own(path, key, e)),
             };
@@ -797,7 +953,16 @@ impl TxnShared {
             return Err(e);
         }
         let mut tickets = Vec::new();
-        if self.resolve_all(path, key, cts, &point, others, durability, &mut tickets) {
+        if self.resolve_all(
+            path,
+            key,
+            cts,
+            &point,
+            others,
+            durability,
+            &mut tickets,
+            epochs,
+        ) {
             return Err(self.lose(key));
         }
         Ok(Committed {
@@ -818,6 +983,7 @@ impl TxnShared {
         mine: &Share,
         others: &BTreeMap<u64, Share>,
         durability: Option<Durability>,
+        epoch: Option<u64>,
     ) -> Result<(Ts, DurableTicket)> {
         let (anchor, txid) = key;
         let units = self.cross_units(key);
@@ -828,7 +994,11 @@ impl TxnShared {
             &record_key(anchor, txid),
             &encode_record(Outcome::Committed(cts), &units),
         );
-        let point = match propose_one(path, anchor, p.into_bytes(), durability) {
+        let proposed = match epoch {
+            Some(e) => propose_led(path, anchor, e, p.into_bytes(), durability),
+            None => propose_one(path, anchor, p.into_bytes(), durability),
+        };
+        let point = match proposed {
             Ok(t) => t,
             Err(e) => {
                 self.publish_commit_ts(cts);
@@ -852,6 +1022,7 @@ impl TxnShared {
 
     /// Resolves every participant in `others`; true if a fault stopped the
     /// coordinator. A dropped or refused resolution stays for a resolver.
+    /// `epochs`: on units with leaders, the epochs the commit began under.
     #[allow(clippy::too_many_arguments)]
     fn resolve_all(
         &self,
@@ -862,6 +1033,7 @@ impl TxnShared {
         others: &BTreeMap<u64, Share>,
         durability: Option<Durability>,
         tickets: &mut Vec<(u64, DurableTicket)>,
+        epochs: &[(u64, u64)],
     ) -> bool {
         for (u, s) in others {
             match self.fault(CrossStage::Resolve(*u)) {
@@ -869,10 +1041,20 @@ impl TxnShared {
                 CrossFault::Drop => continue,
                 CrossFault::Go => {}
             }
-            if let Ok(t) = self.resolve_share(path, key, cts, point, *u, s, durability) {
+            // In the term the prepare record was written under: a leader
+            // in between may have finished the unit already.
+            let epoch = epochs.iter().find(|(x, _)| x == u).map(|(_, e)| *e);
+            if let Ok(t) = self.resolve_share(path, key, cts, point, *u, s, durability, epoch) {
                 if let Some(c) = lock_or_recover(&self.cross.map).get_mut(&key) {
                     c.unresolved.remove(u);
                     c.finished.push(t.clone());
+                    // With leaders the entry can still be lost: the unit
+                    // is finished only once it is applied.
+                    if has_leaders(path, *u) {
+                        c.resolving.insert(*u, (s.clone(), t.clone()));
+                    } else {
+                        c.done.insert(*u);
+                    }
                 }
                 tickets.push((*u, t));
             }
@@ -894,10 +1076,14 @@ impl TxnShared {
         unit: u64,
         share: &Share,
         durability: Option<Durability>,
+        epoch: Option<u64>,
     ) -> Result<DurableTicket> {
         let mut p = share.payload(cts);
         p.delete(Cf::Data, &prepare_key(unit, key.0, key.1));
-        let t = propose_one(path, unit, p.into_bytes(), durability)?;
+        let t = match epoch {
+            Some(e) => propose_led(path, unit, e, p.into_bytes(), durability)?,
+            None => propose_one(path, unit, p.into_bytes(), durability)?,
+        };
         if !share.writes.is_empty() {
             let moved = self
                 .overlay
@@ -1011,6 +1197,10 @@ impl TxnShared {
     }
 
     fn drive_entry(&self, path: &dyn CommitPath, key: (u64, u64)) {
+        if has_leaders(path, key.0) {
+            self.drive_entry_led(path, key);
+            return;
+        }
         let ordered = self.ordered(path);
         let now = self.hlc.physical_ms();
         let stale_ms = self.cross.stale_ms.load(Ordering::Relaxed);
@@ -1045,7 +1235,16 @@ impl TxnShared {
             Outcome::Committed(cts) => {
                 if !c.unresolved.is_empty() && (ordered || c.point.is_durable()) {
                     for (u, s) in std::mem::take(&mut c.unresolved) {
-                        match self.resolve_share(path, key, cts, &c.point, u, &s, c.durability) {
+                        match self.resolve_share(
+                            path,
+                            key,
+                            cts,
+                            &c.point,
+                            u,
+                            &s,
+                            c.durability,
+                            None,
+                        ) {
                             Ok(t) => c.finished.push(t),
                             Err(_) => {
                                 c.unresolved.insert(u, s);
@@ -1105,6 +1304,382 @@ impl TxnShared {
         }
     }
 
+    /// [`TxnShared::drive_entry`] for a transaction anchored in a unit with
+    /// a leader (see the module docs). Never blocks on the log.
+    #[allow(clippy::too_many_lines)]
+    fn drive_entry_led(&self, path: &dyn CommitPath, key: (u64, u64)) {
+        let (anchor, txid) = key;
+        let now = self.hlc.physical_ms();
+        let stale_ms = self.cross.stale_ms.load(Ordering::Relaxed);
+        // A coordinator here that has been silent too long: aborted in
+        // memory under the anchor's latch, where its commit-point step
+        // checks the entry (exactly one of them wins).
+        let overdue = |c: &Cross| {
+            c.coordinated
+                && c.outcome == Outcome::Pending
+                && now.saturating_sub(c.started_ms) >= stale_ms
+        };
+        if lock_or_recover(&self.cross.map)
+            .get(&key)
+            .is_some_and(&overdue)
+        {
+            let latch = self.latch(anchor);
+            let _g = lock_or_recover(&latch);
+            if let Some(c) = lock_or_recover(&self.cross.map).get_mut(&key)
+                && overdue(c)
+            {
+                c.outcome = Outcome::Aborted;
+                c.coordinated = false;
+            }
+        }
+        let mut m = lock_or_recover(&self.cross.map);
+        let Some(c) = m.get_mut(&key) else { return };
+        if c.coordinated {
+            return;
+        }
+
+        // 1. Finishing entries proposed earlier: applied, or lost and to
+        // be proposed again.
+        for (u, (share, t)) in std::mem::take(&mut c.resolving) {
+            if t.is_durable() {
+                c.done.insert(u);
+            } else if t.is_lost() {
+                c.unresolved.insert(u, share);
+            } else {
+                c.resolving.insert(u, (share, t));
+            }
+        }
+
+        // 2. The outcome. A coordinator on this node decided an abort for
+        // good (it never writes the commit point afterwards), and a commit
+        // once its commit point is applied. Anything else is what the
+        // anchor's record says.
+        let anchor_epoch = path.leader_epoch_of(anchor);
+        if !c.sure && !c.loaded {
+            match c.outcome {
+                Outcome::Aborted => c.sure = true,
+                Outcome::Committed(_) if c.point.is_durable() => c.sure = true,
+                Outcome::Committed(_) if !c.point.is_lost() => {}
+                // The commit point was lost with the anchor's leadership
+                // (or its fate is unknown), or the coordinator stopped
+                // before it: the anchor's log knows.
+                Outcome::Committed(_) | Outcome::Pending => {
+                    c.loaded = true;
+                    c.outcome = Outcome::Pending;
+                    c.point = DurableTicket::Ready;
+                }
+            }
+        }
+        if !c.sure && c.loaded {
+            if c.outcome == Outcome::Aborted {
+                // This node's own `ABORTED` write.
+                if c.abort.is_durable() {
+                    c.sure = true;
+                } else if c.abort.is_lost() {
+                    c.outcome = Outcome::Pending;
+                    c.abort = DurableTicket::Ready;
+                }
+            }
+            if c.outcome == Outcome::Pending {
+                // The epoch first, then the store: the decision below is
+                // proposed only in the term the store was read under.
+                match read_record(path, key) {
+                    Err(e) => {
+                        tracing::error!(anchor, txid, error = %e, "a cross-unit transaction record can't be read; its participants stay prepared");
+                        return;
+                    }
+                    Ok(Some((Outcome::Committed(cts), units))) => {
+                        c.outcome = Outcome::Committed(cts);
+                        c.units = units;
+                        c.has_record = true;
+                        c.sure = true;
+                    }
+                    Ok(Some((Outcome::Aborted, units))) => {
+                        c.outcome = Outcome::Aborted;
+                        c.units = units;
+                        c.has_record = true;
+                        c.sure = true;
+                    }
+                    Ok(rec) => {
+                        c.has_record = rec.is_some();
+                        if let Some((_, units)) = rec {
+                            c.units = units;
+                        }
+                        if anchor_epoch > 0 {
+                            // This node leads the anchor and no coordinator
+                            // here runs the transaction: nobody can still
+                            // commit it. Decided through the anchor's log.
+                            let mut units = c.units.clone();
+                            for u in c.unresolved.keys().chain(c.resolving.keys()) {
+                                if !units.contains(u) {
+                                    units.push(*u);
+                                }
+                            }
+                            if !units.contains(&anchor) {
+                                units.push(anchor);
+                            }
+                            units.sort_unstable();
+                            if let Ok(t) = propose_led(
+                                path,
+                                anchor,
+                                anchor_epoch,
+                                put_entry(
+                                    &record_key(anchor, txid),
+                                    &encode_record(Outcome::Aborted, &units),
+                                ),
+                                c.durability,
+                            ) {
+                                c.outcome = Outcome::Aborted;
+                                c.abort = t;
+                                c.units = units;
+                                c.has_record = true;
+                            }
+                        } else if now.saturating_sub(c.asked_ms) >= stale_ms.clamp(1, ASK_ANCHOR_MS)
+                        {
+                            // Undecided for long where the anchor is led
+                            // elsewhere (its record was lost with a leader,
+                            // or its leader holds no prepare record of it):
+                            // decide it here.
+                            if c.asked_ms != 0 {
+                                tracing::warn!(
+                                    anchor,
+                                    txid,
+                                    "a prepared cross-unit transaction has no outcome in the anchor's log; asking for the anchor's leadership to decide it"
+                                );
+                                path.request_lead(anchor);
+                            }
+                            c.asked_ms = now;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Participants this node leads, once the outcome is final:
+        // finished while their prepare record is still there.
+        if c.sure {
+            let waiting: Vec<u64> = c.unresolved.keys().copied().collect();
+            for u in waiting {
+                let epoch = path.leader_epoch_of(u);
+                if epoch == 0 || self.fault(CrossStage::Resolve(u)) != CrossFault::Go {
+                    continue;
+                }
+                match has_prepare(path, u, key) {
+                    Err(_) => continue,
+                    Ok(false) => {
+                        c.unresolved.remove(&u);
+                        c.done.insert(u);
+                        continue;
+                    }
+                    Ok(true) => {}
+                }
+                let Some(share) = c.unresolved.get(&u).cloned() else {
+                    continue;
+                };
+                let proposed = match c.outcome {
+                    Outcome::Committed(cts) => self.resolve_share(
+                        path,
+                        key,
+                        cts,
+                        &c.point,
+                        u,
+                        &share,
+                        c.durability,
+                        Some(epoch),
+                    ),
+                    Outcome::Aborted => propose_led(
+                        path,
+                        u,
+                        epoch,
+                        delete_entry(&prepare_key(u, anchor, txid)),
+                        c.durability,
+                    ),
+                    Outcome::Pending => continue,
+                };
+                if let Ok(t) = proposed {
+                    c.unresolved.remove(&u);
+                    c.finished.push(t.clone());
+                    c.resolving.insert(u, (share, t));
+                    // Its versions are in the overlay now: this node's
+                    // clock and read views move past the commit.
+                    if let (true, Outcome::Committed(cts)) = (c.loaded, c.outcome) {
+                        self.observe(cts);
+                    }
+                }
+            }
+        }
+
+        // 4. Locks: kept while a participant led here still waits to be
+        // finished (its keys must stay blocked) or the outcome isn't known.
+        // Locks on keys of units led elsewhere mean nothing.
+        let taking = lock_or_recover(&self.cross.taking).clone();
+        let led_waiting = c
+            .unresolved
+            .keys()
+            .any(|u| path.leader_epoch_of(*u) > 0 || taking.contains(u));
+        if !c.released && !led_waiting && (c.sure || c.loaded) {
+            c.released = true;
+            if matches!(c.outcome, Outcome::Committed(_)) && !self.early_lock_release() {
+                let waits: Vec<DurableTicket> =
+                    c.resolving.values().map(|(_, t)| t.clone()).collect();
+                self.hold_until_durable(DurableTicket::all(waits), c.txn);
+            } else {
+                self.locks.release_all(c.txn);
+            }
+        }
+
+        // 5. The record goes once every participant is known finished
+        // (this node saw its own finishing entry applied, or leads the
+        // unit and finds no prepare record).
+        let idle = c.unresolved.is_empty() && c.resolving.is_empty();
+        if c.sure && c.has_record && anchor_epoch > 0 && idle {
+            let known = c.units.iter().filter(|u| **u != anchor).all(|u| {
+                c.done.contains(u)
+                    || (has_leaders(path, *u)
+                        && path.leader_epoch_of(*u) > 0
+                        && matches!(has_prepare(path, *u, key), Ok(false)))
+            });
+            if known
+                && propose_led(
+                    path,
+                    anchor,
+                    anchor_epoch,
+                    delete_entry(&record_key(anchor, txid)),
+                    c.durability,
+                )
+                .is_ok()
+            {
+                c.has_record = false;
+            }
+        }
+
+        // 6. Nothing left for this node: the entry goes (a unit's next
+        // leader reads it back from the store). A record whose participants
+        // other nodes finish stays in the anchor's log; the anchor's next
+        // leader looks at it again.
+        let in_flight = !c.sure && !c.loaded;
+        let deciding = anchor_epoch > 0 && !c.sure;
+        if !led_waiting && c.resolving.is_empty() && !in_flight && !deciding {
+            if !c.released {
+                self.locks.release_all(c.txn);
+            }
+            m.remove(&key);
+            self.cross.open.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    /// This node is taking `unit`'s leadership (`on`), or has taken it
+    /// (its leader epoch is set).
+    pub(crate) fn cross_taking(&self, unit: u64, on: bool) {
+        let mut t = lock_or_recover(&self.cross.taking);
+        t.retain(|u| *u != unit);
+        if on {
+            t.push(unit);
+        }
+    }
+
+    /// This node takes `unit`'s leadership (everything its earlier leaders
+    /// committed is in the store): the unit's prepare records come back
+    /// with their locks, and the records of transactions it anchors with
+    /// what they say. Call it between [`TxnShared::cross_taking`] on and
+    /// off, before the unit's leader epoch is set, so whoever finds the
+    /// unit led here finds its prepared transactions too; the resolver
+    /// ([`TxnShared::drive_cross`]) finishes them afterwards.
+    pub(crate) fn load_cross_led(&self, path: &dyn CommitPath, unit: u64) {
+        let mut records: Vec<((u64, u64), RecordBody)> = Vec::new();
+        let mut prepares: Vec<((u64, u64), Share)> = Vec::new();
+        let be = |b: &[u8]| u64::from_be_bytes(b.try_into().unwrap_or([0; 8]));
+        for (field, is_record) in [(RECORD, true), (PREPARE, false)] {
+            let prefix = keys::unit_meta_key(unit, field);
+            let mut it = path
+                .store()
+                .iter(Cf::Data, IterOpts::range(&KeyRange::prefix(&prefix)));
+            it.seek_to_first();
+            while it.valid() {
+                let id = &it.key()[prefix.len()..];
+                if is_record && id.len() == 8 {
+                    match decode_record(it.value()) {
+                        Ok(r) => records.push(((unit, be(id)), r)),
+                        Err(e) => {
+                            tracing::error!(anchor = unit, txid = be(id), error = %e, "a cross-unit transaction record can't be read; its participants are left prepared");
+                        }
+                    }
+                } else if !is_record && id.len() == 16 {
+                    match decode_prepare(it.value()) {
+                        Ok(s) => prepares.push(((be(&id[..8]), be(&id[8..])), s)),
+                        Err(e) => {
+                            tracing::error!(unit, anchor = be(&id[..8]), txid = be(&id[8..]), error = %e, "a cross-unit prepare record can't be read; it is left prepared");
+                        }
+                    }
+                }
+                it.next();
+            }
+            if let Err(e) = it.status().and_then(crate::store::Read::expect_ready) {
+                tracing::error!(unit, error = %e, "reading the unit's cross-unit commit records failed; they wait for its next leader");
+                return;
+            }
+        }
+        if records.is_empty() && prepares.is_empty() {
+            return;
+        }
+        let fresh = |s: &Self, units: Vec<u64>, has_record: bool| Cross {
+            txn: s.fresh_txn_id(),
+            outcome: Outcome::Pending,
+            units,
+            unresolved: BTreeMap::new(),
+            point: DurableTicket::Ready,
+            abort: DurableTicket::Ready,
+            finished: Vec::new(),
+            coordinated: false,
+            started_ms: 0,
+            has_record,
+            released: false,
+            durability: None,
+            resolving: BTreeMap::new(),
+            done: std::collections::BTreeSet::new(),
+            loaded: true,
+            sure: false,
+            asked_ms: 0,
+        };
+        {
+            let mut m = lock_or_recover(&self.cross.map);
+            let mut added = 0;
+            for (k, (_, units)) in records {
+                m.entry(k).or_insert_with(|| {
+                    added += 1;
+                    fresh(self, units, true)
+                });
+            }
+            for (k, share) in prepares {
+                let c = m.entry(k).or_insert_with(|| {
+                    added += 1;
+                    fresh(self, Vec::new(), false)
+                });
+                if !c.resolving.contains_key(&unit) {
+                    // Its keys stay blocked until it is finished.
+                    let weight = Arc::new(AtomicUsize::new(share.writes.len()));
+                    for key in share.writes.iter().map(|(k, _)| k).chain(&share.locks) {
+                        self.locks.restore_exclusive(c.txn, &weight, key);
+                    }
+                    c.released = false;
+                    c.done.remove(&unit);
+                    c.unresolved.entry(unit).or_insert(share);
+                }
+            }
+            self.cross.open.fetch_add(added, Ordering::AcqRel);
+        }
+    }
+
+    /// Whether a transaction this node did not coordinate is prepared on
+    /// `unit` and not yet finished here: its outcome may already be a
+    /// commit this node's readers must not miss.
+    pub(crate) fn cross_unfinished_on(&self, unit: u64) -> bool {
+        self.cross.open.load(Ordering::Acquire) > 0
+            && lock_or_recover(&self.cross.map)
+                .values()
+                .any(|c| c.loaded && c.unresolved.contains_key(&unit))
+    }
+
     // ----- recovery -------------------------------------------------------------
 
     /// Reads back unfinished commits across units after a restart (or a
@@ -1130,6 +1705,14 @@ impl TxnShared {
                     // Every record is read (a participant's anchor may be
                     // another unit); prepares of the unit asked for, or
                     // anchored there.
+                    // A unit with a leader is read back by the node that
+                    // leads it, when it takes the leadership
+                    // (`load_cross_led`): this node's copy may lag, and
+                    // only the leader may act on it.
+                    if has_leaders(path, unit) {
+                        it.next();
+                        continue;
+                    }
                     if let Some(id) = field.strip_prefix(RECORD)
                         && id.len() == 8
                     {
@@ -1175,6 +1758,11 @@ impl TxnShared {
             has_record,
             released: false,
             durability: None,
+            resolving: BTreeMap::new(),
+            done: std::collections::BTreeSet::new(),
+            loaded: true,
+            sure: false,
+            asked_ms: 0,
         };
         // A transaction with an unreadable record is left alone (its
         // participants stay prepared, holding nothing in memory) rather
@@ -1199,10 +1787,16 @@ impl TxnShared {
             match r {
                 Ok(share) if !damaged.contains(&key) => {
                     // No record: the commit point was never written, so it
-                    // aborts.
+                    // aborts. Not so when the anchor has a leader: its
+                    // record is in the anchor's log, which decides.
+                    let outcome = if has_leaders(path, key.0) {
+                        Outcome::Pending
+                    } else {
+                        Outcome::Aborted
+                    };
                     found
                         .entry(key)
-                        .or_insert_with(|| fresh(self, Outcome::Aborted, Vec::new(), false))
+                        .or_insert_with(|| fresh(self, outcome, Vec::new(), false))
                         .unresolved
                         .insert(unit, share);
                 }

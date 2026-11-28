@@ -49,11 +49,12 @@ fn statements(metrics: &str) -> f64 {
         .fold(0.0, |a, b| a + b)
 }
 
+#[ignore = "live: needs SPRIG_TEST_OPS_TRACE; tools/live/README.md"]
 #[tokio::test]
 async fn a_slow_statement_is_traced_from_gateway_to_backend() {
     let Some(v) = skip::var(ENV) else {
         skip::report_missing(ENV, "a_slow_statement_is_traced_from_gateway_to_backend");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let parts: Vec<&str> = v.split(',').collect();
     let [listener, telemetry, user, password] = parts[..] else {

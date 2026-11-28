@@ -13,6 +13,8 @@
 //! - [`sweep`]: active expiry;
 //! - [`notify`]: keyspace notifications' events, recorded with each batch;
 //! - [`backend`]: which tenants are on the engine;
+//! - [`wall`]: the tenant wall: a tenant's databases are on a unit that
+//!   refuses every other tenant's keys;
 //! - [`engine_unit`]: the engine's transactions as a unit;
 //! - [`mem`]: an in-memory unit for tests.
 //!
@@ -47,8 +49,10 @@ pub mod mem;
 pub mod notify;
 pub mod store;
 pub mod sweep;
+pub mod wall;
 
 pub use backend::{Backend, Tenants};
 pub use db::{EngineDb, ScriptTxn, Uids, Versions, Waiters};
 pub use engine_unit::EngineUnit;
 pub use store::{Batch, StoreError, StoreResult, Unit};
+pub use wall::{TenantWall, Walled};

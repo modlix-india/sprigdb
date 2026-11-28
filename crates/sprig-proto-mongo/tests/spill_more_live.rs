@@ -230,12 +230,13 @@ fn pipelines() -> Vec<(&'static str, &'static str, Vec<Document>, bool)> {
     ]
 }
 
+#[ignore = "live: needs SPRIG_TEST_MONGO_URI, SPRIG_TEST_MONGO_REF_URI; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread")]
 async fn spill_leftovers_match_mongodb() {
     let (Some(gw), Some(rf)) = (var("SPRIG_TEST_MONGO_URI"), var("SPRIG_TEST_MONGO_REF_URI"))
     else {
         eprintln!("SPRIG_TEST_MONGO_URI / SPRIG_TEST_MONGO_REF_URI not set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let bytes: i64 = var("SPRIG_TEST_SPILL_STAGE_BYTES").map_or(1 << 20, |s| s.parse().unwrap());
     let n: i64 = var("SPRIG_TEST_SPILL_DOCS").map_or(6000, |s| s.parse().unwrap());
@@ -437,11 +438,12 @@ fn files(dir: &str) -> usize {
     n
 }
 
+#[ignore = "live: needs SPRIG_TEST_MONGO_URI, SPRIG_TEST_SPILL_DIR; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread")]
 async fn find_spill_files_go_away() {
     let (Some(gw), Some(dir)) = (var("SPRIG_TEST_MONGO_URI"), var("SPRIG_TEST_SPILL_DIR")) else {
         eprintln!("SPRIG_TEST_MONGO_URI / SPRIG_TEST_SPILL_DIR not set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let g = Client::with_uri_str(&gw).await.unwrap();
     let db = g.database("m7_spill_files");

@@ -95,6 +95,11 @@ async fn apply_settings(dir: &UnitDirectory, store: &dyn MetaStore) {
         if d.unit != d.tenant {
             continue;
         }
+        // A voter on a lost node: the unit is being re-replicated, and its
+        // learner is the replacement catching up, not a read copy.
+        if crate::ops::replicate::short_of_copies(g) {
+            continue;
+        }
         let want = wanted(d.tenant).await;
         if d.learners.len() == want {
             continue;
@@ -139,19 +144,16 @@ pub fn choose(
 ) -> Vec<u64> {
     let mut out: Vec<u64> = d.learners.iter().copied().take(want).collect();
     let domain = |id: u64| {
-        nodes
-            .iter()
-            .find(|n| n.id == id)
-            .map_or_else(
-                || format!("node-{id}"),
-                |n| {
-                    if n.failure_domain.is_empty() {
-                        format!("node-{}", n.id)
-                    } else {
-                        n.failure_domain.clone()
-                    }
-                },
-            )
+        nodes.iter().find(|n| n.id == id).map_or_else(
+            || format!("node-{id}"),
+            |n| {
+                if n.failure_domain.is_empty() {
+                    format!("node-{}", n.id)
+                } else {
+                    n.failure_domain.clone()
+                }
+            },
+        )
     };
     let mut candidates: Vec<&NodeRecord> = nodes
         .iter()
@@ -244,7 +246,8 @@ fn reconcile(dir: &UnitDirectory) -> usize {
             continue;
         }
         let Some(d) = dir.get(g) else { continue };
-        if d.unit != g {
+        if d.unit != g || crate::ops::replicate::short_of_copies(g) {
+            // (Re-replication owns the unit's learners meanwhile.)
             continue;
         }
         let Some(st) = node.status(g) else { continue };

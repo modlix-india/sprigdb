@@ -27,9 +27,9 @@
 //!   and metrics;
 //! - [`settings`]: the `ai.*` keys;
 //! - [`budget`]: daily token budgets;
-//! - [`audit`]: conversations, messages and usage in the tenant catalog,
-//!   and the administration assistant's in a system schema
-//!   ([`audit::system`]);
+//! - [`audit`]: conversations, messages and usage in the tenant's catalog
+//!   records, and the administration assistant's in the system records
+//!   ([`audit::rec`]);
 //! - [`feedback`]: votes on answers and proposal outcomes, and the prompt
 //!   notes made of them;
 //! - [`functions`]: the AI functions in statements (`AI_CLASSIFY` and
@@ -76,12 +76,12 @@ pub mod sql_guard;
 pub mod tools;
 pub mod turn;
 
-pub use audit::system::SystemAudit;
-pub use audit::{AuditStore, CatalogAudit, ConvId, MemoryAudit, MsgKind};
+pub use audit::rec::RecAudit;
+pub use audit::{AuditStore, ConvId, MemoryAudit, MsgKind};
 pub use budget::{Budget, UsageToday};
 pub use egress::{EgressPolicy, Scrubber};
 pub use feedback::{FeedbackStore, Outcome};
-pub use glossary::{CatalogGlossary, GlossaryStore, MemoryGlossary};
+pub use glossary::{GlossaryStore, MemoryGlossary, RecGlossary};
 pub use provider::{
     Block, ChatOutcome, ChatRequest, ChatSink, Delta, Effort, Message, MsgRole, Provider,
     ProviderKind, Sent, Stop, ToolDef, Usage,

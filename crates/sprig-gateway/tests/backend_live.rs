@@ -248,6 +248,7 @@ async fn side(u: &Url) -> MysqlClient {
     MysqlClient::connect(&u.addr, &c).await.unwrap()
 }
 
+#[ignore = "live: needs SPRIG_TEST_MARIADB_SINGLE; tools/live/README.md"]
 #[tokio::test]
 async fn pool_reuse_replays_session_state() {
     let u = need!(skip::MARIADB_SINGLE, "pool_reuse_replays_session_state");
@@ -370,6 +371,7 @@ async fn pool_reuse_replays_session_state() {
     c.close().await;
 }
 
+#[ignore = "live: needs SPRIG_TEST_GALERA_ACK_SECS, SPRIG_TEST_MARIADB_SINGLE, SPRIG_TEST_MARIADB_REPLICATION, ...; tools/live/README.md"]
 #[tokio::test]
 async fn pins_hold_one_connection_until_released() {
     let u = need!(
@@ -453,6 +455,7 @@ async fn pins_hold_one_connection_until_released() {
     b.close().await;
 }
 
+#[ignore = "live: needs SPRIG_TEST_MARIADB_SINGLE, SPRIG_TEST_MARIADB_REPLICATION or SPRIG_TEST_MARIADB_GALERA; tools/live/README.md"]
 #[tokio::test]
 async fn writer_selection_per_topology() {
     if let Some(u) = urls(skip::MARIADB_SINGLE) {
@@ -553,6 +556,7 @@ async fn writer_selection_per_topology() {
     }
 }
 
+#[ignore = "live: needs SPRIG_TEST_GALERA_ACK_SECS, SPRIG_TEST_MARIADB_SINGLE, SPRIG_TEST_MARIADB_REPLICATION, ...; tools/live/README.md"]
 #[tokio::test]
 async fn read_your_writes_on_primary_and_replicas() {
     let u = need!(
@@ -608,6 +612,7 @@ async fn read_your_writes_on_primary_and_replicas() {
 /// didn't move and another session's next read went to a replica that
 /// hadn't applied the commit (a read-your-writes bug the differential
 /// suite found under Sprig 2PC).
+#[ignore = "live: needs SPRIG_TEST_GALERA_ACK_SECS, SPRIG_TEST_MARIADB_SINGLE, SPRIG_TEST_MARIADB_REPLICATION, ...; tools/live/README.md"]
 #[tokio::test]
 async fn read_your_writes_after_a_commit_under_a_fixed_timestamp() {
     let u = need!(
@@ -682,6 +687,7 @@ async fn read_your_writes_after_a_commit_under_a_fixed_timestamp() {
 /// the writer and pins there; before the fix it went
 /// to a replica, opened the transaction there, and the gateway discarded
 /// that connection and pinned the session as untracked for good.
+#[ignore = "live: needs SPRIG_TEST_GALERA_ACK_SECS, SPRIG_TEST_MARIADB_SINGLE, SPRIG_TEST_MARIADB_REPLICATION, ...; tools/live/README.md"]
 #[tokio::test]
 async fn autocommit_off_reads_stay_on_the_writer() {
     let u = need!(
@@ -744,6 +750,7 @@ async fn autocommit_off_reads_stay_on_the_writer() {
     a.close().await;
 }
 
+#[ignore = "live: needs SPRIG_TEST_MARIADB_GALERA; tools/live/README.md"]
 #[tokio::test]
 async fn read_your_writes_on_galera() {
     let u = need!(skip::MARIADB_GALERA, "read_your_writes_on_galera");
@@ -811,6 +818,7 @@ async fn read_your_writes_on_galera() {
 /// transaction, delete and insert), with and without a pause before the
 /// read, once per `reads.galera_unconfirmed` mode. No read misses its
 /// write; with `check` most reads leave the writer.
+#[ignore = "live: needs SPRIG_TEST_MARIADB_GALERA; tools/live/README.md"]
 #[tokio::test]
 async fn read_your_writes_on_galera_stress() {
     let u = need!(skip::MARIADB_GALERA, "read_your_writes_on_galera_stress");
@@ -942,6 +950,7 @@ async fn kill(u: &Url, thread: &str) {
     c.quit().await;
 }
 
+#[ignore = "live: needs SPRIG_TEST_MARIADB_SINGLE; tools/live/README.md"]
 #[tokio::test]
 async fn failures_mid_statement() {
     let u = need!(skip::MARIADB_SINGLE, "failures_mid_statement");
@@ -1046,6 +1055,7 @@ fn toxiproxy() -> Option<Toxiproxy> {
     skip::var(skip::TOXIPROXY).map(|u| Toxiproxy::new(&u).unwrap())
 }
 
+#[ignore = "live: needs SPRIG_TEST_MARIADB_SINGLE; tools/live/README.md"]
 #[tokio::test]
 async fn network_cut_mid_result() {
     let u = need!(skip::MARIADB_SINGLE, "network_cut_mid_result");
@@ -1112,6 +1122,7 @@ async fn network_cut_mid_result() {
     a.close().await;
 }
 
+#[ignore = "live: needs SPRIG_TEST_GALERA_ACK_SECS, SPRIG_TEST_MARIADB_SINGLE, SPRIG_TEST_MARIADB_REPLICATION, ...; tools/live/README.md"]
 #[tokio::test]
 async fn replica_down_reads_fail_over_to_the_writer() {
     let u = need!(
@@ -1230,11 +1241,12 @@ async fn connect_retry(addr: &str) -> MysqlClient {
     }
 }
 
+#[ignore = "live: needs SPRIG_TEST_DOCKER; tools/live/README.md"]
 #[tokio::test]
 async fn read_your_writes_with_a_lagging_replica() {
     if !skip::flag(skip::DOCKER) {
         skip::report_missing(skip::DOCKER, "read_your_writes_with_a_lagging_replica");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     }
     let Some(tp) = toxiproxy() else {
         skip::report_missing(skip::TOXIPROXY, "read_your_writes_with_a_lagging_replica");
@@ -1323,6 +1335,7 @@ async fn read_your_writes_with_a_lagging_replica() {
     drop(primary);
 }
 
+#[ignore = "live: needs SPRIG_TEST_MARIADB_SINGLE; tools/live/README.md"]
 #[tokio::test]
 async fn lowered_limits_converge() {
     let u = need!(skip::MARIADB_SINGLE, "lowered_limits_converge");
@@ -1375,6 +1388,7 @@ async fn lowered_limits_converge() {
 /// the same text on the same pooled connection must each get their own
 /// schema's table (the statement cache keys by schema and text); before the
 /// fix the second session got the first one's statement.
+#[ignore = "live: needs SPRIG_TEST_GALERA_ACK_SECS, SPRIG_TEST_MARIADB_SINGLE, SPRIG_TEST_MARIADB_REPLICATION, ...; tools/live/README.md"]
 #[tokio::test]
 async fn prepared_statements_follow_the_session_schema() {
     let u = need!(
@@ -1480,6 +1494,7 @@ async fn wait_synced(u: &Url) {
 /// may try it and lose at most `reads.galera_sync_wait_timeout_ms` before
 /// rerunning on the writer; once it is marked behind it is never tried.
 /// Once the node catches up, reads return to it.
+#[ignore = "live: needs SPRIG_TEST_GALERA_ACK_SECS, SPRIG_TEST_MARIADB_SINGLE, SPRIG_TEST_MARIADB_REPLICATION, ...; tools/live/README.md"]
 #[tokio::test]
 async fn a_lagging_galera_node_never_stalls_reads() {
     let u = need!(
@@ -1633,6 +1648,7 @@ async fn a_lagging_galera_node_never_stalls_reads() {
 
 /// Follow-up 1: the session reports the capabilities its backend
 /// connection negotiated, not the ones `SessionOpts` asked for.
+#[ignore = "live: needs SPRIG_TEST_MARIADB_SINGLE; tools/live/README.md"]
 #[tokio::test]
 async fn backend_caps_are_the_connections_own() {
     use sprig_proto_mysql::Caps;
@@ -1689,6 +1705,7 @@ fn reader_route(r: RouteKind) -> bool {
 /// wait-or-fail prefix (including timeouts), user variables, schema and
 /// variable syncs, prepared reads, and `SET STATEMENT ... FOR SELECT`,
 /// whose temporary values MariaDB's tracking reports as if they stuck.
+#[ignore = "live: needs SPRIG_TEST_MARIADB_REPLICATION or SPRIG_TEST_MARIADB_GALERA; tools/live/README.md"]
 #[tokio::test]
 async fn reads_leave_no_state_on_readers() {
     let mut ran = false;
@@ -1837,6 +1854,7 @@ async fn reads_leave_no_state_on_readers() {
 /// settings never stick to the backend connection. The gateway keeps the
 /// client's values (to answer) and its own tracking: commits, schema and
 /// variables are still seen, on this connection and the next session's.
+#[ignore = "live: needs SPRIG_TEST_GALERA_ACK_SECS, SPRIG_TEST_MARIADB_SINGLE, SPRIG_TEST_MARIADB_REPLICATION, ...; tools/live/README.md"]
 #[tokio::test]
 async fn clients_cannot_change_the_gateways_session_tracking() {
     let u = need!(
@@ -1968,6 +1986,7 @@ async fn clients_cannot_change_the_gateways_session_tracking() {
 /// statement's own connection, less the reading's own cost, give the rows
 /// a scan, a range read and a point lookup examined; pinned sessions are
 /// never probed, so their diagnostics survive.
+#[ignore = "live: needs SPRIG_TEST_GALERA_ACK_SECS, SPRIG_TEST_MARIADB_SINGLE, SPRIG_TEST_MARIADB_REPLICATION, ...; tools/live/README.md"]
 #[tokio::test]
 async fn probes_measure_rows_examined_on_the_same_connection() {
     let u = need!(
@@ -2049,6 +2068,7 @@ async fn probes_measure_rows_examined_on_the_same_connection() {
 /// with `autocommit = 0` and prepared writes, where a statement after the
 /// abort opens a new transaction. Each node is a cluster of its own here so
 /// that sessions write on all three.
+#[ignore = "live: needs SPRIG_TEST_MARIADB_GALERA; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn galera_commits_answered_ok_are_kept() {
     let u = need!(skip::MARIADB_GALERA, "galera_commits_answered_ok_are_kept");

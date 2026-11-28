@@ -7,7 +7,7 @@
 #   deploy/compose/mover/run.sh up      # build, start the gateway, make the tenant
 #   deploy/compose/mover/run.sh down    # stop the gateway, drop the tenant
 #
-# Then: SPRIG_TEST_MOVER_GATEWAY=1 cargo test -p sprig-mover --test live_gateway
+# Then: SPRIG_TEST_MOVER_GATEWAY=1 cargo test -p sprig-mover --test live_gateway -- --ignored
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/../../.."
 state=deploy/compose/mover/.state

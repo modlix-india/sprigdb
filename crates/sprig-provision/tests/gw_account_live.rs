@@ -19,6 +19,7 @@ use sprig_common::ids::NodeId;
 use sprig_provision::credentials::CredentialConnector;
 use sprig_provision::gw_account::{self, Ensured};
 
+#[ignore = "live: needs SPRIG_TEST_GW_CREDENTIALS, SPRIG_TEST_GW_NODES; tools/live/README.md"]
 #[tokio::test]
 async fn sprig_gw_is_created_and_can_only_monitor() {
     let (Ok(creds), Ok(nodes)) = (
@@ -26,7 +27,7 @@ async fn sprig_gw_is_created_and_can_only_monitor() {
         std::env::var("SPRIG_TEST_GW_NODES"),
     ) else {
         eprintln!("skipped: SPRIG_TEST_GW_CREDENTIALS and SPRIG_TEST_GW_NODES not set");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let refs = sprig_provision::credentials::refs_for(&creds).unwrap();
     let nodes: Vec<NodeSpec> = nodes

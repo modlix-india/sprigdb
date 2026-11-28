@@ -28,6 +28,7 @@ async fn exists(pool: &Pool, schema: &str) -> bool {
     n == Some(1)
 }
 
+#[ignore = "live: needs SPRIG_TEST_MARIADB_SINGLE; tools/live/README.md"]
 #[tokio::test]
 async fn a_process_that_never_creates_schemas_refuses_a_missing_one() {
     let Some(url) = std::env::var("SPRIG_TEST_MARIADB_SINGLE")
@@ -35,7 +36,7 @@ async fn a_process_that_never_creates_schemas_refuses_a_missing_one() {
         .filter(|v| !v.trim().is_empty())
     else {
         eprintln!("skipped: set SPRIG_TEST_MARIADB_SINGLE to run it");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let pool = Pool::new(Opts::from_url(&url).unwrap());
     let schema = format!("__sprig_test_nocreate_{}", std::process::id());

@@ -212,11 +212,12 @@ struct Tally {
     first: BTreeMap<String, String>,
 }
 
+#[ignore = "live: needs SPRIG_TEST_DB_GRANTS, SPRIG_TEST_DB_GRANTS_TENANT, SPRIG_TEST_DB_GRANTS_MOVE_TO, ...; tools/live/README.md"]
 #[tokio::test]
 async fn database_grants_follow_regroups_splits_merges_and_moves() {
     let Some(e) = env() else {
         eprintln!("skipped: set SPRIG_TEST_DB_GRANTS=<gateway mysql port>,<admin port>");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let created = ctl_retry(&e, &["tenant", "create", &e.tenant, "--cluster", "dc-a-c1"]).await;
     eprintln!("tenant {} created: id {}", e.tenant, tenant_id(&created));

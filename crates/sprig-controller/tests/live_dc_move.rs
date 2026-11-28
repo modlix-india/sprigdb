@@ -417,11 +417,12 @@ async fn run_move(from: &str, to: &str) -> (u64, u64, Duration, Duration) {
     (pause, duration, gap, l.max_latency)
 }
 
+#[ignore = "live: needs SPRIG_TEST_DC_MOVE; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn tenant_moves_between_data_centers_under_load() {
     if !enabled() {
         eprintln!("skipped: set SPRIG_TEST_DC_MOVE=1 with deploy/compose/dc/run.sh up");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     }
     let t = sprigctl("mum1", &["tenant", "show", TENANT]);
     let home = t["home_dc"].as_str().unwrap().to_owned();

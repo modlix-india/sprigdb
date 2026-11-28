@@ -3524,14 +3524,9 @@ fn analyze_as_explain(t: &str) -> Option<String> {
     query.then(|| format!("EXPLAIN {rest}"))
 }
 
-
 /// The syntax error both servers answer for an XA statement whose xid has
 /// a part over 64 bytes: 1064 quoting the text after that part.
-fn long_xid_error(
-    sql: &[u8],
-    opts: sprig_sql::lex::LexOptions,
-    mysql: bool,
-) -> Option<SprigError> {
+fn long_xid_error(sql: &[u8], opts: sprig_sql::lex::LexOptions, mysql: bool) -> Option<SprigError> {
     use sprig_sql::lex::TokenKind;
     let toks = sprig_sql::lex::lex(sql, &opts).ok()?;
     let long = toks.iter().find(|t| {
@@ -3572,7 +3567,11 @@ mod long_xid_tests {
         let join = format!("XA START '{}' JOIN", "a".repeat(65));
         let e = long_xid_error(join.as_bytes(), opts, true).expect("refused");
         assert!(e.message.contains("MySQL server version"));
-        assert!(e.message.ends_with("near 'JOIN' at line 1"), "{}", e.message);
+        assert!(
+            e.message.ends_with("near 'JOIN' at line 1"),
+            "{}",
+            e.message
+        );
         let ok = format!("XA START '{}'", "a".repeat(64));
         assert!(long_xid_error(ok.as_bytes(), opts, false).is_none());
     }

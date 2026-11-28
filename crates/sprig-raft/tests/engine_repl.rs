@@ -19,7 +19,7 @@ use bytes::Bytes;
 use sprig_common::time::SystemClock;
 use sprig_engine::keys::{KeyPrefix, kind};
 use sprig_engine::log::SyncMode;
-use sprig_engine::txn::TxnOptions;
+use sprig_engine::txn::{CrossFault, CrossStage, TxnOptions};
 use sprig_engine::{Engine, EngineConfig, StoreKind, UnitId};
 use sprig_raft::{EngineLogStore, EngineNode, EngineNodeOptions, MemNetwork, RaftConfig};
 
@@ -171,6 +171,14 @@ impl Cluster {
         let e = &self.replicas[&id].engine;
         let mut t = e.begin(TxnOptions::default()).unwrap();
         t.get_snapshot(k).unwrap()
+    }
+
+    /// [`Cluster::get`] that returns a failed read (retryable while a
+    /// unit's leadership is moving) instead of panicking: for reads inside
+    /// [`until`].
+    fn try_get(&self, id: u64, k: &[u8]) -> sprig_common::Result<Option<Bytes>> {
+        let e = &self.replicas[&id].engine;
+        e.begin(TxnOptions::default())?.get_snapshot(k)
     }
 
     /// Waits until every replica's store holds the same unit.
@@ -612,8 +620,8 @@ fn a_commit_across_units_led_by_different_nodes() {
     e.resolve_cross_unit();
     for id in VOTERS {
         until("both writes on every replica", || {
-            (c.get(id, &ka).as_deref() == Some(&b"a"[..])
-                && c.get(id, &kb).as_deref() == Some(&b"b"[..]))
+            (c.try_get(id, &ka).ok()?.as_deref() == Some(&b"a"[..])
+                && c.try_get(id, &kb).ok()?.as_deref() == Some(&b"b"[..]))
             .then_some(())
         });
     }
@@ -841,4 +849,445 @@ fn an_isolated_leader_does_not_serve_stale_reads() {
         let mut t = old.begin(TxnOptions::default()).ok()?;
         (t.get_snapshot(&k).ok()?.as_deref() == Some(&b"v1"[..])).then_some(())
     });
+}
+
+/// Starts `ua` and `ub` and brings both under one node's leadership;
+/// returns that node.
+fn lead_both(c: &Cluster, ua: UnitId, ub: UnitId) -> u64 {
+    for u in [ua, ub] {
+        c.replicas
+            .values()
+            .next()
+            .unwrap()
+            .node
+            .start_unit(u, &VOTERS)
+            .unwrap();
+    }
+    let l = c.leader(ua);
+    until("one node leading both units", || {
+        if c.replicas[&l].engine.leader_epoch(ua) > 0 && c.replicas[&l].engine.leader_epoch(ub) > 0
+        {
+            return Some(());
+        }
+        for u in [ua, ub] {
+            let other = c.leader(u);
+            if other != l {
+                let _ = c.replicas[&other].node.node().transfer_leader(u.0, l);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        None
+    });
+    l
+}
+
+/// Drops every participant's resolution on its way out of the coordinator,
+/// as if the node had stopped right after the commit was acknowledged.
+fn drop_resolutions(e: &Engine) {
+    e.txn_shared()
+        .set_cross_unit_faults(Some(Arc::new(|s| match s {
+            CrossStage::Resolve(_) => CrossFault::Drop,
+            _ => CrossFault::Go,
+        })));
+}
+
+/// An acknowledged commit across two units stays whole when the node that
+/// ran it dies before the participant's resolution reached that unit's
+/// log: the commit point is in the anchor's log, the participant holds
+/// only its prepare record, and whichever replicas lead the units next
+/// must finish it. Both halves are then readable on the new leaders.
+#[test]
+fn an_acknowledged_commit_across_units_survives_its_coordinators_death() {
+    let mut c = Cluster::new("cross-death");
+    let (ua, ub) = (
+        Engine::unit_of_tenant(TENANT + 20),
+        Engine::unit_of_tenant(TENANT + 21),
+    );
+    let (ka, kb) = (key(TENANT + 20, 1), key(TENANT + 21, 1));
+    let l = lead_both(&c, ua, ub);
+    let e = c.replicas[&l].engine.clone();
+    drop_resolutions(&e);
+    let mut t = e.begin(TxnOptions::default()).unwrap();
+    t.put(ka.clone(), Bytes::from_static(b"a")).unwrap();
+    t.put(kb.clone(), Bytes::from_static(b"b")).unwrap();
+    // Acknowledged: the reply waits for the commit point only.
+    t.commit().unwrap().wait().unwrap();
+    drop(e);
+    c.kill(l);
+    for (u, k, v) in [(ua, &ka, &b"a"[..]), (ub, &kb, &b"b"[..])] {
+        until("both halves on the new leaders", || {
+            let n = c
+                .replicas
+                .iter()
+                .find(|(_, r)| r.engine.leader_epoch(u) > 0)
+                .map(|(id, _)| *id)?;
+            for r in c.replicas.values() {
+                r.engine.resolve_cross_unit();
+            }
+            let e = &c.replicas[&n].engine;
+            let mut t = e.begin(TxnOptions::default()).ok()?;
+            (t.get_snapshot(k).ok()?.as_deref() == Some(v)).then_some(())
+        });
+    }
+    // And the replicas agree.
+    c.converged(ua);
+    c.converged(ub);
+}
+
+/// The same with no crash: the participant's leadership is handed to
+/// another node (a graceful transfer) while its resolution is still
+/// missing. The new leader finishes the commit from the anchor's record.
+#[test]
+fn a_commit_across_units_is_finished_after_the_participants_leader_moves() {
+    let c = Cluster::new("cross-move");
+    let (ua, ub) = (
+        Engine::unit_of_tenant(TENANT + 22),
+        Engine::unit_of_tenant(TENANT + 23),
+    );
+    let (ka, kb) = (key(TENANT + 22, 1), key(TENANT + 23, 1));
+    let l = lead_both(&c, ua, ub);
+    let e = c.replicas[&l].engine.clone();
+    drop_resolutions(&e);
+    let mut t = e.begin(TxnOptions::default()).unwrap();
+    t.put(ka.clone(), Bytes::from_static(b"a")).unwrap();
+    t.put(kb.clone(), Bytes::from_static(b"b")).unwrap();
+    t.commit().unwrap().wait().unwrap();
+    // The participant (the higher unit: the anchor is the lower on a tie)
+    // moves to another node; the coordinator never resolves it.
+    let to = VOTERS.into_iter().find(|id| *id != l).unwrap();
+    until("the participant's leader to move", || {
+        let _ = c.replicas[&l].node.node().transfer_leader(ub.0, to);
+        std::thread::sleep(Duration::from_millis(20));
+        (c.replicas[&to].engine.leader_epoch(ub) > 0).then_some(())
+    });
+    until("the participant's half on its new leader", || {
+        for r in c.replicas.values() {
+            r.engine.resolve_cross_unit();
+        }
+        let mut t = c.replicas[&to].engine.begin(TxnOptions::default()).ok()?;
+        (t.get_snapshot(&kb).ok()?.as_deref() == Some(&b"b"[..])).then_some(())
+    });
+    assert_eq!(c.get(l, &ka).as_deref(), Some(&b"a"[..]));
+    c.converged(ub);
+}
+
+/// A replica that doesn't lead a unit doesn't answer a read of it while a
+/// commit across units is prepared there and not finished. The commit is
+/// acknowledged once its commit point is durable in the anchor, so a read
+/// that starts afterwards must see it; and when the participant is
+/// finished, its versions carry a timestamp below versions the replica may
+/// already hold. The read waits (here: fails as retryable, the resolution
+/// being held back), and reads the new value once the participant is
+/// finished.
+#[test]
+fn a_follower_read_waits_for_a_commit_across_units_prepared_on_its_unit() {
+    let c = Cluster::new("cross-follow");
+    let (ua, ub) = (
+        Engine::unit_of_tenant(TENANT + 24),
+        Engine::unit_of_tenant(TENANT + 25),
+    );
+    let (ka, kb) = (key(TENANT + 24, 1), key(TENANT + 25, 1));
+    let l = lead_both(&c, ua, ub);
+    let e = c.replicas[&l].engine.clone();
+    let mut t = e.begin(TxnOptions::default()).unwrap();
+    t.put(kb.clone(), Bytes::from_static(b"old")).unwrap();
+    t.commit().unwrap().wait().unwrap();
+    drop_resolutions(&e);
+    let mut t = e.begin(TxnOptions::default()).unwrap();
+    t.put(ka.clone(), Bytes::from_static(b"a")).unwrap();
+    t.put(kb.clone(), Bytes::from_static(b"b")).unwrap();
+    t.commit().unwrap().wait().unwrap();
+    // The leader shows the acknowledged commit at once.
+    assert_eq!(c.get(l, &kb).as_deref(), Some(&b"b"[..]));
+    // A follower holds the prepare record and not yet the resolution.
+    let f = VOTERS.into_iter().find(|id| *id != l).unwrap();
+    let fe = &c.replicas[&f].engine;
+    let mut r = fe.begin(TxnOptions::default()).unwrap();
+    match r.get_snapshot(&kb) {
+        Ok(v) => assert_eq!(
+            v.as_deref(),
+            Some(&b"b"[..]),
+            "a follower read missed an acknowledged commit across units"
+        ),
+        Err(err) => assert_eq!(
+            err.code(),
+            Some(sprig_common::SprigCode::ShardMoved),
+            "retryable: {err}"
+        ),
+    }
+    drop(r);
+    // The coordinator's node finishes the participant; the follower reads it.
+    e.txn_shared().set_cross_unit_faults(None);
+    until("the follower to read the commit", || {
+        let mut t = fe.begin(TxnOptions::default()).ok()?;
+        (t.get_snapshot(&kb).ok()?.as_deref() == Some(&b"b"[..])).then_some(())
+    });
+}
+
+/// A commit across units whose coordinator dies between the prepare
+/// records and the commit point is aborted by the anchor's next leader
+/// (through the anchor's log), the participant's next leader then drops
+/// its prepare record, and the rows it had locked take new writes.
+#[test]
+fn a_commit_across_units_without_a_commit_point_is_aborted_by_the_next_leaders() {
+    let mut c = Cluster::new("cross-abort");
+    let (ua, ub) = (
+        Engine::unit_of_tenant(TENANT + 26),
+        Engine::unit_of_tenant(TENANT + 27),
+    );
+    let (ka, kb) = (key(TENANT + 26, 1), key(TENANT + 27, 1));
+    let l = lead_both(&c, ua, ub);
+    let e = c.replicas[&l].engine.clone();
+    for k in [&ka, &kb] {
+        let mut t = e.begin(TxnOptions::default()).unwrap();
+        t.put(k.clone(), Bytes::from_static(b"old")).unwrap();
+        t.commit().unwrap().wait().unwrap();
+    }
+    e.txn_shared()
+        .set_cross_unit_faults(Some(Arc::new(|s| match s {
+            CrossStage::Prepared => CrossFault::CoordinatorLost,
+            _ => CrossFault::Go,
+        })));
+    let mut t = e.begin(TxnOptions::default()).unwrap();
+    t.put(ka.clone(), Bytes::from_static(b"a")).unwrap();
+    t.put(kb.clone(), Bytes::from_static(b"b")).unwrap();
+    assert!(
+        t.commit().is_err(),
+        "the coordinator stops before its commit point"
+    );
+    drop(e);
+    c.kill(l);
+    // Neither half ever shows, and both rows take new writes on the new
+    // leaders once the transaction is aborted there.
+    for (u, k) in [(ua, &ka), (ub, &kb)] {
+        until("a new write past the aborted transaction", || {
+            let n = c
+                .replicas
+                .iter()
+                .find(|(_, r)| r.engine.leader_epoch(u) > 0)
+                .map(|(id, _)| *id)?;
+            let e = &c.replicas[&n].engine;
+            let mut r = e.begin(TxnOptions::default()).ok()?;
+            let seen = r.get_snapshot(k).ok()?;
+            assert_eq!(seen.as_deref(), Some(&b"old"[..]), "an aborted half showed");
+            drop(r);
+            let mut t = e
+                .begin(TxnOptions {
+                    lock_wait_timeout: Some(Duration::from_millis(200)),
+                    ..TxnOptions::default()
+                })
+                .ok()?;
+            let row = Bytes::from(k.clone());
+            t.lock_get_blocking(&row, sprig_engine::txn::LockRequest::for_update())
+                .ok()?;
+            t.put(k.clone(), Bytes::from_static(b"new")).ok()?;
+            t.commit().ok()?.wait().ok()
+        });
+    }
+    c.converged(ua);
+    c.converged(ub);
+}
+
+/// A resolution the coordinator proposes while it is cut off (it still
+/// believes it leads the participant) is lost to the next leader's log.
+/// The next leader finishes the participant from the anchor's record; the
+/// coordinator, back in touch, finds its own entry lost and the prepare
+/// record gone, and applies nothing a second time.
+#[test]
+fn a_resolution_lost_to_a_leader_change_is_applied_once() {
+    let c = Cluster::new("cross-lost");
+    let (ua, ub) = (
+        Engine::unit_of_tenant(TENANT + 28),
+        Engine::unit_of_tenant(TENANT + 29),
+    );
+    let (ka, kb) = (key(TENANT + 28, 1), key(TENANT + 29, 1));
+    let l = lead_both(&c, ua, ub);
+    let e = c.replicas[&l].engine.clone();
+    drop_resolutions(&e);
+    let mut t = e.begin(TxnOptions::default()).unwrap();
+    t.put(ka.clone(), Bytes::from_static(b"a")).unwrap();
+    t.put(kb.clone(), Bytes::from_static(b"b")).unwrap();
+    t.commit().unwrap().wait().unwrap();
+    // Cut off, the coordinator's resolver proposes the resolution.
+    c.net.isolate(l, true);
+    e.txn_shared().set_cross_unit_faults(None);
+    e.resolve_cross_unit();
+    let new = until("a new leader of the participant", || {
+        c.replicas
+            .iter()
+            .find(|(id, r)| **id != l && r.engine.leader_epoch(ub) > 0)
+            .map(|(id, _)| *id)
+    });
+    until("the participant's half on its new leader", || {
+        let mut t = c.replicas[&new].engine.begin(TxnOptions::default()).ok()?;
+        (t.get_snapshot(&kb).ok()?.as_deref() == Some(&b"b"[..])).then_some(())
+    });
+    c.net.isolate(l, false);
+    until("the old coordinator to follow", || {
+        (e.leader_epoch(ub) == 0).then_some(())
+    });
+    c.converged(ub);
+    c.converged(ua);
+    for id in VOTERS {
+        until("both halves on every replica", || {
+            (c.try_get(id, &ka).ok()?.as_deref() == Some(&b"a"[..])
+                && c.try_get(id, &kb).ok()?.as_deref() == Some(&b"b"[..]))
+            .then_some(())
+        });
+    }
+    // The old coordinator keeps nothing of it: the units are led elsewhere.
+    until("the old coordinator to drop its entry", || {
+        e.resolve_cross_unit();
+        (e.txn_shared().cross_unit_open() == 0 || e.leader_epoch(ua) > 0 || e.leader_epoch(ub) > 0)
+            .then_some(())
+    });
+}
+
+/// Fills `unit` (of `tenant`) with about `mb` MB through its leader, in
+/// commits of 1 MB.
+fn fill(c: &Cluster, unit: UnitId, tenant: u64, mb: u64) {
+    let value = vec![7u8; 4096];
+    for batch in 0..mb {
+        until("a filling commit", || {
+            let l = c.leader(unit);
+            let e = &c.replicas[&l].engine;
+            let mut t = e.begin(TxnOptions::default()).ok()?;
+            for i in 0..256 {
+                t.put(key(tenant, batch * 256 + i), Bytes::copy_from_slice(&value))
+                    .ok()?;
+            }
+            t.commit().ok()?.wait().ok()
+        });
+    }
+}
+
+/// Adds node `id` as a learner of `unit` through its leader.
+fn add_learner(c: &Cluster, unit: UnitId, id: u64) {
+    use sprig_raft::{ConfChangeSingle, ConfChangeType, ConfChangeV2};
+    until("the learner added", || {
+        let l = c.leader(unit);
+        let mut s = ConfChangeSingle::default();
+        s.set_change_type(ConfChangeType::AddLearnerNode);
+        s.node_id = id;
+        let mut cc = ConfChangeV2::default();
+        cc.mut_changes().push(s);
+        let slot = c.replicas[&l]
+            .node
+            .node()
+            .change_membership(unit.0, cc)
+            .ok()?;
+        slot.wait_timeout(WAIT)?.ok()
+    });
+}
+
+/// Copies `unit` (about `mb` MB, its log trimmed) to a new node 4 as a
+/// learner, its leader sending at most `rate` bytes a second; checks that
+/// the snapshot went as a file in chunks, at the pace, while the leader's
+/// driver kept committing another unit's writes promptly, and that the
+/// copy equals the leader's. Returns how long the copy took.
+fn copy_to_a_new_replica(name: &str, mb: u64, rate: u64) -> Duration {
+    let mut c = Cluster::new(name);
+    let (ua, ub) = (
+        Engine::unit_of_tenant(TENANT + 20),
+        Engine::unit_of_tenant(TENANT + 21),
+    );
+    let l = lead_both(&c, ua, ub);
+    fill(&c, ua, TENANT + 20, mb);
+    // The voters trim their logs: a new replica needs a snapshot.
+    let last = c.replicas[&l].node.node().committed(ua.0);
+    for id in VOTERS {
+        until("the log trimmed", || {
+            let r = &c.replicas[&id];
+            let _ = r.engine.checkpoint();
+            r.node
+                .node()
+                .log_first_index(ua.0)
+                .is_none_or(|f| f > last.saturating_sub(2))
+                .then_some(())
+        });
+    }
+    c.start(4);
+    for id in VOTERS {
+        c.replicas[&id].node.node().set_snapshot_rate(rate);
+    }
+    let before = c.replicas[&l].node.node().stats();
+    let started = Instant::now();
+    add_learner(&c, ua, 4);
+    // Meanwhile the leader's other unit commits as usual: the snapshot is
+    // built and sent off its driver thread.
+    let mut worst = Duration::ZERO;
+    let mut i = 0u64;
+    let want = c.replicas[&l].engine.unit_checksum(ua).unwrap();
+    loop {
+        if c.replicas[&4].engine.unit_checksum(ua).unwrap() == want {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(600),
+            "the new replica never caught up"
+        );
+        let t0 = Instant::now();
+        c.put(ub, &key(TENANT + 21, i), b"w");
+        worst = worst.max(t0.elapsed());
+        i += 1;
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let took = started.elapsed();
+    let after = c.replicas[&l].node.node().stats();
+    let sent = after.snapshot_bytes_sent - before.snapshot_bytes_sent;
+    let got = c.replicas[&4].node.node().stats().snapshot_bytes_received;
+    eprintln!(
+        "{name}: {mb} MB unit copied in {took:?} ({sent} bytes sent, {got} received; {i} writes to the other unit meanwhile, slowest {worst:?})"
+    );
+    assert!(
+        after.snapshots_built > before.snapshots_built,
+        "built off the driver"
+    );
+    assert!(sent >= mb << 20, "sent in chunks: {sent} bytes");
+    assert_eq!(got, sent, "every chunk arrived once");
+    assert!(
+        worst < Duration::from_secs(2),
+        "the leader's other unit waited {worst:?} for a commit"
+    );
+    if rate > 0 {
+        #[allow(clippy::cast_precision_loss)]
+        let floor = Duration::from_secs_f64(sent as f64 / rate as f64 * 0.8);
+        assert!(
+            took >= floor,
+            "paced: {took:?} for {sent} bytes at {rate} B/s"
+        );
+    }
+    // The copy follows later writes.
+    c.put(ua, &key(TENANT + 20, u64::MAX - 1), b"after");
+    until("the copy follows the log", || {
+        (c.try_get(4, &key(TENANT + 20, u64::MAX - 1))
+            .ok()?
+            .as_deref()
+            == Some(&b"after"[..]))
+        .then_some(())
+    });
+    took
+}
+
+/// A unit of 48 MB reaches a new replica as a snapshot built off the
+/// leader's driver thread and sent in 1 MiB chunks at 16 MB/s.
+#[test]
+fn a_large_snapshot_goes_in_paced_chunks_off_the_driver() {
+    copy_to_a_new_replica("chunks", 48, 16 << 20);
+}
+
+/// The same with a unit of several GB (`SPRIG_SNAPSHOT_TEST_MB`, default
+/// 3072) and no pace (`SPRIG_SNAPSHOT_TEST_RATE`, bytes a second).
+#[test]
+#[ignore = "heavy: a unit of several GB on disk; run with --ignored"]
+fn a_unit_of_several_gb_goes_in_chunks() {
+    let mb = std::env::var("SPRIG_SNAPSHOT_TEST_MB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3072);
+    let rate = std::env::var("SPRIG_SNAPSHOT_TEST_RATE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    copy_to_a_new_replica("gb", mb, rate);
 }

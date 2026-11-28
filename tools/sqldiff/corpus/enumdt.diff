@@ -1,0 +1,10 @@
+# An ENUM column read through a derived table or common table expression and computed with outside it.
+x:DROP TABLE IF EXISTS ed_e
+q:CREATE TABLE ed_e (id INT PRIMARY KEY, st ENUM('own','hide','orphan','ovr') NOT NULL, v INT)
+q:INSERT INTO ed_e VALUES (1,'own',10),(2,'hide',20),(3,'orphan',30),(4,'ovr',40)
+q:SELECT x.id FROM (SELECT id, st FROM ed_e) x WHERE x.st <> 'hide' ORDER BY x.id
+q:WITH c AS (SELECT c.id, c.st FROM ed_e c) SELECT c.id FROM c WHERE c.st IN ('own', 'orphan') ORDER BY 1
+q:SELECT COUNT(*) FROM (SELECT l.id, l.st FROM ed_e AS l WHERE l.id <= 3 UNION ALL SELECT 9, 'ovr') l WHERE l.st IS NULL OR l.st <> 'hide'
+q:SELECT x.id, CONCAT(x.st, '!') FROM (SELECT id, st FROM ed_e) x WHERE x.st LIKE 'o%' ORDER BY x.id
+q:SELECT x.st FROM (SELECT id, st FROM ed_e) x WHERE x.id = 3
+x:DROP TABLE ed_e

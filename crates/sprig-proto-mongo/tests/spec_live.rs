@@ -1647,11 +1647,12 @@ fn suite_files(root: &Path, suite: &str) -> Vec<PathBuf> {
         .collect()
 }
 
+#[ignore = "live: needs SPRIG_SPEC_DIR, SPRIG_SPEC_URI; tools/live/README.md"]
 #[tokio::test]
 async fn unified_spec_tests() {
     let (Some(dir), Some(uri)) = (env("SPRIG_SPEC_DIR"), env("SPRIG_SPEC_URI")) else {
         eprintln!("SPRIG_SPEC_DIR or SPRIG_SPEC_URI not set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let topology = env("SPRIG_SPEC_TOPOLOGY").unwrap_or_else(|| "sharded".into());
     let suites = env("SPRIG_SPEC_SUITES")

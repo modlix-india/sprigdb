@@ -14,9 +14,14 @@
 //! - **Whose.** Each row belongs to one user of the tenant (`user_id`);
 //!   every route reads and writes only the caller's own rows. A tenant
 //!   login is needed (not the accounts file).
-//! - **Where.** Three tables in `t<tenant>_sprig`, module `library`, created
-//!   the first time a gateway needs them for a tenant. They aren't
-//!   versioned catalog state: nothing is cached, every call reads them.
+//! - **Where.** The tenant's catalog records in the storage engine, module
+//!   `library`: `m/library/saved/<user><name>`, `m/library/runs/<user><n>`
+//!   (the user's run numbers, with the window of kept numbers in
+//!   `m/library/run_window/<user>`) and `m/library/prefs/<user><name>`.
+//!   Every transaction runs on the tenant unit's leader, so any node can
+//!   write.
+//!   They aren't versioned catalog state: nothing is cached, every call
+//!   reads them.
 //! - **Secrets.** Text is redacted here as well as in the clients: a
 //!   string after `IDENTIFIED BY`, `PASSWORD`, `SECRET`, `TOKEN` and the
 //!   other secret words becomes `'***'`, words that look like API keys or
@@ -28,16 +33,16 @@
 //! - **Left behind.** A dropped user's rows stay until the tenant is
 //!   dropped; they are never shown to a new user (ids aren't reused).
 
-use sprig_catalog::pool_wait::Bounded as _;
 use std::sync::Arc;
 
 use hyper::Request;
 use hyper::Response;
 use hyper::body::Incoming;
-use mysql_async::prelude::Queryable as _;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sprig_catalog::migrate::{MigrateOpts, Migration, Migrator, Module, Phase};
-use sprig_common::names::quote;
+use sprig_catalog::migrate::{Migration, Phase};
+use sprig_catalog::{Pk, RecordStore, RecordTx, RowTable};
+use sprig_common::ids::TenantId;
 use sprig_common::{SprigCode, SprigError};
 use tonic::body::Body;
 
@@ -81,7 +86,9 @@ const DDL_PREFS: &str = "CREATE TABLE IF NOT EXISTS library_prefs (
   PRIMARY KEY (user_id, name)
 ) ENGINE=InnoDB";
 
-/// The module's migrations.
+/// The module's migrations, for tenant catalogs on MariaDB made before
+/// the library moved to the catalog records (the registry still declares
+/// the module); nothing creates these tables now.
 pub static LIBRARY_MIGRATIONS: &[Migration] = &[
     Migration {
         format: 1,
@@ -96,10 +103,6 @@ pub static LIBRARY_MIGRATIONS: &[Migration] = &[
         statements: &[DDL_PREFS],
     },
 ];
-
-/// The table the newest migration creates: when it exists, the module is
-/// current.
-const NEWEST_TABLE: &str = "library_prefs";
 
 /// The preference keeping the user's last Studio workspace.
 const PREF_WORKSPACE: &str = "workspace";
@@ -451,28 +454,86 @@ fn query_u64(query: &str, key: &str) -> Option<u64> {
 
 // ---- storage ----
 
+/// Saved queries, by user and name.
+const SAVED: RowTable = RowTable::new(MODULE, "saved");
+/// Runs, by user and the user's own run number (see [`RunWindow`]).
+const RUNS: RowTable = RowTable::new(MODULE, "runs");
+/// Each user's run window, by user.
+const RUN_WINDOWS: RowTable = RowTable::new(MODULE, "run_window");
+/// Preferences, by user and name.
+const PREFS: RowTable = RowTable::new(MODULE, "prefs");
+
+/// A user's kept runs are numbers `oldest..next`: recording one writes
+/// `next` and deletes from `oldest` while more than `studio.history_max`
+/// are kept; listing reads the newest `n` by key. Neither reads the other
+/// runs.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+struct RunWindow {
+    oldest: u64,
+    next: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SavedRec {
+    name: String,
+    language: String,
+    database: Option<String>,
+    text: String,
+    saved_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RunRec {
+    /// The user's run number.
+    id: u64,
+    language: String,
+    database: Option<String>,
+    text: String,
+    ok: bool,
+    ms: u32,
+    error: Option<String>,
+    client: String,
+    at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PrefRec {
+    value: String,
+    updated_ms: i64,
+}
+
 struct Ctx {
-    conn: mysql_async::Conn,
-    schema: String,
+    records: Arc<dyn RecordStore>,
+    tenant: TenantId,
     user: u32,
     history_max: u64,
 }
 
 impl Ctx {
-    fn t(&self, table: &str) -> String {
-        format!("{}.{}", quote(&self.schema), quote(table))
+    async fn begin(&self) -> Result<Box<dyn RecordTx>, SprigError> {
+        self.records.begin(self.tenant).await
+    }
+
+    fn mine(&self) -> Pk {
+        Pk::new().u32(self.user)
+    }
+
+    fn named(&self, name: &str) -> Pk {
+        Pk::new().u32(self.user).bytes(name.as_bytes())
+    }
+
+    fn run(&self, n: u64) -> Pk {
+        Pk::new().u32(self.user).u64(n)
     }
 }
 
-fn unavailable(e: mysql_async::Error) -> SprigError {
-    SprigError::new(
-        SprigCode::CatalogUnavailable,
-        "the tenant's catalog is unreachable",
-    )
-    .with_source(e)
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
-async fn context(core: &Arc<Core>, caller: &Caller) -> Result<Ctx, SprigError> {
+fn context(core: &Arc<Core>, caller: &Caller) -> Result<Ctx, SprigError> {
     let (Some(svc), Some(tid), Some(user)) = (
         &core.studio.tenants,
         caller.principal.tenant,
@@ -480,228 +541,161 @@ async fn context(core: &Arc<Core>, caller: &Caller) -> Result<Ctx, SprigError> {
     ) else {
         return Err(invalid("saved queries need a tenant login"));
     };
-    let ep = sprig_catalog::CatalogLocator::writer(&*svc.locator, tid).await?;
-    let mut conn = ep.pool.get_conn_bounded().await.map_err(unavailable)?;
-    let schema = ep.store.schema().to_owned();
-    let have: Option<u64> = conn
-        .exec_first(
-            "SELECT COUNT(*) FROM information_schema.TABLES \
-             WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
-            (schema.as_str(), NEWEST_TABLE),
-        )
-        .await
-        .map_err(unavailable)?;
-    if have.unwrap_or(0) == 0 {
-        Migrator::new(&[Module {
-            name: MODULE,
-            migrations: LIBRARY_MIGRATIONS,
-        }])?
-        .run(&mut conn, &schema, &MigrateOpts::existing())
-        .await?;
-    }
     let history_max = core
         .studio
         .tenant_get(&sprig_studio::settings::HISTORY_MAX, Some(tid), None);
     Ok(Ctx {
-        conn,
-        schema,
+        records: Arc::clone(&svc.writers),
+        tenant: tid,
         user: user.0,
         history_max,
     })
 }
 
-type SavedRow = (String, String, Option<String>, String, i64);
-type RunRow = (
-    u64,
-    String,
-    Option<String>,
-    String,
-    bool,
-    u32,
-    Option<String>,
-    String,
-    i64,
-);
-
-async fn list(c: &mut Ctx, history: u64) -> Result<Value, SprigError> {
-    let saved: Vec<SavedRow> = c
-        .conn
-        .exec(
-            format!(
-                "SELECT name, language, db_name, body, \
-                 CAST(TIMESTAMPDIFF(MICROSECOND, '1970-01-01', saved_at) DIV 1000 AS SIGNED) \
-                 FROM {} WHERE user_id = ? ORDER BY saved_at DESC, name",
-                c.t("library_saved")
-            ),
-            (c.user,),
-        )
-        .await
-        .map_err(unavailable)?;
-    let runs: Vec<RunRow> = if history == 0 {
-        Vec::new()
-    } else {
-        c.conn
-            .exec(
-                format!(
-                    "SELECT run_id, language, db_name, body, ok, ms, error, client, \
-                     CAST(TIMESTAMPDIFF(MICROSECOND, '1970-01-01', ran_at) DIV 1000 AS SIGNED) \
-                     FROM {} WHERE user_id = ? ORDER BY run_id DESC LIMIT ?",
-                    c.t("library_history")
-                ),
-                (c.user, history),
-            )
-            .await
-            .map_err(unavailable)?
-    };
+async fn list(c: &Ctx, history: u64) -> Result<Value, SprigError> {
+    let mut tx = c.begin().await?;
+    let mut saved: Vec<SavedRec> = SAVED.rows(&mut *tx, &c.mine()).await?;
+    let mut runs: Vec<RunRec> = Vec::new();
+    if history > 0 {
+        let w: RunWindow = RUN_WINDOWS
+            .get(&mut *tx, &c.mine())
+            .await?
+            .unwrap_or_default();
+        let from = w.oldest.max(w.next.saturating_sub(history));
+        for n in (from..w.next).rev() {
+            if let Some(r) = RUNS.get(&mut *tx, &c.run(n)).await? {
+                runs.push(r);
+            }
+        }
+    }
+    drop(tx);
+    saved.sort_by(|a, b| b.saved_ms.cmp(&a.saved_ms).then(a.name.cmp(&b.name)));
     Ok(json!({
-        "saved": saved.into_iter().map(|(name, language, db, text, at)| json!({
-            "name": name, "language": language, "database": db, "text": text, "saved_at_ms": at,
+        "saved": saved.into_iter().map(|r| json!({
+            "name": r.name, "language": r.language, "database": r.database, "text": r.text,
+            "saved_at_ms": r.saved_ms,
         })).collect::<Vec<_>>(),
-        "history": runs.into_iter().map(|(id, language, db, text, ok, ms, error, client, at)| json!({
-            "id": id.to_string(), "language": language, "database": db, "text": text,
-            "ok": ok, "ms": ms, "error": error, "client": client, "at_ms": at,
+        // Newest first.
+        "history": runs.into_iter().map(|r| json!({
+            "id": r.id.to_string(), "language": r.language, "database": r.database, "text": r.text,
+            "ok": r.ok, "ms": r.ms, "error": r.error, "client": r.client, "at_ms": r.at_ms,
         })).collect::<Vec<_>>(),
         "history_max": c.history_max,
     }))
 }
 
-async fn save(c: &mut Ctx, r: &SaveReq) -> Result<(), SprigError> {
-    c.conn
-        .exec_drop(
-            format!(
-                "INSERT INTO {} (user_id, name, language, db_name, body, saved_at) \
-                 VALUES (?, ?, ?, ?, ?, UTC_TIMESTAMP(3)) \
-                 ON DUPLICATE KEY UPDATE language = VALUES(language), db_name = VALUES(db_name), \
-                 body = VALUES(body), saved_at = VALUES(saved_at)",
-                c.t("library_saved")
-            ),
-            (c.user, &r.name, &r.language, &r.database, &r.text),
-        )
-        .await
-        .map_err(unavailable)
+async fn save(c: &Ctx, r: &SaveReq) -> Result<(), SprigError> {
+    let mut tx = c.begin().await?;
+    let row = SavedRec {
+        name: r.name.clone(),
+        language: r.language.clone(),
+        database: r.database.clone(),
+        text: r.text.clone(),
+        saved_ms: now_ms(),
+    };
+    SAVED.put(&mut *tx, &c.named(&r.name), &row).await?;
+    tx.commit().await
 }
 
-async fn delete(c: &mut Ctx, name: &str) -> Result<bool, SprigError> {
-    let t = c.t("library_saved");
-    c.conn
-        .exec_drop(
-            format!("DELETE FROM {t} WHERE user_id = ? AND name = ?"),
-            (c.user, name),
-        )
-        .await
-        .map_err(unavailable)?;
-    Ok(c.conn.affected_rows() > 0)
+async fn delete(c: &Ctx, name: &str) -> Result<bool, SprigError> {
+    let mut tx = c.begin().await?;
+    let pk = c.named(name);
+    let had = SAVED
+        .get_for_update::<Value>(&mut *tx, &pk)
+        .await?
+        .is_some();
+    if had {
+        SAVED.delete(&mut *tx, &pk).await?;
+    }
+    tx.commit().await?;
+    Ok(had)
 }
 
-async fn record(c: &mut Ctx, r: &RunReq) -> Result<bool, SprigError> {
+async fn record(c: &Ctx, r: &RunReq) -> Result<bool, SprigError> {
     if c.history_max == 0 {
         return Ok(false);
     }
-    let t = c.t("library_history");
-    c.conn
-        .exec_drop(
-            format!(
-                "INSERT INTO {t} (user_id, language, db_name, body, ok, ms, error, client, ran_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(3))"
-            ),
-            (
-                c.user,
-                &r.language,
-                &r.database,
-                &r.text,
-                r.ok,
-                r.ms,
-                &r.error,
-                &r.client,
-            ),
-        )
-        .await
-        .map_err(unavailable)?;
-    // Keep the newest `history_max`.
-    let cut: Option<u64> = c
-        .conn
-        .exec_first(
-            format!(
-                "SELECT run_id FROM {t} WHERE user_id = ? ORDER BY run_id DESC LIMIT 1 OFFSET ?"
-            ),
-            (c.user, c.history_max),
-        )
-        .await
-        .map_err(unavailable)?;
-    if let Some(cut) = cut {
-        c.conn
-            .exec_drop(
-                format!("DELETE FROM {t} WHERE user_id = ? AND run_id <= ?"),
-                (c.user, cut),
-            )
-            .await
-            .map_err(unavailable)?;
+    let mut tx = c.begin().await?;
+    let mut w: RunWindow = RUN_WINDOWS
+        .get_for_update(&mut *tx, &c.mine())
+        .await?
+        .unwrap_or_default();
+    let row = RunRec {
+        id: w.next,
+        language: r.language.clone(),
+        database: r.database.clone(),
+        text: r.text.clone(),
+        ok: r.ok,
+        ms: r.ms,
+        error: r.error.clone(),
+        client: r.client.clone(),
+        at_ms: now_ms(),
+    };
+    RUNS.put(&mut *tx, &c.run(w.next), &row).await?;
+    w.next += 1;
+    // Keep the newest `history_max`: delete the oldest by number.
+    while w.next - w.oldest > c.history_max {
+        RUNS.delete(&mut *tx, &c.run(w.oldest)).await?;
+        w.oldest += 1;
     }
+    RUN_WINDOWS.put(&mut *tx, &c.mine(), &w).await?;
+    tx.commit().await?;
     Ok(true)
 }
 
-async fn clear(c: &mut Ctx) -> Result<(), SprigError> {
-    let t = c.t("library_history");
-    c.conn
-        .exec_drop(format!("DELETE FROM {t} WHERE user_id = ?"), (c.user,))
-        .await
-        .map_err(unavailable)
+async fn clear(c: &Ctx) -> Result<(), SprigError> {
+    let mut tx = c.begin().await?;
+    let mut w: RunWindow = RUN_WINDOWS
+        .get_for_update(&mut *tx, &c.mine())
+        .await?
+        .unwrap_or_default();
+    for n in w.oldest..w.next {
+        RUNS.delete(&mut *tx, &c.run(n)).await?;
+    }
+    w.oldest = w.next;
+    RUN_WINDOWS.put(&mut *tx, &c.mine(), &w).await?;
+    tx.commit().await
 }
 
-async fn set_pref(c: &mut Ctx, name: &str, value: Option<&str>) -> Result<(), SprigError> {
-    let t = c.t("library_prefs");
+async fn set_pref(c: &Ctx, name: &str, value: Option<&str>) -> Result<(), SprigError> {
+    let mut tx = c.begin().await?;
+    let pk = c.named(name);
     match value {
-        Some(v) => c
-            .conn
-            .exec_drop(
-                format!(
-                    "INSERT INTO {t} (user_id, name, value, updated_at) \
-                     VALUES (?, ?, ?, UTC_TIMESTAMP(3)) \
-                     ON DUPLICATE KEY UPDATE value = VALUES(value), updated_at = VALUES(updated_at)"
-                ),
-                (c.user, name, v),
-            )
-            .await
-            .map_err(unavailable),
-        None => c
-            .conn
-            .exec_drop(
-                format!("DELETE FROM {t} WHERE user_id = ? AND name = ?"),
-                (c.user, name),
-            )
-            .await
-            .map_err(unavailable),
+        Some(v) => {
+            let row = PrefRec {
+                value: v.to_owned(),
+                updated_ms: now_ms(),
+            };
+            PREFS.put(&mut *tx, &pk, &row).await?;
+        }
+        None => {
+            if PREFS
+                .get_for_update::<Value>(&mut *tx, &pk)
+                .await?
+                .is_some()
+            {
+                PREFS.delete(&mut *tx, &pk).await?;
+            }
+        }
     }
+    tx.commit().await
 }
 
 /// The caller's last Studio workspace, for `WhoAmI`. `None` when there is
 /// none, for logins without a tenant user, and when the tenant's catalog
-/// can't answer (or doesn't have the table yet): Studio then picks the
-/// default. It reads only; the table is created by the first write.
+/// records can't answer: Studio then picks the default.
 pub(super) async fn workspace_pref(core: &Arc<Core>, caller: &Caller) -> Option<String> {
-    let (Some(svc), Some(tid), Some(user)) = (
-        &core.studio.tenants,
-        caller.principal.tenant,
-        caller.principal.user_id,
-    ) else {
-        return None;
-    };
-    let ep = sprig_catalog::CatalogLocator::writer(&*svc.locator, tid)
-        .await
-        .ok()?;
-    let mut conn = ep.pool.get_conn_bounded().await.ok()?;
-    let sql = format!(
-        "SELECT value FROM {}.{} WHERE user_id = ? AND name = ?",
-        quote(ep.store.schema()),
-        quote(NEWEST_TABLE)
-    );
-    let v: Option<String> = conn
-        .exec_first(sql, (user.0, PREF_WORKSPACE))
+    let c = context(core, caller).ok()?;
+    let mut tx = c.begin().await.ok()?;
+    let v: Option<PrefRec> = PREFS
+        .get(&mut *tx, &c.named(PREF_WORKSPACE))
         .await
         .map_err(|e| tracing::debug!(error = %e, "WhoAmI: the workspace preference wasn't read"))
         .ok()
         .flatten();
-    v.filter(|w| sprig_studio::settings::WORKSPACES.contains(&w.as_str()))
+    drop(tx);
+    v.map(|p| p.value)
+        .filter(|w| sprig_studio::settings::WORKSPACES.contains(&w.as_str()))
 }
 
 // ---- routes ----
@@ -731,16 +725,16 @@ pub(super) async fn route(
     };
     match (method.as_str(), path.as_str()) {
         ("GET", "/v1/library") => {
-            let mut c = context(core, &caller).await?;
+            let c = context(core, &caller)?;
             let n = query_u64(&query, "history")
                 .unwrap_or(100)
                 .min(c.history_max);
-            Ok(json_response(200, &list(&mut c, n).await?))
+            Ok(json_response(200, &list(&c, n).await?))
         }
         ("POST", "/v1/library/saved") => {
             let r = save_req(&body)?;
-            let mut c = context(core, &caller).await?;
-            save(&mut c, &r).await?;
+            let c = context(core, &caller)?;
+            save(&c, &r).await?;
             Ok(json_response(
                 200,
                 &json!({"name": r.name, "language": r.language, "database": r.database, "text": r.text}),
@@ -755,25 +749,25 @@ pub(super) async fn route(
             if name.is_empty() {
                 return Err(invalid("name is empty"));
             }
-            let mut c = context(core, &caller).await?;
-            let deleted = delete(&mut c, name).await?;
+            let c = context(core, &caller)?;
+            let deleted = delete(&c, name).await?;
             Ok(json_response(200, &json!({"deleted": deleted})))
         }
         ("POST", "/v1/library/history") => {
             let r = run_req(&body)?;
-            let mut c = context(core, &caller).await?;
-            let recorded = record(&mut c, &r).await?;
+            let c = context(core, &caller)?;
+            let recorded = record(&c, &r).await?;
             Ok(json_response(200, &json!({"recorded": recorded})))
         }
         ("POST", "/v1/library/history:clear") => {
-            let mut c = context(core, &caller).await?;
-            clear(&mut c).await?;
+            let c = context(core, &caller)?;
+            clear(&c).await?;
             Ok(json_response(200, &json!({})))
         }
         ("POST", "/v1/library/prefs") => {
             let workspace = prefs_req(&body)?;
-            let mut c = context(core, &caller).await?;
-            set_pref(&mut c, PREF_WORKSPACE, workspace.as_deref()).await?;
+            let c = context(core, &caller)?;
+            set_pref(&c, PREF_WORKSPACE, workspace.as_deref()).await?;
             Ok(json_response(200, &json!({ "workspace": workspace })))
         }
         _ => Err(invalid(format!("no route {method} {path}"))),
@@ -874,7 +868,7 @@ mod tests {
         assert!(prefs_req(&json!({})).is_err());
         assert!(prefs_req(&json!({"workspace": "analyst", "theme": "dark"})).is_err());
         assert_eq!(LIBRARY_MIGRATIONS.last().map(|m| m.format), Some(2));
-        assert!(DDL_PREFS.contains(NEWEST_TABLE));
+        assert!(DDL_PREFS.contains("library_prefs"));
     }
 
     #[test]
@@ -884,5 +878,105 @@ mod tests {
         assert!(!is_library_path("/v1/libraryx"));
         assert_eq!(query_u64("history=20&x=1", "history"), Some(20));
         assert_eq!(query_u64("x=1", "history"), None);
+    }
+
+    /// Saved queries, runs and preferences live in the catalog records,
+    /// one user's never another's, the newest `history_max` runs kept.
+    #[tokio::test]
+    async fn rows_live_in_records() {
+        let records: Arc<dyn RecordStore> =
+            Arc::new(sprig_catalog::records::mem::MemRecords::new());
+        let ctx = |user: u32| Ctx {
+            records: Arc::clone(&records),
+            tenant: TenantId(7),
+            user,
+            history_max: 3,
+        };
+        let (alice, bob) = (ctx(1), ctx(2));
+        let query = |name: &str, text: &str| {
+            save_req(&json!({"name": name, "text": text, "database": "shop"})).expect("ok")
+        };
+        save(&alice, &query("open", "SELECT 1")).await.unwrap();
+        save(&alice, &query("open", "SELECT 2")).await.unwrap();
+        save(&alice, &query("x\0y", "SELECT 3")).await.unwrap();
+        save(&bob, &query("open", "SELECT 9")).await.unwrap();
+        let listed = list(&alice, 10).await.unwrap();
+        let saved = listed["saved"].as_array().unwrap();
+        assert_eq!(saved.len(), 2);
+        assert!(
+            saved
+                .iter()
+                .any(|r| r["name"] == "open" && r["text"] == "SELECT 2")
+        );
+        assert_eq!(
+            list(&bob, 10).await.unwrap()["saved"][0]["text"],
+            "SELECT 9"
+        );
+        assert!(delete(&alice, "open").await.unwrap());
+        assert!(!delete(&alice, "open").await.unwrap());
+        assert_eq!(
+            list(&bob, 10).await.unwrap()["saved"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+
+        for n in 0..5 {
+            let run = run_req(&json!({"text": format!("SELECT {n}"), "ms": 1})).expect("ok");
+            assert!(record(&alice, &run).await.unwrap());
+        }
+        let hist = list(&alice, 10).await.unwrap();
+        let texts: Vec<&str> = hist["history"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|r| r["text"].as_str())
+            .collect();
+        assert_eq!(texts, ["SELECT 4", "SELECT 3", "SELECT 2"]);
+        // Only the kept runs are stored.
+        let mut tx = alice.begin().await.unwrap();
+        let kept: Vec<(Pk, Value)> = RUNS.scan(&mut *tx, &alice.mine()).await.unwrap();
+        assert_eq!(kept.len(), 3);
+        drop(tx);
+        assert_eq!(
+            list(&alice, 1).await.unwrap()["history"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            list(&bob, 10).await.unwrap()["history"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        clear(&alice).await.unwrap();
+        assert!(
+            list(&alice, 10).await.unwrap()["history"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+
+        set_pref(&alice, PREF_WORKSPACE, Some("developer"))
+            .await
+            .unwrap();
+        let mut tx = alice.begin().await.unwrap();
+        let pref: Option<PrefRec> = PREFS
+            .get(&mut *tx, &alice.named(PREF_WORKSPACE))
+            .await
+            .unwrap();
+        assert_eq!(pref.map(|p| p.value).as_deref(), Some("developer"));
+        drop(tx);
+        set_pref(&alice, PREF_WORKSPACE, None).await.unwrap();
+        set_pref(&alice, PREF_WORKSPACE, None).await.unwrap();
+        let mut tx = alice.begin().await.unwrap();
+        let pref: Option<PrefRec> = PREFS
+            .get(&mut *tx, &alice.named(PREF_WORKSPACE))
+            .await
+            .unwrap();
+        assert!(pref.is_none());
     }
 }

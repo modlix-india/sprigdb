@@ -50,10 +50,10 @@ macro_rules! topology_or_skip {
     ($var:literal) => {
         match endpoints($var) {
             Some(eps) => eps,
-            None => {
-                eprintln!("skipped: {} is not set", $var);
-                return;
-            }
+            None => panic!(
+                "{} is not set: a live test needs its environment (see tools/live/README.md)",
+                $var
+            ),
         }
     };
 }
@@ -116,6 +116,7 @@ fn assert_common(p: &sprig_cluster::CapabilityProfile) {
     assert!(p.privileges.sql_log_bin_settable == Some(true));
 }
 
+#[ignore = "live: needs SPRIG_TEST_MARIADB_SINGLE; tools/live/README.md"]
 #[tokio::test]
 async fn single_node_profile_health_and_heartbeat() {
     let eps = topology_or_skip!("SPRIG_TEST_MARIADB_SINGLE");
@@ -151,6 +152,7 @@ async fn single_node_profile_health_and_heartbeat() {
     assert!(mine.age_ms < 5_000, "{mine:?}");
 }
 
+#[ignore = "live: needs SPRIG_TEST_MARIADB_REPLICATION; tools/live/README.md"]
 #[tokio::test]
 async fn replication_profile_semi_sync_downgrade_and_lag() {
     let eps = topology_or_skip!("SPRIG_TEST_MARIADB_REPLICATION");
@@ -235,6 +237,7 @@ async fn replication_profile_semi_sync_downgrade_and_lag() {
     let _ = probes;
 }
 
+#[ignore = "live: needs SPRIG_TEST_MARIADB_GALERA; tools/live/README.md"]
 #[tokio::test]
 async fn galera_profile_and_health() {
     let eps = topology_or_skip!("SPRIG_TEST_MARIADB_GALERA");
@@ -255,6 +258,7 @@ async fn galera_profile_and_health() {
     assert_eq!(report.writers.len(), 3);
 }
 
+#[ignore = "live: needs SPRIG_TEST_MARIADB_SINGLE; tools/live/README.md"]
 #[tokio::test]
 async fn registration_flow_on_the_single_node() {
     let eps = topology_or_skip!("SPRIG_TEST_MARIADB_SINGLE");
@@ -359,6 +363,7 @@ async fn capture_fixtures() {
 /// it until the sustain period ends. Single node and primary + replicas
 /// report XA; Galera doesn't. (Before the fix, the light passes carried
 /// the published `false` forward and the upgrade never published.)
+#[ignore = "live: needs SPRIG_TEST_MARIADB_SINGLE, SPRIG_TEST_MARIADB_REPLICATION or SPRIG_TEST_MARIADB_GALERA; tools/live/README.md"]
 #[tokio::test]
 async fn xa_upgrades_publish_across_light_passes() {
     use sprig_cluster::driver::{StaticConnector, for_topology};
@@ -403,7 +408,8 @@ async fn xa_upgrades_publish_across_light_passes() {
         println!("{kind}: XA {want}, published after light passes: {published:?}");
         assert_eq!(published, Some(want), "{kind}");
     }
-    if ran == 0 {
-        eprintln!("skipped: no topology variable is set");
-    }
+    assert!(
+        ran > 0,
+        "no topology variable is set: a live test needs its environment (see tools/live/README.md)"
+    );
 }

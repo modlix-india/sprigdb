@@ -237,6 +237,7 @@ async fn trigger_bodies(r: &mut mysql_async::Conn, tid: u64, table: &str) -> Vec
     .unwrap()
 }
 
+#[ignore = "live: needs SPRIG_TEST_RLS_SQL, SPRIG_TEST_RLS_MONGO, SPRIG_TEST_RLSR_ROOT, ...; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn policies_stored_by_older_builds_are_compiled_again() {
     let (Ok(sql_addr), Ok(mongo_addr), Ok(root_addr), Ok(tid)) = (
@@ -249,7 +250,7 @@ async fn policies_stored_by_older_builds_are_compiled_again() {
             "skipped: set SPRIG_TEST_RLS_SQL, SPRIG_TEST_RLS_MONGO, SPRIG_TEST_RLSR_ROOT, \
              SPRIG_TEST_RLS_TENANT_ID and SPRIG_TEST_RLSR_RESTART"
         );
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let tid: u64 = tid.parse().unwrap();
     let mut ck = Checks {

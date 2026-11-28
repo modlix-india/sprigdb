@@ -47,6 +47,7 @@ async fn round_trip(c: &mut mysql_async::Conn) -> Duration {
     t.elapsed()
 }
 
+#[ignore = "live: needs SPRIG_TEST_TOXIPROXY; tools/live/README.md"]
 #[tokio::test]
 async fn toxiproxy_slows_and_cuts_an_own_route() {
     let api = require_env!(skip::TOXIPROXY);
@@ -97,6 +98,7 @@ fn ping(from: &str, ip: &str) -> bool {
     docker(&["exec", from, "ping", "-c", "1", "-W", "1", ip]).is_ok()
 }
 
+#[ignore = "live: needs SPRIG_TEST_DOCKER; tools/live/README.md"]
 #[tokio::test]
 async fn faultd_partitions_and_docker_faults_on_own_containers() {
     require_env!(skip::DOCKER);
@@ -152,11 +154,12 @@ impl Drop for NetGuard {
     }
 }
 
+#[ignore = "live: needs SPRIG_TEST_ELLE; tools/live/README.md"]
 #[test]
 fn elle_finds_write_skew() {
     let Some(elle) = ElleCli::from_env() else {
         skip::report_missing(skip::ELLE, module_path!());
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let h = History::new();
     h.record(
@@ -194,11 +197,12 @@ fn elle_finds_write_skew() {
     );
 }
 
+#[ignore = "live: needs SPRIG_TEST_ELLE; tools/live/README.md"]
 #[tokio::test]
 async fn list_append_on_mariadb_is_serializable() {
     let Some(elle) = ElleCli::from_env() else {
         skip::report_missing(skip::ELLE, module_path!());
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let single = skip::urls(&require_env!(skip::MARIADB_SINGLE)).remove(0);
     let schema = unique_ident("elle");
@@ -263,6 +267,7 @@ async fn server_offset_ms(c: &mut mysql_async::Conn) -> i64 {
 /// libfaketime in a throwaway MariaDB: `skew_clock` moves the server's
 /// `NOW()` forward and back while it runs; healing restores it. Shared
 /// containers are refused.
+#[ignore = "live: needs SPRIG_TEST_DOCKER; tools/live/README.md"]
 #[tokio::test]
 async fn clock_skew_in_an_own_faketime_container() {
     require_env!(skip::DOCKER);

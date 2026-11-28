@@ -497,11 +497,12 @@ fn rss_kb(pid: Option<&str>) -> Option<u64> {
     String::from_utf8_lossy(&out.stdout).trim().parse().ok()
 }
 
+#[ignore = "live: needs SPRIG_TEST_M7_SOAK, SPRIG_SOAK_SECONDS, SPRIG_SOAK_CERTS, ...; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn listeners_certificates_and_settings_change_under_load() {
     let Some(v) = skip::var(ENV) else {
         skip::report_missing(ENV, "listeners_certificates_and_settings_change_under_load");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let urls = skip::urls(&v);
     let seconds: u64 = std::env::var("SPRIG_SOAK_SECONDS")

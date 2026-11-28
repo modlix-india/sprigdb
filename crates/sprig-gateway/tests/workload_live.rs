@@ -93,7 +93,7 @@ fn ours<'a>(w: &'a [FpWindowStats], db: &str) -> Option<&'a FpWindowStats> {
 async fn slow_statements_reach_the_tenants_workload_tables_and_only_its() {
     let Some(gw) = skip::var(GATEWAY) else {
         skip::report_missing(GATEWAY, "workload_live");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let Some(backend) = skip::var(BACKEND) else {
         skip::report_missing(BACKEND, "workload_live");

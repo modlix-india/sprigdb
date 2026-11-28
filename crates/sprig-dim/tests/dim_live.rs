@@ -142,6 +142,7 @@ fn cells(r: &Row) -> Vec<Option<String>> {
         .collect()
 }
 
+#[ignore = "live: needs SPRIG_TEST_KV_MYSQL; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn analytics_against_with_rollup() {
     let Some(url) = std::env::var("SPRIG_TEST_KV_MYSQL")
@@ -149,7 +150,7 @@ async fn analytics_against_with_rollup() {
         .filter(|s| !s.is_empty())
     else {
         eprintln!("SPRIG_TEST_KV_MYSQL not set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let mut sql = My(
         mysql_async::Conn::new(mysql_async::Opts::from_url(&url).unwrap())

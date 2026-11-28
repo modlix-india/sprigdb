@@ -119,7 +119,8 @@ pub fn short_of_copies(unit: u64) -> bool {
 
 /// The units led here that hold a member on a lost node.
 fn work() -> Vec<Work> {
-    let (Some(raft), Some(dir)) = (node_engine::engine_raft(), node_engine::unit_directory()) else {
+    let (Some(raft), Some(dir)) = (node_engine::engine_raft(), node_engine::unit_directory())
+    else {
         return Vec::new();
     };
     if !node_engine::raft_placed() || nodes::directory().is_none() {
@@ -151,7 +152,9 @@ fn work() -> Vec<Work> {
             // Raft's (a replacement whose last write failed leaves the old
             // voters). Learners are read copies, kept by their own
             // reconciler from the descriptor; they are left alone here.
-            if g == tenant && let Some(d) = dir.get(tenant) {
+            if g == tenant
+                && let Some(d) = dir.get(tenant)
+            {
                 let mut v = st.voters.clone();
                 v.sort_unstable();
                 let mut dv = d.voters.clone();
@@ -532,7 +535,8 @@ fn remove_learner(unit: u64, l: u64) -> sprig_common::Result<()> {
 /// Drops the replicas this node holds that their unit's descriptor no
 /// longer lists here (module docs). Returns how many it dropped.
 pub fn drop_stale() -> usize {
-    let (Some(raft), Some(dir)) = (node_engine::engine_raft(), node_engine::unit_directory()) else {
+    let (Some(raft), Some(dir)) = (node_engine::engine_raft(), node_engine::unit_directory())
+    else {
         return 0;
     };
     if !node_engine::raft_placed() || !dir.is_ready() {

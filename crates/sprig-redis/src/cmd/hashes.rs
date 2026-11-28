@@ -7,7 +7,7 @@ use bytes::Bytes;
 use sprig_kv::layout::{KeyType, live};
 use sprig_kv::sql::{cell_u64, lit};
 use sprig_proto_redis::Frame;
-use sprig_proto_redis::num::{ld2string_human, parse_f64, parse_i64};
+use sprig_proto_redis::num::{incr_float_text, parse_f64, parse_i64};
 
 use crate::cmd::keys::scan_opts;
 use crate::ctx::{Ctx, KeyRow, R, crc, fail, int_arg, upper};
@@ -398,7 +398,7 @@ pub async fn hincrbyfloat(cx: &mut Ctx<'_>, a: &[Bytes]) -> R<Frame> {
     if n.is_nan() || n.is_infinite() {
         return fail(Frame::err("increment would produce NaN or Infinity"));
     }
-    let s = ld2string_human(n);
+    let s = incr_float_text(n);
     upsert(cx, &row, &[(&a[2], Some(s.as_bytes()))]).await?;
     if have.is_empty() {
         row.n += 1;

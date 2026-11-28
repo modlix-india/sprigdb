@@ -1057,7 +1057,7 @@ pub async fn run_sink_task_of(
         def.target.kind(),
     )?;
     match &def.source {
-        SourceSpec::FanInQueue { .. } => {
+        SourceSpec::FanInQueue { .. } | SourceSpec::FanIn { .. } => {
             run_fan_in_task(env, tenant, sink, task_no, of, cancel, c, store, def, opts).await
         }
         SourceSpec::Queue { .. } => {
@@ -1069,10 +1069,6 @@ pub async fn run_sink_task_of(
         SourceSpec::Stream { .. } => {
             run_stream_task(env, tenant, sink, task_no, of, cancel, c, store, def, opts).await
         }
-        other @ SourceSpec::FanIn { .. } => Err(err(
-            SprigCode::SinkOptionInvalid,
-            format!("{} sources don't run in workers yet", other.kind()),
-        )),
     }
 }
 /// A queue sink's `ordering` option: `queue` (strict queue order) or
@@ -1110,6 +1106,17 @@ async fn run_fan_in_task(
     // tag, as a queue task does, and gives back a dead
     // predecessor's in each member it opens.
     let me = env.worker_id();
+    // A fan-in stream task's offsets per member, as its predecessor saved
+    // them.
+    let saved = if matches!(def.source, SourceSpec::FanIn { .. }) {
+        store
+            .task_claim(sink, task_no)
+            .await?
+            .map(|(_, _, part)| crate::stream_source::saved_members(&part))
+            .unwrap_or_default()
+    } else {
+        BTreeMap::new()
+    };
     let (my_lease, release) = if matches!(def.source, SourceSpec::FanInQueue { .. }) {
         let my_lease = worker_lease(env.dc().as_ref(), &me).await;
         let prev = store.task_claim(sink, task_no).await?;
@@ -1124,19 +1131,16 @@ async fn run_fan_in_task(
     } else {
         (None, None)
     };
-    let epoch = store
-        .claim_task(
-            sink,
-            task_no,
-            &json!({
-                "source": def.source.kind().as_str(),
-                "multi": def.source.name(),
-                "of": of.max(1),
-                "worker_lease": my_lease,
-            }),
-            &me,
-        )
-        .await?;
+    let mut part = json!({
+        "source": def.source.kind().as_str(),
+        "multi": def.source.name(),
+        "of": of.max(1),
+        "worker_lease": my_lease,
+    });
+    if matches!(def.source, SourceSpec::FanIn { .. }) {
+        part["members"] = crate::stream_source::members_part(&saved)["members"].clone();
+    }
+    let epoch = store.claim_task(sink, task_no, &part, &me).await?;
     let mut conns = Vec::new();
     for r in &def.connections {
         conns.push(open_conn(env.as_ref(), tenant, &store, r, &opts).await?);
@@ -1203,6 +1207,46 @@ async fn run_fan_in_task(
             )
             .await?
         }
+        SourceSpec::FanIn {
+            def_tenant,
+            def_object,
+            under,
+            db,
+            name,
+            ..
+        } => {
+            let peer = env.peer().ok_or_else(|| {
+                err(
+                    SprigCode::SinkOptionInvalid,
+                    "stream sources need the DC's gateways, and this worker reaches none",
+                )
+            })?;
+            crate::source::FanInSource::open(
+                Box::new(EnvFanInStream {
+                    env: Arc::clone(&env),
+                    peer,
+                    run_as: run_as(env.as_ref(), tenant, &def, &opts).await?,
+                    tenant: tenant.0,
+                    def: (*def_tenant, *def_object),
+                    under: *under,
+                    db: db.clone(),
+                    stream: name.clone(),
+                    seed: sink.0,
+                    task_group: (task_no.0, of.max(1)),
+                    from_ms: stream_from_ms(&store, sink, &def).await?,
+                    members: Arc::new(std::sync::Mutex::new(saved)),
+                    saver: crate::change_source::Saver {
+                        store: store.clone(),
+                        sink,
+                        task_no,
+                        epoch,
+                    },
+                    part: part.clone(),
+                }),
+                refresh,
+            )
+            .await?
+        }
         _ => return Ok(TaskEnd::Stopped),
     };
     let prepare = SinkPrepare {
@@ -1225,7 +1269,7 @@ async fn run_fan_in_task(
         // instead of paused when its tables' policies bind the owner.
         rls: None,
         regroup: match &def.source {
-            SourceSpec::FanInQueue { .. } => Some(Regroup {
+            SourceSpec::FanInQueue { .. } | SourceSpec::FanIn { .. } => Some(Regroup {
                 dc: env.dc(),
                 tenant: tenant.0,
                 sink: sink.0,
@@ -1291,89 +1335,15 @@ struct EnvFanInQueue {
 #[async_trait]
 impl crate::source::FanInOpener for EnvFanInQueue {
     async fn members(&self) -> Result<Vec<(crate::source::FanInMember, Vec<u32>)>> {
-        let dc = self.env.dc();
-        let prefix = dc.tier().key("inherit-instances/")?;
-        let page = dc
-            .list(
-                &prefix,
-                sprig_meta::ListOpts {
-                    limit: 1_000_000,
-                    ..sprig_meta::ListOpts::default()
-                },
-            )
-            .await?;
-        let Some(global) = self.env.global() else {
-            return Ok(Vec::new());
-        };
-        let mut out = Vec::new();
-        for kv in &page.kvs {
-            let Ok(v) = serde_json::from_slice::<Value>(&kv.value) else {
-                continue;
-            };
-            let def = (
-                v.pointer("/def/tenant").and_then(Value::as_u64),
-                v.pointer("/def/object").and_then(Value::as_u64),
-            );
-            if def != (Some(self.def.0), Some(self.def.1))
-                || v.get("kind").and_then(Value::as_str) != Some("queue")
-            {
-                continue;
-            }
-            let (Some(member), Some(queue)) = (
-                v.get("tenant").and_then(Value::as_u64),
-                v.get("instance_id").and_then(Value::as_u64),
-            ) else {
-                continue;
-            };
-            if crate::meta::fanin_task_of(member, self.task_group.1) != self.task_group.0 {
-                continue;
-            }
-            let Some(e) = global
-                .get(
-                    &global.tier().key(&format!("tenants/{member}"))?,
-                    sprig_meta::Consistency::Serializable,
-                )
-                .await?
-                .and_then(|kv| serde_json::from_slice::<Value>(&kv.value).ok())
-            else {
-                continue;
-            };
-            let path: Vec<u64> = e
-                .get("path")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .split('/')
-                .filter_map(|x| x.parse().ok())
-                .collect();
-            if member == self.tenant || !path.contains(&self.tenant) {
-                continue;
-            }
-            if self.under.is_some_and(|u| !path.contains(&u)) {
-                continue;
-            }
-            if e.pointer("/residency/deny_remote_access")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-            {
-                metrics::counter!("sprig_inherit_fanin_skipped_total", "reason" => "residency")
-                    .increment(1);
-                continue;
-            }
-            let name = e
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned();
-            out.push((
-                crate::source::FanInMember {
-                    tenant: member,
-                    name,
-                    stream: queue,
-                },
-                Vec::new(),
-            ));
-        }
-        Ok(out)
+        fan_in_members(
+            self.env.as_ref(),
+            self.def,
+            "queue",
+            self.tenant,
+            self.under,
+            self.task_group,
+        )
+        .await
     }
 
     async fn open(
@@ -1397,6 +1367,193 @@ impl crate::source::FanInOpener for EnvFanInQueue {
             .with_lease_tag(self.tag.clone(), self.release.clone()),
         ))
     }
+}
+
+/// The member instances of definition `def` (of `kind`, `stream` or
+/// `queue`, in the DC's `inherit-instances/` index) a fan-in task of
+/// `tenant`'s reads: below `tenant` (and `UNDER under`), those of the
+/// task's group, members denying remote access left out.
+async fn fan_in_members(
+    env: &dyn SinkEnv,
+    def: (u64, u64),
+    kind: &str,
+    tenant: u64,
+    under: Option<u64>,
+    task_group: (u32, u32),
+) -> Result<Vec<(crate::source::FanInMember, Vec<u32>)>> {
+    let dc = env.dc();
+    let prefix = dc.tier().key("inherit-instances/")?;
+    let page = dc
+        .list(
+            &prefix,
+            sprig_meta::ListOpts {
+                limit: 1_000_000,
+                ..sprig_meta::ListOpts::default()
+            },
+        )
+        .await?;
+    let Some(global) = env.global() else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for kv in &page.kvs {
+        let Ok(v) = serde_json::from_slice::<Value>(&kv.value) else {
+            continue;
+        };
+        let of = (
+            v.pointer("/def/tenant").and_then(Value::as_u64),
+            v.pointer("/def/object").and_then(Value::as_u64),
+        );
+        if of != (Some(def.0), Some(def.1)) || v.get("kind").and_then(Value::as_str) != Some(kind) {
+            continue;
+        }
+        let (Some(member), Some(instance)) = (
+            v.get("tenant").and_then(Value::as_u64),
+            v.get("instance_id").and_then(Value::as_u64),
+        ) else {
+            continue;
+        };
+        if crate::meta::fanin_task_of(member, task_group.1) != task_group.0 {
+            continue;
+        }
+        let Some(e) = global
+            .get(
+                &global.tier().key(&format!("tenants/{member}"))?,
+                sprig_meta::Consistency::Serializable,
+            )
+            .await?
+            .and_then(|kv| serde_json::from_slice::<Value>(&kv.value).ok())
+        else {
+            continue;
+        };
+        let path: Vec<u64> = e
+            .get("path")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .split('/')
+            .filter_map(|x| x.parse().ok())
+            .collect();
+        if member == tenant || !path.contains(&tenant) {
+            continue;
+        }
+        if under.is_some_and(|u| !path.contains(&u)) {
+            continue;
+        }
+        if e.pointer("/residency/deny_remote_access")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            metrics::counter!("sprig_inherit_fanin_skipped_total", "reason" => "residency")
+                .increment(1);
+            continue;
+        }
+        let name = e
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        out.push((
+            crate::source::FanInMember {
+                tenant: member,
+                name,
+                stream: instance,
+            },
+            Vec::new(),
+        ));
+    }
+    Ok(out)
+}
+
+/// A fan-in stream sink's member instances: each read through a gateway
+/// as the sink's owner ([`crate::peer::SqlOp::FanInStreamRead`]), its
+/// offsets in the task's row.
+struct EnvFanInStream {
+    env: Arc<dyn SinkEnv>,
+    peer: Arc<dyn crate::peer::SinkPeer>,
+    run_as: crate::peer::RunAs,
+    tenant: u64,
+    def: (u64, u64),
+    under: Option<u64>,
+    db: String,
+    stream: String,
+    seed: u64,
+    /// This task's group: (task, of).
+    task_group: (u32, u32),
+    /// Where an instance's partitions start without a saved offset.
+    from_ms: i64,
+    members: crate::stream_source::Members,
+    saver: crate::change_source::Saver,
+    /// The task's row besides the offsets (its `of`).
+    part: Value,
+}
+
+#[async_trait]
+impl crate::source::FanInOpener for EnvFanInStream {
+    async fn members(&self) -> Result<Vec<(crate::source::FanInMember, Vec<u32>)>> {
+        fan_in_members(
+            self.env.as_ref(),
+            self.def,
+            "stream",
+            self.tenant,
+            self.under,
+            self.task_group,
+        )
+        .await
+    }
+
+    async fn open(
+        &self,
+        m: &crate::source::FanInMember,
+        _partitions: Vec<u32>,
+    ) -> Result<Box<dyn crate::runtime::SourceReader>> {
+        let saved = self
+            .members
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&m.tenant)
+            .cloned()
+            .unwrap_or_default();
+        let parts: Vec<u32> = saved.keys().copied().collect();
+        Ok(Box::new(
+            crate::stream_source::StreamSource::new(
+                Arc::clone(&self.peer),
+                self.run_as.clone(),
+                self.db.clone(),
+                self.stream.clone(),
+                m.stream,
+                &parts,
+                &saved,
+                self.from_ms,
+                self.seed ^ m.tenant,
+                Some(self.saver.clone()),
+            )
+            .fan_in(
+                (self.def.0, self.def.1, m.tenant),
+                Arc::clone(&self.members),
+                self.part.clone(),
+            ),
+        ))
+    }
+}
+
+/// Where a stream sink's partition starts without a saved offset: START
+/// AT EARLIEST from the partition's start, a time from that time, LATEST
+/// (the default) from the sink's creation, so a task that restarts before
+/// saving loses nothing.
+async fn stream_from_ms(store: &SinksStore, sink: SinkId, def: &SinkDef) -> Result<i64> {
+    Ok(match def.start_at {
+        crate::model::StartAt::Earliest => 0,
+        crate::model::StartAt::Timestamp { ms } => ms.max(1),
+        crate::model::StartAt::Latest | crate::model::StartAt::Snapshot => store
+            .created_ms(sink)
+            .await?
+            .unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+            })
+            .max(1),
+    })
 }
 
 /// The lease tag a queue sink's task takes its messages under:
@@ -1806,23 +1963,7 @@ async fn run_stream_task(
     }
     let db = script_db(env.as_ref(), tenant, &def, &opts).await?;
     let target = build_target_with(&ctx, db).await?;
-    // Without a saved offset: START AT EARLIEST reads from the partition's
-    // start, a time from that time, and LATEST (the default) from the
-    // sink's creation, so a task that restarts before saving loses
-    // nothing.
-    let from_ms = match def.start_at {
-        crate::model::StartAt::Earliest => 0,
-        crate::model::StartAt::Timestamp { ms } => ms.max(1),
-        crate::model::StartAt::Latest | crate::model::StartAt::Snapshot => store
-            .created_ms(sink)
-            .await?
-            .unwrap_or_else(|| {
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
-            })
-            .max(1),
-    };
+    let from_ms = stream_from_ms(&store, sink, &def).await?;
     let source = crate::stream_source::StreamSource::new(
         peer,
         who.clone(),

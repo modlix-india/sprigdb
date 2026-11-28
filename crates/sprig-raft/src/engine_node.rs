@@ -80,6 +80,32 @@ impl UnitSnapshots for WeakSnapshots {
     fn ingest(&self, unit: UnitId, index: u64, data: &[u8]) -> Result<(), RaftError> {
         self.engine()?.ingest(unit, index, data)
     }
+
+    fn drop_unit(&self, unit: UnitId) -> Result<(), RaftError> {
+        self.engine()?.drop_unit(unit)
+    }
+
+    fn exports_off_driver(&self) -> bool {
+        true
+    }
+
+    fn export_to(
+        &self,
+        unit: UnitId,
+        fixed: &mut dyn FnMut(),
+        out: &mut dyn std::io::Write,
+    ) -> Result<(), RaftError> {
+        self.engine()?.export_to(unit, fixed, out)
+    }
+
+    fn ingest_from(
+        &self,
+        unit: UnitId,
+        index: u64,
+        input: &mut dyn std::io::Read,
+    ) -> Result<(), RaftError> {
+        self.engine()?.ingest_from(unit, index, input)
+    }
 }
 
 /// A leadership change for the engine.
@@ -207,7 +233,8 @@ impl EngineNode {
             ));
         }
         let weak = engine.downgrade();
-        let tx = if opts.inline_roles {
+        let inline = opts.inline_roles;
+        let tx = if inline {
             None
         } else {
             let (tx, rx) = mpsc::channel::<Role>();
@@ -231,9 +258,13 @@ impl EngineNode {
         let sm = engine.state_machine();
         let snaps: Arc<dyn UnitSnapshots> = Arc::new(WeakSnapshots(weak));
         let voters = opts.config.static_voters.clone();
+        let mut config = opts.config;
+        // The simulator steps every thread itself: snapshots stay on the
+        // driver there.
+        config.snapshot_off_driver &= !inline;
         let node = Node::open(NodeOptions {
             id: opts.id,
-            config: opts.config,
+            config,
             store: opts.store,
             transport: opts.transport,
             clock: opts.clock,
@@ -248,11 +279,16 @@ impl EngineNode {
             seed: opts.seed,
         })?;
         let mut consensus = RaftConsensus::with_voters(node.clone(), voters);
-        consensus.set_read_barriers(!opts.inline_roles);
+        consensus.set_read_barriers(!inline);
         let consensus = Arc::new(consensus);
         engine
             .attach_replication(Arc::clone(&consensus) as Arc<dyn sprig_engine::ReplicatedLog>)
             .map_err(|e| RaftError::Invalid(e.message))?;
+        if !inline {
+            engine
+                .start_cross_resolver()
+                .map_err(|e| RaftError::Storage(format!("spawn the cross-unit resolver: {e}")))?;
+        }
         Ok(EngineNode { node, consensus })
     }
 

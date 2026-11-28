@@ -5,8 +5,8 @@
 //! - [`codec`]: request decoding (multibulk and inline, with Redis's
 //!   limits and protocol errors) and reply encoding ([`Frame`], RESP3
 //!   frames downgraded for RESP2 clients).
-//! - [`num`]: Redis's number rules: `string2ll`, `strtod`-style doubles,
-//!   and `d2string`, the text Redis 7.2 gives a double.
+//! - [`num`]: Redis's number rules: the integers and doubles it accepts,
+//!   and the text Redis 7.2 gives a double.
 
 // Redis's number rules are casts by design: lengths and counts become RESP
 // integers, scores move between doubles and 52-bit geohashes, and the

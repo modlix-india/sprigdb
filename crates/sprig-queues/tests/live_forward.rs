@@ -137,10 +137,11 @@ async fn publisher(
     }
 }
 
+#[ignore = "live: needs SPRIG_FWD_MYSQL, SPRIG_FWD_AMQP; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn transactional_publishes_arrive_once_in_commit_order() {
     let (Some(url), Some(amqp)) = (var("SPRIG_FWD_MYSQL"), var("SPRIG_FWD_AMQP")) else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let label = var("SPRIG_FWD_LABEL").unwrap_or_else(|| "run".into());
     let q = format!("fwd_{label}_{}", now_us());
@@ -154,6 +155,7 @@ async fn transactional_publishes_arrive_once_in_commit_order() {
 /// rows the member's forwarder enqueues. `SPRIG_FWD_XO_MYSQL` (the
 /// ancestor, database `mq`), `SPRIG_FWD_XO_AMQP` (the member, vhost `mq`),
 /// `SPRIG_FWD_XO_PUBLISH` (the publish with `{id}`), `SPRIG_FWD_XO_QUEUE`.
+#[ignore = "live: needs SPRIG_FWD_XO_MYSQL, SPRIG_FWD_XO_AMQP, SPRIG_FWD_XO_PUBLISH, ...; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn cross_tenant_publishes_arrive_once_in_commit_order() {
     let (Some(url), Some(amqp), Some(publish), Some(q)) = (
@@ -162,7 +164,7 @@ async fn cross_tenant_publishes_arrive_once_in_commit_order() {
         var("SPRIG_FWD_XO_PUBLISH"),
         var("SPRIG_FWD_XO_QUEUE"),
     ) else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let label = var("SPRIG_FWD_LABEL").unwrap_or_else(|| "xo".into());
     run(&url, &amqp, &q, false, &publish, &label).await;

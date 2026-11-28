@@ -242,9 +242,12 @@ const PLACE_JS: &str =
   return {total: total};
 $$";
 
+#[ignore = "live: needs SPRIG_TEST_LOGIC_GATEWAY, SPRIG_TEST_LOGIC_USER, SPRIG_TEST_LOGIC_PASSWORD; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_runs() {
-    let Some(e) = env("test_runs") else { return };
+    let Some(e) = env("test_runs") else {
+        panic!("live test run without its environment: see tools/live/README.md")
+    };
     let db = "r7follow_tr";
     let mut ck = Checks::new();
     let mut c = conn(&e.mysql, &e.user, &e.password, None).await;
@@ -561,10 +564,11 @@ async fn ver(c: &mut Conn) -> Result<i64, (u16, String)> {
     Ok(r[0][1].as_deref().unwrap_or("0").parse().unwrap())
 }
 
+#[ignore = "live: needs SPRIG_TEST_LOGIC_GATEWAY, SPRIG_TEST_LOGIC_USER, SPRIG_TEST_LOGIC_PASSWORD; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn staged_rollout() {
     let Some(e) = env("staged_rollout") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md")
     };
     let db = "r7follow_ro";
     let mut ck = Checks::new();
@@ -817,10 +821,11 @@ const QTY_RULE: &str = r#"{"namespace": "Test", "name": "QtyPositive",
     "parameterMap": {"eventName": {"e": {"type": "VALUE", "value": "reject"}},
       "results": {"r": {"type": "VALUE", "value": {"name": "message", "value": {"isExpression": false, "value": "qty must be positive"}}}}}}}}"#;
 
+#[ignore = "live: needs SPRIG_TEST_LOGIC_GATEWAY, SPRIG_TEST_LOGIC_USER, SPRIG_TEST_LOGIC_PASSWORD; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn drops_with_dependents() {
     let Some(e) = env("drops_with_dependents") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let db = "r7follow_dr";
     let mut ck = Checks::new();

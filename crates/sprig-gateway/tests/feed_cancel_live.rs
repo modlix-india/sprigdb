@@ -102,6 +102,7 @@ fn sse_events(text: &str) -> Vec<serde_json::Value> {
         .collect()
 }
 
+#[ignore = "live: needs SPRIG_TEST_FC_SQL, SPRIG_TEST_FC_HTTP, SPRIG_TEST_FC_LOGIN; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn http_stream_keeps_every_new_tables_first_row() {
     let (Some(sql_url), Some(http), Some(login)) = (
@@ -110,7 +111,7 @@ async fn http_stream_keeps_every_new_tables_first_row() {
         var("SPRIG_TEST_FC_LOGIN"),
     ) else {
         eprintln!("skipped: set SPRIG_TEST_FC_SQL, SPRIG_TEST_FC_HTTP and SPRIG_TEST_FC_LOGIN");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let n = tables();
     let mut c = sql(&sql_url).await;
@@ -200,11 +201,12 @@ async fn http_stream_keeps_every_new_tables_first_row() {
     assert!(twice.is_empty(), "twice: {twice:?}");
 }
 
+#[ignore = "live: needs SPRIG_TEST_FC_MONGO; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mongo_stream_keeps_every_new_collections_first_document() {
     let Some(uri) = var("SPRIG_TEST_FC_MONGO") else {
         eprintln!("skipped: set SPRIG_TEST_FC_MONGO");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let n = tables();
     let client = mongodb::Client::with_uri_str(&uri).await.unwrap();
@@ -285,6 +287,7 @@ fn resp(args: &[&str]) -> Vec<u8> {
     v
 }
 
+#[ignore = "live: needs SPRIG_TEST_FC_SQL, SPRIG_TEST_FC_REDIS, SPRIG_TEST_FC_LOGIN; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn redis_keyspace_notifications_from_the_feed_keep_every_change() {
     let (Some(sql_url), Some(redis), Some(login)) = (
@@ -293,7 +296,7 @@ async fn redis_keyspace_notifications_from_the_feed_keep_every_change() {
         var("SPRIG_TEST_FC_LOGIN"),
     ) else {
         eprintln!("skipped: set SPRIG_TEST_FC_SQL, SPRIG_TEST_FC_REDIS and SPRIG_TEST_FC_LOGIN");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let (user, pw) = login.split_once(':').unwrap();
     let keys = 60;

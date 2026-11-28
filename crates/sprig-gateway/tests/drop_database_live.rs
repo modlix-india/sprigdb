@@ -186,11 +186,12 @@ fn setup(db: &str) -> Vec<String> {
     ]
 }
 
+#[ignore = "live: needs SPRIG_TEST_DROPDB_SQL, SPRIG_TEST_DROPDB_TENANT, SPRIG_TEST_DROPDB_TENANT_ID, ...; tools/live/README.md"]
 #[tokio::test]
 async fn drop_database_takes_its_sinks_and_triggers() {
     let Some(e) = env() else {
         eprintln!("SPRIG_TEST_DROPDB_* not set; skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let t = e.tenant_id;
     let cat = format!("t{t}_sprig");

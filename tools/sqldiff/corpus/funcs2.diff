@@ -1,0 +1,19 @@
+# Common functions, second slice: time conversions, SOUNDEX, the session's user and version.
+x:DROP TABLE IF EXISTS f2_t
+x:CREATE TABLE f2_t (id INT PRIMARY KEY, t TIME, t3 TIME(3), d DATETIME, s VARCHAR(20))
+x:INSERT INTO f2_t VALUES (1, '01:00:05', '01:00:05.250', '2024-01-01 10:00:00', 'Robert'), (2, '-12:30:00', '838:59:59.000', '2024-03-01 00:00:01', 'Rupert'), (3, NULL, NULL, NULL, NULL), (4, '00:00:00', '00:00:00.001', '1999-12-31 23:59:59', 'Tymczak'), (5, '23:59:59', '10:10:10.999', '2000-02-29 12:00:00', 'Ashcraft')
+q:SELECT id, TIME_TO_SEC(t), TIME_TO_SEC(t3), TIME_TO_SEC(d) FROM f2_t ORDER BY id
+q:SELECT TIME_TO_SEC('01:00:05'), TIME_TO_SEC('-00:00:10'), TIME_TO_SEC(3600) FROM f2_t WHERE id = 1
+q:SELECT id, MAKETIME(id, 20, 30), MAKETIME(id, 61, 0), MAKETIME(-id, 1, 2) FROM f2_t ORDER BY id
+q:SELECT id, TIMEDIFF(t, '00:30:00'), TIMEDIFF(d, '2024-01-01 00:00:00'), TIMEDIFF(d, t) FROM f2_t ORDER BY id
+q:SELECT TIMEDIFF('10:00:00', '08:30:15'), TIMEDIFF('2024-01-02 00:00:00', '2024-01-01 12:00:00') FROM f2_t WHERE id = 1
+q:SELECT id, TIME_FORMAT(t, '%H:%i:%s %p'), TIME_FORMAT(t3, '%h %f'), TIME_FORMAT(d, '%H.%i') FROM f2_t ORDER BY id
+q:SELECT id, SOUNDEX(s), SOUNDEX(CONCAT(s, ' smith')) FROM f2_t ORDER BY id
+q:SELECT SOUNDEX('Honeyman'), SOUNDEX(''), SOUNDEX('123'), SOUNDEX('Ashcroft') FROM f2_t WHERE id = 1
+q:SELECT LENGTH(VERSION()) > 3, VERSION() LIKE '%.%' FROM f2_t WHERE id = 1
+x:DROP TABLE IF EXISTS f2_t
+x:DROP TABLE IF EXISTS f2_i
+x:CREATE TABLE f2_i (id INT PRIMARY KEY, ip VARCHAR(45))
+x:INSERT INTO f2_i VALUES (1, '10.0.5.9'), (2, '2001:db8::ff00:42:8329'), (3, '::1'), (4, 'nope'), (5, NULL), (6, '::ffff:192.168.1.1'), (7, 'fe80::1')
+q:SELECT id, HEX(INET6_ATON(ip)), INET6_NTOA(INET6_ATON(ip)) FROM f2_i ORDER BY id
+x:DROP TABLE IF EXISTS f2_i

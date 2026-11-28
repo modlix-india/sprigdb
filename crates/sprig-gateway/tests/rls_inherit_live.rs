@@ -597,10 +597,11 @@ async fn stream_keys(s: &mut tokio::net::TcpStream, secs: u64) -> Vec<(String, i
         .collect()
 }
 
+#[ignore = "live: needs SPRIG_TEST_RLSI_MYSQL, SPRIG_TEST_RLSI_MARIADB, SPRIG_TEST_RLSI_HTTP, ...; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn no_read_path_returns_an_inherited_row_a_policy_hides() {
     let Some(e) = env() else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let pid = std::process::id() % 10_000;
     let tag = if e.materialized { "m" } else { "r" };
@@ -1661,10 +1662,11 @@ async fn read_inherited(e: &Env, db: &str) -> Result<(), Vec<String>> {
 /// 1449; the child's account: 1356) is re-pointed at the gateway's start,
 /// and by the drift sweep while it runs (`SPRIG_TEST_RLSI_SWEEP_SECS`:
 /// the deployment's `auth.reconcile_interval_seconds`).
+#[ignore = "live: needs SPRIG_TEST_RLSI_MYSQL, SPRIG_TEST_RLSI_MARIADB, SPRIG_TEST_RLSI_HTTP, ...; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn share_views_survive_restarts() {
     let Some(e) = env() else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let Ok(restart) = std::env::var("SPRIG_TEST_RLSI_RESTART") else {
         eprintln!("skipped: set SPRIG_TEST_RLSI_RESTART");

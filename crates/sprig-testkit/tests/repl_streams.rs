@@ -54,6 +54,9 @@ struct Cluster {
     groups: u32,
     /// Stream appends written once (note blobs).
     blobs: bool,
+    /// A stopped replica loses what its store held only in memory (the
+    /// store isn't flushed at close), as after `kill -9`.
+    crash: bool,
 }
 
 fn key() -> PartKey {
@@ -100,6 +103,7 @@ impl Cluster {
             c.log.sync = SyncMode::Off;
             c.budget.engine_mb = 64;
             c.replicated = true;
+            c.rocks.avoid_flush_on_close = self.crash;
             c
         };
         // A restarted replica's previous engine may still be closing (a
@@ -327,6 +331,7 @@ async fn every_replica_writes_the_streams_segments() {
         replicas: BTreeMap::new(),
         groups: 0,
         blobs: false,
+        crash: false,
     };
     for id in VOTERS {
         c.start(id);
@@ -411,6 +416,7 @@ async fn topic_records_reach_every_replica() {
         replicas: BTreeMap::new(),
         groups: 0,
         blobs: false,
+        crash: false,
     };
     for id in VOTERS {
         c.start(id);
@@ -506,6 +512,7 @@ async fn partition_groups_spread_their_leaders_and_replicate() {
         replicas: BTreeMap::new(),
         groups: GROUPS,
         blobs: true,
+        crash: false,
     };
     for id in VOTERS {
         c.start(id);
@@ -609,6 +616,7 @@ async fn appends_are_written_once_on_every_replica() {
         replicas: BTreeMap::new(),
         groups: 0,
         blobs: true,
+        crash: false,
     };
     for id in VOTERS {
         c.start(id);
@@ -731,4 +739,184 @@ async fn appends_are_written_once_on_every_replica() {
     );
     let kept = c.records(leader);
     assert!(kept.len() < want.len() && kept.ends_with(&want[want.len() - 5..]));
+}
+
+/// Proposes one membership change of `unit` (`what` for node `id`) through
+/// its leader, retrying while there is none or another change is pending.
+async fn change_member(c: &Cluster, unit: u64, what: sprig_raft::ConfChangeType, id: u64) {
+    use sprig_raft::{ConfChangeSingle, ConfChangeV2};
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "no membership change {what:?} {id}"
+        );
+        if let Some(l) = c.leader_of(unit) {
+            let mut s = ConfChangeSingle::default();
+            s.set_change_type(what);
+            s.node_id = id;
+            let mut cc = ConfChangeV2::default();
+            cc.mut_changes().push(s);
+            if let Ok(slot) = c.replicas[&l].node.node().change_membership(unit, cc)
+                && matches!(slot.wait_timeout(W), Some(Ok(_)))
+            {
+                return;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// A read copy (a learner on a node outside the voters) removed and added
+/// again, round after round, on the same node: each time it catches up
+/// (from the log, or from a snapshot once the voters trimmed their logs),
+/// its Raft driver keeps running, and its stream log holds the voters'
+/// records. Before the fix the dropped copy kept the unit's keys, its
+/// stream log's partitions and floor: the stream log of the node restarted
+/// meanwhile didn't open (it waited for a log the node no longer had, or
+/// read topics of a unit it held no copy of), and every later snapshot of
+/// the unit failed to restore there ("stream log: closed").
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_read_copy_removed_and_added_again_catches_up() {
+    use sprig_raft::ConfChangeType::{AddLearnerNode, RemoveNode};
+    let dir = std::env::temp_dir().join(format!("sprig-repl-relearn-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut c = Cluster {
+        dir,
+        net: MemNetwork::new(),
+        replicas: BTreeMap::new(),
+        groups: 0,
+        blobs: false,
+        crash: false,
+    };
+    for id in VOTERS {
+        c.start(id);
+    }
+    // Node 4 holds no unit until a leader adds it.
+    c.start(4);
+    let unit = UnitId(TENANT);
+    c.replicas[&1].node.start_unit(unit, &VOTERS).unwrap();
+    let mut want = Vec::new();
+    for _ in 0..10 {
+        let base = c.append(4).await;
+        want.extend(base..base + 4);
+    }
+    for round in 0..6 {
+        change_member(&c, unit.0, AddLearnerNode, 4).await;
+        until(&format!("round {round}: the read copy's records"), || {
+            assert!(
+                !c.replicas[&4].node.node().is_closed(),
+                "round {round}: node 4's Raft driver stopped"
+            );
+            (c.records(4) == want).then_some(())
+        })
+        .await;
+        change_member(&c, unit.0, RemoveNode, 4).await;
+        // A removed copy never hears of its removal (the leader stops
+        // sending to it): the node drops it when the unit's descriptor no
+        // longer lists it, as the gateway's stale-replica sweep does.
+        c.replicas[&4].node.node().drop_group(unit.0).unwrap();
+        if round % 3 == 2 {
+            // The copy's node restarts while it holds no copy.
+            c.kill(4);
+            c.start(4);
+        }
+        for _ in 0..5 {
+            let base = c.append(4).await;
+            want.extend(base..base + 4);
+        }
+        if round % 2 == 1 {
+            // The voters trim their logs: the next add gets a snapshot.
+            let l = c.leader().unwrap();
+            let last = c.replicas[&l].node.node().committed(unit.0);
+            for id in VOTERS {
+                until("the log trimmed", || {
+                    let r = &c.replicas[&id];
+                    let _ = r.log().flush();
+                    let _ = r.engine.checkpoint();
+                    r.node
+                        .node()
+                        .log_first_index(unit.0)
+                        .is_none_or(|f| f > last.saturating_sub(2))
+                        .then_some(())
+                })
+                .await;
+            }
+        }
+    }
+    change_member(&c, unit.0, AddLearnerNode, 4).await;
+    until("the read copy at the end", || {
+        (c.records(4) == want).then_some(())
+    })
+    .await;
+    assert!(!c.replicas[&4].node.node().is_closed());
+    // The copy's engine holds the same unit as the voters'.
+    let l = c.leader().unwrap();
+    until("the copy's keys equal the leader's", || {
+        let a = c.replicas[&l].engine.unit_checksum(unit).ok()?;
+        let b = c.replicas[&4].engine.unit_checksum(unit).ok()?;
+        (a == b).then_some(())
+    })
+    .await;
+}
+
+/// A tenant's first appends survive a replica's crash before the engine's
+/// first checkpoint of the unit: the restarted replica's stream log holds
+/// every record (it replays them from the log) and keeps taking new ones.
+/// Before the fix, the store had lost the unit's applied index with its
+/// unflushed memory, so the restart restored the group's creation record
+/// (an export of the empty unit, with its stream part); that part, handed
+/// to the stream log when it registered, wiped the partitions it had just
+/// restored, and the log went on from the store's index: every record
+/// before the crash was gone on that replica, and on a leader elected
+/// later, lost to clients (Kafka kill loops on a fresh tenant).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fresh_units_appends_survive_a_replicas_crash() {
+    for blobs in [false, true] {
+        let dir =
+            std::env::temp_dir().join(format!("sprig-repl-crash-{blobs}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut c = Cluster {
+            dir,
+            net: MemNetwork::new(),
+            replicas: BTreeMap::new(),
+            groups: 0,
+            blobs,
+            crash: true,
+        };
+        for id in VOTERS {
+            c.start(id);
+        }
+        c.replicas[&1]
+            .node
+            .start_unit(UnitId(TENANT), &VOTERS)
+            .unwrap();
+        let mut want = Vec::new();
+        for _ in 0..20 {
+            let base = c.append(3).await;
+            want.extend(base..base + 3);
+        }
+        for id in VOTERS {
+            until("every replica's stream log", || {
+                (c.records(id) == want).then_some(())
+            })
+            .await;
+        }
+        // Every replica crashes in turn and comes back; appends go on.
+        for victim in VOTERS {
+            c.kill(victim);
+            for _ in 0..5 {
+                let base = c.append(3).await;
+                want.extend(base..base + 3);
+            }
+            c.start(victim);
+            for id in VOTERS {
+                until(
+                    &format!("blobs {blobs}: replica {id} after replica {victim}'s crash"),
+                    || (c.records(id) == want).then_some(()),
+                )
+                .await;
+            }
+        }
+    }
 }

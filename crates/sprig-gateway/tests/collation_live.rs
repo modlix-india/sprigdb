@@ -246,12 +246,13 @@ async fn backend_thread(c: &mut MysqlClient) -> u64 {
         .unwrap()
 }
 
+#[ignore = "live: needs SPRIG_TEST_GATEWAY, SPRIG_TEST_MARIADB_SINGLE; tools/live/README.md"]
 #[tokio::test]
 async fn login_collation_and_set_names_match_mariadb() {
     let test = "login_collation_and_set_names_match_mariadb";
     let Some(gw) = skip::var(GATEWAY) else {
         skip::report_missing(GATEWAY, test);
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let Some(direct) = skip::var(skip::MARIADB_SINGLE) else {
         skip::report_missing(skip::MARIADB_SINGLE, test);

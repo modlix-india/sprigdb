@@ -405,10 +405,11 @@ async fn worker_copies_the_tree(test: &str) -> bool {
     }
 }
 
+#[ignore = "live: needs SPRIG_TEST_R6I_GATEWAY, SPRIG_TEST_R6I_TENANTS, SPRIG_TEST_R6I_PASSWORD, ...; tools/live/README.md"]
 #[tokio::test]
 async fn merged_views_match_the_model() {
     let Some(eps) = endpoints("merged_views_match_the_model") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     if Box::pin(worker_copies_the_tree("merged_views_match_the_model")).await {
         return;
@@ -419,10 +420,11 @@ async fn merged_views_match_the_model() {
 /// The materialized workload on engine databases: the gateway hosting them
 /// seeds and keeps the copies from its change log, with no worker
 /// (`SPRIG_TEST_R6I_ENGINE_COPIES=1`).
+#[ignore = "live: needs SPRIG_TEST_R6I_GATEWAY, SPRIG_TEST_R6I_TENANTS, SPRIG_TEST_R6I_PASSWORD, ...; tools/live/README.md"]
 #[tokio::test]
 async fn engine_copies_converge_to_the_model() {
     let Some(eps) = endpoints("engine_copies_converge_to_the_model") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     if needs(
         "engine_copies_converge_to_the_model",
@@ -515,11 +517,12 @@ async fn child_copy_serves(c: &mut Conn, db: &str, what: &str) {
 /// the same versions, made read-through while the parent writes, and made
 /// materialized again. The child's view never misses a parent row: the old
 /// copy is not read until it is seeded again from the new share.
+#[ignore = "live: needs SPRIG_TEST_R6I_GATEWAY, SPRIG_TEST_R6I_TENANTS, SPRIG_TEST_R6I_PASSWORD, ...; tools/live/README.md"]
 #[tokio::test]
 async fn engine_copy_of_a_share_made_again() {
     let test = "engine_copy_of_a_share_made_again";
     let Some(eps) = endpoints(test) else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     if needs(test, "SPRIG_TEST_R6I_ENGINE_COPIES").is_none() {
         return;
@@ -729,11 +732,12 @@ async fn timed(c: &mut Conn, sql: &str, n: usize, want: usize) -> Vec<u128> {
 /// right after the top updates it (exact reads: a copy behind waits or
 /// reads through). A plain table with the same rows at the top is the
 /// baseline.
+#[ignore = "live: needs SPRIG_TEST_R6I_GATEWAY, SPRIG_TEST_R6I_TENANTS, SPRIG_TEST_R6I_PASSWORD, ...; tools/live/README.md"]
 #[tokio::test]
 async fn engine_read_depth() {
     let test = "engine_read_depth";
     let Some(eps) = endpoints(test) else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let Some(chain) = needs(test, "SPRIG_TEST_R6I_DEPTH") else {
         return;
@@ -1281,10 +1285,11 @@ async fn model_run(eps: &[String], mut worker: Option<&mut copyw::Worker>, engin
     }
 }
 
+#[ignore = "live: needs SPRIG_TEST_R6I_GATEWAY, SPRIG_TEST_R6I_TENANTS, SPRIG_TEST_R6I_PASSWORD, ...; tools/live/README.md"]
 #[tokio::test]
 async fn materialized_views_converge_to_the_model() {
     let Some(eps) = endpoints("materialized_views_converge_to_the_model") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     if Box::pin(worker_copies_the_tree(
         "materialized_views_converge_to_the_model",
@@ -1306,10 +1311,11 @@ async fn materialized_views_converge_to_the_model() {
     w.stop().await;
 }
 
+#[ignore = "live: needs SPRIG_TEST_R6I_GATEWAY, SPRIG_TEST_R6I_TENANTS, SPRIG_TEST_R6I_PASSWORD, ...; tools/live/README.md"]
 #[tokio::test]
 async fn orphans_origin_and_record_mode() {
     let Some(eps) = endpoints("orphans_origin_and_record_mode") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let t = tenants();
     let ep = &eps[eps.len() - 1];
@@ -1428,10 +1434,11 @@ async fn orphans_origin_and_record_mode() {
     exec(&mut a, &format!("DROP DATABASE {db}")).await;
 }
 
+#[ignore = "live: needs SPRIG_TEST_R6I_GATEWAY, SPRIG_TEST_R6I_TENANTS, SPRIG_TEST_R6I_PASSWORD, ...; tools/live/README.md"]
 #[tokio::test]
 async fn schema_changes_while_shared() {
     let Some(eps) = endpoints("schema_changes_while_shared") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let t = tenants();
     let ep = &eps[0];
@@ -1526,10 +1533,11 @@ async fn schema_changes_while_shared() {
     exec(&mut b, &format!("DROP DATABASE {db}")).await;
 }
 
+#[ignore = "live: needs SPRIG_TEST_R6I_GATEWAY, SPRIG_TEST_R6I_TENANTS, SPRIG_TEST_R6I_PASSWORD, ...; tools/live/README.md"]
 #[tokio::test]
 async fn privileges_and_isolation() {
     let Some(eps) = endpoints("privileges_and_isolation") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let t = tenants();
     let ep = &eps[eps.len() - 1];
@@ -1633,10 +1641,11 @@ async fn privileges_and_isolation() {
     }
 }
 
+#[ignore = "live: needs SPRIG_TEST_R6I_GATEWAY, SPRIG_TEST_R6I_TENANTS, SPRIG_TEST_R6I_PASSWORD, ...; tools/live/README.md"]
 #[tokio::test]
 async fn schema_metadata() {
     let Some(eps) = endpoints("schema_metadata") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let t = tenants();
     for (pi, ep) in eps.iter().enumerate() {
@@ -1679,10 +1688,11 @@ async fn schema_metadata() {
 /// catalog under its lock. The "other session" here writes the share row
 /// straight into the catalog, so no version moves and the gateway's
 /// snapshot (and its early check) can't see it.
+#[ignore = "live: needs SPRIG_TEST_R6I_GATEWAY, SPRIG_TEST_R6I_TENANTS, SPRIG_TEST_R6I_PASSWORD, ...; tools/live/README.md"]
 #[tokio::test]
 async fn prepare_phase_sees_a_share_the_snapshot_missed() {
     let Some(eps) = endpoints("prepare_phase_sees_a_share_the_snapshot_missed") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let test = "prepare_phase_sees_a_share_the_snapshot_missed";
     // A root login on the tenant's node, and the deployment's etcd: no

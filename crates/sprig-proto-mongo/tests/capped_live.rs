@@ -888,12 +888,13 @@ fn compare(want: &Log, got: &Log) -> (usize, Vec<String>) {
     (ok, bad)
 }
 
+#[ignore = "live: needs SPRIG_TEST_MONGO_URI, SPRIG_TEST_MONGO_REF_URI; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread")]
 async fn capped_matches_mongodb() {
     let (Some(gw), Some(rf)) = (var("SPRIG_TEST_MONGO_URI"), var("SPRIG_TEST_MONGO_REF_URI"))
     else {
         eprintln!("SPRIG_TEST_MONGO_URI / SPRIG_TEST_MONGO_REF_URI not set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let r = Client::with_uri_str(&rf).await.unwrap();
     let g = Client::with_uri_str(&gw).await.unwrap();
@@ -955,12 +956,13 @@ async fn tail(client: &Client) -> Vec<Bson> {
     seen
 }
 
+#[ignore = "live: needs SPRIG_TEST_MONGO_URI, SPRIG_TEST_MONGO_REF_URI; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread")]
 async fn driver_tail_matches_mongodb() {
     let (Some(gw), Some(rf)) = (var("SPRIG_TEST_MONGO_URI"), var("SPRIG_TEST_MONGO_REF_URI"))
     else {
         eprintln!("SPRIG_TEST_MONGO_URI / SPRIG_TEST_MONGO_REF_URI not set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let r = Client::with_uri_str(&rf).await.unwrap();
     let g = Client::with_uri_str(&gw).await.unwrap();

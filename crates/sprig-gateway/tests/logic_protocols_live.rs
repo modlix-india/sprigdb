@@ -139,6 +139,7 @@ async fn setup(c: &mut mysql_async::Conn) {
     assert_eq!((event.as_str(), total), ("output", 1240.0));
 }
 
+#[ignore = "live: needs SPRIG_TEST_LOGIC_SQL, SPRIG_TEST_LOGIC_MONGO, SPRIG_TEST_LOGIC_REDIS; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mongo_and_redis_call_logic_functions() {
     let (Some(sql_url), Some(mongo_url), Some(redis_url)) = (
@@ -149,7 +150,7 @@ async fn mongo_and_redis_call_logic_functions() {
         eprintln!(
             "skipped: set SPRIG_TEST_LOGIC_SQL, SPRIG_TEST_LOGIC_MONGO and SPRIG_TEST_LOGIC_REDIS"
         );
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let opts = mysql_async::Opts::from_url(&sql_url).unwrap();
     let opts = mysql_async::OptsBuilder::from_opts(opts).ssl_opts(Some(

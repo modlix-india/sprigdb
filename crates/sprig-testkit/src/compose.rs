@@ -8,13 +8,14 @@
 //! `SPRIG_TEST_KEEP=1` to leave the project running for debugging.
 //!
 //! The commands are blocking: start a stack before entering async code, or
-//! from `spawn_blocking`. Gate tests that start stacks on
-//! `SPRIG_TEST_DOCKER=1` (see [`crate::skip`]).
+//! from `spawn_blocking`. Mark tests that start stacks `#[ignore]` and gate
+//! them on `SPRIG_TEST_DOCKER=1` (see [`crate::skip`]).
 //!
 //! ```no_run
 //! use sprig_testkit::{ComposeProject, require_env, skip};
 //!
 //! #[test]
+//! #[ignore = "live: needs SPRIG_TEST_DOCKER; tools/live/README.md"]
 //! fn three_dcs_come_up() {
 //!     require_env!(skip::DOCKER);
 //!     let stack = ComposeProject::three_dc().up().unwrap();

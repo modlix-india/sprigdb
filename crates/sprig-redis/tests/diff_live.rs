@@ -742,11 +742,12 @@ NOSUCHCOMMAND a b
 GET
 ";
 
+#[ignore = "live: needs SPRIG_TEST_REDIS_REF; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn corpus_matches_redis() {
     let (Some(refaddr), Some(url)) = (var("SPRIG_TEST_REDIS_REF"), sprig_url().await) else {
         eprintln!("SPRIG_TEST_REDIS_REF or SprigDB not set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let mut r = conn(&format!("redis://{refaddr}")).await;
     let mut s = conn(&url).await;
@@ -930,11 +931,12 @@ async fn dump(c: &mut redis::aio::MultiplexedConnection) -> Vec<String> {
     out
 }
 
+#[ignore = "live: needs SPRIG_TEST_REDIS_REF; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn random_ops_match_redis() {
     let (Some(refaddr), Some(url)) = (var("SPRIG_TEST_REDIS_REF"), sprig_url().await) else {
         eprintln!("SPRIG_TEST_REDIS_REF or SprigDB not set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let seeds: Vec<u64> = var("SPRIG_TEST_SEEDS").map_or_else(
         || vec![1, 2, 3],
@@ -1000,11 +1002,12 @@ fn v(xs: &[&str]) -> Vec<String> {
     xs.iter().map(|x| (*x).to_owned()).collect()
 }
 
+#[ignore = "live: needs SPRIG_TEST_REDIS_REF; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn scripts_match_redis() {
     let (Some(refaddr), Some(url)) = (var("SPRIG_TEST_REDIS_REF"), sprig_url().await) else {
         eprintln!("SPRIG_TEST_REDIS_REF or SprigDB not set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let mut r = conn(&format!("redis://{refaddr}")).await;
     let mut s = conn(&url).await;
@@ -1170,11 +1173,12 @@ async fn scripts_match_redis() {
     assert!(bad.is_empty(), "{} of {} differ", bad.len(), cmds.len());
 }
 
+#[ignore = "live: needs SPRIG_TEST_REDIS_REF; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn transactions_match_redis() {
     let (Some(refaddr), Some(url)) = (var("SPRIG_TEST_REDIS_REF"), sprig_url().await) else {
         eprintln!("SPRIG_TEST_REDIS_REF or SprigDB not set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let rurl = format!("redis://{refaddr}");
     let mut bad = Vec::new();
@@ -1328,12 +1332,13 @@ fn creds_of(url: &str) -> (String, String) {
     (u.to_owned(), p.to_owned())
 }
 
+#[ignore = "live: needs SPRIG_TEST_REDIS_REF; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn wire_bytes_pubsub_and_blocking_match_redis() {
     use tokio::io::AsyncWriteExt;
     let (Some(refaddr), Some(url)) = (var("SPRIG_TEST_REDIS_REF"), sprig_url().await) else {
         eprintln!("SPRIG_TEST_REDIS_REF or SprigDB not set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let saddr = host_of(&url);
     let (cu, cp) = creds_of(&url);
@@ -1539,11 +1544,12 @@ fn random_batched(g: &mut Rng) -> Vec<String> {
 /// the batched set with every option, wrong types, expired keys and
 /// integer edge cases, then the final state; then 8 clients incrementing
 /// one counter and pushing to one list at once.
+#[ignore = "live: needs SPRIG_TEST_REDIS_REF; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn batched_writes_match_redis() {
     let (Some(refaddr), Some(url)) = (var("SPRIG_TEST_REDIS_REF"), sprig_url().await) else {
         eprintln!("SPRIG_TEST_REDIS_REF or SprigDB not set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let ops: usize = var("SPRIG_TEST_OPS")
         .and_then(|s| s.parse().ok())
@@ -1624,12 +1630,13 @@ async fn batched_writes_match_redis() {
 /// clients pipelining 16 `INCR`s and `RPUSH`es on shared keys at once
 /// (groups that deadlock or race on a new key rerun one by one) lose
 /// nothing.
+#[ignore = "live: needs SPRIG_TEST_REDIS_REF; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn pipelines_match_redis() {
     use tokio::io::AsyncWriteExt;
     let (Some(refaddr), Some(url)) = (var("SPRIG_TEST_REDIS_REF"), sprig_url().await) else {
         eprintln!("SPRIG_TEST_REDIS_REF or SprigDB not set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let saddr = host_of(&url);
     let (cu, cp) = creds_of(&url);
@@ -1953,6 +1960,7 @@ async fn view_counts(c: &mut mysql_async::Conn) -> Vec<String> {
 ///
 /// The tenant's settings `advisor.min_ndv_per_shard` and
 /// `sharding.min_shards` change; delete the tenant afterwards.
+#[ignore = "live: needs SPRIG_TEST_REDIS_REF, SPRIG_TEST_REDIS_SPRIG, SPRIG_TEST_REDIS_SHARD, ...; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(clippy::many_single_char_names)]
 async fn sharded_by_a_pin_still_matches_redis() {
@@ -1966,7 +1974,7 @@ async fn sharded_by_a_pin_still_matches_redis() {
             "SPRIG_TEST_REDIS_REF, SPRIG_TEST_REDIS_SPRIG, SPRIG_TEST_REDIS_SHARD or \
              SPRIG_TEST_REDIS_SHARD_SPRIGCTL not set: skipped"
         );
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let (mysql, admin) = shard.split_once(',').expect("<mysql port>,<admin port>");
     let mysql: u16 = mysql.trim().parse().unwrap();

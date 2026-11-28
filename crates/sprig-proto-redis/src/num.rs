@@ -1,8 +1,8 @@
 //! Redis's number rules, so replies and refusals match Redis 7.2 byte for
 //! byte.
 
-/// Redis's `string2ll`: an optional `-`, then digits without leading zeros
-/// (except `0` itself), no spaces, no `+`, within `i64`.
+/// An integer as Redis accepts one: an optional `-`, then digits without
+/// leading zeros (except `0` itself), no spaces, no `+`, within `i64`.
 #[must_use]
 pub fn parse_i64(s: &[u8]) -> Option<i64> {
     if s.is_empty() || s.len() > 20 {
@@ -32,7 +32,7 @@ pub fn parse_i64(s: &[u8]) -> Option<i64> {
     }
 }
 
-/// Redis's `string2ld` / `strtod` check for scores and floats: the whole
+/// A score or float as Redis accepts one: the whole
 /// text must parse, no surrounding spaces, `inf`, `+inf`, `-inf` and
 /// `infinity` accepted (any case), NaN refused.
 #[must_use]
@@ -76,11 +76,11 @@ fn double_as_i64(d: f64) -> Option<i64> {
     if (l as f64) == d { Some(l) } else { None }
 }
 
-/// The text Redis 7.2 gives a double (`d2string`): `nan`, `inf`, `-inf`,
+/// The text Redis 7.2 gives a double: `nan`, `inf`, `-inf`,
 /// `0` / `-0`, an integer when the value is one, else the shortest
-/// round-trip digits laid out as `fpconv_dtoa` does.
+/// round-trip digits, in plain or exponent form as Redis lays them out.
 #[must_use]
-pub fn d2string(d: f64) -> String {
+pub fn reply_double_text(d: f64) -> String {
     if d.is_nan() {
         return "nan".into();
     }
@@ -97,11 +97,12 @@ pub fn d2string(d: f64) -> String {
     if let Some(l) = double_as_i64(d) {
         return l.to_string();
     }
-    fpconv(d)
+    shortest_layout(d)
 }
 
-/// `fpconv_dtoa`'s layout over Rust's shortest digits.
-fn fpconv(d: f64) -> String {
+/// Rust's shortest round-trip digits laid out as Redis prints a double:
+/// plain digits for moderate exponents, else `d.ddde±x`.
+fn shortest_layout(d: f64) -> String {
     let neg = d < 0.0;
     // "{:e}" is the shortest round-trip representation: "1.2345e-7".
     let sci = format!("{:e}", d.abs());
@@ -152,12 +153,12 @@ fn fpconv(d: f64) -> String {
     out
 }
 
-/// Redis's `%.17Lg`-free text for `INCRBYFLOAT` and `HINCRBYFLOAT`
-/// (`ld2string` with `LD_STR_HUMAN`): no exponent, trailing zeros dropped.
+/// The text of an `INCRBYFLOAT` or `HINCRBYFLOAT` result as Redis prints it:
+/// plain decimal, no exponent, trailing zeros dropped.
 /// SprigDB computes in `f64`, so it prints the shortest digits rather than
 /// a long double's.
 #[must_use]
-pub fn ld2string_human(d: f64) -> String {
+pub fn incr_float_text(d: f64) -> String {
     if d.is_infinite() {
         return if d < 0.0 { "-inf".into() } else { "inf".into() };
     }
@@ -199,7 +200,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn integers_follow_string2ll() {
+    fn integers_parse_as_redis_accepts_them() {
         assert_eq!(parse_i64(b"0"), Some(0));
         assert_eq!(parse_i64(b"-1"), Some(-1));
         assert_eq!(parse_i64(b"9223372036854775807"), Some(i64::MAX));
@@ -235,7 +236,7 @@ mod tests {
             (-2.5e-10, "-2.5e-10"),
             (3.14e100, "3.14e+100"),
         ] {
-            assert_eq!(d2string(d), s, "{d}");
+            assert_eq!(reply_double_text(d), s, "{d}");
         }
     }
 
@@ -252,10 +253,10 @@ mod tests {
 
     #[test]
     fn human_long_doubles() {
-        assert_eq!(ld2string_human(10.5), "10.5");
-        assert_eq!(ld2string_human(3.0), "3");
-        assert_eq!(ld2string_human(5e20), "500000000000000000000");
-        assert_eq!(ld2string_human(1.5e-5), "0.000015");
-        assert_eq!(ld2string_human(-2.25), "-2.25");
+        assert_eq!(incr_float_text(10.5), "10.5");
+        assert_eq!(incr_float_text(3.0), "3");
+        assert_eq!(incr_float_text(5e20), "500000000000000000000");
+        assert_eq!(incr_float_text(1.5e-5), "0.000015");
+        assert_eq!(incr_float_text(-2.25), "-2.25");
     }
 }

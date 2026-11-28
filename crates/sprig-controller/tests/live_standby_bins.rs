@@ -705,11 +705,12 @@ async fn job_state(store: &dyn MetaStore, dc: &str, job: &str) -> Value {
 
 static ONE_AT_A_TIME: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+#[ignore = "live: needs SPRIG_TEST_DOCKER; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn bins_job_standby_settings_and_promotion() {
     if !skip::flag(skip::DOCKER) {
         skip::report_missing(skip::DOCKER, "bins_job_standby_settings_and_promotion");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     }
     let _one = ONE_AT_A_TIME.lock().await;
     let Some((sprigdb, sprigctl)) = bins() else {

@@ -1,0 +1,18 @@
+# JSON_TABLE on engine databases: constant documents, lateral over a table, LEFT JOIN, NESTED PATH, ON EMPTY / ON ERROR, errors.
+x:DROP TABLE IF EXISTS jt_a
+q:CREATE TABLE jt_a (id INT PRIMARY KEY, doc JSON)
+q:INSERT INTO jt_a VALUES (1, '[{"a":1,"b":"x"},{"a":2}]'), (2, '[{"a":"q","b":[1,2]}]'), (3, NULL), (4, '[]')
+q:SELECT * FROM JSON_TABLE('[{"a":1,"b":"x"},{"a":2},{"c":3}]', '$[*]' COLUMNS (rn FOR ORDINALITY, a INT PATH '$.a', b VARCHAR(5) PATH '$.b', e INT EXISTS PATH '$.c')) AS jt
+q:SELECT * FROM JSON_TABLE('[{"a":1,"b":"x"},{"a":2}]', '$[*]' COLUMNS (b VARCHAR(10) PATH '$.b' DEFAULT 'none' ON EMPTY)) AS jt
+q:SELECT jt_a.id, jt.* FROM jt_a, JSON_TABLE(jt_a.doc, '$[*]' COLUMNS (a INT PATH '$.a' NULL ON ERROR, b VARCHAR(10) PATH '$.b')) AS jt ORDER BY jt_a.id, jt.a
+q:SELECT jt_a.id, jt.a FROM jt_a LEFT JOIN JSON_TABLE(jt_a.doc, '$[*]' COLUMNS (a INT PATH '$.a' NULL ON ERROR)) AS jt ON 1 ORDER BY jt_a.id, jt.a
+q:SELECT jt_a.id, COUNT(jt.a) FROM jt_a, JSON_TABLE(jt_a.doc, '$[*]' COLUMNS (a INT PATH '$.a' NULL ON ERROR)) AS jt GROUP BY jt_a.id ORDER BY jt_a.id
+q:SELECT * FROM JSON_TABLE('{"x":[1,2],"y":[{"z":5},{"z":6}]}', '$' COLUMNS (NESTED PATH '$.x[*]' COLUMNS (x INT PATH '$'), NESTED PATH '$.y[*]' COLUMNS (z INT PATH '$.z'))) jt
+q:SELECT * FROM JSON_TABLE('[{"n":"a","t":[1,2]},{"n":"b","t":[]}]', '$[*]' COLUMNS (n VARCHAR(5) PATH '$.n', NESTED PATH '$.t[*]' COLUMNS (i FOR ORDINALITY, t INT PATH '$'))) jt
+q:SELECT * FROM JSON_TABLE('[1,2,3]', '$[*]' COLUMNS (a INT PATH '$')) AS jt WHERE a > 1
+q:SELECT * FROM JSON_TABLE('[1.5, 2.25]', '$[*]' COLUMNS (d DECIMAL(5,2) PATH '$', f DOUBLE PATH '$')) AS jt
+q:SELECT * FROM JSON_TABLE('["2024-01-02", "x"]', '$[*]' COLUMNS (d DATE PATH '$')) AS jt
+q:SELECT * FROM JSON_TABLE(NULL, '$[*]' COLUMNS (a INT PATH '$')) jt
+q:SELECT * FROM JSON_TABLE('[1,2]', '$[*]' COLUMNS (a INT PATH '$'))
+q:SELECT * FROM JSON_TABLE('[1,2]', '$[*]' COLUMNS (a INT PATH '$', a INT PATH '$')) jt
+x:DROP TABLE IF EXISTS jt_a

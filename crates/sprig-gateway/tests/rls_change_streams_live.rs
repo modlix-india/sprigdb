@@ -196,6 +196,7 @@ fn resp(args: &[&str]) -> Vec<u8> {
     v
 }
 
+#[ignore = "live: needs SPRIG_TEST_RLS_SQL, SPRIG_TEST_RLS_HTTP, SPRIG_TEST_RLS_REDIS; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn change_streams_filtered_per_event() {
     let (Ok(sql_addr), Ok(http_addr), Ok(redis_addr)) = (
@@ -204,7 +205,7 @@ async fn change_streams_filtered_per_event() {
         std::env::var("SPRIG_TEST_RLS_REDIS"),
     ) else {
         eprintln!("skipped: set SPRIG_TEST_RLS_SQL, SPRIG_TEST_RLS_HTTP and SPRIG_TEST_RLS_REDIS");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let mut ck = Checks {
         n: 0,
@@ -749,6 +750,7 @@ async fn open_limits(addr: &str, query: &str) -> tokio::net::TcpStream {
 /// streams per tenant on a gateway (39780), the slow-consumer end (39790);
 /// a `start_at_hlc` older than the feed's time index (39800).
 #[allow(clippy::many_single_char_names)] // streams a to d, h
+#[ignore = "live: needs SPRIG_TEST_RLS_SQL, SPRIG_TEST_RLS_HTTP, SPRIG_TEST_RLS_CTL; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn change_stream_limits() {
     let (Ok(sql_addr), Ok(http_addr), Ok(ctl)) = (
@@ -757,7 +759,7 @@ async fn change_stream_limits() {
         std::env::var("SPRIG_TEST_RLS_CTL"),
     ) else {
         eprintln!("skipped: set SPRIG_TEST_RLS_SQL, SPRIG_TEST_RLS_HTTP and SPRIG_TEST_RLS_CTL");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let mut ck = Checks {
         n: 0,
@@ -875,6 +877,7 @@ async fn change_stream_limits() {
 /// token too it is 39801. The deployment's controller must have written
 /// the time index for 40 s (the start reads a position 30 s or more
 /// before the time).
+#[ignore = "live: needs SPRIG_TEST_RLS_SQL, SPRIG_TEST_RLS_HTTP; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn change_streams_start_at_a_time() {
     const HDB: &str = "rlsh_suite";
@@ -884,7 +887,7 @@ async fn change_streams_start_at_a_time() {
         std::env::var("SPRIG_TEST_RLS_HTTP"),
     ) else {
         eprintln!("skipped: set SPRIG_TEST_RLS_SQL and SPRIG_TEST_RLS_HTTP");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let mut ck = Checks {
         n: 0,

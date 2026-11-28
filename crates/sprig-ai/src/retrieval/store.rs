@@ -99,7 +99,9 @@ impl State {
         }
     }
 
-    fn parse(s: &str) -> Self {
+    /// The state a column value names (`building` for any other).
+    #[must_use]
+    pub fn parse(s: &str) -> Self {
         match s {
             "ready" => State::Ready,
             "rebuilding" => State::Rebuilding,

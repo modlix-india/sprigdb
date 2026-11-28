@@ -13,13 +13,15 @@ The pack holds the pages cut into chunks of a few hundred words, each with its p
 
 ## How it gets there
 
-At start, the controller checks the pack's SHA-256 and loads it into every cluster of the data centre, into a database no tenant can write to, and creates a read-only account for searching it. It loads each release once: a later start only checks that the rows still match the pack, and loads them again if they were changed. After an upgrade, the previous release's docs are kept beside the new one (`docs.keep_versions`, 2), so a rollback has its own docs at once.
+The pack is a file shipped beside the `sprigdb` binary: `sprig-docs-<version>.pack`, or the file `docs.pack_path` names. Each node reads it into memory when it starts, after checking its SHA-256, and serves every docs search from that copy. Nothing is written anywhere, so nobody can change the docs a node serves. An upgrade brings the new release's pack with the new binary, so the docs always match the release that answers. A node also looks at the file again every minute and reads it again when it changed. A file that no longer reads, for example a damaged one, leaves the copy it had in place.
 
-Until a cluster has the release's docs, searches use another cluster's copy; if none has them, they fail with 39989 `ER_SPRIG_DOCS_UNAVAILABLE` (retryable). The controller logs the events `docs.pack.loaded`, `docs.pack.tampered` (rows changed since the load, reloaded) and `docs.pack.unavailable` (no valid pack found).
+Without a pack, searches fail with 39989 `ER_SPRIG_DOCS_UNAVAILABLE` (retryable). The gateway logs the events `docs.pack.loaded` (with the release, the SHA-256 and the chunk count) and `docs.pack.unavailable` (no valid pack found).
 
 ## From SQL: the sprig_docs database
 
 Every session can read `sprig_docs.chunks`, on any port that speaks SQL, whatever its grants. Nobody can change it.
+
+Each node answers these statements from its copy of the pack in memory, so they read exactly the docs its REST search reads. `MATCH ... AGAINST` on `text`, `heading_path` or `terms` (any of them) ranks by the docs search's own keyword score (BM25 over the heading path, the text and the identifiers), best first.
 
 ```sql test
 DESCRIBE sprig_docs.chunks;
@@ -87,10 +89,10 @@ has_operator_pages
 
 The rules:
 
-- Reads work: `SELECT`, `WITH`, `EXPLAIN` of a `SELECT`, and `DESCRIBE`, `SHOW COLUMNS`, `SHOW INDEX` and `SHOW CREATE TABLE` of `sprig_docs.chunks`.
+- Reads work: `SELECT` and `WITH`, and `DESCRIBE` and `SHOW COLUMNS` of `sprig_docs.chunks`. A statement may name `sprig_docs.chunks` once (a join of the docs with themselves is refused), read at most 1,000,000 rows and return 32 MiB; past that it fails with 1041.
 - Writes and DDL fail with 1044, as writes to `information_schema` do on MySQL.
 - `USE sprig_docs` fails with 39051: name the table as `sprig_docs.chunks`.
-- One statement can't join the docs with your own tables: it fails with 1142.
+- One statement can't join the docs with your own tables: your tables aren't there (1146).
 - `sprig_docs.embed` takes a string literal only. It needs the model on the gateway (`docs.embed_queries` on, and the model in `docs.model_dir`); without it, it fails with 39989.
 - `sprig_docs` is a reserved name: no tenant can create a database with it, on any protocol.
 - Prepared statements, MongoDB and Redis can't read `sprig_docs`; use SQL text or REST.
@@ -108,7 +110,7 @@ DELETE FROM sprig_docs.chunks;   -- 1044: the docs are read-only
 | `query` | yes | The question or words to search for |
 | `audience` | no | `user`, `dba` or `operator`: only chunks for that audience |
 | `limit` | no | How many hits, at most 50. Default `docs.search_limit` (8) |
-| `version` | no | A release whose docs are loaded. Default: this gateway's own release, else the newest loaded |
+| `version` | no | The release to search. A node serves its own release's docs; another release fails with 503 and 39989 |
 
 ```sh
 curl -s -u acme.app:'<password>' -X POST https://sprig.example.com/v1/docs:search \
@@ -168,7 +170,7 @@ curl -s -u acme.app:'<password>' https://sprig.example.com/v1/docs/pages/tools/d
 
 ### The pack's format
 
-The pack has format 2 since chunk positions (`seq`) were added. The controller still loads a format 1 pack, with every `seq` 0. When it starts, it adds `seq` to a cluster's `__sprig_docs.chunks` table if the table doesn't have it yet. The rows already there get 0, including those of an older release kept for a rollback.
+The pack has format 2 since chunk positions (`seq`) were added. A format 1 pack still reads, with every `seq` 0.
 
 ## Settings
 
@@ -177,8 +179,7 @@ All are operator settings, live, at data-centre or global scope. See [Settings](
 | Setting | Default | What |
 |---|---|---|
 | `docs.enabled` | `true` | Load the docs and serve docs search |
-| `docs.pack_path` | empty | The pack the controller loads; empty: `sprig-docs-<version>.pack` next to the `sprigdb` binary |
-| `docs.keep_versions` | `2` | Releases kept on each cluster, the running one included |
+| `docs.pack_path` | empty | The pack each node reads; empty: `sprig-docs-<version>.pack` next to the `sprigdb` binary |
 | `docs.search_limit` | `8` | Hits returned when a request gives no `limit` |
 | `docs.embed_queries` | `true` | Embed questions for hybrid search; off: keyword search only, and the model is never loaded |
 | `docs.embed_threads` | `2` | CPU threads one query's embedding may use |
@@ -190,9 +191,8 @@ The gateway loads the model on the first search that needs it.
 
 | Metric | What |
 |---|---|
-| `sprig_docs_pack_info{version,sha}` | The pack the controller verified and loads |
-| `sprig_docs_load_seconds` | Time to load the pack into one cluster |
-| `sprig_docs_verify_failures_total` | Changed or missing rows found and reloaded |
+| `sprig_docs_pack_info{version,sha}` | The pack the node read and serves |
+| `sprig_docs_load_seconds` | Time to read the pack into memory |
 | `sprig_docs_search_total{result}` | Searches by result: `ok`, `empty`, `invalid`, `refused`, `unavailable`, `error` |
 | `sprig_docs_search_seconds{mode}` | Search time: `hybrid`, `keyword` or `sql` |
 | `sprig_docs_search_degraded_total` | Searches answered by keywords only because the model couldn't run |
@@ -203,7 +203,7 @@ See [Metrics](../reference/metrics.md).
 
 | Symptom | What to do |
 |---|---|
-| 39989 on every search | The docs aren't loaded on any cluster. Check `docs.enabled`, that the pack is next to the binary or at `docs.pack_path`, and the controller's `docs.pack.unavailable` event. After an upgrade, retry in a minute |
+| 39989 on every search | The node has no pack. Check `docs.enabled`, that the pack is next to the binary or at `docs.pack_path`, and the gateway's `docs.pack.unavailable` event |
 | 39989 from `sprig_docs.embed` only | The gateway has no model: check `docs.embed_queries` and `docs.model_dir` |
 | `mode` is always `keyword` | Same cause; `sprig_docs_search_degraded_total` rises |
-| Results from an older release | This gateway's release isn't loaded yet; pass `version` or wait for the controller |
+| Results from an older release | The pack beside the binary is an older release's (the gateway logs a warning when the pack's release isn't its own); install the release's pack |

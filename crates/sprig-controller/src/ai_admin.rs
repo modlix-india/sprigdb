@@ -15,11 +15,10 @@
 //! and never read.
 //!
 //! [`AiPurgeLoop`] runs on the DC leader: every hour, for each active
-//! tenant homed here whose catalog has the `ai` module, payloads older
+//! tenant homed here, payloads (in its catalog records) older
 //! than the tenant's `ai.audit_payload_days` are dropped from their
 //! notes, keeping each payload's SHA-256.
 
-use sprig_catalog::pool_wait::Bounded as _;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -29,12 +28,10 @@ use axum::extract::{Path as UrlPath, State};
 use axum::http::HeaderMap;
 use axum::response::Response;
 use axum::routing::get;
-use mysql_async::prelude::Queryable as _;
 use serde_json::{Value, json};
 use sprig_ai::keys::{self, AiKeyring};
 use sprig_ai::provider::{ChatRequest, Delta, Message};
 use sprig_ai::providers::{ProviderRecord, ProviderSettings, ProviderStore, check_name};
-use sprig_catalog::CatalogLocator;
 use sprig_catalog::cache::{Loaded, TenantCatalog};
 use sprig_common::audit::AuditStream;
 use sprig_common::ids::{DcId, TenantId};
@@ -376,7 +373,6 @@ async fn method(
 /// The payload purge (module docs).
 pub struct AiPurgeLoop {
     dir: Directory,
-    locator: Arc<dyn CatalogLocator>,
     dc: DcId,
     live: Option<LiveSettings>,
 }
@@ -392,18 +388,8 @@ impl std::fmt::Debug for AiPurgeLoop {
 impl AiPurgeLoop {
     /// The loop over the tenants homed in `dc`.
     #[must_use]
-    pub fn new(
-        dir: Directory,
-        locator: Arc<dyn CatalogLocator>,
-        dc: DcId,
-        live: Option<LiveSettings>,
-    ) -> Self {
-        Self {
-            dir,
-            locator,
-            dc,
-            live,
-        }
+    pub fn new(dir: Directory, dc: DcId, live: Option<LiveSettings>) -> Self {
+        Self { dir, dc, live }
     }
 
     fn ours(&self, e: &DirectoryEntry) -> bool {
@@ -477,41 +463,9 @@ impl Reconciler for AiPurgeLoop {
         if !self.ours(entry.body()) {
             return Ok(Outcome::Done);
         }
-        // A tenant whose catalog schema was never made has no
-        // assistant messages: nothing to ask MariaDB.
-        if sprig_catalog::migrate::lazy_schema(*key)
-            .await?
-            .is_some_and(|l| !l.mariadb)
-        {
-            return Ok(Outcome::RequeueAfter(PURGE_INTERVAL));
-        }
-        let ep = self.locator.writer(*key).await?;
-        let schema = ep.store.schema().to_owned();
-        // Only tenants that used the assistants: the check never creates
-        // the module.
-        let have: Option<u64> = {
-            let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
-                SprigError::new(
-                    SprigCode::CatalogUnavailable,
-                    "the tenant's catalog is unreachable",
-                )
-                .with_source(e)
-            })?;
-            conn.exec_first(
-                "SELECT COUNT(*) FROM information_schema.TABLES \
-                 WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'ai_messages'",
-                (schema.as_str(),),
-            )
-            .await
-            .map_err(|e| {
-                SprigError::new(
-                    SprigCode::CatalogUnavailable,
-                    "the tenant's catalog is unreachable",
-                )
-                .with_source(e)
-            })?
-        };
-        if have.unwrap_or(0) == 0 {
+        // Only tenants with a payload still kept: one record read.
+        let audit = sprig_ai::audit::rec::RecAudit::tenant(crate::catalog_records(), *key);
+        if !audit.has_payloads().await? {
             return Ok(Outcome::RequeueAfter(PURGE_INTERVAL));
         }
         // The catalog's core rows are engine records.
@@ -519,11 +473,8 @@ impl Reconciler for AiPurgeLoop {
             .snapshot()
             .await?;
         let days = self.days(*key, snap);
-        let n = sprig_ai::audit::AuditStore::purge_payloads(
-            &sprig_ai::CatalogAudit::new(ep.pool.clone(), schema),
-            days,
-        )
-        .await?;
+        // The tenant's conversations are catalog records too.
+        let n = sprig_ai::audit::AuditStore::purge_payloads(&audit, days).await?;
         if n > 0 {
             sprig_ai::metrics::payloads_purged(n);
             tracing::debug!(tenant = %key, n, days, "AI payloads past their retention purged");

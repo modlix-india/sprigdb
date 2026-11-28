@@ -862,6 +862,7 @@ fn features(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+#[ignore = "live: needs SPRIG_TCK_DIR; tools/live/README.md"]
 #[tokio::test]
 async fn opencypher_tck() {
     let Some(dir) = std::env::var("SPRIG_TCK_DIR")
@@ -869,7 +870,7 @@ async fn opencypher_tck() {
         .filter(|v| !v.is_empty())
     else {
         eprintln!("skipped: SPRIG_TCK_DIR is not set");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let mut files = Vec::new();
     features(Path::new(&dir), &mut files);

@@ -711,11 +711,13 @@ fn rest(
     )
 }
 
+#[ignore = "live: needs SPRIG_TEST_RX_SQL, SPRIG_TEST_RX_HTTP, SPRIG_TEST_RX_TENANT, SPRIG_TEST_RX_USER, SPRIG_TEST_RX_PASSWORD, SPRIG_TEST_RX_BACKEND (a MariaDB-era deployment; engine nodes: retrieval_engine_live); tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn retrieval_indexes_end_to_end() {
     let Ok(addr) = std::env::var("SPRIG_TEST_RX_SQL") else {
-        eprintln!("skipped: set SPRIG_TEST_RX_SQL");
-        return;
+        panic!(
+            "live test run without its environment (SPRIG_TEST_RX_SQL): see tools/live/README.md"
+        );
     };
     let user = var("SPRIG_TEST_RX_USER", "admin");
     let password = var("SPRIG_TEST_RX_PASSWORD", "sprig-dev-app");

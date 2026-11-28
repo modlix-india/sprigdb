@@ -195,10 +195,11 @@ const TYPES_INSERT: &str = "INSERT INTO ty VALUES
 
 /// Text and binary results of every common type, compared with the same
 /// statements run straight on the cluster's writer.
+#[ignore = "live: needs SPRIG_TEST_GATEWAY, SPRIG_TEST_MARIADB_SINGLE, SPRIG_TEST_MARIADB_REPLICATION, ...; tools/live/README.md"]
 #[tokio::test]
 async fn text_and_binary_results_match_the_backend() {
     let Some(eps) = endpoints("text_and_binary_results_match_the_backend") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     for (addr, persona, topo) in matrix(&eps) {
         let db = Db::create(&addr, topo.user, "gw_types").await;
@@ -329,10 +330,11 @@ async fn begin_with_big_packet(c: &mut Conn, side: &mut [Conn]) {
     panic!("no backend connection with max_allowed_packet {BIG_PACKET} after 64 tries");
 }
 
+#[ignore = "live: needs SPRIG_TEST_GATEWAY, SPRIG_TEST_MARIADB_SINGLE, SPRIG_TEST_MARIADB_REPLICATION, ...; tools/live/README.md"]
 #[tokio::test]
 async fn large_multi_packet_rows() {
     let Some(eps) = endpoints("large_multi_packet_rows") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     // The servers need max_allowed_packet above 16 MiB. Only new
     // connections get it: begin_with_big_packet skips the gateway's older
@@ -405,10 +407,11 @@ async fn large_multi_packet_rows() {
 /// Multi-statements: every result streams, an error stops the rest, and a
 /// session without multi-statements gets 1064. `CALL` returns several
 /// resultsets, through the text and the binary protocol.
+#[ignore = "live: needs SPRIG_TEST_GATEWAY, SPRIG_TEST_MARIADB_SINGLE, SPRIG_TEST_MARIADB_REPLICATION, ...; tools/live/README.md"]
 #[tokio::test]
 async fn multi_statements_and_call() {
     let Some(eps) = endpoints("multi_statements_and_call") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     for (addr, persona, topo) in matrix(&eps) {
         let ctx = format!("{persona:?} {}", topo.user);
@@ -554,10 +557,11 @@ async fn kill_backend(side: &mut [Conn], id: u64) -> bool {
 /// lands on another backend connection: the backend statement is
 /// re-prepared there and the parameter types re-sent, although the client
 /// doesn't send them again. Also MariaDB's direct execute (0xFFFFFFFF).
+#[ignore = "live: needs SPRIG_TEST_GATEWAY, SPRIG_TEST_MARIADB_SINGLE, SPRIG_TEST_MARIADB_REPLICATION, ...; tools/live/README.md"]
 #[tokio::test]
 async fn prepared_statements_move_between_backend_connections() {
     let Some(eps) = endpoints("prepared_statements_move_between_backend_connections") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     for (addr, persona, topo) in matrix(&eps) {
         let ctx = format!("{persona:?} {}", topo.user);
@@ -628,10 +632,11 @@ async fn prepared_statements_move_between_backend_connections() {
 
 /// `COM_STMT_SEND_LONG_DATA` pieces are buffered and reach the backend
 /// with the execute, wherever it runs.
+#[ignore = "live: needs SPRIG_TEST_GATEWAY, SPRIG_TEST_MARIADB_SINGLE, SPRIG_TEST_MARIADB_REPLICATION, ...; tools/live/README.md"]
 #[tokio::test]
 async fn long_data_reaches_the_backend() {
     let Some(eps) = endpoints("long_data_reaches_the_backend") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     for (addr, persona, topo) in matrix(&eps) {
         let ctx = format!("{persona:?} {}", topo.user);
@@ -725,10 +730,11 @@ async fn long_data_reaches_the_backend() {
 /// A cursor: the execute returns only the column definitions with
 /// `CURSOR_EXISTS`, `COM_STMT_FETCH` the rows in batches on the same
 /// backend connection, the last batch has `LAST_ROW_SENT`.
+#[ignore = "live: needs SPRIG_TEST_GATEWAY, SPRIG_TEST_MARIADB_SINGLE, SPRIG_TEST_MARIADB_REPLICATION, ...; tools/live/README.md"]
 #[tokio::test]
 async fn cursors_and_fetch() {
     let Some(eps) = endpoints("cursors_and_fetch") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     for (addr, persona, topo) in matrix(&eps) {
         let ctx = format!("{persona:?} {}", topo.user);
@@ -815,10 +821,11 @@ async fn cursors_and_fetch() {
 
 /// `LOAD DATA LOCAL INFILE` streams the client's file; a client without
 /// `LOCAL_FILES` gets 3948 and nothing is loaded.
+#[ignore = "live: needs SPRIG_TEST_GATEWAY, SPRIG_TEST_MARIADB_SINGLE, SPRIG_TEST_MARIADB_REPLICATION, ...; tools/live/README.md"]
 #[tokio::test]
 async fn local_infile_allowed_and_refused() {
     let Some(eps) = endpoints("local_infile_allowed_and_refused") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     for (addr, persona, topo) in matrix(&eps) {
         let ctx = format!("{persona:?} {}", topo.user);
@@ -887,10 +894,11 @@ async fn local_infile_allowed_and_refused() {
 /// `KILL QUERY` from another session stops a running statement on the
 /// backend: the client gets 1317 at once, the session and its open
 /// transaction go on.
+#[ignore = "live: needs SPRIG_TEST_GATEWAY, SPRIG_TEST_MARIADB_SINGLE, SPRIG_TEST_MARIADB_REPLICATION, ...; tools/live/README.md"]
 #[tokio::test]
 async fn kill_query_mid_statement() {
     let Some(eps) = endpoints("kill_query_mid_statement") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     for (addr, persona, topo) in matrix(&eps) {
         let ctx = format!("{persona:?} {}", topo.user);
@@ -947,10 +955,11 @@ async fn kill_query_mid_statement() {
 /// Read-your-writes through the gateway: a read right after a write sees
 /// it, on every topology; on primary and replicas also while both
 /// replicas stop applying (the read then waits or goes to the primary).
+#[ignore = "live: needs SPRIG_TEST_GATEWAY, SPRIG_TEST_MARIADB_SINGLE, SPRIG_TEST_MARIADB_REPLICATION, ...; tools/live/README.md"]
 #[tokio::test]
 async fn read_your_writes_through_the_gateway() {
     let Some(eps) = endpoints("read_your_writes_through_the_gateway") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     for (addr, persona, topo) in matrix(&eps) {
         let ctx = format!("{persona:?} {}", topo.user);
@@ -1022,10 +1031,11 @@ async fn read_your_writes_through_the_gateway() {
 }
 
 /// `COM_FIELD_LIST`, `COM_INIT_DB` and `COM_RESET_CONNECTION`.
+#[ignore = "live: needs SPRIG_TEST_GATEWAY, SPRIG_TEST_MARIADB_SINGLE, SPRIG_TEST_MARIADB_REPLICATION, ...; tools/live/README.md"]
 #[tokio::test]
 async fn field_list_init_db_and_reset() {
     let Some(eps) = endpoints("field_list_init_db_and_reset") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     for (addr, persona, topo) in matrix(&eps) {
         let ctx = format!("{persona:?} {}", topo.user);
@@ -1112,10 +1122,11 @@ async fn field_list_init_db_and_reset() {
 }
 
 /// MariaDB's `COM_STMT_BULK_EXECUTE` on 3307.
+#[ignore = "live: needs SPRIG_TEST_GATEWAY, SPRIG_TEST_MARIADB_SINGLE, SPRIG_TEST_MARIADB_REPLICATION, ...; tools/live/README.md"]
 #[tokio::test]
 async fn bulk_execute_on_mariadb() {
     let Some(eps) = endpoints("bulk_execute_on_mariadb") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     for (addr, persona, topo) in matrix(&eps) {
         if persona != Persona::MariaDb {
@@ -1182,10 +1193,11 @@ async fn bulk_execute_on_mariadb() {
 /// session can ask for MariaDB's behaviour, and keeps it across pooled
 /// connections. Not on Galera, whose certification answers such conflicts
 /// itself.
+#[ignore = "live: needs SPRIG_TEST_GATEWAY, SPRIG_TEST_MARIADB_SINGLE, SPRIG_TEST_MARIADB_REPLICATION, ...; tools/live/README.md"]
 #[tokio::test]
 async fn snapshot_isolation_per_persona() {
     let Some(eps) = endpoints("snapshot_isolation_per_persona") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     for (addr, persona, topo) in matrix(&eps) {
         if topo.user == "app_galera" {
@@ -1275,10 +1287,11 @@ fn scalars(sets: &[Vec<Row>]) -> Vec<i64> {
 /// `CALL db.p()` made session tracking report an empty schema, which the
 /// gateway replayed as `USE` on the next backend connection: every later
 /// statement failed with 1046.
+#[ignore = "live: needs SPRIG_TEST_GATEWAY, SPRIG_TEST_MARIADB_SINGLE, SPRIG_TEST_MARIADB_REPLICATION, ...; tools/live/README.md"]
 #[tokio::test]
 async fn multi_statement_transactions_after_session_state() {
     let Some(eps) = endpoints("multi_statement_transactions_after_session_state") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     for (addr, persona, topo) in matrix(&eps) {
         let db = Db::create(&addr, topo.user, "gw_mtx").await;

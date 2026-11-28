@@ -149,10 +149,11 @@ fn token(d: &lapin::message::BasicGetMessage) -> String {
     }
 }
 
+#[ignore = "live: needs SPRIG_GATEWAY_RESTART; tools/live/README.md"]
 #[tokio::test]
 async fn survives_a_gateway_restart() {
     let (Some(conn), Some(restart)) = (amqp().await, var("SPRIG_GATEWAY_RESTART")) else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let q = uniq("restart");
     let ch = conn.create_channel().await.unwrap();
@@ -233,10 +234,11 @@ async fn survives_a_gateway_restart() {
     );
 }
 
+#[ignore = "live: needs SPRIG_AMQP_ADDR, SPRIG_AMQP_USER, SPRIG_AMQP_PASSWORD, ...; tools/live/README.md"]
 #[tokio::test]
 async fn transactional_publish_commits_or_rolls_back_with_the_data() {
     let (Some(conn), Some(mut db)) = (amqp().await, sql().await) else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let q = uniq("txpub");
     let t = uniq("orders");
@@ -308,10 +310,11 @@ async fn transactional_publish_commits_or_rolls_back_with_the_data() {
     eprintln!("transactional publish: rolled back = not delivered; committed = delivered once");
 }
 
+#[ignore = "live: needs SPRIG_AMQP_ADDR, SPRIG_AMQP_USER, SPRIG_AMQP_PASSWORD, ...; tools/live/README.md"]
 #[tokio::test]
 async fn ack_inside_a_transaction_commits_with_the_consumers_writes() {
     let (Some(conn), Some(mut db)) = (amqp().await, sql().await) else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let q = uniq("txack");
     let t = uniq("invoices");

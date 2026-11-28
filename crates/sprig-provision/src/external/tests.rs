@@ -335,11 +335,12 @@ async fn input_and_credentials_are_checked_before_probing() {
 /// The whole flow against the Compose single node, with root as both
 /// accounts (development): prechecks pass, the record is active with a
 /// profile; a powerless account fails with the exact missing items.
+#[ignore = "live: needs SPRIG_TEST_MARIADB_SINGLE; tools/live/README.md"]
 #[tokio::test]
 async fn registers_the_compose_single_node() {
     let Ok(url) = std::env::var("SPRIG_TEST_MARIADB_SINGLE") else {
         eprintln!("skipped: SPRIG_TEST_MARIADB_SINGLE is not set");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let opts = mysql_async::Opts::from_url(&url).unwrap();
     let addr = format!("{}:{}", opts.ip_or_hostname(), opts.tcp_port());
@@ -443,11 +444,12 @@ async fn registers_the_compose_single_node() {
 /// `sprig_repl`, on the Compose single node: the dump probe fails with
 /// 1227, registration still passes, the feed and the mover are
 /// `unsupported`, and the advisory names the grant.
+#[ignore = "live: needs SPRIG_TEST_MARIADB_SINGLE; tools/live/README.md"]
 #[tokio::test]
 async fn a_sprig_repl_without_replication_slave_leaves_the_feed_unsupported() {
     let Ok(url) = std::env::var("SPRIG_TEST_MARIADB_SINGLE") else {
         eprintln!("skipped: SPRIG_TEST_MARIADB_SINGLE is not set");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let opts = mysql_async::Opts::from_url(&url).unwrap();
     let addr = format!("{}:{}", opts.ip_or_hostname(), opts.tcp_port());

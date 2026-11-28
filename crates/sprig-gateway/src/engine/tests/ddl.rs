@@ -1118,7 +1118,7 @@ async fn a_sweep_deletes_what_dropped_tables_left_behind() {
 #[ignore = "reads a stopped node's engine directory named by RF_ENGINE_DIR"]
 async fn engine_dir_keys_per_object() {
     let (Ok(dir), Ok(t)) = (std::env::var("RF_ENGINE_DIR"), std::env::var("RF_TENANT")) else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let tenant: u64 = t.parse().unwrap();
     let e = open(std::path::Path::new(&dir), StoreKind::Rocks, SyncMode::Off);

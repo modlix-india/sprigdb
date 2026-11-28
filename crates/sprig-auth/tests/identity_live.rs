@@ -290,9 +290,12 @@ async fn world() -> Option<World> {
     })
 }
 
+#[ignore = "live: needs SPRIG_IDENTITY_LIVE, SPRIG_IDENTITY_TENANT, SPRIG_IDENTITY_TENANT_ID, ...; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn identity_live() {
-    let Some(w) = world().await else { return };
+    let Some(w) = world().await else {
+        panic!("live test run without its environment: see tools/live/README.md")
+    };
     let _ = &w.global;
     let pw = "Identity-pw-1";
 
@@ -567,11 +570,14 @@ async fn identity_live() {
 /// Account changes through `AccountOps`, with their audit events (an
 /// operator acting from tenant 0, above the tenant). Needs only the
 /// catalog and etcd.
+#[ignore = "live: needs SPRIG_IDENTITY_LIVE, SPRIG_IDENTITY_TENANT, SPRIG_IDENTITY_TENANT_ID, ...; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn identity_live_account_ops() {
     use sprig_auth::admin::AccountOps;
     use sprig_auth::audit::{Actor, MemoryAudit};
-    let Some(w) = world().await else { return };
+    let Some(w) = world().await else {
+        panic!("live test run without its environment: see tools/live/README.md")
+    };
     let audit = MemoryAudit::new();
     let ops = AccountOps {
         cat: &w.auth,

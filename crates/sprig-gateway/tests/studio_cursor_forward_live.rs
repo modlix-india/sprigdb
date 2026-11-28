@@ -220,11 +220,12 @@ async fn forwarded_total(telemetry: Option<&str>) -> Option<f64> {
     )
 }
 
+#[ignore = "live: needs SPRIG_TEST_CF_SQL; tools/live/README.md"]
 #[tokio::test]
 async fn studio_cursor_forwarded_with_a_bearer_token() {
     let Ok(sql) = std::env::var("SPRIG_TEST_CF_SQL") else {
         eprintln!("skipped: set SPRIG_TEST_CF_SQL");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let (gw_a, gw_b) = (
         var("SPRIG_TEST_CF_HTTP_A", "127.0.0.1:44080"),

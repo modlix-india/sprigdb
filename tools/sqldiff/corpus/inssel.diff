@@ -1,0 +1,29 @@
+# INSERT ... SELECT into engine tables (base and temporary): rows, conversions, errors, self-insert, transactions.
+x:DROP TABLE IF EXISTS is_a
+x:DROP TABLE IF EXISTS is_b
+q:CREATE TABLE is_a (id INT PRIMARY KEY, v VARCHAR(10), n DECIMAL(6,2))
+q:INSERT INTO is_a VALUES (1,'one',1.5),(2,'two',2.25),(3,'three',NULL)
+q:CREATE TABLE is_b (id INT AUTO_INCREMENT PRIMARY KEY, v VARCHAR(3), n INT, k INT DEFAULT 7)
+q:INSERT INTO is_b (v, n) SELECT v, n FROM is_a ORDER BY id
+q:SHOW WARNINGS
+q:SELECT * FROM is_b ORDER BY id
+q:INSERT INTO is_b (v, n) SELECT v, n FROM is_a WHERE id > 5
+q:INSERT INTO is_b (v, n) SELECT 'x', 1
+q:INSERT INTO is_b SELECT id + 10, v, NULL, 1 FROM is_a WHERE id = 1
+q:INSERT INTO is_b (v) SELECT v, n FROM is_a
+q:INSERT INTO is_b (id, v) SELECT id, v FROM is_a WHERE id = 1
+q:INSERT INTO is_b (nosuch) SELECT 1
+q:INSERT INTO is_b (v, n) SELECT a.v, COUNT(*) FROM is_a a JOIN is_b b ON b.v = a.v GROUP BY a.v ORDER BY a.v
+q:INSERT INTO is_a SELECT id + 100, v, n FROM is_a
+q:SELECT COUNT(*) FROM is_a
+q:BEGIN
+q:INSERT INTO is_b (v) SELECT v FROM is_a WHERE id = 2
+q:ROLLBACK
+q:SELECT COUNT(*) FROM is_b
+q:CREATE TEMPORARY TABLE is_t (id INT, v VARCHAR(10))
+q:INSERT INTO is_t SELECT id, v FROM is_a WHERE id < 100
+q:INSERT INTO is_b (v, n) SELECT v, id FROM is_t WHERE id = 3
+q:SELECT t.id, t.v, a.n FROM is_t t JOIN is_a a USING (id) ORDER BY t.id
+q:SELECT * FROM is_b ORDER BY id
+x:DROP TABLE IF EXISTS is_a
+x:DROP TABLE IF EXISTS is_b

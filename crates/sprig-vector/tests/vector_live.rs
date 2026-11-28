@@ -114,6 +114,7 @@ fn ids(o: &sprig_vector::SearchOutcome) -> Vec<Vec<u8>> {
     o.hits.iter().map(|h| h.id.clone()).collect()
 }
 
+#[ignore = "live: needs SPRIG_TEST_KV_MYSQL; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn search_against_brute_force() {
     let Some(url) = std::env::var("SPRIG_TEST_KV_MYSQL")
@@ -121,7 +122,7 @@ async fn search_against_brute_force() {
         .filter(|s| !s.is_empty())
     else {
         eprintln!("SPRIG_TEST_KV_MYSQL not set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let mut sql = My(
         mysql_async::Conn::new(mysql_async::Opts::from_url(&url).unwrap())
@@ -484,6 +485,7 @@ async fn search_against_brute_force() {
 /// HNSW recall on a harder set: 20,000 uniform random vectors of 64
 /// dimensions (a hard case: no clusters), at `ef` 20, 64 (the default),
 /// 200 and 1000, with latencies against exact search. Reports only.
+#[ignore = "live: needs SPRIG_TEST_KV_MYSQL; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn recall_at_scale() {
     let Some(url) = std::env::var("SPRIG_TEST_KV_MYSQL")
@@ -491,7 +493,7 @@ async fn recall_at_scale() {
         .filter(|s| !s.is_empty())
     else {
         eprintln!("SPRIG_TEST_KV_MYSQL not set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let db = "r6models_vec2";
     let mut sql = My(

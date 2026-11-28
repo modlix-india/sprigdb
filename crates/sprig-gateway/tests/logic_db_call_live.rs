@@ -172,10 +172,11 @@ const CALLER: &str = "export default function (x) {
   return { e: p.event, price: p.fields.price, cheap: p.fields.cheap, why: p.fields.why, took, err, checks };
 }";
 
+#[ignore = "live: needs SPRIG_TEST_LOGIC_GATEWAY, SPRIG_TEST_LOGIC_USER, SPRIG_TEST_LOGIC_PASSWORD; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn compiled_calls_and_publishes_run_the_same_everywhere() {
     let Some(mut c) = connect_as("compiled_calls_and_publishes", None).await else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let started = Instant::now();
     let mut ck = Checks {

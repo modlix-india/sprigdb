@@ -107,10 +107,11 @@ impl Checks {
     }
 }
 
+#[ignore = "live: needs SPRIG_TEST_LOGIC_GATEWAY, SPRIG_TEST_LOGIC_USER, SPRIG_TEST_LOGIC_PASSWORD, ...; tools/live/README.md"]
 #[tokio::test]
 async fn nested_calls_run_inside_the_callers_wall_budget() {
     let Some(mut c) = connect("nested_calls_run_inside_the_callers_wall_budget").await else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     must(&mut c, &format!("DROP DATABASE IF EXISTS {DB}")).await;
     must(&mut c, &format!("CREATE DATABASE {DB}")).await;
@@ -170,10 +171,11 @@ async fn nested_calls_run_inside_the_callers_wall_budget() {
     assert!(ck.failed.is_empty(), "{:#?}", ck.failed);
 }
 
+#[ignore = "live: needs SPRIG_TEST_LOGIC_GATEWAY, SPRIG_TEST_LOGIC_USER, SPRIG_TEST_LOGIC_PASSWORD, ...; tools/live/README.md"]
 #[tokio::test]
 async fn many_short_statements_stop_at_the_budget() {
     let Some(mut c) = connect("many_short_statements_stop_at_the_budget").await else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let db = "sf14_budget";
     must(&mut c, &format!("DROP DATABASE IF EXISTS {db}")).await;
@@ -282,10 +284,11 @@ async fn many_short_statements_stop_at_the_budget() {
     assert!(ck.failed.is_empty(), "{:#?}", ck.failed);
 }
 
+#[ignore = "live: needs SPRIG_TEST_LOGIC_GATEWAY, SPRIG_TEST_LOGIC_USER, SPRIG_TEST_LOGIC_PASSWORD, ...; tools/live/README.md"]
 #[tokio::test]
 async fn validations_triggers_and_schedules_keep_their_budgets() {
     let Some(mut c) = connect("validations_triggers_and_schedules_keep_their_budgets").await else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let db = "sf14_bound";
     must(&mut c, &format!("DROP DATABASE IF EXISTS {db}")).await;

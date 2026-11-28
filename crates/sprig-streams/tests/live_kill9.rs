@@ -105,7 +105,7 @@ fn produce_req(topic: &str, records: Vec<u8>) -> ProduceRequest {
 async fn acknowledged_produces_survive_a_gateway_kill9() {
     let Some(crash) = env("SPRIG_GATEWAY_CRASH") else {
         println!("skipped: set SPRIG_GATEWAY_CRASH");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let db = env("SPRIG_LIVE_KAFKA_DB").unwrap();
     let topic = format!("{db}.kill9_{}", std::process::id());

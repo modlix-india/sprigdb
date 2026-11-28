@@ -9,10 +9,23 @@
 //!   account; anything else that names `sprig_docs` is refused.
 //! - [`page`]: `GET /v1/docs/pages/{page}`: one page's chunks in page
 //!   order and its Markdown rebuilt from them, for Studio's Docs panel.
+//! - [`memsql`]: `sprig_docs.chunks` over the local pack, as an in-memory
+//!   table the engine's planner runs.
 //! - [`embed`]: the query embedding model, loaded on first use.
 //! - [`http`]: the REST handlers.
 //!
-//! **Reads.** Every read goes through `sprig_docs_r`, the docs-reader
+//! **The local pack.** Every gateway reads its own release's docs pack
+//! (`docs.pack_path`, else `sprig-docs-<version>.pack` next to the binary)
+//! into memory when it starts ([`sprig_docs::index::DocsIndex`]: the
+//! pack's checksum verified, BM25 and the vectors in memory), and looks
+//! at the file again every minute, so a new pack is read without a
+//! restart. Searches, pages and the `sprig_docs` database are answered
+//! from it; nothing is written, so it is read-only by construction. This
+//! is how docs work on engine nodes, which have no MariaDB cluster.
+//!
+//! **Clusters (MariaDB deployments only).** Without a local pack, or for
+//! another release than the local one, reads go to the clusters the
+//! controller loaded. Every read goes through `sprig_docs_r`, the docs-reader
 //! account (`sprig_provision::docs_account`), which can `SELECT` from
 //! `__sprig_docs` and nothing else; never through a tenant's account,
 //! which has no grant there. The cluster is the caller's tenant's
@@ -23,6 +36,7 @@
 
 pub mod embed;
 pub mod http;
+pub mod memsql;
 pub mod page;
 pub mod search;
 pub mod sql;
@@ -31,8 +45,8 @@ use sprig_catalog::pool_wait::Bounded as _;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock};
+use std::time::{Duration, Instant, SystemTime};
 
 use mysql_async::prelude::Queryable;
 use mysql_async::{Conn, OptsBuilder, Pool, PoolConstraints, PoolOpts};
@@ -40,6 +54,7 @@ use sprig_cluster::record::AdminState;
 use sprig_cluster::registry::ClusterRegistry;
 use sprig_common::ids::{ClusterId, DcId, TenantId};
 use sprig_common::{Result, SprigCode, SprigError};
+use sprig_docs::index::DocsIndex;
 use sprig_docs::settings as keys;
 use sprig_docs::table;
 use sprig_settings::{LiveSettings, SettingCtx};
@@ -52,11 +67,20 @@ const POOL_MAX: usize = 4;
 const READY_TTL: Duration = Duration::from_secs(30);
 /// The longest wait for a reader connection.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// How often the local pack's file is looked at again.
+pub const LOCAL_RECHECK: Duration = Duration::from_secs(60);
+
+/// A file's length and change time, when it can be read.
+fn file_stamp(path: &std::path::Path) -> Option<(u64, SystemTime)> {
+    let m = std::fs::metadata(path).ok()?;
+    Some((m.len(), m.modified().ok()?))
+}
 
 static SERVICE: OnceLock<Arc<DocsService>> = OnceLock::new();
 
 /// Makes `svc` the process's docs service (once; later calls are ignored).
 pub fn install(svc: Arc<DocsService>) {
+    svc.preload();
     let _ = SERVICE.set(svc);
 }
 
@@ -92,7 +116,16 @@ pub struct DocsService {
     /// Searches are keyword-only for want of the model (for the event on
     /// each change).
     degraded: AtomicBool,
+    /// The local pack, once read.
+    local: RwLock<Option<Arc<DocsIndex>>>,
+    /// The file last read (or tried): its path, length and change time,
+    /// and when it was looked at.
+    local_file: Mutex<Option<LocalFile>>,
 }
+
+/// The local pack's path, its length and change time, and when it was
+/// looked at.
+type LocalFile = (PathBuf, Option<(u64, SystemTime)>, Instant);
 
 impl std::fmt::Debug for DocsService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -137,7 +170,133 @@ impl DocsService {
             clusters: Mutex::new(None),
             model: embed::Model::default(),
             degraded: AtomicBool::new(false),
+            local: RwLock::new(None),
+            local_file: Mutex::new(None),
         })
+    }
+
+    /// Reads the local pack in the background now (call once the service
+    /// is shared), so the first search doesn't wait for it.
+    pub fn preload(self: &Arc<Self>) {
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            let me = Arc::clone(self);
+            rt.spawn_blocking(move || {
+                let _ = me.local();
+            });
+        }
+    }
+
+    /// `docs.pack_path`, else this release's pack next to the binary.
+    #[must_use]
+    pub fn pack_path(&self) -> PathBuf {
+        let set = self.get(&keys::PACK_PATH);
+        if set.trim().is_empty() {
+            let name = keys::pack_file_name(env!("CARGO_PKG_VERSION"));
+            keys::next_to_binary(&name).unwrap_or_else(|| PathBuf::from(name))
+        } else {
+            PathBuf::from(set.trim())
+        }
+    }
+
+    /// The local pack, read (or read again when its file changed) at most
+    /// every [`LOCAL_RECHECK`]; `None` when docs are off or there is no
+    /// good pack. Reading takes a fraction of a second: the first call
+    /// blocks (see [`DocsService::preload`]).
+    #[must_use]
+    pub fn local(&self) -> Option<Arc<DocsIndex>> {
+        if !self.enabled() {
+            return None;
+        }
+        let path = self.pack_path();
+        let current = self
+            .local
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        {
+            let mut f = self
+                .local_file
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            match &mut *f {
+                Some((p, _, at)) if *p == path && at.elapsed() < LOCAL_RECHECK => {
+                    return current;
+                }
+                Some((p, stamp, at)) if *p == path => {
+                    *at = Instant::now();
+                    let now = file_stamp(&path);
+                    if now == *stamp && (current.is_some() || now.is_none()) {
+                        return current;
+                    }
+                    *stamp = now;
+                }
+                _ => *f = Some((path.clone(), file_stamp(&path), Instant::now())),
+            }
+        }
+        // A pack already served: the new one is read in the background, and
+        // the old one answers meanwhile.
+        if current.is_some()
+            && let Ok(rt) = tokio::runtime::Handle::try_current()
+            && let Some(svc) = service()
+        {
+            rt.spawn_blocking(move || {
+                let _ = svc.read_pack(&path, None);
+            });
+            return current;
+        }
+        self.read_pack(&path, current)
+    }
+
+    /// Reads the pack at `path` into memory and serves it; on failure the
+    /// one served now (`current`) stays.
+    fn read_pack(
+        &self,
+        path: &std::path::Path,
+        current: Option<Arc<DocsIndex>>,
+    ) -> Option<Arc<DocsIndex>> {
+        let current = current.or_else(|| {
+            self.local
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+        });
+        let started = Instant::now();
+        match DocsIndex::load(path) {
+            Ok(ix) => {
+                let ix = Arc::new(ix);
+                let sha = sprig_docs::pack::hex(ix.sha256());
+                if ix.version() != env!("CARGO_PKG_VERSION") {
+                    tracing::warn!(pack = %path.display(), version = ix.version(),
+                        "the docs pack describes another release than this binary's");
+                }
+                tracing::info!(event = "docs.pack.loaded", pack = %path.display(),
+                    version = ix.version(), sha256 = %sha, chunks = ix.chunks().len(),
+                    seconds = started.elapsed().as_secs_f64(), "docs pack read into memory");
+                metrics::gauge!("sprig_docs_pack_info", "version" => ix.version().to_owned(), "sha" => sha)
+                    .set(1.0);
+                metrics::histogram!("sprig_docs_load_seconds")
+                    .record(started.elapsed().as_secs_f64());
+                *self.local.write().unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(&ix));
+                Some(ix)
+            }
+            Err(why) => {
+                if current.is_none() {
+                    tracing::warn!(event = "docs.pack.unavailable", error = %why,
+                        "no docs pack to serve from memory");
+                } else {
+                    tracing::warn!(event = "docs.pack.unavailable", error = %why,
+                        "the docs pack changed and doesn't read; the one read before is kept");
+                }
+                current
+            }
+        }
+    }
+
+    /// The local pack when it is the release asked for (any, for `None`).
+    #[must_use]
+    pub fn local_for(&self, version: Option<&str>) -> Option<Arc<DocsIndex>> {
+        self.local()
+            .filter(|ix| version.is_none_or(|v| v == ix.version()))
     }
 
     fn get<T: sprig_settings::SettingValue>(&self, s: &sprig_settings::Setting<T>) -> T {

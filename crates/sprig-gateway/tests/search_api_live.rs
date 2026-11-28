@@ -80,11 +80,12 @@ fn ids(v: &Value) -> Vec<i64> {
         .collect()
 }
 
+#[ignore = "live: needs SPRIG_TEST_SEARCH_API; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn search_query_over_rest_and_grpc() {
     let Ok(v) = std::env::var(VAR) else {
         eprintln!("{VAR} not set; skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let (mysql, http) = v.split_once(',').expect("mysql,http");
     let url = format!("mysql://{USER}:{PASSWORD}@{mysql}");

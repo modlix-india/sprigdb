@@ -53,6 +53,43 @@ const ADDR_TTL: Duration = Duration::from_secs(2);
 /// Bytes read from the client per up frame.
 const CHUNK: usize = 32 * 1024;
 
+/// How long a node that accepted a forwarded connection of a tenant this
+/// node holds no replica of is tried first for the tenant's next ones.
+const LEARNED_TTL: Duration = Duration::from_secs(10);
+
+/// Per tenant: the node that last accepted a forwarded connection of it
+/// when that wasn't the node first tried (the unit's leader moved away
+/// from its home), and when.
+fn learned() -> &'static Mutex<HashMap<u64, (u64, Instant)>> {
+    static L: OnceLock<Mutex<HashMap<u64, (u64, Instant)>>> = OnceLock::new();
+    L.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The node `tenant`'s connections went to last, while that is recent.
+fn learned_leader(tenant: u64) -> Option<u64> {
+    let mut m = learned().lock().unwrap_or_else(PoisonError::into_inner);
+    match m.get(&tenant) {
+        Some((n, at)) if at.elapsed() < LEARNED_TTL => Some(*n),
+        Some(_) => {
+            m.remove(&tenant);
+            None
+        }
+        None => None,
+    }
+}
+
+fn learn_leader(tenant: u64, node: Option<u64>) {
+    let mut m = learned().lock().unwrap_or_else(PoisonError::into_inner);
+    match node {
+        Some(n) => {
+            m.insert(tenant, (n, Instant::now()));
+        }
+        None => {
+            m.remove(&tenant);
+        }
+    }
+}
+
 /// What forwarding needs from the running node.
 pub struct Host {
     /// The client listeners: a forwarded connection is served by the
@@ -153,6 +190,17 @@ pub enum Route {
     Node(u64),
 }
 
+/// Whether this node holds a replica of `tenant`'s unit but knows no leader
+/// of it: cut off from the other replicas (its Raft links down), or an
+/// election is running.
+#[must_use]
+pub(crate) fn leaderless_here(tenant: u64) -> bool {
+    let unit = sprig_engine::Engine::unit_of_tenant(tenant).0;
+    node_engine::engine_raft()
+        .and_then(|r| r.node().status(unit))
+        .is_some_and(|st| !st.is_leader && st.leader.is_none())
+}
+
 /// Whether this process forwards at all: a replicated engine node with the
 /// peer service's host set.
 #[must_use]
@@ -179,6 +227,15 @@ pub async fn route(tenant: u64, protocol: Protocol) -> Route {
             _ => return Route::Here,
         }
     }
+    // A node without a replica knows the tenant's leader only from the
+    // unit's descriptor (its home): one that recently took a connection
+    // the home didn't goes first.
+    if !holds_replica(tenant)
+        && let Some(n) = learned_leader(tenant)
+        && n != me
+    {
+        return Route::Node(n);
+    }
     let deadline = Instant::now() + LEADER_WAIT;
     loop {
         match node_engine::tenant_leader(tenant) {
@@ -193,6 +250,15 @@ pub async fn route(tenant: u64, protocol: Protocol) -> Route {
                     .or_else(|| node_engine::unit_directory().and_then(|d| d.get(tenant)))
                 {
                     Some(d) if d.home != me => Route::Node(d.home),
+                    // The home is this node, which knows no leader (cut off
+                    // from the other replicas, or electing): another voter
+                    // may know one; the hand-off tries them in turn.
+                    Some(d) if leaderless_here(tenant) => d
+                        .voters
+                        .iter()
+                        .copied()
+                        .find(|v| *v != me)
+                        .map_or(Route::Here, Route::Node),
                     _ => Route::Here,
                 };
             }
@@ -398,42 +464,77 @@ type Opened = (
 );
 
 /// Opens the splice for `h`: from `h.to`, and when that node can't be
-/// reached (it died; this node's idea of the leader is stale), from each
-/// other voter of the tenant's unit in turn, any of which redirects to the
-/// leader it knows.
+/// reached (it died; this node's idea of the leader is stale) or holds a
+/// replica but knows no leader (it is cut off from the other replicas, or
+/// an election runs), from each other voter of the tenant's unit in turn,
+/// any of which redirects to the leader it knows. Nodes that knew no
+/// leader are asked again, every 100 ms for up to 2 s (an election ends);
+/// unreachable ones aren't.
 async fn dial(host: &Host, h: &Handoff) -> Result<Opened> {
     let me = node_engine::raft_id_from_env().unwrap_or(0);
     let voters = node_engine::unit_directory()
         .and_then(|d| d.get(h.tenant))
         .map(|d| d.voters)
         .unwrap_or_default();
-    let mut tried = vec![h.to];
+    let mut order = vec![h.to];
+    order.extend(voters.iter().copied().filter(|v| *v != me && *v != h.to));
+    let deadline = Instant::now() + LEADER_WAIT;
+    let mut unreachable: Vec<u64> = Vec::new();
     let mut first: Option<SprigError> = None;
-    let mut to = h.to;
     loop {
-        match dial_from(host, h, to).await {
-            Ok(o) => return Ok(o),
-            Err(e) if e.code() == Some(SprigCode::ForwardFailed) => {
-                let next = voters
-                    .iter()
-                    .copied()
-                    .find(|v| *v != me && !tried.contains(v));
-                let e = first.take().unwrap_or(e);
-                let Some(n) = next else { return Err(e) };
-                tracing::debug!(tenant = h.tenant, from = to, to = n, error = %e,
-                    "forwarding: node unreachable; trying another voter");
-                first = Some(e);
-                tried.push(n);
-                to = n;
+        let mut leaderless = false;
+        let round: Vec<u64> = order
+            .iter()
+            .copied()
+            .filter(|n| !unreachable.contains(n))
+            .collect();
+        for to in round {
+            match dial_from(host, h, to).await {
+                Ok((o, at)) => {
+                    // Not where the descriptor pointed: the next
+                    // connections of a tenant this node holds no replica
+                    // of go straight there.
+                    if !holds_replica(h.tenant) {
+                        let hinted = learned_leader(h.tenant).is_some();
+                        learn_leader(h.tenant, (at != h.to || hinted).then_some(at));
+                    }
+                    return Ok(o);
+                }
+                Err(e) if e.code() == Some(SprigCode::ShardMoved) => {
+                    metrics::counter!("sprig_node_locator_corrections_total", "reason" => "no_leader")
+                        .increment(1);
+                    tracing::debug!(tenant = h.tenant, node = to, error = %e,
+                        "forwarding: the node knows no leader; trying another voter");
+                    leaderless = true;
+                    first.get_or_insert(e);
+                }
+                Err(e) if e.code() == Some(SprigCode::ForwardFailed) => {
+                    tracing::debug!(tenant = h.tenant, node = to, error = %e,
+                        "forwarding: node unreachable; trying another voter");
+                    unreachable.push(to);
+                    first.get_or_insert(e);
+                }
+                Err(e) => return Err(e),
             }
-            Err(e) => return Err(e),
         }
+        if !leaderless || Instant::now() >= deadline {
+            let e = first.unwrap_or_else(|| failed("no node accepted the connection"));
+            return Err(if e.code() == Some(SprigCode::ShardMoved) {
+                failed(format!(
+                    "no replica of the tenant's unit knows its leader yet; retry ({})",
+                    e.message
+                ))
+            } else {
+                e
+            });
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
 /// Opens the splice for `h` at node `start`, following redirects: the up
-/// sender and the down stream once a node accepted.
-async fn dial_from(host: &Host, h: &Handoff, start: u64) -> Result<Opened> {
+/// sender and the down stream once a node accepted, and that node.
+async fn dial_from(host: &Host, h: &Handoff, start: u64) -> Result<(Opened, u64)> {
     let me = node_engine::raft_id_from_env().unwrap_or(0);
     let mut to = start;
     let mut hops = 0;
@@ -495,8 +596,10 @@ async fn dial_from(host: &Host, h: &Handoff, start: u64) -> Result<Opened> {
             }
         };
         match first.msg {
-            Some(splice_down::Msg::Accepted(_)) => return Ok((tx, resp)),
+            Some(splice_down::Msg::Accepted(_)) => return Ok(((tx, resp), to)),
             Some(splice_down::Msg::Redirect(n)) if hops + 1 < MAX_HOPS && n != me => {
+                metrics::counter!("sprig_node_locator_corrections_total", "reason" => "not_leader")
+                    .increment(1);
                 tracing::debug!(
                     tenant = h.tenant,
                     from = to,

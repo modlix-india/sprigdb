@@ -222,12 +222,13 @@ fn pipelines() -> Vec<(&'static str, Vec<Document>, bool)> {
     ]
 }
 
+#[ignore = "live: needs SPRIG_TEST_MONGO_URI, SPRIG_TEST_MONGO_REF_URI; tools/live/README.md"]
 #[tokio::test]
 async fn spill_matches_mongodb() {
     let (Some(gw), Some(rf)) = (var("SPRIG_TEST_MONGO_URI"), var("SPRIG_TEST_MONGO_REF_URI"))
     else {
         eprintln!("SPRIG_TEST_MONGO_URI / SPRIG_TEST_MONGO_REF_URI not set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let bytes: i64 = var("SPRIG_TEST_SPILL_STAGE_BYTES").map_or(1 << 20, |s| s.parse().unwrap());
     let n: i64 = var("SPRIG_TEST_SPILL_DOCS").map_or(20_000, |s| s.parse().unwrap());
@@ -375,11 +376,12 @@ fn files(dir: &str) -> usize {
     n
 }
 
+#[ignore = "live: needs SPRIG_TEST_MONGO_URI, SPRIG_TEST_SPILL_DIR; tools/live/README.md"]
 #[tokio::test]
 async fn spill_files_go_away() {
     let (Some(gw), Some(dir)) = (var("SPRIG_TEST_MONGO_URI"), var("SPRIG_TEST_SPILL_DIR")) else {
         eprintln!("SPRIG_TEST_MONGO_URI / SPRIG_TEST_SPILL_DIR not set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let g = client(&gw).await;
     let db = g.database("m5_spill_files");
@@ -425,11 +427,12 @@ async fn spill_files_go_away() {
     let _ = db.drop().await;
 }
 
+#[ignore = "live: needs SPRIG_TEST_MONGO_URI; tools/live/README.md"]
 #[tokio::test]
 async fn group_over_100_mb() {
     let Some(gw) = var("SPRIG_TEST_MONGO_URI") else {
         eprintln!("SPRIG_TEST_MONGO_URI not set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     if var("SPRIG_TEST_SPILL_BIG").is_none() {
         eprintln!("SPRIG_TEST_SPILL_BIG not set: skipped");

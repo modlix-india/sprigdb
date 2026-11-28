@@ -665,7 +665,7 @@ async fn record(
     physical: Value,
     state: InstanceState,
 ) -> Result<()> {
-    let store = MsgStore::new(Arc::clone(&svc.records), t);
+    let store = MsgStore::new(Arc::clone(&svc.writers), t);
     if store.instance(s.key()).await?.is_none() {
         let id = svc.catalog.backend().next_object_id(t).await?.0;
         store
@@ -725,7 +725,7 @@ async fn ensure_one(
     }
     let sig = signature(chain, s, &conns);
     let row = {
-        let store = MsgStore::new(Arc::clone(&svc.records), t);
+        let store = MsgStore::new(Arc::clone(&svc.writers), t);
         store.instance(s.key()).await?
     };
     let phys = row.as_ref().and_then(|r| r.physical.clone());
@@ -1024,13 +1024,10 @@ pub async fn drop_instance(
     s: &Definition,
     conn_names: &[String],
 ) -> Result<bool> {
-    let ep = svc.locator.writer(t).await?;
-    let conn = ep.pool.get_conn_bounded().await.map_err(cat_err)?;
-    let store = MsgStore::new(Arc::clone(&svc.records), t);
+    let store = MsgStore::new(Arc::clone(&svc.writers), t);
     let Some(row) = store.instance(s.key()).await? else {
         return Ok(false);
     };
-    drop(conn);
     let spec: SinkSpec = serde_json::from_value(s.definition.clone()).unwrap_or_default();
     let cat = catalog(svc, t).await?;
     let run_as = sprig_auth::cache::TenantAuth::of(&cat).and_then(|a| {
@@ -1138,7 +1135,7 @@ pub(crate) async fn drop_instance_rows(
     t: TenantId,
     sink: u64,
 ) -> Result<usize> {
-    let store = MsgStore::new(Arc::clone(&svc.records), t);
+    let store = MsgStore::new(Arc::clone(&svc.writers), t);
     let mut n = 0;
     for i in store.instances().await? {
         let of_sink = i
@@ -1165,9 +1162,7 @@ pub(crate) async fn stale_instance_rows(
     svc: &Arc<TenantServices>,
     t: TenantId,
 ) -> Result<Vec<DefKey>> {
-    let ep = svc.locator.writer(t).await?;
-    let conn = ep.pool.get_conn_bounded().await.map_err(cat_err)?;
-    let store = MsgStore::new(Arc::clone(&svc.records), t);
+    let store = MsgStore::new(Arc::clone(&svc.writers), t);
     let rows: Vec<DefKey> = store
         .instances()
         .await?
@@ -1175,7 +1170,6 @@ pub(crate) async fn stale_instance_rows(
         .filter(|i| i.kind == DefKind::Sink)
         .map(|i| i.def)
         .collect();
-    drop(conn);
     if rows.is_empty() {
         return Ok(rows);
     }
@@ -1207,13 +1201,10 @@ pub(crate) async fn delete_instance_row(
     t: TenantId,
     k: DefKey,
 ) -> Result<()> {
-    let ep = svc.locator.writer(t).await?;
-    let conn = ep.pool.get_conn_bounded().await.map_err(cat_err)?;
-    let store = MsgStore::new(Arc::clone(&svc.records), t);
+    let store = MsgStore::new(Arc::clone(&svc.writers), t);
     let Some(row) = store.instance(k).await? else {
         return Ok(());
     };
-    drop(conn);
     let ids: Vec<u64> = row
         .physical
         .as_ref()
@@ -1374,7 +1365,7 @@ pub async fn unindexed_members(
             continue;
         }
         let r = async {
-            let store = MsgStore::new(Arc::clone(&svc.records), t);
+            let store = MsgStore::new(Arc::clone(&svc.writers), t);
             Ok::<bool, SprigError>(store.instance(s.key()).await?.is_some())
         }
         .await;
@@ -1616,7 +1607,7 @@ impl Host for DeployHost {
         }
         let v = c.commit().await?;
         sprig_sinks::sql::after_commit(
-            &sprig_sinks::store::SinksStore::new(Arc::clone(&self.svc.records), tenant),
+            &sprig_sinks::store::SinksStore::new(Arc::clone(&self.svc.writers), tenant),
             &change,
         )
         .await?;
@@ -1630,7 +1621,7 @@ impl Host for DeployHost {
     }
 
     async fn tasks(&mut self, sink: SinkId) -> Result<Vec<TaskRow>> {
-        sprig_sinks::store::SinksStore::new(Arc::clone(&self.svc.records), self.cat.tenant)
+        sprig_sinks::store::SinksStore::new(Arc::clone(&self.svc.writers), self.cat.tenant)
             .tasks(sink)
             .await
     }
@@ -1638,7 +1629,7 @@ impl Host for DeployHost {
     async fn live_states(
         &mut self,
     ) -> Result<std::collections::HashMap<u64, (SinkState, Option<String>)>> {
-        sprig_sinks::store::SinksStore::new(Arc::clone(&self.svc.records), self.cat.tenant)
+        sprig_sinks::store::SinksStore::new(Arc::clone(&self.svc.writers), self.cat.tenant)
             .states()
             .await
     }
@@ -1667,7 +1658,7 @@ impl Host for DeployHost {
     }
 
     async fn function_source(&mut self, db: u32, name: &str) -> Result<Option<(String, String)>> {
-        let mut c = self.svc.records.begin(self.cat.tenant).await?;
+        let mut c = self.svc.writers.begin(self.cat.tenant).await?;
         Ok(sprig_sinks::transform::source_of(&mut *c, db, name)
             .await?
             .map(|(runtime, _, source, _)| (runtime, source)))

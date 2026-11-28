@@ -3,8 +3,9 @@
 //! ```text
 //! spawn(services, login, engine): one task per process
 //!   every tick (1 s; SPRIGDB_SQL_EVENTS_TICK_MS), for each tenant whose
-//!   catalog this process has loaded and whose unit is led here (or has
-//!   no single leader):
+//!   unit this node leads (crate::led; every tenant on an engine that
+//!   doesn't replicate) and whose catalog has events, loaded here on
+//!   demand whether or not a client of it reached this process:
 //!     each ENABLED event whose latest run time is after its last run:
 //!       a run, in its own task: a fresh session as the event's definer
 //!       (as the logic peer service opens one), and in it the marked
@@ -15,12 +16,11 @@
 //!     with ON COMPLETION PRESERVE, in a session as its definer
 //! ```
 //!
-//! Runs missed while no process led the tenant (or before it was loaded
-//! here) are skipped, as the servers skip runs missed while their
+//! Runs missed while no process led the tenant are skipped, as the servers skip runs missed while their
 //! scheduler was off. A run's errors go to this process's log with the
 //! event's name; no client sees them.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,7 +32,6 @@ use tokio::sync::mpsc;
 use crate::engine::routine::event::{self, EvDef};
 use crate::engine::routine::parse::EvStatus;
 use crate::http::sql::{Caller, SqlCall, SqlEngine, collect};
-use crate::node_engine::{self, UnitLeader};
 use crate::tenant::TenantServices;
 
 /// The tick, in milliseconds (tests shorten it).
@@ -95,9 +94,8 @@ pub(crate) fn spawn(
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .map_or(Duration::from_secs(1), Duration::from_millis);
-    let mut loads = svc.cache.loads();
+    let mut led = crate::led::Led::new(&svc);
     tokio::spawn(async move {
-        let mut tenants: BTreeSet<u64> = BTreeSet::new();
         // The last run time of each event (or where catching up starts).
         let mut last: HashMap<Key, i64> = HashMap::new();
         // Events whose completion was sent (until the catalog drops them
@@ -108,26 +106,18 @@ pub(crate) fn spawn(
         loop {
             tokio::select! {
                 () = stop.cancelled() => return,
-                l = loads.recv() => {
-                    if let Ok(l) = l {
-                        tenants.insert(l.tenant.0);
-                    }
-                    continue;
-                }
+                _ = led.changed() => continue,
                 _ = timer.tick() => {}
             }
             let now = unix_now();
             let mut seen: HashSet<Key> = HashSet::new();
-            for &t in &tenants {
-                if !matches!(
-                    node_engine::tenant_leader(t),
-                    UnitLeader::Here | UnitLeader::Any
-                ) {
-                    continue;
-                }
-                let Some(cat) = svc.cache.cached(TenantId(t)) else {
-                    continue;
-                };
+            let cats = led
+                .catalogs(&svc, |cat| {
+                    crate::engine::catalog::of(cat).is_some_and(|e| !e.events.is_empty())
+                })
+                .await;
+            for cat in cats {
+                let t = cat.tenant.0;
                 let Some(eng) = crate::engine::catalog::of(&cat) else {
                     continue;
                 };
@@ -172,7 +162,10 @@ pub(crate) fn spawn(
                     tokio::spawn(job.run(runs.is_some(), complete));
                 }
             }
-            last.retain(|k, _| seen.contains(k) || !tenants.contains(&k.0));
+            // A tenant no longer led here (or not looked at this tick)
+            // starts over when it comes back: runs missed meanwhile are
+            // skipped.
+            last.retain(|k, _| seen.contains(k));
             completing.retain(|k| seen.contains(k));
         }
     })
@@ -227,9 +220,11 @@ impl Job {
 
     /// A caller for the event's definer.
     async fn caller(&self) -> sprig_common::Result<Caller> {
-        let cat = self.svc.cache.cached(self.tenant).ok_or_else(|| {
-            sprig_common::SprigError::internal("the tenant's catalog isn't loaded")
-        })?;
+        let cat = self
+            .svc
+            .cache
+            .get(self.tenant, sprig_catalog::Freshness::Latest)
+            .await?;
         let (u, h) = &self.definer;
         let uid = sprig_auth::TenantAuth::of(&cat)
             .and_then(|auth| {

@@ -3,7 +3,7 @@
 use bytes::Bytes;
 use sprig_kv::layout::{KeyType, live};
 use sprig_proto_redis::Frame;
-use sprig_proto_redis::num::{ld2string_human, parse_f64, parse_i64};
+use sprig_proto_redis::num::{incr_float_text, parse_f64, parse_i64};
 
 use crate::ctx::{Ctx, KeyRow, R, fail, int_arg, upper};
 use crate::reply;
@@ -446,7 +446,7 @@ pub async fn incrbyfloat(cx: &mut Ctx<'_>, a: &[Bytes]) -> R<Frame> {
     if n.is_nan() || n.is_infinite() {
         return fail(Frame::err("increment would produce NaN or Infinity"));
     }
-    let text = ld2string_human(n);
+    let text = incr_float_text(n);
     let exp = row.as_ref().and_then(|r| r.exp);
     put(cx, &a[1], row, text.clone().into_bytes(), exp).await?;
     Ok(Frame::bulk(text))

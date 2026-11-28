@@ -1043,6 +1043,11 @@ impl Engine {
         txn: &mut SessionTxn,
         found_rows: bool,
     ) -> Result<Outcome> {
+        // The embedded-column runner's switch covers a one-table UPDATE
+        // only (each row's write then checks its columns).
+        if !(w.update && w.targets.len() == 1) {
+            crate::exec::embed_ddl::write::refuse("a multiple-table write or a DELETE")?;
+        }
         let rows = self.general_run_in(&w.select, a, txn).await?;
         let Some(tx) = txn.open_tx() else {
             return Err(SprigError::internal("engine: no open transaction"));

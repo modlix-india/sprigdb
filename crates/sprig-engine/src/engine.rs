@@ -41,6 +41,13 @@ const LAYOUT_UNITS: u64 = 2;
 /// Queue messages in their tenants' ranges (layout 3, the current one).
 const LAYOUT_QUEUES: u64 = 3;
 
+/// How often the cross-unit resolver thread looks for unfinished commits.
+const CROSS_RESOLVE_EVERY: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// How long a read on a unit's new leader waits for the commits across
+/// units its predecessors left unfinished there.
+const CROSS_READ_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// The field of a unit's bookkeeping that holds its applied index.
 const APPLIED: &[u8] = b"applied";
 
@@ -61,6 +68,53 @@ struct StoreMachine {
     /// opened (what a read view on a replica that doesn't lead the unit
     /// takes: see [`Engine::follower_read`]).
     unit_ts: RwLock<std::collections::HashMap<UnitId, u64>>,
+    /// Per unit, the prepare records of commits across units this replica
+    /// has applied and not yet seen finished (the finishing entry deletes
+    /// the record). While a unit has one, a commit that is already
+    /// acknowledged may still be missing from the unit here, at a timestamp
+    /// below versions it already holds: a replica that doesn't lead the
+    /// unit doesn't open a read view on it until the record is gone.
+    prepared: Mutex<std::collections::HashMap<UnitId, std::collections::BTreeSet<Vec<u8>>>>,
+    /// How many units have one (read without the latch).
+    prepared_units: std::sync::atomic::AtomicUsize,
+}
+
+/// What an applied batch did to prepare records: per record, its unit, its
+/// key and whether it was written (else deleted); and the ranges deleted.
+#[derive(Default)]
+struct PrepareOps {
+    records: Vec<(UnitId, Vec<u8>, bool)>,
+    ranges: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+/// Every prepare record in the store, by unit (`only`: that unit's).
+fn scan_prepared(
+    store: &dyn SortedStore,
+    only: Option<UnitId>,
+) -> Result<std::collections::HashMap<UnitId, std::collections::BTreeSet<Vec<u8>>>> {
+    let mut out: std::collections::HashMap<UnitId, std::collections::BTreeSet<Vec<u8>>> =
+        std::collections::HashMap::new();
+    let all = keys::unit_meta_key(0, b"");
+    let units = &all[..all.len() - 8];
+    let prefix = match only {
+        Some(u) => keys::unit_meta_key(u.0, crate::txn::CROSS_PREPARE),
+        None => units.to_vec(),
+    };
+    let mut it = store.iter(
+        Cf::Data,
+        crate::store::IterOpts::range(&keys::KeyRange::prefix(&prefix)),
+    );
+    it.seek_to_first();
+    while it.valid() {
+        let rest = &it.key()[units.len()..];
+        if rest.len() >= 8 && rest[8..].starts_with(crate::txn::CROSS_PREPARE) {
+            let unit = UnitId(u64::from_be_bytes(rest[..8].try_into().unwrap_or([0; 8])));
+            out.entry(unit).or_default().insert(it.key().to_vec());
+        }
+        it.next();
+    }
+    it.status()?.expect_ready()?;
+    Ok(out)
 }
 
 /// The field of a unit's bookkeeping that holds the highest version
@@ -86,6 +140,57 @@ fn version_of(key: &[u8]) -> Option<keys::Ts> {
 }
 
 impl StoreMachine {
+    /// The prepare records `unit` holds here now (see `prepared`).
+    fn prepared_of(&self, unit: UnitId) -> Vec<Vec<u8>> {
+        if self.prepared_units.load(Ordering::Acquire) == 0 {
+            return Vec::new();
+        }
+        self.prepared
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&unit)
+            .map(|s| s.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Whether `unit` still holds any of `records`.
+    fn any_prepared(&self, unit: UnitId, records: &[Vec<u8>]) -> bool {
+        self.prepared
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&unit)
+            .is_some_and(|s| records.iter().any(|r| s.contains(r)))
+    }
+
+    /// Folds an applied batch's prepare records in.
+    fn note_prepares(&self, ops: PrepareOps) {
+        let mut p = self.prepared.lock().unwrap_or_else(PoisonError::into_inner);
+        for (start, end) in &ops.ranges {
+            for set in p.values_mut() {
+                set.retain(|k| k.as_slice() < start.as_slice() || k.as_slice() >= end.as_slice());
+            }
+        }
+        for (unit, key, put) in ops.records {
+            if put {
+                p.entry(unit).or_default().insert(key);
+            } else if let Some(set) = p.get_mut(&unit) {
+                set.remove(&key);
+            }
+        }
+        p.retain(|_, set| !set.is_empty());
+        self.prepared_units.store(p.len(), Ordering::Release);
+    }
+
+    /// Reads `unit`'s prepare records back from the store (after its
+    /// snapshot was ingested).
+    fn reload_prepared(&self, unit: UnitId) {
+        let found = scan_prepared(self.store.as_ref(), Some(unit)).unwrap_or_default();
+        let mut p = self.prepared.lock().unwrap_or_else(PoisonError::into_inner);
+        p.remove(&unit);
+        p.extend(found);
+        self.prepared_units.store(p.len(), Ordering::Release);
+    }
+
     /// `unit`'s last applied index.
     fn last_applied(&self, unit: UnitId) -> u64 {
         if let Some(i) = self
@@ -121,6 +226,7 @@ impl StateMachine for StoreMachine {
         let mut batch = StoreBatch::new();
         let mut lasts = Vec::with_capacity(parts.len());
         let mut maxes = Vec::with_capacity(parts.len());
+        let mut prepares = PrepareOps::default();
         for (unit, entries) in parts {
             let Some(last) = entries.last() else {
                 continue;
@@ -128,6 +234,23 @@ impl StateMachine for StoreMachine {
             let from = batch.ops().len();
             for e in *entries {
                 log::payload::decode_into(&e.data, &mut batch)?;
+            }
+            let tp = keys::unit_meta_key(unit.0, crate::txn::CROSS_PREPARE);
+            for o in &batch.ops()[from..] {
+                match o {
+                    BatchOp::Put {
+                        cf: Cf::Data, key, ..
+                    } if key.starts_with(&tp) => prepares.records.push((*unit, key.clone(), true)),
+                    BatchOp::Delete { cf: Cf::Data, key } if key.starts_with(&tp) => {
+                        prepares.records.push((*unit, key.clone(), false));
+                    }
+                    BatchOp::DeleteRange {
+                        cf: Cf::Data,
+                        start,
+                        end,
+                    } => prepares.ranges.push((start.clone(), end.clone())),
+                    _ => {}
+                }
             }
             let part_max = batch.ops()[from..]
                 .iter()
@@ -158,6 +281,11 @@ impl StateMachine for StoreMachine {
             return Ok(());
         }
         self.store.write(&batch, WalMode::Off)?;
+        if !prepares.records.is_empty()
+            || (!prepares.ranges.is_empty() && self.prepared_units.load(Ordering::Acquire) > 0)
+        {
+            self.note_prepares(prepares);
+        }
         // Published only once the batch is in the store: a read on a copy
         // that finds a unit's timestamp at or above its token reads the
         // store without waiting for anything else.
@@ -278,6 +406,9 @@ struct Inner {
     pending_parts: Mutex<Vec<crate::snapshot::PendingPart>>,
     stop: Arc<Stop>,
     checkpointer: Mutex<Option<JoinHandle<()>>>,
+    /// Whether the cross-unit resolver thread runs
+    /// ([`Engine::start_cross_resolver`]).
+    cross_resolver: std::sync::atomic::AtomicBool,
 }
 
 impl Drop for Inner {
@@ -426,12 +557,15 @@ impl Engine {
             StoreKind::Mem => (Arc::new(MemStore::with_gc(Some(rule))), None),
         };
         let max_ts = max_ts_of_units(store.as_ref())?;
+        let prepared = scan_prepared(store.as_ref(), None)?;
         let sm = Arc::new(StoreMachine {
             store: Arc::clone(&store),
             observers: RwLock::new(Vec::new()),
             last_applied: RwLock::new(std::collections::HashMap::new()),
             max_ts: AtomicU64::new(max_ts),
             unit_ts: RwLock::new(std::collections::HashMap::new()),
+            prepared_units: std::sync::atomic::AtomicUsize::new(prepared.len()),
+            prepared: Mutex::new(prepared),
         });
         let leaders = Arc::new(crate::leader::Leaders::new(1, cfg.replicated));
         let log = Arc::new(LocalLog::open(
@@ -480,6 +614,7 @@ impl Engine {
                 pending_parts: Mutex::new(Vec::new()),
                 stop,
                 checkpointer: Mutex::new(None),
+                cross_resolver: std::sync::atomic::AtomicBool::new(false),
                 cfg,
             }),
         };
@@ -581,6 +716,7 @@ impl Engine {
             if let Some(r) = self.replicated_log() {
                 r.leader_barrier(unit)?;
             }
+            self.wait_cross_finished(unit)?;
             return Ok(None);
         }
         let Some(r) = self.replicated_log() else {
@@ -605,17 +741,43 @@ impl Engine {
             crate::reads::Served::Barrier
         };
         crate::reads::stats().count(served);
-        let ts = self
-            .inner
-            .sm
-            .unit_ts
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(&unit)
-            .copied()
-            // Nothing applied since the engine opened: the node's highest
-            // (at or above the unit's own).
-            .unwrap_or_else(|| self.inner.sm.max_ts.load(Ordering::Acquire));
+        let applied_ts = || {
+            self.inner
+                .sm
+                .unit_ts
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(&unit)
+                .copied()
+                // Nothing applied since the engine opened: the node's highest
+                // (at or above the unit's own).
+                .unwrap_or_else(|| self.inner.sm.max_ts.load(Ordering::Acquire))
+        };
+        // The timestamp first, then the prepare records: a commit across
+        // units at or below the timestamp was prepared here before the
+        // version that carries the timestamp was applied, so it is either
+        // finished here or its prepare record is among those found now.
+        // The view waits for exactly those: such a commit may be
+        // acknowledged already, and its versions would appear below the
+        // view once it is finished. Records prepared later belong to
+        // commits above the timestamp.
+        let ts = applied_ts();
+        let prepared = self.inner.sm.prepared_of(unit);
+        if !prepared.is_empty() {
+            let deadline = std::time::Instant::now() + CROSS_READ_WAIT;
+            while self.inner.sm.any_prepared(unit, &prepared) {
+                if !self.inner.cross_resolver.load(Ordering::Acquire)
+                    || std::time::Instant::now() >= deadline
+                {
+                    return Err(SprigError::new(
+                        sprig_common::SprigCode::ShardMoved,
+                        "a commit across units is prepared on this data and not finished on this \
+                         replica yet; retry",
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
         let ts = keys::Ts(ts);
         // The node's clock and views move past what it now holds.
         self.txn_shared().observe(ts);
@@ -627,6 +789,34 @@ impl Engine {
             p.raise(self.unit_readable_ts(unit));
         }
         Ok(Some(ts))
+    }
+
+    /// On the unit's leader: waits until every commit across units that an
+    /// earlier leader left prepared on `unit` is finished here (its
+    /// versions readable). Until then such a commit may already be
+    /// acknowledged while this node's readers can't see its writes to the
+    /// unit. Only where the resolver thread runs.
+    fn wait_cross_finished(&self, unit: UnitId) -> Result<()> {
+        let shared = self.txn_shared();
+        if !shared.cross_unfinished_on(unit.0) || !self.inner.cross_resolver.load(Ordering::Acquire)
+        {
+            return Ok(());
+        }
+        let deadline = std::time::Instant::now() + CROSS_READ_WAIT;
+        loop {
+            self.resolve_cross_unit();
+            if !shared.cross_unfinished_on(unit.0) {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(SprigError::new(
+                    sprig_common::SprigCode::ShardMoved,
+                    "a commit across units an earlier leader left unfinished on this data has no \
+                     outcome here yet; retry",
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 
     /// The highest version timestamp applied to `unit` since the engine
@@ -643,6 +833,48 @@ impl Engine {
             .get(&unit)
             .copied()
             .unwrap_or(0)
+    }
+
+    /// A proposal to `unit` under leader epoch `epoch` (see
+    /// `CommitPath::propose_led`).
+    pub(crate) fn propose_under(
+        &self,
+        unit: UnitId,
+        epoch: u64,
+        payload: Vec<u8>,
+        durability: crate::log::Durability,
+    ) -> Result<crate::log::Ticket> {
+        self.inner
+            .router
+            .propose_under(unit, epoch, payload, durability)
+    }
+
+    /// Starts the thread that finishes commits across units left
+    /// unfinished by a leadership change (the units' next leaders read
+    /// them back; this drives them every few milliseconds while any is
+    /// open). A node whose log runs on its own threads calls it once; a
+    /// simulation that steps everything itself calls
+    /// [`Engine::resolve_cross_unit`] instead.
+    ///
+    /// # Errors
+    /// The thread could not be started.
+    pub fn start_cross_resolver(&self) -> std::io::Result<()> {
+        if self.inner.cross_resolver.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        let weak = self.downgrade();
+        std::thread::Builder::new()
+            .name("sprig-cross-resolve".into())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(CROSS_RESOLVE_EVERY);
+                    let Some(e) = weak.upgrade() else { return };
+                    if e.txn_shared().cross_unit_open() > 0 {
+                        e.resolve_cross_unit();
+                    }
+                }
+            })
+            .map(drop)
     }
 
     /// Attaches the replicated log tenant units commit through. Once only,
@@ -882,6 +1114,33 @@ impl Engine {
         Ok(())
     }
 
+    /// Forgets every observer's floor on `unit`: this node's replica of the
+    /// unit left, so nothing here needs its log kept.
+    ///
+    /// # Errors
+    /// The store failed.
+    pub fn forget_log_floors_of(&self, unit: UnitId) -> Result<()> {
+        let mut floors = self
+            .inner
+            .floors
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let gone: Vec<(UnitId, String)> =
+            floors.keys().filter(|(u, _)| *u == unit).cloned().collect();
+        if gone.is_empty() {
+            return Ok(());
+        }
+        let mut b = StoreBatch::new();
+        for (u, n) in &gone {
+            b.delete(Cf::Local, floor_key(*u, n));
+        }
+        self.inner.store.write(&b, WalMode::Sync)?;
+        for k in gone {
+            floors.remove(&k);
+        }
+        Ok(())
+    }
+
     /// Forgets observer `name`'s floors on every unit: the log may be
     /// trimmed past them.
     ///
@@ -1061,6 +1320,7 @@ impl Engine {
             .entry(unit)
             .and_modify(|t| *t = (*t).max(max_ts))
             .or_insert(max_ts);
+        self.inner.sm.reload_prepared(unit);
         self.inner.txn.load_prepared_of(self, Some(unit.0));
     }
 

@@ -79,12 +79,13 @@ fn env_usize(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+#[ignore = "live: needs SPRIG_EXEC_ORACLE_CASES, SPRIG_EXEC_ORACLE_SEED, SPRIG_EXEC_ORACLE_ONLY, ...; tools/live/README.md"]
 #[test]
 fn expressions_match_the_servers() {
     let oracles = Oracle::from_env();
     if oracles.is_empty() {
         eprintln!("no SPRIG_EXEC_ORACLE_* command set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     }
     let cases = env_usize("SPRIG_EXEC_ORACLE_CASES", 400);
     let seed = env_usize("SPRIG_EXEC_ORACLE_SEED", 1) as u64;

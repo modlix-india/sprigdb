@@ -123,7 +123,9 @@ impl sprig_sinks::job::SinkEnv for GwSinkEnv {
     }
 
     fn records(&self) -> Arc<dyn sprig_catalog::records::RecordStore> {
-        Arc::clone(&self.svc.records)
+        // A sink's task writes its states wherever it runs: on the unit's
+        // leader.
+        Arc::clone(&self.svc.writers)
     }
 
     async fn shard_pool(&self, tenant: TenantId) -> Result<mysql_async::Pool> {
@@ -476,8 +478,10 @@ impl Host for GwHost<'_> {
             return Err(e);
         }
         let v = c.commit().await?;
+        // On the unit's leader, also when the leadership moved after the
+        // catalog change committed.
         sprig_sinks::sql::after_commit(
-            &sprig_sinks::store::SinksStore::new(Arc::clone(&svc.records), tenant),
+            &sprig_sinks::store::SinksStore::new(Arc::clone(&svc.writers), tenant),
             &change,
         )
         .await?;
@@ -626,6 +630,60 @@ impl Host for GwHost<'_> {
             def_tenant: k.tenant.0,
             def_object: k.object,
             partitions: 0,
+            under,
+        }))
+    }
+
+    // `FROM STREAM s FAN IN`: a stream definition this tenant declares or
+    // inherits; partitions from its template.
+    async fn fan_in_stream(
+        &mut self,
+        db: &str,
+        name: &str,
+        under: Option<&str>,
+    ) -> Result<Option<sprig_sinks::sql::FanInDef>> {
+        let svc = Arc::clone(
+            self.ts()
+                .ok_or_else(|| SprigError::internal("no tenant"))?
+                .services(),
+        );
+        let me = self.cat.tenant;
+        let fresh = crate::inherited::catalog(&svc, me).await?;
+        let user = self.ts().and_then(|t| t.principal.user_id);
+        let g = crate::tenant::authz::grants_of(&svc, &fresh, user);
+        if !g.unrestricted() && !g.allows(Action::FanIn, Target::Tenant) {
+            return Err(SprigError::new(
+                SprigCode::SinkPrivilege,
+                "Access denied; you need (at least one of) the SPRIG_FAN_IN privilege(s) for a \
+                 fan-in sink",
+            ));
+        }
+        let chain = crate::inherited::chain(&svc, &self.cat).await?;
+        let Some(d) = crate::inherited::fanin_sink::stream_definition(&chain, db, name) else {
+            return Ok(None);
+        };
+        let under = match under {
+            None => None,
+            Some(u) => {
+                let id = crate::inherited::tenant_by_name(&svc, u)
+                    .await?
+                    .ok_or_else(|| crate::inherited::target_err(format!("no tenant '{u}'")))?;
+                let e = crate::inherited::dir_entry(&svc, id)
+                    .await?
+                    .unwrap_or_default();
+                if id != me && !e.path_ids().contains(&me.0) {
+                    return Err(crate::inherited::target_err(format!(
+                        "tenant '{u}' isn't below this one"
+                    )));
+                }
+                Some(id.0)
+            }
+        };
+        let k = d.key();
+        Ok(Some(sprig_sinks::sql::FanInDef {
+            def_tenant: k.tenant.0,
+            def_object: k.object,
+            partitions: crate::inherited::fanin_sink::template_partitions(&d),
             under,
         }))
     }

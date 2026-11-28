@@ -5,40 +5,40 @@
 //!   ai.enabled off, or ai.digest = off -> nothing
 //!   the last whole day (daily) or week (weekly, Monday to Monday), UTC
 //!   a digest for it exists -> nothing
-//!   facts from the tenant's catalog (schema versions, the workload store,
-//!     automatic indexes, the approvals inbox) and table sizes from every
-//!     cluster that may hold the tenant's schemas (information_schema.TABLES)
+//!   facts from the tenant's catalog records (schema versions, the workload
+//!     store, the approvals inbox); table sizes aren't read (noted as missing)
 //!   sprig_ai::digest::build: values stripped unless ai.share_data, worded by
 //!     ai.model.data (else ai.model.dba) within the tenant's budgets, stored in
-//!     ai_digests with its conversation; facts alone when it can't be worded
+//!     the catalog records with its conversation; facts alone when it can't be worded
 //!   ai.digest_email -> emailed to the tenant's approvals subscribers
 //!   one ai.digest audit event on the tenant's stream
 //! ```
 //!
 //! Only names, counts and sizes are read; no table row is.
 
-use sprig_catalog::pool_wait::Bounded as _;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use mysql_async::prelude::Queryable as _;
 use serde_json::json;
 use sprig_ai::Role;
 use sprig_ai::audit::AuditStore;
-use sprig_ai::digest::{self, Cadence, CatalogDigests, DigestStore, Facts, Volume};
+use sprig_ai::audit::rec::RecAudit;
+use sprig_ai::digest::{
+    self, Cadence, DigestStore, Facts, RecDigests, SchemaChange, Statement, Waiting, Workload,
+};
 use sprig_ai::settings::{Lookup, TurnSettings};
-use sprig_catalog::CatalogLocator;
+use sprig_catalog::RecordStore;
 use sprig_catalog::cache::{Loaded, TenantCatalog};
+use sprig_catalog::store::DbState;
+use sprig_catalog::store::rec::CoreRecords;
+use sprig_common::Result;
 use sprig_common::audit::AuditStream;
 use sprig_common::ids::{DcId, TenantId};
-use sprig_common::names::SchemaName;
-use sprig_common::{Result, SprigCode, SprigError};
 use sprig_settings::{LiveSettings, MemSettings, Registry, Setting, Value as SettingValue};
 
 use crate::ai_incidents::IncidentEnv;
 use crate::approvals::notify::Notifier;
-use crate::catalogs::{ClusterPools, RegistryPools};
 use crate::runtime::{LoopCx, LoopTier, MetaEvent, Outcome, Reconciler, WatchSpec};
 use crate::tree::{Directory, DirectoryEntry, TenantState};
 
@@ -48,11 +48,10 @@ pub const CHECK_INTERVAL: Duration = Duration::from_secs(3600);
 /// The digest loop (module docs).
 pub struct DigestLoop {
     dir: Directory,
-    locator: Arc<dyn CatalogLocator>,
+    records: Arc<dyn RecordStore>,
     dc: DcId,
     live: Option<LiveSettings>,
     env: Arc<dyn IncidentEnv>,
-    pools: RegistryPools,
     notifier: Option<Arc<Notifier>>,
 }
 
@@ -102,14 +101,6 @@ impl Lookup for TenantLookup<'_> {
     }
 }
 
-fn unavailable(e: mysql_async::Error) -> SprigError {
-    SprigError::new(
-        SprigCode::CatalogUnavailable,
-        "the tenant's catalog is unreachable",
-    )
-    .with_source(e)
-}
-
 fn now_ms() -> i64 {
     i64::try_from(
         std::time::SystemTime::now()
@@ -121,25 +112,23 @@ fn now_ms() -> i64 {
 }
 
 impl DigestLoop {
-    /// The loop over the tenants homed in `dc`; `env` opens the models,
-    /// `pools` reaches the clusters for table sizes, `notifier` emails.
+    /// The loop over the tenants homed in `dc`, whose catalog records are
+    /// `records`; `env` opens the models, `notifier` emails.
     #[must_use]
     pub fn new(
         dir: Directory,
-        locator: Arc<dyn CatalogLocator>,
+        records: Arc<dyn RecordStore>,
         dc: DcId,
         live: Option<LiveSettings>,
         env: Arc<dyn IncidentEnv>,
-        pools: RegistryPools,
         notifier: Option<Arc<Notifier>>,
     ) -> Self {
         Self {
             dir,
-            locator,
+            records,
             dc,
             live,
             env,
-            pools,
             notifier,
         }
     }
@@ -154,60 +143,139 @@ impl DigestLoop {
             None => Registry::global(),
         }
     }
+}
 
-    /// Approximate rows and bytes of every table of `tenant`, summed over
-    /// its shards, from every cluster that may hold them.
-    async fn volumes(&self, tenant: TenantId, dbs: &BTreeMap<u32, String>) -> Result<Vec<Volume>> {
-        let mut sum: BTreeMap<(String, String), (u64, u64)> = BTreeMap::new();
-        let pattern = format!("t{}\\_d%", tenant.0);
-        for cluster in self.pools.sweepable().await? {
-            let pool = match self.pools.writer(&cluster).await {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::debug!(error = %e, %cluster, "a digest skipped a cluster");
-                    continue;
-                }
-            };
-            let mut c = pool.get_conn_bounded().await.map_err(unavailable)?;
-            let rows: Vec<(String, String, Option<u64>, Option<u64>)> = c
-                .exec(
-                    "SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_ROWS, DATA_LENGTH + INDEX_LENGTH \
-                     FROM information_schema.TABLES WHERE TABLE_SCHEMA LIKE ? \
-                     AND TABLE_TYPE = 'BASE TABLE'",
-                    (pattern.as_str(),),
-                )
-                .await
-                .map_err(unavailable)?;
-            for (schema, table, n, bytes) in rows {
-                let Ok(SchemaName::Shard { db, .. } | SchemaName::Reference { db, .. }) =
-                    schema.parse::<SchemaName>()
-                else {
-                    continue;
-                };
-                let Some(name) = dbs.get(&db.0) else {
-                    continue;
-                };
-                // SprigDB's own tables in a shard schema aren't the tenant's.
-                if table.starts_with("__sprig") || table.starts_with("sprig_") {
-                    continue;
-                }
-                let e = sum.entry((name.clone(), table)).or_default();
-                e.0 += n.unwrap_or(0);
-                e.1 += bytes.unwrap_or(0);
+/// `ms` (since the epoch) as a time.
+fn time_of(ms: i64) -> std::time::SystemTime {
+    std::time::UNIX_EPOCH + Duration::from_millis(u64::try_from(ms.max(0)).unwrap_or(0))
+}
+
+fn ms_of(t: std::time::SystemTime) -> i64 {
+    t.duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+}
+
+/// Fills `facts` from `tenant`'s catalog records: schema changes in the
+/// period (the object and the statement's verb, never its text), the
+/// workload store's totals and slowest statements, and the
+/// recommendations waiting (automatic index proposals among them). Only names, counts and
+/// times are read. Table sizes aren't: they are noted as missing.
+///
+/// # Errors
+/// The records' (39070 when the engine node can't be reached).
+#[allow(clippy::cast_precision_loss)] // counters far below 2^52
+#[allow(clippy::too_many_lines)] // one step per part of the facts
+pub async fn gather(
+    records: &dyn RecordStore,
+    tenant: TenantId,
+    dbs: &BTreeMap<u32, String>,
+    objects: &BTreeMap<u64, (u32, String, String)>,
+    facts: &mut Facts,
+    now_ms: i64,
+) -> Result<()> {
+    use sprig_workload::store::WorkloadTables;
+    let mut tx = records.begin(tenant).await?;
+    // Schema changes in the period.
+    let mut changes = Vec::new();
+    for (id, (db, name, kind)) in objects {
+        let Some(db) = dbs.get(db) else { continue };
+        for v in CoreRecords::schema_versions(&mut *tx, sprig_common::ids::ObjectId(*id)).await? {
+            let at = ms_of(v.applied_at);
+            if at >= facts.from_ms && at < facts.to_ms {
+                changes.push(SchemaChange {
+                    db: db.clone(),
+                    object: name.clone(),
+                    kind: kind.clone(),
+                    verb: v
+                        .ddl
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("CHANGE")
+                        .to_ascii_uppercase(),
+                    at_ms: at,
+                });
             }
         }
-        Ok(sum
-            .into_iter()
-            .map(|((db, table), (rows, bytes))| Volume {
-                db,
-                table,
-                rows,
-                bytes,
-                rows_before: None,
-                bytes_before: None,
-            })
-            .collect())
     }
+    changes.sort_by_key(|c| c.at_ms);
+    facts.schema_change_count = changes.len() as u64;
+    changes.truncate(digest::MAX_CHANGES);
+    facts.schema_changes = changes;
+    // The workload store: totals for the period and the one before, and
+    // the statements that took the most time.
+    let len = facts.to_ms - facts.from_ms;
+    let now = WorkloadTables::window(
+        &mut *tx,
+        tenant,
+        time_of(facts.from_ms),
+        time_of(facts.to_ms),
+    )
+    .await?;
+    let before = WorkloadTables::window(
+        &mut *tx,
+        tenant,
+        time_of(facts.from_ms - len),
+        time_of(facts.from_ms),
+    )
+    .await?;
+    let sum = |w: &[sprig_workload::window::FpWindowStats]| Workload {
+        statements: w.iter().map(|s| s.stats.exec_count).sum(),
+        errors: w.iter().map(|s| s.stats.error_count).sum(),
+        total_ms: w.iter().map(|s| s.stats.total_us as f64).sum::<f64>() / 1000.0,
+    };
+    if now.is_empty() && before.is_empty() {
+        facts
+            .missing
+            .push("the workload (no statements recorded yet)".to_owned());
+    } else {
+        facts.workload = sum(&now);
+        facts.workload_before = Some(sum(&before)).filter(|w| w.statements > 0);
+        let mut top: Vec<&sprig_workload::window::FpWindowStats> = now.iter().collect();
+        top.sort_by_key(|s| std::cmp::Reverse(s.stats.total_us));
+        for s in top.into_iter().take(digest::SLOWEST) {
+            let text: String = s.text.split_whitespace().collect::<Vec<_>>().join(" ");
+            facts.slowest.push(Statement {
+                fingerprint: format!("{:016x}", s.id.0),
+                db: s
+                    .shape
+                    .tables
+                    .iter()
+                    .find_map(|t| t.object_id)
+                    .and_then(|o| objects.get(&o.0))
+                    .and_then(|(d, _, _)| dbs.get(d).cloned()),
+                text: text.chars().take(digest::MAX_STATEMENT).collect(),
+                calls: s.stats.exec_count,
+                errors: s.stats.error_count,
+                total_ms: s.stats.total_us as f64 / 1000.0,
+                max_ms: s.stats.max_us as f64 / 1000.0,
+            });
+        }
+    }
+    // Recommendations waiting for review: kind, target and age only.
+    let recs = sprig_approvals::catalog::RecRecords::new(tenant)
+        .list(&mut *tx, &sprig_approvals::Filter::default())
+        .await?;
+    let mut waiting: Vec<Waiting> = Vec::new();
+    for r in &recs {
+        let state = r.state.as_str();
+        if matches!(state, "open" | "snoozed" | "approved") {
+            waiting.push(Waiting {
+                kind: r.kind.as_str().to_owned(),
+                target: r.target.clone(),
+                state: state.to_owned(),
+                age_hours: ((now_ms * 1000 - r.created_at_us).max(0) as f64) / 3.6e9,
+            });
+        }
+    }
+    waiting.sort_by(|a, b| b.age_hours.total_cmp(&a.age_hours));
+    facts.waiting_count = waiting.len() as u64;
+    waiting.truncate(digest::MAX_WAITING);
+    facts.waiting = waiting;
+    drop(tx);
+    facts
+        .missing
+        .push("table sizes (not read for engine tables yet)".to_owned());
+    Ok(())
 }
 
 #[async_trait::async_trait]
@@ -250,12 +318,26 @@ impl Reconciler for DigestLoop {
         if !self.ours(entry.body()) {
             return Ok(Outcome::Done);
         }
-        let ep = self.locator.writer(*key).await?;
-        let schema = ep.store.schema().to_owned();
         // The catalog's core rows (settings among them) are engine records.
-        let snap = sprig_catalog::store::rec::CoreReader::new(crate::catalog_records(), *key)
+        let snap = sprig_catalog::store::rec::CoreReader::new(Arc::clone(&self.records), *key)
             .snapshot()
             .await?;
+        let dbs: BTreeMap<u32, String> = snap
+            .databases
+            .iter()
+            .filter(|d| d.state == DbState::Active)
+            .map(|d| (d.db_id.0, d.name.clone()))
+            .collect();
+        let objects: BTreeMap<u64, (u32, String, String)> = snap
+            .objects
+            .iter()
+            .map(|o| {
+                (
+                    o.object_id.0,
+                    (o.db_id.0, o.name.clone(), o.kind.as_str().to_owned()),
+                )
+            })
+            .collect();
         let reg = self.registry()?;
         let empty = MemSettings::new(reg);
         let held = self.live.as_ref().map(LiveSettings::snapshot);
@@ -274,21 +356,12 @@ impl Reconciler for DigestLoop {
         }
         let now = now_ms();
         let (from, to) = cadence.period(now);
-        let store = CatalogDigests::new(ep.pool.clone(), schema.clone());
-        if store.exists().await? && store.for_period(cadence, to).await?.is_some() {
+        let store = RecDigests::new(Arc::clone(&self.records), *key);
+        if store.for_period(cadence, to).await?.is_some() {
             return Ok(Outcome::RequeueAfter(CHECK_INTERVAL));
         }
         let mut facts = Facts::new(cadence, from, to);
-        {
-            let mut c = ep.pool.get_conn_bounded().await.map_err(unavailable)?;
-            digest::gather::catalog(&mut c, &schema, &mut facts, now).await?;
-            let dbs = digest::gather::databases(&mut c, &schema).await?;
-            drop(c);
-            match self.volumes(*key, &dbs).await {
-                Ok(v) => facts.volumes = v,
-                Err(e) => facts.missing.push(format!("table sizes ({})", e.message)),
-            }
-        }
+        gather(&*self.records, *key, &dbs, &objects, &mut facts, now).await?;
         let settings = TurnSettings::read(&look, Role::Data);
         // The data assistant's model, else the DBA's.
         let model = if settings.model.trim().is_empty() {
@@ -298,7 +371,7 @@ impl Reconciler for DigestLoop {
             self.env.model(Role::Data, &settings.model).await
         };
         let audit: Arc<dyn AuditStore> =
-            Arc::new(sprig_ai::CatalogAudit::new(ep.pool.clone(), schema.clone()));
+            Arc::new(RecAudit::tenant(Arc::clone(&self.records), *key));
         let (d, new) = match digest::build(&store, audit, model, &settings, *key, facts).await {
             Ok(r) => r,
             Err(e) => {

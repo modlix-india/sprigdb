@@ -6,8 +6,9 @@
 //! ```text
 //! spawn(services): one task per process
 //!   every tick (1 s; SPRIGDB_INHERIT_ORPHANS_TICK_MS), for each tenant whose
-//!   catalog this process has loaded, whose databases are all the engine's
-//!   and whose unit is led here (or has no single leader):
+//!   unit this node leads (crate::led; every tenant on an engine that
+//!   doesn't replicate) and whose databases are all the engine's, its
+//!   catalog loaded here on demand:
 //!     each inheritable table it shares to child tenants (from its root
 //!     space, to a tenant or to all children), or shares materialized to
 //!     anyone, names a family: the tree root, the database and the table
@@ -62,7 +63,6 @@ use sprig_inherit::ids::TreeTable;
 use sprig_inherit::model::{MergeMode, ROOT_SPACE, ShareTarget};
 use sprig_types::{Done, Rows, TypesChange};
 
-use crate::node_engine::{self, UnitLeader};
 use crate::table_changes::Watched;
 use crate::tenant::TenantServices;
 
@@ -118,9 +118,8 @@ pub(crate) fn spawn(
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .map_or(Duration::from_secs(1), Duration::from_millis);
-    let mut loads = svc.cache.loads();
+    let mut led = crate::led::Led::new(&svc);
     tokio::spawn(async move {
-        let mut tenants: BTreeSet<u64> = BTreeSet::new();
         let mut known: BTreeMap<Family, Known> = BTreeMap::new();
         let mut last_load = Instant::now();
         let mut timer = tokio::time::interval(tick);
@@ -128,20 +127,22 @@ pub(crate) fn spawn(
         loop {
             tokio::select! {
                 () = stop.cancelled() => return,
-                l = loads.recv() => {
-                    if let Ok(l) = l {
-                        tenants.insert(l.tenant.0);
-                    }
-                    // A catalog changed: a tenant may have adopted a table
-                    // (joined a family), so the families' tenants are
-                    // looked up again.
+                _ = led.changed() => {
+                    // A catalog changed (or loads were missed): a tenant
+                    // may have adopted a table (joined a family), so the
+                    // families' tenants are looked up again.
                     last_load = Instant::now();
                     continue;
                 }
                 () = crate::inherit_lag::nudged() => wait_wanted().await,
                 _ = timer.tick() => {}
             }
-            let families = families(&svc, &tenants);
+            let families: BTreeSet<Family> = led
+                .catalogs(&svc, |cat| !families_of(cat).is_empty())
+                .await
+                .iter()
+                .flat_map(|cat| families_of(cat.as_ref()))
+                .collect();
             known.retain(|f, _| {
                 let keep = families.contains(f);
                 if !keep {
@@ -198,42 +199,30 @@ fn applied_of(p: sprig_streams::changes::Pos) -> u64 {
     }
 }
 
-/// The families of the loaded tenants led here.
-fn families(svc: &TenantServices, tenants: &BTreeSet<u64>) -> BTreeSet<Family> {
-    let mut out = BTreeSet::new();
-    for &t in tenants {
-        if !matches!(
-            node_engine::tenant_leader(t),
-            UnitLeader::Here | UnitLeader::Any
-        ) {
+/// The families `cat`'s tenant shares (across tenants, or materialized),
+/// when its databases are all the engine's.
+fn families_of(cat: &TenantCatalog) -> Vec<Family> {
+    let mut out = Vec::new();
+    if crate::engine::catalog::of(cat).is_none() || !crate::exec::inherit_tree::all_engine(cat) {
+        return out;
+    }
+    let Some(st) = sprig_inherit::plan::state_of(cat) else {
+        return out;
+    };
+    let root = cat.ancestry.first().map_or(cat.tenant.0, |a| a.id.0);
+    for s in st.shares() {
+        let across = s.from == ROOT_SPACE
+            && matches!(s.to, ShareTarget::Tenant(_) | ShareTarget::AllChildren);
+        if !across && s.mode != MergeMode::Materialized {
             continue;
         }
-        let Some(cat) = svc.cache.cached(TenantId(t)) else {
+        let Some(o) = st.object(s.object_id) else {
             continue;
         };
-        if crate::engine::catalog::of(&cat).is_none()
-            || !crate::exec::inherit_tree::all_engine(&cat)
-        {
-            continue;
-        }
-        let Some(st) = sprig_inherit::plan::state_of(&cat) else {
+        let Some(db) = cat.databases.get(o.db).map(|d| d.name.clone()) else {
             continue;
         };
-        let root = cat.ancestry.first().map_or(t, |a| a.id.0);
-        for s in st.shares() {
-            let across = s.from == ROOT_SPACE
-                && matches!(s.to, ShareTarget::Tenant(_) | ShareTarget::AllChildren);
-            if !across && s.mode != MergeMode::Materialized {
-                continue;
-            }
-            let Some(o) = st.object(s.object_id) else {
-                continue;
-            };
-            let Some(db) = cat.databases.get(o.db).map(|d| d.name.clone()) else {
-                continue;
-            };
-            out.insert((root, db, o.table.clone()));
-        }
+        out.push((root, db, o.table.clone()));
     }
     out
 }

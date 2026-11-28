@@ -490,6 +490,7 @@ async fn drop_all(c: &mut mysql_async::Conn) {
     }
 }
 
+#[ignore = "live: needs SPRIG_TEST_FLD_SQL, SPRIG_TEST_FLD_NODES, SPRIG_TEST_FLD_HOOK_PORT; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn feed_readers_survive_purged_local_domains() {
     let (Ok(addr), Ok(nodes), Ok(port)) = (
@@ -500,7 +501,7 @@ async fn feed_readers_survive_purged_local_domains() {
         eprintln!(
             "skipped: set SPRIG_TEST_FLD_SQL, SPRIG_TEST_FLD_NODES and SPRIG_TEST_FLD_HOOK_PORT"
         );
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let nodes: Vec<String> = nodes.split(',').map(str::to_owned).collect();
     let hook = webhook(port.parse().unwrap()).await;

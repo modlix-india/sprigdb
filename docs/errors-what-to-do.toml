@@ -1097,7 +1097,7 @@ what_to_do = "Retry, or use the default consistency for searches that can accept
 
 [ER_SPRIG_SEARCH_WINDOW_EXCEEDED]
 meaning = "The search would have to read more hits than `search.max_window`, for example deep paging, or counts and facets for a user bound by row-level security. Also a warning, not an error, from `RETRIEVE()` and the retrieval REST search: a user that row-level security restricts searched words that match more than 1,000 chunks in one shard, so the hits come from the vector list alone, without a keyword ranking."
-what_to_do = "Narrow the query, ask for fewer results or a smaller offset, or ask for no facets. For the retrieval warning, use rarer or more specific words, or add a filter on the index's `FILTERS` columns."
+what_to_do = "Narrow the query, ask for fewer results or a smaller offset, or ask for no facets. For the retrieval warning, use rarer or more specific words, or add a filter on the index's `FILTERS` columns. When the warning says \"no vector list\", the index has more chunks than `ai.retrieval.max_scan_chunks` (an operator can raise it, at the cost of slower searches) and the hits come from the full-text list alone."
 
 [ER_SPRIG_SEARCH_ANALYZER_UNKNOWN]
 meaning = "The search index or query names an analyser or language that isn't defined, or a MongoDB `$language` other than the text index's default."
@@ -1548,8 +1548,8 @@ meaning = "`sprig` refused to send a password over plain HTTP to a host other th
 what_to_do = "Use `https` (port 8443 by default). If the network is trusted, pass `--allow-insecure-http` or set `allow_insecure_http = true` in the profile."
 
 [ER_SPRIG_DOCS_UNAVAILABLE]
-meaning = "Docs search (the REST call, the `sprig_docs` database or `sprig_docs.embed`) can't be answered: docs are turned off, no cluster has this release's docs pack loaded yet, or the embedding model isn't available to `sprig_docs.embed`."
-what_to_do = "Retry shortly after an upgrade: the controller loads the pack into every cluster at start. If it lasts, check `docs.enabled`, that the controller found a valid pack (`docs.pack_path`, the `docs.pack.unavailable` event) and that `sprig_ctl` may manage `__sprig_docs`; for `sprig_docs.embed`, check `docs.embed_queries` and `docs.model_dir`."
+meaning = "Docs search (the REST call, the `sprig_docs` database or `sprig_docs.embed`) can't be answered: docs are turned off, the node has no valid docs pack, the release asked for isn't the one the node serves, SQL over `sprig_docs` was asked of an engine node (not served there yet), or the embedding model isn't available to `sprig_docs.embed`."
+what_to_do = "Check `docs.enabled` and that the release's pack is next to the `sprigdb` binary or at `docs.pack_path` (the gateway logs `docs.pack.unavailable` when it can't read one). On an engine node, search with `POST /v1/docs:search` instead of SQL. For `sprig_docs.embed`, check `docs.embed_queries` and `docs.model_dir`."
 
 [ER_SPRIG_AI_NOT_CONFIGURED]
 meaning = "The assistant or AI function has no model: `ai.model.<role>` (for the AI functions, `ai.functions.model`, else `ai.model.data`) is empty or names a provider that doesn't exist, an AI function names a model not listed in `ai.functions.models`, or the provider's record can't be used (its base URL is invalid, or its key doesn't open with this process's master key file)."

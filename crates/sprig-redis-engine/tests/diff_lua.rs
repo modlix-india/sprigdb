@@ -240,10 +240,11 @@ async fn pair() -> Option<(
     Some((s, r, surl, rurl))
 }
 
+#[ignore = "live: needs SPRIG_TEST_REDIS_ENGINE, SPRIG_TEST_REDIS_REF; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn lua_corpus_matches_redis() {
     let Some((mut s, mut r, _, _)) = pair().await else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let cmds = lines(CORPUS);
     let mut bad = Vec::new();
@@ -271,10 +272,11 @@ async fn lua_corpus_matches_redis() {
 
 /// A script that runs past the busy threshold: the others get `BUSY`,
 /// `SCRIPT KILL` stops it (it wrote nothing), and the server is free again.
+#[ignore = "live: needs SPRIG_TEST_REDIS_ENGINE, SPRIG_TEST_REDIS_REF; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn busy_scripts_and_kill_match_redis() {
     let Some((_s, _r, surl, rurl)) = pair().await else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let mut logs = Vec::new();
     for url in [&rurl, &surl] {
@@ -377,10 +379,11 @@ async fn concurrent_scripts_are_atomic() {
 
 /// A library dumped by Redis restores on SprigDB and back, and `RESTORE`'s
 /// policies match.
+#[ignore = "live: needs SPRIG_TEST_REDIS_ENGINE, SPRIG_TEST_REDIS_REF; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn function_dump_and_restore_cross_servers() {
     let Some((mut s, mut r, _, _)) = pair().await else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let lib = "#!lua name=dumped\nredis.register_function('d1', function(keys, args) return 'd1:' .. args[1] end)\nredis.register_function{function_name='d2', callback=function(keys, args) return redis.call('GET', keys[1]) end, flags={'no-writes'}}";
     let lib2 = "#!lua name=second\nredis.register_function('s1', function() return 's1' end)";

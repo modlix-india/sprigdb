@@ -157,7 +157,6 @@ Two objectives per data centre, with recording rules (`sprig:availability_errors
 | `EtcdDbGrowing` | ticket | Live etcd data grew more than 16 MiB in 6 hours (compaction off, or keys leak) |
 | `BackupMissed` | page | A cluster has no full backup younger than 26 hours |
 | `SprigTracesDropped` | ticket | More than 1,000 spans dropped in 15 minutes |
-| `SprigStreamSequencersLagging` | ticket | A worker's stream sequencers have stayed further behind than `stream.sequencer_lag_alert_seconds` (60) for 10 minutes |
 | `SprigThrashing` | ticket | The balancer reverted one of its own moves in the last 6 hours |
 
 `BackupMissed` reads `sprig_backup_last_success_timestamp_seconds{cluster, kind}`, the time of each cluster's newest successful backup. SprigDB exports it in two places:

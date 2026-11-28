@@ -587,6 +587,7 @@ async fn past_the_window(
     }
 }
 
+#[ignore = "live: needs SPRIG_TEST_RLS_SQL, SPRIG_TEST_RLS_HTTP, SPRIG_TEST_RLS_MONGO, ...; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn search_respects_row_policies() {
     let (Ok(sql_addr), Ok(http), Ok(mongo_addr), Ok(redis_addr)) = (
@@ -596,7 +597,7 @@ async fn search_respects_row_policies() {
         std::env::var("SPRIG_TEST_RLS_REDIS"),
     ) else {
         eprintln!("SPRIG_TEST_RLS_SQL, _HTTP, _MONGO or _REDIS not set; skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let mut ck = Checks {
         n: 0,

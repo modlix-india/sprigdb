@@ -419,6 +419,7 @@ fn analyzed(json: &str) -> Vec<(String, f64, f64)> {
     out
 }
 
+#[ignore = "live: needs SPRIG_PLAN_ORACLE_REPORT; tools/live/README.md"]
 #[test]
 fn plan_shapes_match_mariadb() {
     let Some(oracle) = Oracle::from_env()
@@ -426,7 +427,7 @@ fn plan_shapes_match_mariadb() {
         .find(|o| o.persona == Persona::MariaDb)
     else {
         eprintln!("no SPRIG_PLAN_ORACLE_MARIADB set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let specs = tables();
     oracle.load(DB, &specs);

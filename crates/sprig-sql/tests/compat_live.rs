@@ -375,11 +375,12 @@ async fn checks(c: &mut MysqlClient) {
     }
 }
 
+#[ignore = "live: needs SPRIG_TEST_MARIADB_SINGLE; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread")]
 async fn compat_live() {
     let Ok(url) = std::env::var(ENV) else {
         eprintln!("skipped: {ENV} is not set");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let mut admin = connect(&url).await;
     admin

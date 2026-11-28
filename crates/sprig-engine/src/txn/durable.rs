@@ -234,6 +234,19 @@ impl DurableTicket {
         }
     }
 
+    /// Whether the log reported an entry lost before it was durable
+    /// ([`Ticket::is_lost`]; any part's, for several units). A lost entry
+    /// never becomes durable: whoever needs its effect proposes it again.
+    #[must_use]
+    pub fn is_lost(&self) -> bool {
+        match self {
+            DurableTicket::Ready => false,
+            DurableTicket::Log(t) => t.is_lost(),
+            DurableTicket::Watch(w, i) => w.durable() < *i && w.failed(),
+            DurableTicket::Many(ts) => ts.iter().any(DurableTicket::is_lost),
+        }
+    }
+
     /// Blocks until the client may be answered.
     ///
     /// # Errors

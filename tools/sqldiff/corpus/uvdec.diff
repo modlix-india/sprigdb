@@ -1,0 +1,23 @@
+# Decimal, double and collated user variables read in statements on engine tables.
+x:DROP TABLE IF EXISTS ud_a
+q:CREATE TABLE ud_a (id INT PRIMARY KEY, v INT, p DECIMAL(6,2), s VARCHAR(10))
+q:INSERT INTO ud_a VALUES (1,10,1.25,'a'),(2,20,2.50,'b')
+q:SET @d = 1.5, @h = CAST(3 AS DECIMAL(10,4)), @n = 7
+q:SELECT id, v * @d FROM ud_a ORDER BY id
+q:SELECT id, @d * v, @d, p + @h FROM ud_a ORDER BY id
+q:SELECT id, v + @n, v DIV @n FROM ud_a ORDER BY id
+q:SELECT id FROM ud_a WHERE v * @d > 20
+q:SELECT id FROM ud_a WHERE p < @d
+q:SET @e = @d * 2
+q:SELECT @e
+q:INSERT INTO ud_a VALUES (3, 30, @d, 'c')
+q:SELECT id, p FROM ud_a ORDER BY id
+q:SET @t = 'b'
+q:SELECT id FROM ud_a WHERE s = @t
+q:SELECT id, CONCAT(s, @t) FROM ud_a ORDER BY id
+q:SET @b = _utf8mb4'b' COLLATE utf8mb4_bin
+q:SELECT id FROM ud_a WHERE s = @b
+q:SELECT COLLATION(@b), COERCIBILITY(@b)
+q:SET @d2 = @d + @d
+q:SELECT @d2, @d2 * 1
+x:DROP TABLE IF EXISTS ud_a

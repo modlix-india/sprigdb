@@ -6,6 +6,7 @@ use sprig_testkit::{ComposeProject, require_env, skip};
 
 const HELLO: &str = "crates/sprig-testkit/tests/fixtures/hello.yaml";
 
+#[ignore = "live: needs SPRIG_TEST_DOCKER; tools/live/README.md"]
 #[test]
 fn stack_starts_answers_and_tears_down_on_drop() {
     require_env!(skip::DOCKER);
@@ -39,6 +40,7 @@ fn stack_starts_answers_and_tears_down_on_drop() {
     );
 }
 
+#[ignore = "live: needs SPRIG_TEST_DOCKER; tools/live/README.md"]
 #[test]
 fn failed_start_reports_logs_and_cleans_up() {
     require_env!(skip::DOCKER);

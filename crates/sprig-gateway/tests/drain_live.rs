@@ -91,11 +91,12 @@ async fn wire(addr: &str) -> Conn {
     .unwrap()
 }
 
+#[ignore = "live: needs SPRIG_TEST_M7_DRAIN; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_draining_gateway_finishes_its_work_and_new_requests_go_elsewhere() {
     let Some(v) = skip::var(ENV) else {
         skip::report_missing(ENV, "a_draining_gateway_finishes_its_work");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let u = skip::urls(&v);
     let (g1_mysql, g1_http, g1_tel) = (u[0].clone(), u[1].clone(), u[2].clone());

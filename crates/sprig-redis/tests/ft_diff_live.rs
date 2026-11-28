@@ -315,12 +315,13 @@ EXPIRE ftd:4 1000
 HSET ftd:5 tags 'purple'
 ";
 
+#[ignore = "live: needs SPRIG_TEST_REDIS_REF, SPRIG_TEST_REDIS_SPRIG; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ft_matches_redis() {
     let (Some(refaddr), Some(url)) = (var("SPRIG_TEST_REDIS_REF"), var("SPRIG_TEST_REDIS_SPRIG"))
     else {
         eprintln!("SPRIG_TEST_REDIS_REF or SPRIG_TEST_REDIS_SPRIG not set: skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let mut r = conn(&format!("redis://{refaddr}")).await;
     let mut s = conn(&url).await;

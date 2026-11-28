@@ -1259,95 +1259,100 @@ where
         if !settled.open.is_empty() {
             return Ok(Cleanup::WaitingForJobs(settled.open.len()));
         }
-        // 2. The catalog: hooks, the live-database guard, its database ids.
         let mark = owner_mark(e.body());
-        let catalog_cluster = self.locator.cluster_of(id).await?;
-        // A tenant bootstrapped without its catalog schema that never made
-        // it, nor backend accounts, has nothing on MariaDB.
-        // Nor does one placed with no MariaDB cluster.
-        let engine_only = catalog_cluster
-            .as_ref()
-            .is_some_and(|c| c.as_str() == ENGINE_ONLY_CLUSTER);
-        let on_mariadb = !engine_only
-            && sprig_catalog::migrate::lazy_schema(id)
-                .await?
-                .is_none_or(|l| l.mariadb);
-        let mut catalog: Option<CatalogEndpoint> = None;
-        let mut db_ids = std::collections::BTreeSet::new();
-        if let Some(c) = catalog_cluster.as_ref().filter(|_| on_mariadb) {
-            let ep = CatalogEndpoint {
-                pool: self.locator.pools().writer(c).await?,
-                store: Store::new(self.locator.schema(id)),
-            };
-            self.hooks.dropping(e.body(), Some(&ep)).await?;
-            match catalog_owner(&ep.pool, ep.store.schema()).await? {
-                // Another tenant's mark: never this tenant's to drop.
-                Some(found) if !found.is_empty() && found != mark => {
-                    tracing::warn!(tenant = %id, schema = ep.store.schema(), mark = found,
-                        "the catalog schema carries another tenant's mark; left in place");
-                }
-                // Ours, unmarked (made before marks existed), or gone.
-                _ => {
-                    let live = self.drop_databases(id).await?;
-                    if live > 0 {
-                        return Ok(Cleanup::WaitingForDatabases(live));
-                    }
-                    db_ids = cleanup::catalog_db_ids(id, &ep.pool, ep.store.schema()).await?;
-                    catalog = Some(ep);
-                }
-            }
-        } else {
-            self.hooks.dropping(e.body(), None).await?;
-            // The databases are engine records: they go through the DDL
-            // path here too, before step 4 deletes the records.
-            let live = self.drop_databases(id).await?;
-            if live > 0 {
-                return Ok(Cleanup::WaitingForDatabases(live));
-            }
-        }
-        // 3. Every cluster of the DC, by exact names. Only under the real
-        //    naming: a test's catalog naming says nothing about who owns
-        //    `t<id>_` names on a shared server.
-        if on_mariadb && self.locator.schema(id) == SchemaName::catalog(id).to_string() {
-            let finished: Vec<JobId> = settled.finished.iter().map(|(r, _)| r.job_id).collect();
-            for c in self.locator.pools().sweepable().await? {
-                let pool = self.locator.pools().writer(&c).await?;
-                let mut conn = crate::catalogs::acquire(&pool, "tenant cleanup").await?;
-                let known = sprig_cluster::purge::Known {
-                    owner_mark: Some(mark.clone()),
-                    drop_schemas: true,
-                    db_ids: db_ids.clone(),
-                    keep_catalog: catalog_cluster.as_ref() == Some(&c),
-                    jobs: finished.clone(),
+        let mut on_mariadb = false;
+        // Steps 2 to 4 ran already when the unit is gone (a pass that got
+        // past step 5 and then failed at step 6).
+        if !self.unit_gone(id).await {
+            // 2. The catalog: hooks, the live-database guard, its database ids.
+            let catalog_cluster = self.locator.cluster_of(id).await?;
+            // A tenant bootstrapped without its catalog schema that never made
+            // it, nor backend accounts, has nothing on MariaDB.
+            // Nor does one placed with no MariaDB cluster.
+            let engine_only = catalog_cluster
+                .as_ref()
+                .is_some_and(|c| c.as_str() == ENGINE_ONLY_CLUSTER);
+            on_mariadb = !engine_only
+                && sprig_catalog::migrate::lazy_schema(id)
+                    .await?
+                    .is_none_or(|l| l.mariadb);
+            let mut catalog: Option<CatalogEndpoint> = None;
+            let mut db_ids = std::collections::BTreeSet::new();
+            if let Some(c) = catalog_cluster.as_ref().filter(|_| on_mariadb) {
+                let ep = CatalogEndpoint {
+                    pool: self.locator.pools().writer(c).await?,
+                    store: Store::new(self.locator.schema(id)),
                 };
-                let p = sprig_cluster::purge::purge(&mut conn, id, &known).await?;
-                drop(conn);
-                if let Some(found) = &p.foreign {
-                    tracing::warn!(alert = "TenantCleanupForeignCatalog", tenant = %id, cluster = %c, mark = found,
-                        "another tenant with this id has a catalog here; its names were left alone");
-                    continue;
+                self.hooks.dropping(e.body(), Some(&ep)).await?;
+                match catalog_owner(&ep.pool, ep.store.schema()).await? {
+                    // Another tenant's mark: never this tenant's to drop.
+                    Some(found) if !found.is_empty() && found != mark => {
+                        tracing::warn!(tenant = %id, schema = ep.store.schema(), mark = found,
+                            "the catalog schema carries another tenant's mark; left in place");
+                    }
+                    // Ours, unmarked (made before marks existed), or gone.
+                    _ => {
+                        let live = self.drop_databases(id).await?;
+                        if live > 0 {
+                            return Ok(Cleanup::WaitingForDatabases(live));
+                        }
+                        db_ids = cleanup::catalog_db_ids(id, &ep.pool, ep.store.schema()).await?;
+                        catalog = Some(ep);
+                    }
                 }
-                for (schema, why) in &p.left {
-                    tracing::warn!(tenant = %id, cluster = %c, schema, why, "a schema of the deleted tenant was left in place");
-                }
-                if !p.is_empty() {
-                    tracing::info!(event = "tenant.cleanup", tenant = %id, cluster = %c,
-                        schemas = ?p.drop_schemas,
-                        accounts = ?p.drop_accounts.iter().map(|a| a.user.as_str()).collect::<Vec<_>>(),
-                        names = p.delete_names.len(), jobs = p.jobs.len(),
-                        "deleted tenant's objects removed");
+            } else {
+                self.hooks.dropping(e.body(), None).await?;
+                // The databases are engine records: they go through the DDL
+                // path here too, before step 4 deletes the records.
+                let live = self.drop_databases(id).await?;
+                if live > 0 {
+                    return Ok(Cleanup::WaitingForDatabases(live));
                 }
             }
-        }
-        // 4. The catalog itself.
-        //    Its engine records go too, also when the tenant never had a
-        //    catalog cluster; only a catalog schema carrying another
-        //    tenant's mark (left in place above) keeps them.
-        if let Some(ep) = &catalog {
-            drop_catalog(&ep.pool, &ep.store).await?;
-        }
-        if catalog.is_some() || catalog_cluster.is_none() || !on_mariadb {
-            cleanup::delete_catalog_records(id).await?;
+            // 3. Every cluster of the DC, by exact names. Only under the real
+            //    naming: a test's catalog naming says nothing about who owns
+            //    `t<id>_` names on a shared server.
+            if on_mariadb && self.locator.schema(id) == SchemaName::catalog(id).to_string() {
+                let finished: Vec<JobId> = settled.finished.iter().map(|(r, _)| r.job_id).collect();
+                for c in self.locator.pools().sweepable().await? {
+                    let pool = self.locator.pools().writer(&c).await?;
+                    let mut conn = crate::catalogs::acquire(&pool, "tenant cleanup").await?;
+                    let known = sprig_cluster::purge::Known {
+                        owner_mark: Some(mark.clone()),
+                        drop_schemas: true,
+                        db_ids: db_ids.clone(),
+                        keep_catalog: catalog_cluster.as_ref() == Some(&c),
+                        jobs: finished.clone(),
+                    };
+                    let p = sprig_cluster::purge::purge(&mut conn, id, &known).await?;
+                    drop(conn);
+                    if let Some(found) = &p.foreign {
+                        tracing::warn!(alert = "TenantCleanupForeignCatalog", tenant = %id, cluster = %c, mark = found,
+                            "another tenant with this id has a catalog here; its names were left alone");
+                        continue;
+                    }
+                    for (schema, why) in &p.left {
+                        tracing::warn!(tenant = %id, cluster = %c, schema, why, "a schema of the deleted tenant was left in place");
+                    }
+                    if !p.is_empty() {
+                        tracing::info!(event = "tenant.cleanup", tenant = %id, cluster = %c,
+                            schemas = ?p.drop_schemas,
+                            accounts = ?p.drop_accounts.iter().map(|a| a.user.as_str()).collect::<Vec<_>>(),
+                            names = p.delete_names.len(), jobs = p.jobs.len(),
+                            "deleted tenant's objects removed");
+                    }
+                }
+            }
+            // 4. The catalog itself.
+            //    Its engine records go too, also when the tenant never had a
+            //    catalog cluster; only a catalog schema carrying another
+            //    tenant's mark (left in place above) keeps them.
+            if let Some(ep) = &catalog {
+                drop_catalog(&ep.pool, &ep.store).await?;
+            }
+            if catalog.is_some() || catalog_cluster.is_none() || !on_mariadb {
+                cleanup::delete_catalog_records(id).await?;
+            }
         }
         // 5. Finished job records, then the tenant's keys in the DC tier
         //    (the catalog's shard map among them).
@@ -1363,7 +1368,15 @@ where
         tracing::info!(event = "tenant.cleanup", tenant = %id, keys = n,
             jobs = settled.finished.len(), "deleted tenant's records removed");
         // 6. The entry and its name.
-        self.directory.remove(&e).await?;
+        //    Read again: dropping the databases above allocated catalog
+        //    versions in this very entry, so `e` is stale by now (removing
+        //    it failed with 39071, and the next pass found the unit gone).
+        match self.directory.get(id).await? {
+            Some(cur) if cur.body().state == TenantState::Deleting => {
+                self.directory.remove(&cur).await?;
+            }
+            _ => return Ok(Cleanup::Done),
+        }
         // 7. A gateway that hadn't seen the deletion
         //    yet may have made one of the tenant's backend accounts again
         //    after step 3 (a session's statement, a new login). Look again
@@ -1378,6 +1391,21 @@ where
             });
         }
         Ok(Cleanup::Done)
+    }
+
+    /// Whether an earlier pass of `id`'s cleanup already got past step 5
+    /// on a DC whose nodes place units per tenant: the unit descriptor,
+    /// deleted there after the records, is gone, so there is no catalog
+    /// left to drop or delete (every call to it would answer 39072, "isn't
+    /// placed on any node"). A tenant whose creation stopped before its
+    /// unit was placed has no records either.
+    async fn unit_gone(&self, id: TenantId) -> bool {
+        matches!(
+            sprig_catalog::units::read(self.dc_store.as_ref(), id.0).await,
+            Ok(None)
+        ) && sprig_catalog::units::nodes(self.dc_store.as_ref())
+            .await
+            .is_ok_and(|ns| ns.iter().any(|n| n.placement))
     }
 
     fn view(

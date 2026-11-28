@@ -28,11 +28,12 @@ fn pool() -> Option<Pool> {
     ))
 }
 
+#[ignore = "live: needs SPRIG_TEST_SEARCH; tools/live/README.md"]
 #[tokio::test]
 async fn fulltext_key_and_prepared_against() {
     let Some(pool) = pool() else {
         eprintln!("SPRIG_TEST_SEARCH not set; skipped");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let mut c = pool.get_conn().await.unwrap();
     for s in [

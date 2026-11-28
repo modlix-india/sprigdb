@@ -8,7 +8,8 @@
 //!   MariaDB clusters with their topology and endpoints, etcd tiers), read
 //!   from `SPRIG_TEST_*` variables or a TOML file;
 //! - [`skip`]: the `SPRIG_TEST_*` convention and [`require_env!`], which
-//!   skips a test cleanly when its environment isn't configured;
+//!   fails a live test run without its environment (live tests are
+//!   `#[ignore]`d, so plain runs list them as skipped);
 //! - [`compose`]: Docker Compose fixtures that start a project, wait for
 //!   health, collect logs on failure and tear down on drop;
 //! - [`util`]: unique names, temporary directories and retry with a timeout;
@@ -27,14 +28,15 @@
 //!
 //! # Using it from another crate
 //!
-//! Add `sprig-testkit` as a dev-dependency, then gate each integration test
-//! on its variable:
+//! Add `sprig-testkit` as a dev-dependency, mark each live test
+//! `#[ignore = "live: needs <VAR>; tools/live/README.md"]` and read its
+//! variable:
 //!
 //! ```no_run
 //! # async fn example() {
 //! use sprig_testkit::{require_env, skip};
 //!
-//! // Returns from the test with a "skipped" message unless SPRIG_TEST_ETCD is set.
+//! // Fails the test unless SPRIG_TEST_ETCD is set.
 //! let endpoints = require_env!(skip::ETCD);
 //! # let _ = endpoints;
 //! # }

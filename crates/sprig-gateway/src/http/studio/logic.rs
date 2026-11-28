@@ -138,6 +138,17 @@ async fn store(
     caller: &Caller,
     db: &str,
 ) -> Result<(Box<dyn sprig_catalog::RecordTx>, LogicStore, u32), SprigError> {
+    store_on(core, caller, db, false).await
+}
+
+/// [`store`], on the tenant unit's leader when `write` (the node that took
+/// the request may not lead it).
+async fn store_on(
+    core: &Arc<Core>,
+    caller: &Caller,
+    db: &str,
+    write: bool,
+) -> Result<(Box<dyn sprig_catalog::RecordTx>, LogicStore, u32), SprigError> {
     let (Some(svc), Some(tid)) = (&core.studio.tenants, caller.principal.tenant) else {
         return Err(invalid("the logic views need a tenant login"));
     };
@@ -150,7 +161,8 @@ async fn store(
         .or_else(|| cat.database(&db.to_ascii_lowercase()))
         .ok_or_else(|| SprigError::standard(1049, *b"42000", format!("Unknown database '{db}'")))?;
     let db_id = row.db_id.0;
-    let conn = svc.records.begin(tid).await?;
+    let records = if write { &svc.writers } else { &svc.records };
+    let conn = records.begin(tid).await?;
     Ok((conn, LogicStore::default(), db_id))
 }
 
@@ -557,7 +569,7 @@ async fn settle(
             "name the dead letters (ids) or ask for all of them",
         ));
     }
-    let (mut conn, st, db_id) = store(core, caller, db).await?;
+    let (mut conn, st, db_id) = store_on(core, caller, db, true).await?;
     let m = module_of(&st, &mut *conn, db_id, kind, name).await?;
     let Some(b) = st.binding(&mut *conn, m.module_id).await? else {
         return Err(not_found(&format!("binding of {kind} {name}")));

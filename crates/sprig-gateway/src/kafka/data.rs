@@ -17,6 +17,7 @@ use sprig_catalog::{Freshness, TenantCatalog};
 use sprig_common::ids::{TenantId, UserId};
 use sprig_proto_kafka::broker::data::Limits;
 use sprig_proto_kafka::topics::Principal;
+use sprig_streams::seg::kafka::FanInTopic;
 
 use crate::tenant::TenantServices;
 
@@ -32,7 +33,16 @@ type GrantCache = HashMap<(u64, Option<u64>), (u64, u64, Arc<dyn SessionGrants>)
 pub struct GatewayData {
     svc: Arc<TenantServices>,
     grants: Mutex<GrantCache>,
+    /// Fan-in topics by (tenant, user), with when they were listed.
+    fan_in: Mutex<FanInCache>,
 }
+
+/// Fan-in topics by (tenant, user), and when they were listed.
+type FanInCache = HashMap<(u64, Option<u64>), (std::time::Instant, Arc<Vec<FanInTopic>>)>;
+
+/// How long a fan-in topic list is reused (a member's new instance shows
+/// up after at most this).
+const FAN_IN_FRESH: Duration = Duration::from_secs(2);
 
 impl std::fmt::Debug for GatewayData {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -47,7 +57,67 @@ impl GatewayData {
         Self {
             svc,
             grants: Mutex::new(HashMap::new()),
+            fan_in: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// The fan-in topics `p` may read (`__t.<member>.<db>.<stream>`): each
+    /// member's instance of a `FOR EACH TENANT` stream `p`'s tenant
+    /// declares, when `p` holds `SPRIG_FAN_IN` and `SELECT` on the stream;
+    /// members denying remote access left out.
+    pub(crate) async fn fan_in_topics(
+        &self,
+        p: &Principal,
+        cat: &TenantCatalog,
+    ) -> Arc<Vec<FanInTopic>> {
+        let k = (p.tenant_id, p.user_id);
+        if let Some((at, v)) = lock(&self.fan_in).get(&k)
+            && at.elapsed() < FAN_IN_FRESH
+        {
+            return Arc::clone(v);
+        }
+        let own = crate::inherited::state_of(cat);
+        let defs: Vec<_> = own
+            .defs
+            .values()
+            .filter(|d| {
+                d.kind == sprig_inherit::msg::DefKind::Stream
+                    && d.state == sprig_inherit::msg::DefState::Active
+            })
+            .cloned()
+            .collect();
+        let mut out = Vec::new();
+        let g = self.grants(p, cat);
+        if !defs.is_empty() && (g.unrestricted() || g.allows(Action::FanIn, Target::Tenant)) {
+            for d in defs {
+                if !self.allowed_named(p, cat, &d.db_name, &d.name, Action::Select) {
+                    continue;
+                }
+                let Ok(list) = crate::inherited::instances_of(&self.svc, d.key()).await else {
+                    continue;
+                };
+                for e in list.into_iter().filter(|e| e.tenant != cat.tenant) {
+                    let Ok(Some(entry)) = crate::inherited::dir_entry(&self.svc, e.tenant).await
+                    else {
+                        continue;
+                    };
+                    if !entry.path_ids().contains(&cat.tenant.0)
+                        || sprig_auth::TenantResidency::of(&entry.residency)
+                            .is_some_and(|r| r.deny_remote_access)
+                    {
+                        continue;
+                    }
+                    out.push(FanInTopic {
+                        name: format!("__t.{}.{}.{}", entry.name, d.db_name, d.name),
+                        member: e.tenant.0,
+                        stream: format!("{}.{}", d.db_name, d.name),
+                    });
+                }
+            }
+        }
+        let out = Arc::new(out);
+        lock(&self.fan_in).insert(k, (std::time::Instant::now(), Arc::clone(&out)));
+        out
     }
 
     fn lctn(&self, cat: &TenantCatalog) -> bool {

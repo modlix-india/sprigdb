@@ -280,7 +280,7 @@ pub async fn ensure_vhost(
         .iter()
         .any(|d| d.kind == DefKind::Queue)
         .then(|| tokio::spawn(warm_store(Arc::clone(svc), t, Arc::clone(&row))));
-    let mstore = MsgStore::new(Arc::clone(&svc.records), t);
+    let mstore = MsgStore::new(Arc::clone(&svc.writers), t);
     let st = super::state_of(&cat);
     let mq = cat
         .ext
@@ -520,7 +520,11 @@ pub async fn ensure_vhost(
     }
     // inherit.broadcast_replay, for instances made just now.
     for d in fresh {
-        tokio::spawn(super::broadcast::replay(Arc::clone(svc), d, t));
+        if crate::amqp::queues::messages_on_engine(t.0) {
+            tokio::spawn(crate::exec::inherited_bcast::replay(Arc::clone(svc), d, t));
+        } else {
+            tokio::spawn(super::broadcast::replay(Arc::clone(svc), d, t));
+        }
     }
     Ok(true)
 }
@@ -582,6 +586,10 @@ async fn warm_store(
     t: TenantId,
     row: Arc<sprig_catalog::store::DatabaseRow>,
 ) {
+    // Messages on the engine: no shard tables and no feed to subscribe.
+    if crate::amqp::queues::messages_on_engine(t.0) {
+        return;
+    }
     let Some(schema) = shard_schemas(t, &row).first().map(ToString::to_string) else {
         return;
     };
@@ -642,7 +650,7 @@ pub async fn remove(svc: &Arc<TenantServices>, t: TenantId, def: &Definition) ->
             c.commit().await?;
         }
     }
-    MsgStore::new(Arc::clone(&svc.records), t)
+    MsgStore::new(Arc::clone(&svc.writers), t)
         .delete_instance(def.key())
         .await?;
     super::delete_index(svc, t, def.key()).await?;
@@ -939,6 +947,9 @@ pub async fn deliver_outbox(
     rows: &[OutboxRow],
 ) -> Result<()> {
     let t = tchain.member();
+    if crate::amqp::queues::messages_on_engine(t.0) {
+        return deliver_engine_outbox(svc, tchain, db, exchange, rows).await;
+    }
     Box::pin(ensure_vhost(svc, tchain, db, Cause::Publish)).await?;
     let engine = svc
         .mq
@@ -1006,6 +1017,134 @@ pub async fn deliver_outbox(
     v.committed();
     engine.wake_forwarder(t.0, row.db_id.0);
     Ok(())
+}
+
+/// Member `tchain.member()`'s vhost of database `db` with its instances
+/// made, opened here (its forwarder runs), and its message store on the
+/// engine.
+///
+/// # Errors
+/// The catalog's; the queue engine not running.
+pub async fn engine_vhost(
+    svc: &Arc<TenantServices>,
+    tchain: &Chain,
+    db: &str,
+) -> Result<(
+    sprig_queues::sql::SqlVhost,
+    Arc<sprig_queues::enginestore::EngineMsgStore>,
+)> {
+    let t = tchain.member();
+    Box::pin(ensure_vhost(svc, tchain, db, Cause::Publish)).await?;
+    let engine = svc
+        .mq
+        .get()
+        .cloned()
+        .ok_or_else(|| super::unavailable("the queue engine isn't running on this gateway"))?;
+    let name = super::tenant_name(svc, t).await?;
+    let v = engine
+        .sql_vhost(Arc::new(internal_principal(t, &name)), db, 0)
+        .await
+        .map_err(|e| sql_mq(&e))?;
+    let r = v.vhost();
+    let store = crate::amqp::queues::engine_queues()
+        .map(|q| q.store(r.tenant, r.db_id))
+        .ok_or_else(|| {
+            super::unavailable(
+                "queue messages are stored on the SprigDB engine, which failed to start on this \
+                 node",
+            )
+        })?;
+    Ok((v, store))
+}
+
+/// The queue outbox row that routes message `m` (stamped; its routing
+/// key is the one the member's bindings see) through `exchange` of the
+/// member's vhost (`""`: the default exchange), with `id` as its out id
+/// and its message id there (a second forward of it adds nothing).
+#[must_use]
+pub fn outbox_row(id: [u8; 16], exchange: &str, m: &Message) -> sprig_queues::store::OutboxRow {
+    sprig_queues::store::OutboxRow {
+        out_id: id,
+        kind: sprig_queues::store::OutKind::Publish,
+        dest: sprig_queues::store::OutDest::Exchange {
+            name: exchange.to_owned(),
+            key: m.routing_key.clone(),
+        },
+        msg_id: id,
+        fmt: sprig_queues::msg::fmt_code(m.format),
+        exchange: exchange.to_owned(),
+        routing_key: m.routing_key.clone(),
+        props: m.props.clone(),
+        body: m.body.clone(),
+        deaths: None,
+    }
+}
+
+/// [`OutboxRow`]s as queue messages (an outbox row keeps the encoding and
+/// the properties in its headers, [`xo_headers`]).
+fn rows_as_messages(exchange: &str, rows: &[OutboxRow]) -> Result<Vec<([u8; 16], Message)>> {
+    let mut out = Vec::with_capacity(rows.len());
+    for (id, key, body, h) in rows {
+        let h: Value = h
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or(Value::Null);
+        let fmt = u8::try_from(h.get("fmt").and_then(Value::as_u64).unwrap_or(0)).unwrap_or(0);
+        let props = h
+            .get("props")
+            .and_then(Value::as_str)
+            .and_then(|p| base64::engine::general_purpose::STANDARD.decode(p).ok())
+            .unwrap_or_default();
+        let key = String::from_utf8_lossy(key.as_deref().unwrap_or_default()).into_owned();
+        let m = sprig_queues::msg::rebuild(
+            fmt,
+            exchange.to_owned(),
+            key,
+            props.into(),
+            body.clone().unwrap_or_default().into(),
+        )
+        .map_err(|e| SprigError::internal(e.to_string()))?;
+        let id = <[u8; 16]>::try_from(id.as_slice())
+            .map_err(|_| SprigError::internal("an outbox id isn't 16 bytes"))?;
+        out.push((id, m));
+    }
+    Ok(out)
+}
+
+/// [`deliver_outbox`] for a member whose messages are on the engine: the
+/// rows go into its vhost's outbox on the engine in one transaction, and
+/// its forwarder routes them.
+async fn deliver_engine_outbox(
+    svc: &Arc<TenantServices>,
+    tchain: &Chain,
+    db: &str,
+    exchange: &str,
+    rows: &[OutboxRow],
+) -> Result<()> {
+    let (v, store) = engine_vhost(svc, tchain, db).await?;
+    let eng = crate::node_engine::engine()?;
+    let mut t = eng.begin(sprig_engine::txn::TxnOptions::mysql())?;
+    for (id, m) in rows_as_messages(exchange, rows)? {
+        txn_put(&mut t, store.txn_publish(&outbox_row(id, exchange, &m)))?;
+    }
+    let gate = t.reply_gate();
+    t.commit()?.wait_async().await?;
+    gate.wait_async().await?;
+    v.committed();
+    Ok(())
+}
+
+/// Adds a queue store write to engine transaction `t` (applied with its
+/// commit).
+///
+/// # Errors
+/// The transaction isn't active.
+pub fn txn_put(t: &mut sprig_engine::txn::Txn, op: sprig_queues::enginestore::TxnOp) -> Result<()> {
+    use sprig_queues::enginestore::TxnOp;
+    match op {
+        TxnOp::Put(k, v) => t.add_plain_put(sprig_engine::Cf::Data, k, v),
+        TxnOp::Delete(k) => t.add_plain_delete(sprig_engine::Cf::Data, k),
+    }
 }
 
 // ----------------------------------------------------------------------
@@ -1266,6 +1405,7 @@ impl InheritVhost {
             .replace(rx);
         let svc = Arc::clone(&self.svc);
         let me = self.tenant;
+        let origin = self.tenant_name.clone();
         let db = self.db.clone();
         let def = self.names().chain.as_ref().and_then(|c| {
             declared_in(c, &db)
@@ -1278,6 +1418,21 @@ impl InheritVhost {
             }
             let r = async {
                 let def = def.ok_or_else(|| target_err(format!("no definition {db}.{name}")))?;
+                if crate::amqp::queues::messages_on_engine(me.0) {
+                    // The broadcast log on the engine.
+                    return crate::exec::inherited_bcast::publish_message(
+                        &svc,
+                        &def,
+                        me,
+                        &origin,
+                        super::broadcast::Form::default(),
+                        &m,
+                        &key,
+                        None,
+                    )
+                    .await
+                    .map(|_| ());
+                }
                 let rec = sprig_streams::publish::Publish {
                     key: Some(key.into_bytes()),
                     value: Some(m.body.to_vec()),
@@ -1293,10 +1448,11 @@ impl InheritVhost {
                     &rec,
                 )
                 .await
+                .map(|_| ())
             }
             .await;
             let _ = tx.send(());
-            r.map(|_| ()).map_err(|e| {
+            r.map_err(|e| {
                 tracing::debug!(error = %e, "AMQP broadcast refused");
                 mq_err(&e)
             })

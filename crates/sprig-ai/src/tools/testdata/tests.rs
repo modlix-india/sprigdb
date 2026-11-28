@@ -251,10 +251,10 @@ async fn shape(conn: &mut mysql_async::Conn, db: &str, table: &str) -> GenTable 
 /// tables with foreign keys, unique keys and CHECKs in the schema
 /// `ai_dba2_gen_<pid>`, which MariaDB enforces; dropped afterwards.
 #[tokio::test]
+#[ignore = "live: needs SPRIG_TEST_MARIADB_SINGLE; tools/live/README.md"]
 async fn live_generated_rows_satisfy_mariadb() {
     let Ok(url) = std::env::var("SPRIG_TEST_MARIADB_SINGLE") else {
-        eprintln!("skipped: set SPRIG_TEST_MARIADB_SINGLE to run it");
-        return;
+        panic!("live: set SPRIG_TEST_MARIADB_SINGLE to run it (tools/live/README.md)");
     };
     let opts = mysql_async::OptsBuilder::from_opts(mysql_async::Opts::from_url(&url).unwrap())
         .pool_opts(

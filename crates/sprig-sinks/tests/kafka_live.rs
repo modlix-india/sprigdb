@@ -148,11 +148,13 @@ async fn deliver(t: &dyn Target, b: &Batch) -> BatchOutcome {
     }
 }
 
+#[ignore = "live: needs SPRIG_SINKS_KAFKA_LIVE; tools/live/README.md"]
 #[tokio::test]
 async fn every_format_and_compression_reads_back() {
-    if !live() {
-        return;
-    }
+    assert!(
+        live(),
+        "live test run without its environment: see tools/live/README.md"
+    );
     for fmt in ["json", "raw", "cloudevents"] {
         for comp in ["none", "gzip", "zstd", "snappy", "lz4"] {
             let topic = unique(&format!("r9sinks_fmt_{fmt}_{comp}"));
@@ -213,11 +215,13 @@ async fn every_format_and_compression_reads_back() {
     }
 }
 
+#[ignore = "live: needs SPRIG_SINKS_KAFKA_LIVE; tools/live/README.md"]
 #[tokio::test]
 async fn sasl_logins() {
-    if !live() {
-        return;
-    }
+    assert!(
+        live(),
+        "live test run without its environment: see tools/live/README.md"
+    );
     let topic = unique("r9sinks_sasl");
     for (mech, user, pass) in [
         ("SCRAM-SHA-256", "sprigscram", "scram-secret-1"),
@@ -441,11 +445,13 @@ async fn run_to_end(s: &Arc<Stream>, c: &TargetCtx, ctl: &Arc<Ctl>, lanes: u16, 
     h.await.unwrap().unwrap();
 }
 
+#[ignore = "live: needs SPRIG_SINKS_KAFKA_LIVE; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn throughput_and_a_broker_restart() {
-    if !live() {
-        return;
-    }
+    assert!(
+        live(),
+        "live test run without its environment: see tools/live/README.md"
+    );
     // Throughput: 30,000 records, 8 lanes, zstd.
     let topic = unique("r9sinks_tput");
     let c = ctx(&Cfg {
@@ -546,11 +552,13 @@ async fn throughput_and_a_broker_restart() {
     );
 }
 
+#[ignore = "live: needs SPRIG_SINKS_KAFKA_LIVE; tools/live/README.md"]
 #[tokio::test]
 async fn an_uncommitted_transaction_is_aborted_by_the_next_producer() {
-    if !live() {
-        return;
-    }
+    assert!(
+        live(),
+        "live test run without its environment: see tools/live/README.md"
+    );
     let topic = unique("r9sinks_eo_abort");
     let offsets = unique("r9sinks_offsets");
     let eo_opts = [
@@ -620,11 +628,13 @@ async fn an_uncommitted_transaction_is_aborted_by_the_next_producer() {
     assert!(e.message.contains("SINK_FENCED"), "{e}");
 }
 
+#[ignore = "live: needs SPRIG_SINKS_KAFKA_LIVE; tools/live/README.md"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn exactly_once_through_task_kills() {
-    if !live() {
-        return;
-    }
+    assert!(
+        live(),
+        "live test run without its environment: see tools/live/README.md"
+    );
     let topic = unique("r9sinks_eo_kills");
     let offsets = unique("r9sinks_offsets");
     let opts = [

@@ -1,0 +1,45 @@
+# Multi-table UPDATE and DELETE on engine tables with SQL triggers.
+x:DROP TABLE IF EXISTS tm_a
+x:DROP TABLE IF EXISTS tm_b
+x:DROP TABLE IF EXISTS tm_c
+x:DROP TABLE IF EXISTS tm_log
+q:CREATE TABLE tm_a (id INT PRIMARY KEY, v INT, w VARCHAR(10))
+q:CREATE TABLE tm_b (id INT PRIMARY KEY, aid INT, x INT)
+q:CREATE TABLE tm_c (id INT PRIMARY KEY, n INT)
+q:CREATE TABLE tm_log (k INT AUTO_INCREMENT PRIMARY KEY, msg VARCHAR(120))
+q:INSERT INTO tm_a VALUES (1, 10, 'a'), (2, 20, 'b'), (3, 30, 'c')
+q:INSERT INTO tm_b VALUES (1, 1, 100), (2, 1, 200), (3, 2, 300), (4, 9, 400)
+q:INSERT INTO tm_c VALUES (1, 0), (2, 0)
+q:CREATE TRIGGER tm_a_bu BEFORE UPDATE ON tm_a FOR EACH ROW BEGIN SET NEW.w = CONCAT(NEW.w, '+'); INSERT INTO tm_log (msg) VALUES (CONCAT('a bu ', OLD.id, ' ', OLD.v, '->', NEW.v)); END
+q:CREATE TRIGGER tm_a_au AFTER UPDATE ON tm_a FOR EACH ROW INSERT INTO tm_log (msg) VALUES (CONCAT('a au ', NEW.id, ' ', NEW.v, ' ', NEW.w))
+q:CREATE TRIGGER tm_b_bd BEFORE DELETE ON tm_b FOR EACH ROW INSERT INTO tm_log (msg) VALUES (CONCAT('b bd ', OLD.id, ' ', OLD.x))
+q:CREATE TRIGGER tm_b_ad AFTER DELETE ON tm_b FOR EACH ROW INSERT INTO tm_log (msg) VALUES (CONCAT('b ad ', OLD.id))
+q:CREATE TRIGGER tm_b_au AFTER UPDATE ON tm_b FOR EACH ROW INSERT INTO tm_log (msg) VALUES (CONCAT('b au ', OLD.x, '->', NEW.x))
+q:UPDATE tm_a JOIN tm_b ON tm_b.aid = tm_a.id SET tm_a.v = tm_a.v + tm_b.x WHERE tm_b.x < 300
+q:SELECT * FROM tm_a ORDER BY id
+q:SELECT msg FROM tm_log ORDER BY k
+q:UPDATE tm_a a, tm_b b SET a.v = b.x, b.x = b.x + 1 WHERE b.aid = a.id AND a.id = 2
+q:SELECT * FROM tm_a ORDER BY id
+q:SELECT * FROM tm_b ORDER BY id
+q:SELECT msg FROM tm_log ORDER BY k
+q:UPDATE tm_c JOIN tm_a ON tm_a.id = tm_c.id SET tm_c.n = tm_a.v
+q:SELECT * FROM tm_c ORDER BY id
+q:UPDATE tm_a JOIN tm_b ON tm_b.aid = tm_a.id SET tm_a.v = 0 WHERE tm_b.id = 99
+q:DELETE tm_b FROM tm_b JOIN tm_a ON tm_a.id = tm_b.aid WHERE tm_a.id = 1
+q:SELECT * FROM tm_b ORDER BY id
+q:DELETE FROM tm_b, tm_c USING tm_b JOIN tm_c ON tm_c.id = tm_b.aid
+q:SELECT * FROM tm_b ORDER BY id
+q:SELECT * FROM tm_c ORDER BY id
+q:DELETE b FROM tm_b AS b LEFT JOIN tm_a ON tm_a.id = b.aid WHERE tm_a.id IS NULL
+q:SELECT * FROM tm_b ORDER BY id
+q:SELECT msg FROM tm_log ORDER BY k
+q:CREATE TRIGGER tm_c_bu BEFORE UPDATE ON tm_c FOR EACH ROW UPDATE tm_a SET v = 1
+q:INSERT INTO tm_c VALUES (1, 5)
+q:UPDATE tm_c JOIN tm_a ON tm_a.id = tm_c.id SET tm_c.n = 6
+q:UPDATE tm_a JOIN tm_c ON tm_a.id = tm_c.id SET tm_a.v = 7 ORDER BY tm_a.id LIMIT 1
+q:SELECT * FROM tm_a ORDER BY id
+q:SELECT COUNT(*) FROM tm_log
+x:DROP TABLE IF EXISTS tm_a
+x:DROP TABLE IF EXISTS tm_b
+x:DROP TABLE IF EXISTS tm_c
+x:DROP TABLE IF EXISTS tm_log

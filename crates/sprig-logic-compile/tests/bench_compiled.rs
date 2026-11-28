@@ -209,6 +209,7 @@ fn columns(rt: &tokio::runtime::Runtime, c: &mut Conn) -> StaticColumns {
     cols
 }
 
+#[ignore = "live: needs SPRIG_TEST_MARIADB_SINGLE, SPRIG_LOGIC_BENCH_OUT; tools/live/README.md"]
 #[test]
 fn compiled_tier_timings() {
     let (Ok(url), Ok(out)) = (
@@ -216,7 +217,7 @@ fn compiled_tier_timings() {
         std::env::var("SPRIG_LOGIC_BENCH_OUT"),
     ) else {
         eprintln!("skipped: SPRIG_TEST_MARIADB_SINGLE and SPRIG_LOGIC_BENCH_OUT are not both set");
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let calls: u64 = std::env::var("SPRIG_LOGIC_BENCH_CALLS")
         .ok()

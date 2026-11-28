@@ -487,18 +487,20 @@ async fn round_trip(url: &str) {
     drop_schema(url, &schema).await;
 }
 
+#[ignore = "live: needs a running stack or reference server; tools/live/README.md"]
 #[tokio::test]
 async fn every_column_type_round_trips_on_the_single_node() {
     let Some(u) = urls(common::SINGLE, module_path!()) else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     round_trip(&u[0]).await;
 }
 
+#[ignore = "live: needs a running stack or reference server; tools/live/README.md"]
 #[tokio::test]
 async fn every_column_type_round_trips_on_scratch_servers() {
     let Some(us) = urls(common::SCRATCH, module_path!()) else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     for u in us {
         round_trip(&u).await;
@@ -507,10 +509,11 @@ async fn every_column_type_round_trips_on_scratch_servers() {
 
 /// `binlog_row_image = MINIMAL` and `NOBLOB` (session settings): absent
 /// columns decode as `None`, present ones correctly.
+#[ignore = "live: needs a running stack or reference server; tools/live/README.md"]
 #[tokio::test]
 async fn minimal_and_noblob_images() {
     let Some(u) = urls(common::SINGLE, module_path!()) else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let url = &u[0];
     let schema = schema_name();

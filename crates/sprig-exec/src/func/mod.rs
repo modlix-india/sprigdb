@@ -1,6 +1,7 @@
 //! Built-in functions: the registry that maps a name and its compiled
 //! arguments to a typed closure.
 
+pub(crate) mod aivec;
 mod datetime;
 pub(crate) mod fulltext;
 mod hash;
@@ -70,6 +71,9 @@ pub(crate) fn build(name: &str, args: &[Expr], env: Env<'_>) -> Result<Node> {
         .filter(|a| !matches!(a, Expr::Keyword(_)))
         .map(|a| build_expr(a, env))
         .collect::<Result<Vec<_>>>()?;
+    if aivec::NAMES.contains(&name) {
+        return aivec::build(name, nodes, env);
+    }
     match name {
         "IF" => {
             let [c, a, b] = take(name, nodes)?;

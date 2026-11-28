@@ -9,7 +9,7 @@ source: the settings registry (sprig-settings)
 
 Every setting SprigDB declares, with its default, the scopes that may set it, hard bounds and when a change applies. Settings resolve from the most specific scope: object, database, tenant and its ancestors, cluster, data center, global, then the built-in default. Read them with `SHOW SPRIG SETTINGS`, change them with `ALTER TENANT|DATABASE|TABLE … SPRIG SET (key = value)` or `sprigctl settings`.
 
-714 settings in 60 groups.
+715 settings in 60 groups.
 
 ## `advisor`
 
@@ -76,6 +76,7 @@ Every setting SprigDB declares, with its default, the scopes that may set it, ha
 | `ai.model.triage` | text | `` | global (operator only) | - | live | provider/model that screens administration intake for noise; empty: none |
 | `ai.retrieval.candidates` | int | `40` | global (operator only) | 5 to 1000 | live | Hits a retrieval index search takes from each shard's full-text list and vector list before fusing them |
 | `ai.retrieval.max_chunks_per_row` | int | `64` | global (operator only) | 1 to 10000 | live | Chunks a retrieval index keeps of one row at most; the rest of a longer text isn't indexed |
+| `ai.retrieval.max_scan_chunks` | int | `50000` | global (operator only) | 1000 to 10000000 | live | Chunks a search of an engine database's retrieval index compares with the query's vector at most (an exact scan); a larger index answers from its keyword list alone, with warning 39827 |
 | `ai.share_data` | bool | `false` | database, tenant, global | - | live | Let the assistants send rows, results and value statistics to the AI provider; off sends schema, plans and statistics without values |
 | `ai.timeout_seconds` | int | `120` | global (operator only) | 5 to 3600 | live | Wall time of one assistant turn, model calls and tools together |
 
@@ -389,10 +390,10 @@ Every setting SprigDB declares, with its default, the scopes that may set it, ha
 |---|---|---|---|---|---|---|
 | `docs.embed_queries` | bool | `true` | dc, global (operator only) | - | live | Embed docs search queries with the bundled model for hybrid search; off: keyword search only (the model is never loaded) |
 | `docs.embed_threads` | int | `2` | dc, global (operator only) | 1 to 64 | live | CPU threads the gateway's embedding model may use for one docs query |
-| `docs.enabled` | bool | `true` | dc, global (operator only) | - | live | Load the docs pack into every cluster and serve docs search (the REST call and the sprig_docs database) |
-| `docs.keep_versions` | int | `2` | dc, global (operator only) | 1 to 20 | live | Releases of the docs kept on each cluster, the running one included (2: current and previous, for a rollback) |
+| `docs.enabled` | bool | `true` | dc, global (operator only) | - | live | Serve docs search from the docs pack (the REST call, pages and the sprig_docs database); each node reads the pack into memory |
+| `docs.keep_versions` | int | `2` | dc, global (operator only) | 1 to 20 | live | Releases of the docs kept on each MariaDB cluster, the running one included (2: current and previous, for a rollback); engine nodes serve their own release from memory |
 | `docs.model_dir` | text | `` | dc, global (operator only) | - | live | The embedding model's directory (config.json, tokenizer.json, model.safetensors); empty: models/bge-small-en-v1.5 next to the sprigdb binary |
-| `docs.pack_path` | text | `` | dc, global (operator only) | - | live | The docs pack the controller loads; empty: sprig-docs-<version>.pack next to the sprigdb binary |
+| `docs.pack_path` | text | `` | dc, global (operator only) | - | live | The docs pack each node reads (and a controller with MariaDB clusters loads); empty: sprig-docs-<version>.pack next to the sprigdb binary |
 | `docs.search_limit` | int | `8` | dc, global (operator only) | 1 to 50 | live | Hits a docs search returns when the request gives no limit (at most 50 either way) |
 
 ## `failover`

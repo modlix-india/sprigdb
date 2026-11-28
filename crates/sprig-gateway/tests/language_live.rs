@@ -205,10 +205,11 @@ async fn teardown(w: &mut Conn) {
     let _ = w.query_drop(format!("DROP DATABASE IF EXISTS {DB}")).await;
 }
 
+#[ignore = "live: needs SPRIG_TEST_LANG_GATEWAY, SPRIG_TEST_HTTP_USER, SPRIG_TEST_HTTP_PASSWORD; tools/live/README.md"]
 #[tokio::test]
 async fn languages_over_rest_and_grpc() {
     let Some(e) = env("languages_over_rest_and_grpc") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let mut w = setup(&e).await;
     let auth = basic(&e.user, &e.password);
@@ -382,10 +383,11 @@ async fn languages_over_rest_and_grpc() {
     teardown(&mut w).await;
 }
 
+#[ignore = "live: needs SPRIG_TEST_LANG_GATEWAY, SPRIG_TEST_HTTP_USER, SPRIG_TEST_HTTP_PASSWORD; tools/live/README.md"]
 #[tokio::test]
 async fn mongo_commands_match_the_driver() {
     let Some(e) = env("mongo_commands_match_the_driver") else {
-        return;
+        panic!("live test run without its environment: see tools/live/README.md");
     };
     let mut w = setup(&e).await;
     let auth = basic(&e.user, &e.password);
