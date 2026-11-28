@@ -1041,6 +1041,9 @@ pub struct CheckCtx<'a> {
     /// (their policies are in the text, or MariaDB's triggers check its
     /// writes).
     pub covered: &'a [sprig_common::ids::ObjectId],
+    /// The gateway's own statement (`types.internal`): only these may name
+    /// a retrieval index's chunk table.
+    pub internal: bool,
 }
 
 impl CheckCtx<'_> {
@@ -1076,7 +1079,7 @@ impl CheckCtx<'_> {
         // statements can name them, for a user the retrieval code has
         // checked on the source table (a table-level grant is enough); every
         // hit is checked again on the source through the user's session.
-        if sprig_ai::retrieval::is_chunk_table(name) {
+        if self.internal && sprig_ai::retrieval::is_chunk_table(name) {
             return Ok(());
         }
         let okey = object_key(ObjectKind::Table, name, self.lctn);
@@ -1447,6 +1450,7 @@ pub fn recheck(ts: &TenantSession, persona: Persona, rc: &Recheck) -> Result<()>
         lctn,
         temp: &temp,
         covered: &rc.covered,
+        internal: ts.types.internal,
     };
     let r = check_text(&cx, rc.kind, &rc.text, rc.lex);
     // A table whose policies bind the session since the prepare (a policy
@@ -1521,6 +1525,7 @@ pub fn check_session(
         lctn,
         temp: &temp,
         covered: &ts.rls.covered,
+        internal: ts.types.internal,
     };
     let r = check(&cx, sp, original, lex);
     if r.is_err() {
@@ -1564,6 +1569,7 @@ pub fn allows_needs(
         lctn,
         temp: &temp,
         covered: &ts.rls.covered,
+        internal: ts.types.internal,
     };
     needs.iter().all(|n| cx.need(n).is_ok())
 }

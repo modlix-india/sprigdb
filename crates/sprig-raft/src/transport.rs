@@ -20,6 +20,11 @@ pub trait Transport: Send + Sync {
 pub struct MemNetwork {
     nodes: RwLock<BTreeMap<NodeId, Node>>,
     cut: Mutex<BTreeSet<(NodeId, NodeId)>>,
+    /// Frames larger than this are dropped (0: no limit), as the TCP
+    /// transport refuses frames over its limit.
+    max_frame: std::sync::atomic::AtomicUsize,
+    /// Frames dropped for their size.
+    oversized: std::sync::atomic::AtomicU64,
 }
 
 impl MemNetwork {
@@ -43,6 +48,18 @@ impl MemNetwork {
             .write()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&id);
+    }
+
+    /// Drops frames larger than `bytes` from now on (0: no limit).
+    pub fn set_max_frame(&self, bytes: usize) {
+        self.max_frame
+            .store(bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Frames dropped so far for being larger than [`MemNetwork::set_max_frame`].
+    #[must_use]
+    pub fn oversized(&self) -> u64 {
+        self.oversized.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Cuts (`true`) or restores frames from `from` to `to`.
@@ -91,6 +108,16 @@ pub struct MemTransport {
 
 impl Transport for MemTransport {
     fn send(&self, to: NodeId, frame: Vec<u8>) {
+        let max = self
+            .net
+            .max_frame
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if max > 0 && frame.len() > max {
+            self.net
+                .oversized
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
         if self
             .net
             .cut

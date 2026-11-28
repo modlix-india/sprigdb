@@ -82,6 +82,13 @@ pub struct RaftConfig {
     /// transfers together (0: no limit). [`crate::Node::set_snapshot_rate`]
     /// changes it while the node runs.
     pub snapshot_bytes_per_second: u64,
+    /// The most bytes of messages one frame to a peer carries: a turn's
+    /// messages to a peer that come to more go in several frames, in
+    /// order (a follower catching up after a large snapshot gets up to
+    /// `max_inflight_msgs` appends in one turn, each up to an entry of
+    /// 16 MiB). A single message larger than this goes in a frame of its
+    /// own. Far below the transport's frame limit (1 GiB).
+    pub max_frame_bytes: usize,
 }
 
 impl Default for RaftConfig {
@@ -106,6 +113,7 @@ impl Default for RaftConfig {
             snapshot_off_driver: true,
             snapshot_dir: None,
             snapshot_bytes_per_second: 0,
+            max_frame_bytes: 64 << 20,
         }
     }
 }

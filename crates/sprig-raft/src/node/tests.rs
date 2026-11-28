@@ -780,3 +780,45 @@ fn dropping_a_replicas_state_holds_no_node_lock() {
     });
     assert!(!c.node(1).is_closed());
 }
+
+/// A follower far behind catches up when a turn's appends to it come to
+/// more than one frame may carry (after a large snapshot, up to
+/// `max_inflight_msgs` appends of up to 16 MiB each): they go in several
+/// frames, none over the transport's limit. Before, they went in one
+/// frame, which the receiver refused (1.3-1.5 GB after a 3 GB move).
+#[test]
+fn a_far_behind_follower_catches_up_in_bounded_frames() {
+    let cfg = RaftConfig {
+        max_size_per_msg: 16 << 10,
+        max_frame_bytes: 256 << 10,
+        compact_after: 1_000_000,
+        ..fast()
+    };
+    let c = Cluster::new(&[1, 2, 3], cfg);
+    // As the TCP transport refuses frames over its limit.
+    c.net.set_max_frame(1 << 20);
+    c.create(1, &[1, 2, 3]);
+    c.put(1, 0, 0);
+    let l = c.leader(1);
+    let lagging = c.members.keys().copied().find(|id| *id != l).expect("f");
+    c.net.isolate(lagging, true);
+    // 20 MiB of entries the follower misses.
+    let slots: Vec<_> = (0..2560)
+        .map(|_| {
+            c.node(l)
+                .propose(1, vec![0u8; 8 << 10], Durability::Strict)
+                .expect("propose")
+        })
+        .collect();
+    for s in slots {
+        assert!(matches!(s.wait_timeout(WAIT), Some(Ok(_))));
+    }
+    c.put(1, 1, 1);
+    c.net.isolate(lagging, false);
+    until("the follower caught up", || {
+        let a = c.node(lagging).status(1)?.applied;
+        (a >= c.node(l).status(1)?.applied).then_some(())
+    });
+    assert_eq!(c.net.oversized(), 0, "a frame over the transport's limit");
+    assert_eq!(c.get(1, 1), Some(1));
+}

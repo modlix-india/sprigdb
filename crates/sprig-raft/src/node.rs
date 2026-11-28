@@ -3198,6 +3198,17 @@ impl Node {
             if items.is_empty() {
                 continue;
             }
+            for batch in split_items(items, self.inner.cfg.max_frame_bytes) {
+                self.send_frame(to, batch, now);
+            }
+        }
+    }
+
+    /// Sends `items` to `to` in one frame (the next of its sequence),
+    /// starting the lease clock of every group it carries leader messages
+    /// of.
+    fn send_frame(&self, to: NodeId, items: Vec<Item>, now: Instant) {
+        {
             let (seq, ack_epoch, acks) = {
                 let mut peers = lock(&self.inner.peers);
                 let p = peers.entry(to).or_insert_with(|| Peer {
@@ -3242,6 +3253,45 @@ impl Node {
             self.inner.transport.send(to, frame.encode());
         }
     }
+}
+
+/// About how many bytes `it` takes in a frame.
+fn item_bytes(it: &Item) -> usize {
+    match it {
+        Item::Raft(_, _, m) => {
+            64 + m.get_snapshot().data.len()
+                + m.get_entries()
+                    .iter()
+                    .map(|e| 32 + e.data.len() + e.context.len())
+                    .sum::<usize>()
+        }
+        Item::Quiesce { .. } => 32,
+        Item::SnapChunk { data, .. } => 64 + data.len(),
+    }
+}
+
+/// `items` in order, cut into runs of at most `cap` bytes each (a single
+/// larger item makes a run of its own; 0: one run).
+fn split_items(items: Vec<Item>, cap: usize) -> Vec<Vec<Item>> {
+    if cap == 0 {
+        return vec![items];
+    }
+    let mut out = Vec::new();
+    let mut cur = Vec::new();
+    let mut bytes = 0usize;
+    for it in items {
+        let n = item_bytes(&it);
+        if !cur.is_empty() && bytes + n > cap {
+            out.push(std::mem::take(&mut cur));
+            bytes = 0;
+        }
+        bytes += n;
+        cur.push(it);
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
 }
 
 /// Writes `cell`'s state to `path` through `ex`, from a point fixed under
