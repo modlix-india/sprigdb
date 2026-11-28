@@ -30,6 +30,7 @@ import {
   useUsers,
 } from './data';
 import { connectionLines } from './connect';
+import { columnsText, tableOf } from '../indexing/records';
 
 const fmt = (n: number) => n.toLocaleString(undefined, { maximumFractionDigits: 1 });
 /** A time in ms (number or text) as a short local date and time; '—' when absent. */
@@ -362,19 +363,19 @@ function Approvals({ n = 5 }: { n?: number }) {
 function IndexAdviceCard({ n = 5 }: { n?: number }) {
   const base = useBase();
   const q = useIndexAdvice();
-  const rows = [...(q.data?.indexes ?? [])].sort((a, b) => b.est_net_ms_h - a.est_net_ms_h).slice(0, n);
+  const rows = [...(q.data?.indexes ?? [])].sort((a, b) => b.benefit_ms_per_hour - a.benefit_ms_per_hour).slice(0, n);
   return (
     <Card id="advice" title="Index advice" more={{ to: `${base}/indexing?view=recommendations`, label: 'Automatic indexing' }}>
       <QueryNote q={q} />
       {q.data && rows.length === 0 && <p className="muted">No indexes recommended.</p>}
       <ul className="linklist">
         {rows.map((r) => (
-          <li key={r.index_id}>
+          <li key={r.name}>
             <span className="mono">
-              {r.db}.{r.table} ({r.columns.join(', ')})
+              {tableOf(r)} ({columnsText(r)})
             </span>{' '}
             <span className="muted small">
-              {r.state} · saves about {fmt(r.est_net_ms_h)} ms an hour
+              {r.state} · saves about {fmt(r.benefit_ms_per_hour)} ms an hour
             </span>
           </li>
         ))}

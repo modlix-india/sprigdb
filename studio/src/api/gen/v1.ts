@@ -1331,7 +1331,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** The caller's tenant's automatic indexes */
+        /** The caller's tenant's automatic indexes (the ended ones with all=true or their state), the loop's events of the last 30 days and pending requests, limited to db and table */
         get: operations["Indexing.ListIndexes"];
         put?: never;
         post?: never;
@@ -1348,28 +1348,11 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** One index with its evidence and history */
+        /** One index (name, table.name or db.table.name) with its events and pending requests */
         get: operations["Indexing.GetIndex"];
         put?: never;
-        /** index:approve|apply|reject|dismiss|pin|freeze|unpin|unfreeze|drop, for users who could create the index */
+        /** index:drop|pin|freeze|unpin|unfreeze|restore, for users who could create the index; 202 with the request the tenant's loop applies within a minute */
         post: operations["Indexing.Act"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/v1/indexing/queries/{fingerprint}": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** fingerprint:explain */
-        get: operations["Indexing.ExplainQuery"];
-        put?: never;
-        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -1383,7 +1366,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Recommendations awaiting approval */
+        /** Indexes in state recommended; each names its request in the approvals inbox (approval), where it is approved or dismissed */
         get: operations["Indexing.ListRecommendations"];
         put?: never;
         post?: never;
@@ -5481,37 +5464,6 @@ export interface operations {
                 "application/json": components["schemas"]["IndexActionRequest"];
             };
         };
-        responses: {
-            /** @description OK */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["JsonReply"];
-                };
-            };
-            /** @description An error */
-            default: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-        };
-    };
-    "Indexing.ExplainQuery": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                fingerprint: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
         responses: {
             /** @description OK */
             200: {

@@ -331,14 +331,14 @@ The **Performance** section has four pages.
 
 Four views of [automatic indexing](../performance/automatic-indexing.md), which you can filter to a database or table:
 
-- **Indexes**: each index with its columns, state, estimated net benefit, and size. Choose an index to see its evidence: the rollout per shard, the target fingerprints before and after, validations and history.
-- **Recommendations**: indexes waiting for a decision. **Approve** builds one; **Dismiss** rejects it.
+- **Indexes**: each automatic index with its table, columns, state (and **pinned**, or a request waiting to be applied), the time it saves per hour and how many plans have read it. **Include dropped, rejected and failed** adds the ended ones. Choose an index to see its evidence: why it was decided, rows examined without and with it, its build, a pending request and its decisions.
+- **Recommendations**: with `auto_index.mode = recommend`, the indexes waiting for a decision. Each is approved or dismissed in the [approvals inbox](#approvals).
+- **Events**: the automatic-indexing loop's decisions of the last 30 days, newest first: candidates, deferrals, builds, observations, drops, pins.
 - **Fingerprints**: the tenant's statements by total time over the last hour, 24 hours or 7 days, from applications, Studio or both, with a p95 latency series per fingerprint over 7 days.
-- **Explain a query**: the plan of a fingerprint.
 
 ![The Fingerprints tab of Automatic indexing, set to the last hour and to applications, listing statements on the retail database with their runs, total time, p50 and p95, and a Series button on each row](../img/studio/workload.png)
 
-**Freeze** pins an index so automatic indexing leaves it alone; **Unfreeze** releases it. Acting needs the right privileges on the database; otherwise the page says "view only". Statements run from Studio don't count toward automatic indexing unless `auto_index.include_studio` is on.
+**Pin** keeps an index whatever automatic indexing later finds; **Unpin** lets it judge the index again; **Drop** removes it now (its definition is then not built again for a while); **Restore** builds a dropped or failed index again, pinned. Each is a request that the node running the tenant's automatic indexing applies within a minute; the row shows it until then. Acting needs the privilege to create indexes in the index's database; otherwise the page says "view only". Statements run from Studio don't count toward automatic indexing unless `auto_index.include_studio` is on.
 
 ### Approvals
 

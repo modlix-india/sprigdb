@@ -10,6 +10,7 @@ import { fetchSnapshot, useDatabases, type DbSnapshot } from '../catalog/snapsho
 import { deadLetters, listModules, type ModuleRow } from '../logic/api';
 import type { FingerprintRow } from '../indexing/Fingerprints';
 import { showStatement } from '../settings/settings';
+import type { IndexListing } from '../indexing/records';
 
 /** At most this many databases are read for a home page. */
 export const HOME_MAX_DATABASES = 12;
@@ -108,22 +109,12 @@ export function loadSummary(rows: readonly FingerprintRow[], n = 5): { heaviest:
   };
 }
 
-export interface IndexAdvice {
-  index_id: number;
-  db: string;
-  table: string;
-  name: string;
-  columns: string[];
-  state: string;
-  est_net_ms_h: number;
-}
-
-/** Recommended indexes (the automatic indexing page's Recommendations
- * view, same cache). */
+/** Recommended automatic indexes (the automatic indexing page's
+ * Recommendations view, same cache): the controller's index records. */
 export function useIndexAdvice() {
   return useQuery({
     queryKey: ['indexing', 'recommendations', '', '', false],
-    queryFn: () => json<{ indexes: IndexAdvice[] }>('/v1/indexing/recommendations'),
+    queryFn: () => json<IndexListing>('/v1/indexing/recommendations'),
     retry: false,
   });
 }

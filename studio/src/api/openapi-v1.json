@@ -7009,7 +7009,7 @@
             "description": "An error"
           }
         },
-        "summary": "The caller's tenant's automatic indexes",
+        "summary": "The caller's tenant's automatic indexes (the ended ones with all=true or their state), the loop's events of the last 30 days and pending requests, limited to db and table",
         "tags": [
           "sprig.v1.Indexing"
         ]
@@ -7050,7 +7050,7 @@
             "description": "An error"
           }
         },
-        "summary": "One index with its evidence and history",
+        "summary": "One index (name, table.name or db.table.name) with its events and pending requests",
         "tags": [
           "sprig.v1.Indexing"
         ]
@@ -7099,48 +7099,7 @@
             "description": "An error"
           }
         },
-        "summary": "index:approve|apply|reject|dismiss|pin|freeze|unpin|unfreeze|drop, for users who could create the index",
-        "tags": [
-          "sprig.v1.Indexing"
-        ]
-      }
-    },
-    "/v1/indexing/queries/{fingerprint}": {
-      "get": {
-        "operationId": "Indexing.ExplainQuery",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "fingerprint",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/JsonReply"
-                }
-              }
-            },
-            "description": "OK"
-          },
-          "default": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Error"
-                }
-              }
-            },
-            "description": "An error"
-          }
-        },
-        "summary": "fingerprint:explain",
+        "summary": "index:drop|pin|freeze|unpin|unfreeze|restore, for users who could create the index; 202 with the request the tenant's loop applies within a minute",
         "tags": [
           "sprig.v1.Indexing"
         ]
@@ -7189,7 +7148,7 @@
             "description": "An error"
           }
         },
-        "summary": "Recommendations awaiting approval",
+        "summary": "Indexes in state recommended; each names its request in the approvals inbox (approval), where it is approved or dismissed",
         "tags": [
           "sprig.v1.Indexing"
         ]

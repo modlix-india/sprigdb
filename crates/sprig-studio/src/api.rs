@@ -287,7 +287,7 @@ fn core_paths() -> Value {
     let mut list = op(
         "Indexing.ListIndexes",
         "sprig.v1.Indexing",
-        "The caller's tenant's automatic indexes",
+        "The caller's tenant's automatic indexes (the ended ones with all=true or their state), the loop's events of the last 30 days and pending requests, limited to db and table",
         None,
         "JsonReply",
     );
@@ -295,7 +295,7 @@ fn core_paths() -> Value {
     let mut recs = op(
         "Indexing.ListRecommendations",
         "sprig.v1.Indexing",
-        "Recommendations awaiting approval",
+        "Indexes in state recommended; each names its request in the approvals inbox (approval), where it is approved or dismissed",
         None,
         "JsonReply",
     );
@@ -303,7 +303,7 @@ fn core_paths() -> Value {
     let mut get = op(
         "Indexing.GetIndex",
         "sprig.v1.Indexing",
-        "One index with its evidence and history",
+        "One index (name, table.name or db.table.name) with its events and pending requests",
         None,
         "JsonReply",
     );
@@ -311,19 +311,11 @@ fn core_paths() -> Value {
     let mut act = op(
         "Indexing.Act",
         "sprig.v1.Indexing",
-        "index:approve|apply|reject|dismiss|pin|freeze|unpin|unfreeze|drop, for users who could create the index",
+        "index:drop|pin|freeze|unpin|unfreeze|restore, for users who could create the index; 202 with the request the tenant's loop applies within a minute",
         Some("IndexActionRequest"),
         "JsonReply",
     );
     act["parameters"] = json!([p("index")]);
-    let mut explain = op(
-        "Indexing.ExplainQuery",
-        "sprig.v1.Indexing",
-        "fingerprint:explain",
-        None,
-        "JsonReply",
-    );
-    explain["parameters"] = json!([p("fingerprint")]);
     let mut decision = op(
         "Indexing.GetDecision",
         "sprig.v1.Indexing",
@@ -378,7 +370,6 @@ fn core_paths() -> Value {
         "/v1/indexing/indexes": {"get": list},
         "/v1/indexing/recommendations": {"get": recs},
         "/v1/indexing/indexes/{index}": {"get": get, "post": act},
-        "/v1/indexing/queries/{fingerprint}": {"get": explain},
         "/v1/indexing/decisions/{id}": {"get": decision},
         "/v1/catalog": {"get": op("Catalog.ListObjects", "sprig.v1.Catalog",
             "The logical databases the caller can see; ETag of the catalog and auth versions (If-None-Match gives 304)",

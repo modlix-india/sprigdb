@@ -13,7 +13,7 @@
 //! | `POST /v1/exports:ticket`, `POST /v1/exports` | `Exports.CreateTicket`; the form post that streams the file |
 //! | `POST /v1/users:setPassword` | `Users.SetPassword`, so a password never enters statement text |
 //! | `GET /v1/users`, `GET`/`POST /v1/api-keys`, `POST /v1/api-keys/{id}:revoke` | Accounts and API keys ([`accounts`]) |
-//! | `/v1/indexing/...` | The caller's tenant's automatic indexes, recommendations, actions and explanations |
+//! | `/v1/indexing/...` | The caller's tenant's automatic indexes, their events and pending requests, recommendations and actions ([`indexing`]) |
 //! | `POST /v1/databases/{db}/cursors`, `POST /v1/cursors/{h}:fetch`, `:close` | `Cursors` ([`cursors`]) |
 //! | `/v1/ops/...` | Operator mode: the Admin API for logins in `studio.operator_logins` ([`ops`]) |
 //! | `/v1/library`, `/v1/library/saved[:delete]`, `/v1/library/history[:clear]`, `/v1/library/prefs` | The caller's saved queries, history and preferences ([`library`]) |
@@ -44,6 +44,7 @@ pub mod cursors;
 pub mod dashboards;
 pub mod exports;
 pub mod grants;
+pub mod indexing;
 pub mod library;
 // The logic editors.
 pub mod logic;
@@ -66,7 +67,7 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
 use hyper::header::{self, HeaderValue};
-use hyper::{Method, Request, Response, StatusCode};
+use hyper::{Request, Response, StatusCode};
 use serde_json::{Value, json};
 use sprig_api::proto::v1::ExecuteResponse;
 use sprig_auth::token::{CatalogSessions, KeyRing, SessionStore, Tokens};
@@ -893,7 +894,7 @@ pub async fn handle(
             accounts::revoke_key(core, info, req, &id).await
         }
         ("GET", "/v1/openapi.json") => Ok(json_response(200, &openapi())),
-        (_, p) if p.starts_with("/v1/indexing/") => indexing(core, info, req).await,
+        (_, p) if p.starts_with("/v1/indexing/") => indexing::route(core, info, req).await,
         (_, p) if p.starts_with("/v1/recommendations") => {
             recommendations::handle(core, info, req).await
         }
@@ -1486,129 +1487,6 @@ async fn set_password(
         200,
         &json!({ "user": user, "host": account_host, "changed": true }),
     ))
-}
-
-// ---- automatic indexing for the caller's tenant ----
-
-/// `/v1/indexing/...` → the controller's `/admin/v1/tenants/{t}/...` for
-/// the caller's own tenant. Reads need only a signed-in user (the views
-/// show names and plans, not data); actions need a privilege to create
-/// indexes in the index's database ([`grants::Privileges::may_index`]).
-#[allow(clippy::too_many_lines)] // the route table and the privilege check
-async fn indexing(
-    core: &Arc<Core>,
-    info: &ConnInfo,
-    req: Request<Incoming>,
-) -> Result<Response<Body>, SprigError> {
-    let auth = hdr(&req, "authorization");
-    let host = hdr(&req, "host");
-    let method = req.method().clone();
-    let path = req.uri().path().to_owned();
-    let query = req.uri().query().unwrap_or("").to_owned();
-    let body = read_body(req).await?;
-    let caller = core.caller(info, auth, None, host).await?;
-    let Some(tenant) = caller.principal.tenant_name.clone() else {
-        return Err(invalid("automatic indexing needs a tenant login"));
-    };
-    let rest = path.trim_start_matches("/v1/indexing/");
-    let seg: Vec<&str> = rest.split('/').collect();
-    let keep = |allowed: &[&str]| -> String {
-        let kept: Vec<&str> = query
-            .split('&')
-            .filter(|kv| kv.split('=').next().is_some_and(|k| allowed.contains(&k)))
-            .collect();
-        if kept.is_empty() {
-            String::new()
-        } else {
-            format!("?{}", kept.join("&"))
-        }
-    };
-    let safe = |s: &str| {
-        !s.is_empty()
-            && s.chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':' | '-' | '$'))
-    };
-    let base = format!("/admin/v1/tenants/{tenant}");
-    let target = match (method.as_str(), seg.as_slice()) {
-        ("GET", ["indexes"]) => format!("{base}/indexes{}", keep(&["db", "table", "state", "all"])),
-        ("GET", ["recommendations"]) => {
-            format!("{base}/recommendations{}", keep(&["db", "table"]))
-        }
-        ("GET", ["indexes", i]) if safe(i) => format!("{base}/indexes/{i}"),
-        ("GET", ["queries", fp]) if safe(fp) && fp.ends_with(":explain") => {
-            format!("{base}/queries/{fp}")
-        }
-        ("GET", ["decisions", id]) if safe(id) => format!("{base}/decisions/{id}"),
-        ("POST", ["indexes", i]) if safe(i) => {
-            let Some((index, action)) = i.rsplit_once(':') else {
-                return Err(invalid("POST /v1/indexing/indexes/{index}:{action}"));
-            };
-            if !matches!(
-                action,
-                "approve"
-                    | "apply"
-                    | "reject"
-                    | "dismiss"
-                    | "pin"
-                    | "freeze"
-                    | "unpin"
-                    | "unfreeze"
-                    | "drop"
-            ) {
-                return Err(invalid(format!("unknown index action {action}")));
-            }
-            // Which database the index is in: ask, then check the
-            // caller's privileges there.
-            let detail = core
-                .admin
-                .forward_internal(
-                    &Method::GET,
-                    &format!("{base}/indexes/{index}"),
-                    Bytes::new(),
-                )
-                .await?;
-            if detail.status != 200 {
-                return Ok(passthrough(detail.status, detail.body));
-            }
-            let d: Value = serde_json::from_slice(&detail.body).unwrap_or(Value::Null);
-            let db = d["index"]["db"].as_str().unwrap_or("").to_owned();
-            let grants = run_sql(core, &caller, "-", "SHOW GRANTS".to_owned()).await?;
-            let lines: Vec<String> = rows_of(&grants)
-                .into_iter()
-                .filter_map(|r| r.into_iter().next().flatten())
-                .collect();
-            if !grants::Privileges::of(&lines).may_index(&db) {
-                return Err(SprigError::standard(
-                    1142,
-                    *b"42000",
-                    format!(
-                        "INDEX command denied to user '{}' for database '{db}'",
-                        caller.principal.user
-                    ),
-                ));
-            }
-            let req_body = parse_json(&body)?;
-            let fwd = json!({
-                "reason": text(&req_body, "reason"),
-                "actor": format!("studio:{tenant}.{}", caller.principal.user),
-            });
-            let r = core
-                .admin
-                .forward_internal(
-                    &Method::POST,
-                    &format!("{base}/indexes/{i}"),
-                    Bytes::from(fwd.to_string()),
-                )
-                .await?;
-            return Ok(passthrough(r.status, r.body));
-        }
-        _ => return Err(invalid(format!("no route {method} {path}"))),
-    };
-    let r = core
-        .admin
-        .forward_internal(&Method::GET, &target, Bytes::new())
-        .await?;
-    Ok(passthrough(r.status, r.body))
 }
 
 fn passthrough(status: u16, body: Bytes) -> Response<Body> {
