@@ -152,8 +152,10 @@ fn work() -> Vec<Work> {
             // Raft's (a replacement whose last write failed leaves the old
             // voters). Learners are read copies, kept by their own
             // reconciler from the descriptor; they are left alone here.
+            // A planned move's leader writes the descriptor itself.
             if g == tenant
                 && let Some(d) = dir.get(tenant)
+                && d.moving.is_none()
             {
                 let mut v = st.voters.clone();
                 v.sort_unstable();

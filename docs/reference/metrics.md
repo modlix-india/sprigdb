@@ -9,7 +9,7 @@ source: the metric macros in the source tree, and docs/metrics-help.toml
 
 Every metric SprigDB records, as exported on each process's telemetry port (`/metrics`, Prometheus text) and through OTLP. Counters end in `_total`; durations are histograms in seconds.
 
-498 metrics in 56 groups.
+502 metrics in 56 groups.
 
 ## `sprig_advisor_*`
 
@@ -173,6 +173,8 @@ Every metric SprigDB records, as exported on each process's telemetry port (`/me
 | `sprig_balancer_plan_duration_seconds` | histogram | - | sprig-controller | Time of one balancer planning pass in the data centre. Unit: seconds. |
 | `sprig_balancer_recommendations` | gauge | `kind` | sprig-controller | Balancer recommendations waiting for approval; `kind` is the recommendation kind. Unit: count. |
 | `sprig_balancer_shard_schemas` | gauge | `cluster` | sprig-controller | Shard schemas on each cluster; `cluster` is the cluster. Compare with `placement.max_shard_schemas_per_cluster`. Unit: count. |
+| `sprig_balancer_unit_moves_total` | counter | `kind`, `outcome` | sprig-controller | Engine unit moves the balancer planned; `kind` is `replica` (a copy moves to another node) or `leader` (a voter becomes the unit's home), `outcome` is `scheduled` (written into the unit's descriptor), `recommended` (logged only, `balancer.mode` not auto) or `failed`. Unit: count. |
+| `sprig_balancer_units` | gauge | `node`, `role` | sprig-controller | Engine units per node as the balancer counts them (a pending move counted as done); `node` is the Raft id, `role` is `voter` (copies held) or `home` (units it should lead). Unit: count. |
 
 ## `sprig_binlog_*`
 
@@ -527,7 +529,7 @@ Every metric SprigDB records, as exported on each process's telemetry port (`/me
 | `sprig_node_clock_offset_seconds` | gauge | - | sprig-gateway | How far this node's clock is from the other nodes' (the median of what each other node measures, absolute). Above half of replication.max_offset_ms it warns; above 80% it leads no units. Unit: seconds. |
 | `sprig_node_direct_connections_total` | counter | `protocol` | sprig-gateway | Client connections whose tenant this node served itself after their login named it (no hand-off); `protocol` is the listener's protocol. With `sprig_node_forwarded_connections_total` it gives the forwarded ratio. Unit: count. |
 | `sprig_node_forwarded_connections_total` | counter | `protocol`, `result` | sprig-gateway | Client connections this node handed to the node leading their tenant's unit at the login message (`NodeForward.Splice` on the peer listener); `protocol` is the listener's protocol, `result` is `ok`, `unreachable`, `refused` or `redirect_loop`. Unit: count. |
-| `sprig_node_leader_transfers_total` | counter | `reason` | sprig-gateway | Unit leaderships this node handed to another voter because it is draining, stopping or its clock is out of bounds; `reason` is `drain` or `clock`. Unit: count. |
+| `sprig_node_leader_transfers_total` | counter | `reason` | sprig-gateway | Unit leaderships this node handed to another voter because it is draining, stopping, its clock is out of bounds or a planned replica move takes the unit off it; `reason` is `drain`, `clock` or `move`. Unit: count. |
 | `sprig_node_leaders` | gauge | - | sprig-gateway | Engine units this node leads. Unit: units. |
 | `sprig_node_locator_corrections_total` | counter | `reason` | sprig-gateway | Forwarded connections this node sent on to another node than the one it tried first: `reason` is `not_leader` when the node tried named the unit's leader (a redirect followed) and `no_leader` when it held a copy of the tenant's unit but knew no leader (cut off, or an election running), so another voter was tried. Unit: count. |
 | `sprig_node_replication_lag_entries` | gauge | - | sprig-gateway | The largest gap, over the units this node leads, between the commit index and a voter's matched index. Unit: entries. |
@@ -758,6 +760,8 @@ Every metric SprigDB records, as exported on each process's telemetry port (`/me
 | Metric | Type | Labels | Recorded by | Description |
 |---|---|---|---|---|
 | `sprig_unit_follower_reads_total` | counter | `served` | sprig-gateway | Reads served on this node's copies of tenant units (reader sessions), by how they were let through: `served` is `local` (at once: the copy held the session's token and was fresh within the bound), `waited` (after a short wait for the copy to catch up) or `barrier` (after the leader confirmed its commits). Unit: count. |
+| `sprig_unit_move_seconds` | histogram | - | sprig-gateway | Time from a replica move being asked for to its descriptor written as done, on the unit's leader. Unit: seconds. |
+| `sprig_unit_moves_total` | counter | `result` | sprig-gateway | Planned replica moves of engine units this node finished as the unit's leader; `result` is `done` or `abandoned`. Unit: count. |
 | `sprig_unit_shipped_reads_total` | counter | `protocol`, `result` | sprig-gateway | Reads a session on a tenant's leader sent to a copy (`READ_FROM(follower)`, `SET sprig.read_from = follower`, `reads.read_from`, MongoDB `secondary` read preferences), by protocol and `result`: `ok` (the copy answered), `fallback` (the copy couldn't, so the leader answered) or `unavailable` (no copy reachable; the leader answered). Unit: count. |
 
 ## `sprig_vector_*`

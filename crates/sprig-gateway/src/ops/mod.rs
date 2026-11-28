@@ -7,6 +7,10 @@
 //! - [`replicate`]: on each unit's leader, a voter on a lost node (`dead`
 //!   or `removed`) is replaced on another node; replicas a node no longer
 //!   holds by its unit's descriptor leave it;
+//! - [`moves`]: on each unit's leader, a planned replica move written
+//!   into the unit's descriptor (by the balancer or an operator) is
+//!   carried out;
+//! - [`peers`]: nodes added later are learned from the node registry;
 //! - [`drain`]: a draining node hands every unit it leads to another
 //!   voter (`POST /admin/v1/engine/drain`, also at the start of a
 //!   graceful stop);
@@ -19,7 +23,9 @@
 
 pub mod clock;
 pub mod drain;
+pub mod moves;
 pub mod nodes;
+pub mod peers;
 pub mod replicate;
 pub mod report;
 pub mod version;
@@ -76,6 +82,8 @@ pub fn start(id: u64, dc: &Arc<dyn sprig_meta::MetaStore>, stop: sprig_common::C
     let _ = DC.set(Arc::clone(dc));
     nodes::start(id, Arc::clone(dc), stop.clone());
     replicate::start(dc, stop.clone());
+    moves::start(dc, stop.clone());
+    peers::start(stop.clone());
     drain::start(stop.clone());
     clock::start(Arc::clone(dc), stop.clone());
     report::start(stop);

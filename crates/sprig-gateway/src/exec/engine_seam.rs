@@ -1376,7 +1376,9 @@ impl PassSession {
                 "Prepared statement needs to be re-prepared",
             ));
         }
-        if p.unrestricted() {
+        // A chunk table: checked on its source by the retrieval code.
+        if p.unrestricted() || (ts.types.internal && sprig_ai::retrieval::is_chunk_table(&def.name))
+        {
             return Ok(Some(p));
         }
         let Some(cp) = p.as_any().downcast_ref::<CompiledPrivileges>() else {

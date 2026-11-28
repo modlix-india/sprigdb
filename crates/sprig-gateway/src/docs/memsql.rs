@@ -18,7 +18,9 @@
 //! by construction: the planner here has no writable table.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use sprig_common::{Result, SprigError};
@@ -64,6 +66,164 @@ pub fn check_refs(analysis: &super::sql::Analysis) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// The longest a statement over `sprig_docs` may run (the MariaDB copy's
+/// `max_statement_time`).
+pub const TIME_LIMIT: Duration = Duration::from_secs(30);
+
+/// A statement may name one table in all (1041 otherwise): `chunks` or
+/// `sprig_docs.chunks`, a CTE's name, and the tables of derived tables and
+/// subqueries all count, so no join of the docs with themselves runs.
+///
+/// # Errors
+/// 1041.
+pub fn check_relations(stmt: &sqlparser::ast::Statement) -> Result<()> {
+    let mut n = 0usize;
+    let _ = sqlparser::ast::visit_relations(stmt, |_| {
+        n += 1;
+        std::ops::ControlFlow::<()>::Continue(())
+    });
+    if n > 1 {
+        return Err(SprigError::standard(
+            1041,
+            *b"HY000",
+            "Out of memory: a statement over sprig_docs may read one table once (a join of the \
+             docs with themselves, through a CTE, a derived table or a subquery too, reads \
+             millions of rows)",
+        ));
+    }
+    Ok(())
+}
+
+/// What stops a statement as it reads: the rows read so far (every
+/// table access, inner re-reads of joins included), the deadline, and the
+/// session's `KILL QUERY`.
+#[derive(Debug)]
+pub struct Guard {
+    read: AtomicU64,
+    until: Instant,
+    /// Set when the session is killed (or its connection closes).
+    pub stop: AtomicBool,
+}
+
+impl Guard {
+    /// A guard for a statement starting now.
+    #[must_use]
+    pub fn new(limit: Duration) -> Arc<Self> {
+        Arc::new(Self {
+            read: AtomicU64::new(0),
+            until: Instant::now() + limit,
+            stop: AtomicBool::new(false),
+        })
+    }
+
+    fn step(&self) -> std::result::Result<(), SqlError> {
+        let n = self.read.fetch_add(1, Ordering::Relaxed) + 1;
+        if self.stop.load(Ordering::Relaxed) {
+            return Err(SqlError::new(
+                1317,
+                "70100",
+                "Query execution was interrupted",
+            ));
+        }
+        if n > MAX_EXAMINED {
+            return Err(SqlError::new(
+                1041,
+                "HY000",
+                "Out of memory: a statement over sprig_docs may read at most 1,000,000 rows; \
+                 narrow it with WHERE or LIMIT",
+            ));
+        }
+        if n.is_multiple_of(1024) && Instant::now() >= self.until {
+            return Err(SqlError::new(
+                1969,
+                "70100",
+                "Query execution was interrupted (max_statement_time exceeded)",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The in-memory table under the planner, every row it hands over counted
+/// by the statement's [`Guard`].
+struct Guarded {
+    inner: Arc<dyn sprig_plan::access::Storage>,
+    guard: Arc<Guard>,
+}
+
+struct GuardedCursor {
+    inner: Box<dyn sprig_plan::access::RowCursor>,
+    guard: Arc<Guard>,
+}
+
+impl sprig_plan::access::RowCursor for GuardedCursor {
+    fn next(&mut self) -> std::result::Result<Option<sprig_exec::ops::Row>, SqlError> {
+        let r = self.inner.next()?;
+        if r.is_some() {
+            self.guard.step()?;
+        }
+        Ok(r)
+    }
+
+    fn refused(&mut self) {
+        self.inner.refused();
+    }
+}
+
+impl sprig_plan::access::Storage for Guarded {
+    fn table_rows(&self, table: &TableDef) -> u64 {
+        self.inner.table_rows(table)
+    }
+
+    fn rows_in_range(
+        &self,
+        table: &TableDef,
+        key: sprig_plan::catalog::KeyId,
+        range: &sprig_plan::access::KeyRange,
+    ) -> u64 {
+        self.inner.rows_in_range(table, key, range)
+    }
+
+    fn rows_per_key(
+        &self,
+        table: &TableDef,
+        key: sprig_plan::catalog::KeyId,
+        parts: usize,
+    ) -> Option<f64> {
+        self.inner.rows_per_key(table, key, parts)
+    }
+
+    fn get(
+        &self,
+        table: &TableDef,
+        key: &[Value],
+        counters: &sprig_plan::access::Counters,
+    ) -> std::result::Result<Option<sprig_exec::ops::Row>, SqlError> {
+        let r = self.inner.get(table, key, counters)?;
+        if r.is_some() {
+            self.guard.step()?;
+        }
+        Ok(r)
+    }
+
+    fn scan(
+        &self,
+        table: &TableDef,
+        key: sprig_plan::catalog::KeyId,
+        ranges: Vec<sprig_plan::access::KeyRange>,
+        reverse: bool,
+        fetch: sprig_plan::access::Fetch,
+        counters: Arc<sprig_plan::access::Counters>,
+    ) -> std::result::Result<Box<dyn sprig_plan::access::RowCursor>, SqlError> {
+        Ok(Box::new(GuardedCursor {
+            inner: self
+                .inner
+                .scan(table, key, ranges, reverse, fetch, counters)?,
+            guard: Arc::clone(&self.guard),
+        }))
+    }
 }
 
 /// 1041 for a statement past [`MAX_RESULT_BYTES`] or [`MAX_EXAMINED`].
@@ -307,7 +467,12 @@ pub fn describes_columns(text: &[u8]) -> bool {
 /// # Errors
 /// The planner's or executor's (as MariaDB's codes), or 1064 for a text
 /// that doesn't parse.
-pub fn query(ix: &Arc<DocsIndex>, sql: &str, mysql: bool) -> Result<sprig_types::Rows> {
+pub fn query(
+    ix: &Arc<DocsIndex>,
+    sql: &str,
+    mysql: bool,
+    guard: &Arc<Guard>,
+) -> Result<sprig_types::Rows> {
     use sqlparser::dialect::MySqlDialect;
     use sqlparser::parser::Parser;
     let stmts = Parser::parse_sql(&MySqlDialect {}, sql).map_err(|e| {
@@ -324,6 +489,7 @@ pub fn query(ix: &Arc<DocsIndex>, sql: &str, mysql: bool) -> Result<sprig_types:
             "one statement over sprig_docs at a time",
         ));
     };
+    check_relations(stmt)?;
     let db = db_of(ix)?;
     let persona = if mysql {
         Persona::MySql
@@ -335,7 +501,10 @@ pub fn query(ix: &Arc<DocsIndex>, sql: &str, mysql: bool) -> Result<sprig_types:
         ix: Arc::clone(ix),
         scores: Mutex::default(),
     }));
-    let storage: Arc<dyn sprig_plan::access::Storage> = Arc::new((*db).clone());
+    let storage: Arc<dyn sprig_plan::access::Storage> = Arc::new(Guarded {
+        inner: Arc::new((*db).clone()),
+        guard: Arc::clone(guard),
+    });
     let mut planner = sprig_plan::Planner::new(&*db, storage, &session);
     planner.options = sprig_plan::PlanOptions {
         memory_limit: Some(MEMORY_LIMIT),
@@ -368,13 +537,10 @@ pub fn query(ix: &Arc<DocsIndex>, sql: &str, mysql: bool) -> Result<sprig_types:
             .iter()
             .map(|v| v.as_ref().map_or(1, Vec::len))
             .sum::<usize>();
-        if bytes > MAX_RESULT_BYTES || plan.rows_examined() > MAX_EXAMINED {
+        if bytes > MAX_RESULT_BYTES {
             return Err(too_big());
         }
         rows.push(row);
-    }
-    if plan.rows_examined() > MAX_EXAMINED {
-        return Err(too_big());
     }
     Ok(sprig_types::Rows { columns, rows })
 }
@@ -466,6 +632,47 @@ mod tests {
         Arc::new(DocsIndex::from_bytes(&pack.to_bytes().unwrap()).unwrap())
     }
 
+    fn run(ix: &Arc<DocsIndex>, sql: &str, mysql: bool) -> Result<sprig_types::Rows> {
+        query(ix, sql, mysql, &Guard::new(TIME_LIMIT))
+    }
+
+    #[test]
+    fn one_table_reference_and_the_guard() {
+        let ix = index();
+        for sql in [
+            "SELECT COUNT(*) FROM sprig_docs.chunks a, sprig_docs.chunks b, sprig_docs.chunks c",
+            "SELECT COUNT(*) FROM sprig_docs.chunks a, chunks b",
+            "SELECT COUNT(*) FROM chunks a, chunks b, chunks c",
+            "WITH c AS (SELECT chunk_id FROM sprig_docs.chunks) SELECT COUNT(*) FROM c a, c b, c d",
+            "SELECT COUNT(*) FROM (SELECT * FROM sprig_docs.chunks) x, (SELECT * FROM chunks) y",
+            "SELECT page FROM sprig_docs.chunks WHERE page IN (SELECT page FROM chunks)",
+        ] {
+            let e = run(&ix, sql, false);
+            assert!(
+                e.as_ref()
+                    .is_err_and(|e| e.to_string().contains("one table")),
+                "{sql}: {e:?}"
+            );
+        }
+        assert!(run(&ix, "SELECT COUNT(*) FROM chunks", false).is_ok());
+        // A killed statement stops at its next row.
+        let g = Guard::new(TIME_LIMIT);
+        g.stop.store(true, Ordering::Relaxed);
+        let e = query(&ix, "SELECT page FROM sprig_docs.chunks", false, &g);
+        assert!(
+            e.as_ref()
+                .is_err_and(|e| e.to_string().contains("interrupted")),
+            "{e:?}"
+        );
+        // The read cap and the deadline, as rows are read.
+        let g = Guard::new(TIME_LIMIT);
+        assert!((0..MAX_EXAMINED).all(|_| g.step().is_ok()));
+        assert_eq!(g.step().unwrap_err().code, 1041);
+        let g = Guard::new(Duration::ZERO);
+        let e = (0..2048).find_map(|_| g.step().err()).unwrap();
+        assert_eq!(e.code, 1969);
+    }
+
     fn text(r: &sprig_types::Rows) -> Vec<Vec<String>> {
         r.rows
             .iter()
@@ -483,29 +690,26 @@ mod tests {
     #[test]
     fn selects_match_and_audience() {
         let ix = index();
-        let r = query(
-            &ix,
+        let r = run(&ix,
             "SELECT page, heading_path FROM sprig_docs.chunks WHERE MATCH(text) AGAINST ('suspend tenant') LIMIT 3",
             false,
         )
         .unwrap();
         assert_eq!(text(&r)[0][0], "ops/tenants.md");
-        let r = query(
-            &ix,
+        let r = run(&ix,
             "SELECT COUNT(*) > 0 AS has_operator_pages FROM sprig_docs.chunks WHERE FIND_IN_SET('operator', audience)",
             false,
         )
         .unwrap();
         assert_eq!(text(&r), [["1"]]);
-        let r = query(
-            &ix,
+        let r = run(&ix,
             "SELECT page, MATCH(text, heading_path) AGAINST ('bananas') AS s FROM sprig_docs.chunks ORDER BY s DESC, page LIMIT 1",
             true,
         )
         .unwrap();
         assert_eq!(text(&r)[0][0], "guides/fruit.md");
         assert!(
-            query(
+            run(
                 &ix,
                 "SELECT page FROM sprig_docs.chunks WHERE MATCH(page) AGAINST ('x')",
                 false

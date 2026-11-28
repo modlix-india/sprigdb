@@ -35,6 +35,17 @@ struct Registry {
     open: Mutex<HashMap<u64, (u64, CancellationToken)>>,
 }
 
+/// Wakes the watcher before its next look (a planned leadership hand-off
+/// here just finished).
+static NUDGE: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// Makes the watcher look now: called right after this node handed a
+/// unit's leadership away on purpose, so the tenant's sessions here close
+/// at once instead of at the next look.
+pub fn nudge() {
+    NUDGE.notify_one();
+}
+
 fn registry() -> &'static Registry {
     static R: OnceLock<Registry> = OnceLock::new();
     R.get_or_init(Registry::default)
@@ -102,6 +113,7 @@ pub fn start(sessions: Arc<SessionTable>, stop: CancellationToken) {
             tokio::select! {
                 () = stop.cancelled() => return,
                 () = tokio::time::sleep(EVERY) => {}
+                () = NUDGE.notified() => {}
             }
             let mut tenants: BTreeSet<u64> = sessions.tenants().into_iter().map(|t| t.0).collect();
             let open: Vec<(u64, CancellationToken)> = registry()

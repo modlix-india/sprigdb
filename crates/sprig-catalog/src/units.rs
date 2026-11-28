@@ -49,10 +49,37 @@ pub struct UnitDescriptor {
     /// Raised by every forced reconfiguration and move.
     #[serde(default)]
     pub generation: u64,
+    /// A planned replica move in progress ([`start_move`]): the unit's
+    /// leader copies it to `to` and then takes `from` out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moving: Option<UnitMove>,
+    /// The last replica move that finished (`since_ms`: when it finished):
+    /// the balancer neither moves the unit again within its cooldown nor
+    /// back to the node it left.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_move: Option<UnitMove>,
 }
 
 impl Versioned for UnitDescriptor {
     const V: u32 = 1;
+}
+
+/// A planned move of one replica of a unit from one node to another.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnitMove {
+    /// The voter that leaves.
+    pub from: u64,
+    /// The node that takes its place (a learner until it has caught up).
+    pub to: u64,
+    /// When the move was asked for (Unix milliseconds).
+    #[serde(default)]
+    pub since_ms: u64,
+    /// The unit's home before the move (restored when the move is given up).
+    #[serde(default)]
+    pub home_was: u64,
+    /// Who asked and why (`balancer: ...`, `operator: ...`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reason: String,
 }
 
 /// A node of the DC's engine cluster: `/sprig/dc/<dc_id>/nodes/<raft id>`,
@@ -66,6 +93,11 @@ pub struct NodeRecord {
     pub gateway_id: String,
     /// The host other nodes reach it at.
     pub addr: String,
+    /// Where other nodes reach its Raft traffic (`host:port`): nodes learn
+    /// a node added after them from this. Empty: only the peers listed at
+    /// start reach it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub raft_addr: String,
     /// Its failure domain (rack, zone); empty: a domain of its own.
     #[serde(default)]
     pub failure_domain: String,
@@ -274,6 +306,168 @@ pub async fn update(
         SprigCode::MetaUnavailable,
         "the unit descriptor kept changing while it was rewritten",
     ))
+}
+
+/// Asks for a replica move of `tenant`'s unit from voter `from` to node
+/// `to`, compare-and-set: the descriptor records the move, lists `to` as a
+/// learner (so `to` keeps the replica it is given), and names `to` home if
+/// `from` was. The unit's leader then does the work and ends the move
+/// ([`end_move`]). Returns the descriptor stored.
+///
+/// # Errors
+/// 39792 when the unit has no descriptor, `from` isn't a voter or `to`
+/// already holds a copy; 39470 (retryable) while another move of the unit
+/// is pending; the store's.
+pub async fn start_move(
+    store: &dyn MetaStore,
+    tenant: u64,
+    from: u64,
+    to: u64,
+    reason: &str,
+) -> Result<UnitDescriptor> {
+    let invalid = |m: String| SprigError::new(SprigCode::AdminRequestInvalid, m);
+    let mut refused: Option<SprigError> = None;
+    let r = update(store, tenant, |d| {
+        refused = check_move(d, from, to).err();
+        if refused.is_some() {
+            return false;
+        }
+        d.moving = Some(UnitMove {
+            from,
+            to,
+            since_ms: now_ms(),
+            home_was: d.home,
+            reason: reason.to_owned(),
+        });
+        d.learners.retain(|l| *l != to);
+        d.learners.push(to);
+        if d.home == from {
+            d.home = to;
+        }
+        true
+    })
+    .await?;
+    if let Some(e) = refused {
+        return Err(e);
+    }
+    r.ok_or_else(|| invalid(format!("tenant {tenant}'s unit has no descriptor")))
+}
+
+/// Whether a move of `d`'s unit from `from` to `to` may start now.
+///
+/// # Errors
+/// As [`start_move`].
+pub fn check_move(d: &UnitDescriptor, from: u64, to: u64) -> Result<()> {
+    let invalid = |m: String| SprigError::new(SprigCode::AdminRequestInvalid, m);
+    if let Some(m) = &d.moving {
+        return Err(SprigError::new(
+            SprigCode::ShardBusy,
+            format!(
+                "unit {} is already moving from node {} to node {}",
+                d.unit, m.from, m.to
+            ),
+        ));
+    }
+    if from == to || !d.voters.contains(&from) {
+        return Err(invalid(format!(
+            "node {from} isn't a voter of unit {} (voters {:?})",
+            d.unit, d.voters
+        )));
+    }
+    if d.voters.contains(&to) || d.learners.contains(&to) {
+        return Err(invalid(format!(
+            "node {to} already holds a copy of unit {}",
+            d.unit
+        )));
+    }
+    Ok(())
+}
+
+/// How a move ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MoveEnd {
+    /// Raft's voters now (`to` in, `from` out): the descriptor takes them.
+    Done(Vec<u64>),
+    /// Given up: `to` leaves the learners and the old home comes back.
+    Abandoned,
+}
+
+/// Ends the pending move of `tenant`'s unit (if it is still the one from
+/// `from` to `to`), compare-and-set. Returns the descriptor stored.
+///
+/// # Errors
+/// The store's.
+pub async fn end_move(
+    store: &dyn MetaStore,
+    tenant: u64,
+    from: u64,
+    to: u64,
+    how: &MoveEnd,
+) -> Result<Option<UnitDescriptor>> {
+    update(store, tenant, |d| {
+        let Some(m) = d.moving.clone() else {
+            return false;
+        };
+        if m.from != from || m.to != to {
+            return false;
+        }
+        d.moving = None;
+        d.learners.retain(|l| *l != to);
+        match how {
+            MoveEnd::Done(voters) => {
+                let mut v = voters.clone();
+                v.sort_unstable();
+                d.voters = v;
+                d.learners.retain(|l| !d.voters.contains(l));
+                d.last_move = Some(UnitMove {
+                    since_ms: now_ms(),
+                    ..m.clone()
+                });
+            }
+            MoveEnd::Abandoned => {
+                if d.home == to && d.voters.contains(&m.home_was) {
+                    d.home = m.home_was;
+                }
+            }
+        }
+        if !d.voters.contains(&d.home)
+            && let Some(first) = d.voters.first()
+        {
+            d.home = *first;
+        }
+        true
+    })
+    .await
+}
+
+/// Names `home` the preferred leader of `tenant`'s unit (a leadership
+/// move), compare-and-set; `home` must be one of its voters. Returns the
+/// descriptor stored.
+///
+/// # Errors
+/// 39792 when there is no descriptor or `home` isn't a voter; the store's.
+pub async fn set_home(store: &dyn MetaStore, tenant: u64, home: u64) -> Result<UnitDescriptor> {
+    let mut not_voter = false;
+    let r = update(store, tenant, |d| {
+        not_voter = !d.voters.contains(&home);
+        if not_voter || d.home == home {
+            return false;
+        }
+        d.home = home;
+        true
+    })
+    .await?;
+    match r {
+        Some(_) if not_voter => Err(SprigError::new(
+            SprigCode::AdminRequestInvalid,
+            format!("node {home} isn't a voter of tenant {tenant}'s unit"),
+        )),
+        Some(d) => Ok(d),
+        None => Err(SprigError::new(
+            SprigCode::AdminRequestInvalid,
+            format!("tenant {tenant}'s unit has no descriptor"),
+        )),
+    }
 }
 
 /// The DC's node records, kept in memory by a watch of `nodes/`.
@@ -792,6 +986,8 @@ mod tests {
             learners: Vec::new(),
             home: voters[0],
             generation: 0,
+            moving: None,
+            last_move: None,
         }
     }
 

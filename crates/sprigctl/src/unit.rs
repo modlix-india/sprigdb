@@ -9,6 +9,17 @@
 //! copies, its `placement.read_copies` setting, written through the
 //! controller's Admin API (`--endpoint`); each unit's leader then lists that
 //! many learners in the unit's descriptor and adds them to its group.
+//!
+//! `sprigctl unit move <tenant> --from <node> --to <node>`: a planned move
+//! of one replica of the tenant's unit, written into its descriptor through
+//! the controller (`POST /admin/v1/units/{tenant}:move`); the unit's leader
+//! copies the unit to the new node and takes the old one out. `sprigctl
+//! unit home <tenant> <node>` names a voter the unit's home (its preferred
+//! leader: a leadership move). `sprigctl unit balance` shows units and homes
+//! per node, moves pending and what the balancer's next pass would do
+//! (`GET /admin/v1/balancer/units`).
+
+use std::fmt::Write as _;
 
 use clap::{Arg, ArgMatches, Command};
 use serde_json::Value;
@@ -53,6 +64,89 @@ pub(crate) fn group() -> Command {
                         .help("Why, for the settings audit"),
                 ),
         )
+        .subcommand(
+            Command::new("move")
+                .about("Move one replica of a tenant's unit to another node (controller at --endpoint)")
+                .arg(Arg::new("tenant").required(true).help("The tenant's id or name"))
+                .arg(
+                    Arg::new("from")
+                        .long("from")
+                        .required(true)
+                        .value_parser(clap::value_parser!(u64))
+                        .help("The voter that leaves (Raft id)"),
+                )
+                .arg(
+                    Arg::new("to")
+                        .long("to")
+                        .required(true)
+                        .value_parser(clap::value_parser!(u64))
+                        .help("The node that takes its place (Raft id)"),
+                )
+                .arg(Arg::new("reason").long("reason").help("Why, for the log")),
+        )
+        .subcommand(
+            Command::new("home")
+                .about("Name a voter the home (preferred leader) of a tenant's unit (controller at --endpoint)")
+                .arg(Arg::new("tenant").required(true).help("The tenant's id or name"))
+                .arg(
+                    Arg::new("node")
+                        .required(true)
+                        .value_parser(clap::value_parser!(u64))
+                        .help("A voter's Raft id"),
+                ),
+        )
+        .subcommand(
+            Command::new("balance").about(
+                "Units and homes per node, moves pending, and the balancer's next pass (controller at --endpoint)",
+            ),
+        )
+}
+
+fn render_balance(v: &Value) -> String {
+    let n = |x: &Value| match x {
+        Value::Null => "-".to_owned(),
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    let rows: Vec<[String; 5]> = v["nodes"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|r| {
+                    [
+                        n(&r["id"]),
+                        n(&r["state"]),
+                        n(&r["usable"]),
+                        n(&r["units"]),
+                        n(&r["homes"]),
+                    ]
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut s = table(["NODE", "STATE", "USABLE", "UNITS", "HOMES"], &rows);
+    s.push('\n');
+    for p in v["pending"].as_array().into_iter().flatten() {
+        let _ = writeln!(
+            s,
+            "pending: unit {} from node {} to node {}",
+            n(&p[0]),
+            n(&p[1]),
+            n(&p[2])
+        );
+    }
+    for p in v["planned"].as_array().into_iter().flatten() {
+        let _ = writeln!(
+            s,
+            "next pass: {} tenant {} {} -> {} ({})",
+            n(&p["kind"]),
+            n(&p["tenant"]),
+            n(&p["from"]),
+            n(&p["to"]),
+            n(&p["reason"])
+        );
+    }
+    s
 }
 
 fn ids(v: &Value) -> String {
@@ -160,6 +254,28 @@ pub(crate) async fn run(c: &AdminClient, group: &ArgMatches, out: Output) -> Res
                 .put("/admin/v1/settings/placement.read_copies", &req)
                 .await?;
             print(out, &r, crate::render::settings_write);
+        }
+        "move" | "home" => {
+            let tenant = sub.get_one::<String>("tenant").cloned().unwrap_or_default();
+            let body = if cmd == "move" {
+                serde_json::json!({
+                    "from": sub.get_one::<u64>("from").copied().unwrap_or(0),
+                    "to": sub.get_one::<u64>("to").copied().unwrap_or(0),
+                    "reason": sub.get_one::<String>("reason").cloned().unwrap_or_else(|| "sprigctl unit move".to_owned()),
+                })
+            } else {
+                serde_json::json!({"node": sub.get_one::<u64>("node").copied().unwrap_or(0)})
+            };
+            let v: Value = c
+                .post(&format!("/admin/v1/units/{tenant}:{cmd}"), &body)
+                .await?;
+            print(out, &v, |v| {
+                serde_json::to_string_pretty(v).unwrap_or_default()
+            });
+        }
+        "balance" => {
+            let v: Value = c.get("/admin/v1/balancer/units").await?;
+            print(out, &v, render_balance);
         }
         other => return Err(Failed(format!("unknown subcommand {other}"))),
     }

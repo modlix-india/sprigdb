@@ -13,7 +13,7 @@
 //! export SPRIG_TEST_RXE_SQL=127.0.0.1:46107      # a gateway's MariaDB port
 //! export SPRIG_TEST_RXE_HTTP=127.0.0.1:46101     # its HTTP listener
 //! export SPRIG_TEST_RXE_TENANT=rxe SPRIG_TEST_RXE_USER=app SPRIG_TEST_RXE_PASSWORD=...
-//! export SPRIG_TEST_RXE_GW_LOG=.../gw1.log          # the gateway's JSON log
+//! export SPRIG_TEST_RXE_GW_LOG=.../gw1.log,...      # every gateway's JSON log (comma-separated)
 //! cargo test -p sprig-gateway --test retrieval_engine_live -- --ignored --nocapture
 //! ```
 
@@ -214,16 +214,23 @@ async fn wait_hit(
     .await
 }
 
-/// Waits until the gateway's log has a line holding every one of `parts`.
+/// Waits until a gateway's log (any of `SPRIG_TEST_RXE_GW_LOG`'s: the job
+/// runs on the tenant's leader, whichever node the test talks to) has a
+/// line holding every one of `parts`.
 async fn log_has(parts: &[&str], limit: Duration) -> bool {
-    let path = need("SPRIG_TEST_RXE_GW_LOG");
+    let paths: Vec<String> = need("SPRIG_TEST_RXE_GW_LOG")
+        .split(',')
+        .map(str::to_owned)
+        .collect();
     wait_for(limit, || {
-        let path = path.clone();
+        let paths = paths.clone();
         async move {
-            std::fs::read_to_string(&path)
-                .unwrap_or_default()
-                .lines()
-                .any(|l| parts.iter().all(|p| l.contains(p)))
+            paths.iter().any(|path| {
+                std::fs::read_to_string(path)
+                    .unwrap_or_default()
+                    .lines()
+                    .any(|l| parts.iter().all(|p| l.contains(p)))
+            })
         }
     })
     .await
@@ -612,6 +619,29 @@ async fn retrieval_and_docs_on_an_engine_node() {
         || format!("{err:?}"),
     );
 
+    // A user granted SELECT on the source table alone (no database grant)
+    // searches it: the hidden chunk table needs no grant of its own.
+    let _ = run(&mut c, "DROP USER IF EXISTS 'rxetable'@'%'").await;
+    must(
+        &mut c,
+        "CREATE USER 'rxetable'@'%' IDENTIFIED BY 'Rx-table-Passw0rd'",
+    )
+    .await;
+    must(
+        &mut c,
+        &format!("GRANT SELECT ON {DB}.articles TO 'rxetable'@'%'"),
+    )
+    .await;
+    let mut tbl = login(at, "rxetable", "Rx-table-Passw0rd").await;
+    must(&mut tbl, &format!("USE {DB}")).await;
+    let got = retrieve(&mut tbl, "kb", "authenticator app login codes", 3, None).await;
+    ck.ok(
+        "a table-level grant is enough to search",
+        got.as_ref().is_ok_and(|h| !h.is_empty()),
+        || format!("{got:?}"),
+    );
+    let _ = tbl.disconnect().await;
+    let _ = run(&mut c, "DROP USER IF EXISTS 'rxetable'@'%'").await;
     // ---- sync: insert, update, delete -------------------------------------
     must(
         &mut c,
@@ -764,7 +794,6 @@ async fn retrieval_and_docs_on_an_engine_node() {
         || format!("{leaked:?}"),
     );
     let _ = reader.disconnect().await;
-
     // ---- the docs index, from memory ----------------------------------------
     let started = Instant::now();
     let (code, body) = rest(
@@ -833,7 +862,7 @@ async fn retrieval_and_docs_on_an_engine_node() {
     let started = Instant::now();
     let err = run(
         &mut c,
-        "SELECT COUNT(*) FROM sprig_docs.chunks a, sprig_docs.chunks b",
+        "WITH x AS (SELECT chunk_id FROM sprig_docs.chunks) SELECT COUNT(*) FROM x a, x b, x d",
     )
     .await;
     ck.ok(
@@ -905,6 +934,17 @@ async fn retrieval_and_docs_on_an_engine_node() {
         || format!("{:?}", "the updated row isn't found, or its chunks went"),
     );
     must(&mut c, "DROP RETRIEVAL INDEX pk").await;
+    must(
+        &mut c,
+        "CREATE TABLE floats (id FLOAT PRIMARY KEY, body TEXT)",
+    )
+    .await;
+    let err = run(&mut c, "CREATE RETRIEVAL INDEX fk ON floats (body)").await;
+    ck.ok(
+        "a FLOAT primary key is refused (39997)",
+        err.as_ref().is_err_and(|e| e.contains("39997")),
+        || format!("{err:?}"),
+    );
 
     // ---- DROP -----------------------------------------------------------------
     must(&mut c, "DROP RETRIEVAL INDEX kb").await;

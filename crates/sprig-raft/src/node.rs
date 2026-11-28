@@ -431,6 +431,10 @@ struct Inner {
     /// [`RaftConfig::snapshot_bytes_per_second`], as changed since.
     snapshot_rate: AtomicU64,
     next_snapshot: AtomicU64,
+    /// Groups whose departed replica's state is being dropped here
+    /// ([`Node::drop_state_when_durable`]): no new replica of them starts
+    /// until that is done. Taken before `groups`, never after.
+    dropping: Mutex<BTreeSet<GroupId>>,
 }
 
 /// A node hosting Raft groups. Clones share the node.
@@ -557,6 +561,7 @@ impl Node {
             snaps,
             snapshot_rate: AtomicU64::new(rate),
             next_snapshot: AtomicU64::new(1),
+            dropping: Mutex::new(BTreeSet::new()),
         });
         let node = Node { inner };
         for rg in node.inner.store.recover()? {
@@ -700,7 +705,18 @@ impl Node {
             progress: Arc::new(Progress::default()),
         });
         cell.progress.set(applied, applied);
-        self.write_groups().insert(id, Arc::clone(&cell));
+        {
+            // A replica of this group that left is still having its state
+            // dropped: a new one starts once that is done (the leader, or
+            // the caller, tries again).
+            let dropping = lock(&self.inner.dropping);
+            if dropping.contains(&id) {
+                return Err(RaftError::Busy(
+                    "this node is still dropping the group's previous replica",
+                ));
+            }
+            self.write_groups().insert(id, Arc::clone(&cell));
+        }
         lock(&self.inner.active).insert(id);
         Ok(cell)
     }
@@ -1401,8 +1417,11 @@ impl Node {
     /// Bytes of log entries and cached snapshots held in memory.
     #[must_use]
     pub fn log_mem_bytes(&self) -> usize {
-        self.read_groups()
-            .values()
+        // The cells first, then each group's lock: never a group's lock
+        // under the map's (`drop_group` takes them the other way round).
+        let cells: Vec<Arc<Cell>> = self.read_groups().values().cloned().collect();
+        cells
+            .iter()
             .map(|c| lock(&c.g).raw.store().mem_bytes())
             .sum()
     }
@@ -2652,14 +2671,25 @@ impl Node {
             .name(format!("sprig-raft-drop-{gid}"))
             .spawn(move || match slot.wait_timeout(Duration::from_secs(120)) {
                 Some(Ok(())) => {
-                    // Under the groups' lock: no new replica starts here
-                    // while the old one's state goes.
-                    let groups = node.read_groups();
-                    if groups.contains_key(&gid) {
-                        return;
+                    // No new replica starts here while the old one's state
+                    // goes: the group is marked as dropping (checked against
+                    // the groups map under the same mutex a new replica's
+                    // insert takes). No lock of the node is held while the
+                    // state machine drops its state: that calls back into
+                    // the node (a stream or change log's flush reads
+                    // `Node::committed`, which takes `groups` for reading),
+                    // and a read lock taken twice on one thread deadlocks
+                    // once a writer (`drop_group`, a new group) queues
+                    // between the two.
+                    {
+                        let mut dropping = lock(&node.inner.dropping);
+                        if node.read_groups().contains_key(&gid) {
+                            return;
+                        }
+                        dropping.insert(gid);
                     }
                     lock(&cell.g).sm.removed();
-                    drop(groups);
+                    lock(&node.inner.dropping).remove(&gid);
                 }
                 other => {
                     tracing::warn!(group = gid, outcome = ?other.map(Result::err), "raft: a departed replica's state was kept (its removal wasn't confirmed durable)");

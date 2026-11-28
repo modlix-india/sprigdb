@@ -63,6 +63,7 @@ pub mod recovery;
 mod search_admin;
 pub mod txn_admin;
 pub mod types;
+pub mod unit_admin;
 
 use std::sync::Arc;
 

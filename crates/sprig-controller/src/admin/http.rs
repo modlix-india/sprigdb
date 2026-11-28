@@ -86,6 +86,8 @@ fn routes(app: Arc<App>) -> Router {
         .route("/admin/v1/dcs/{dc}", get(get_dc).post(dc_method))
         .route("/admin/v1/nodes", get(list_nodes))
         .route("/admin/v1/nodes/{node}", post(node_method))
+        .route("/admin/v1/units/{tenant}", post(unit_method))
+        .route("/admin/v1/balancer/units", get(balancer_units))
         .route("/admin/v1/cluster-version", get(cluster_version))
         .route("/admin/v1/cluster-version:finalize", post(finalize_version))
         .route("/admin/v1/tenants", get(list_tenants).post(create_tenant))
@@ -701,6 +703,38 @@ async fn node_method(
                 .to_owned()
         };
         app.svc.node_method(id, method, &reason).await
+    };
+    respond(r.await)
+}
+
+async fn unit_method(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    UrlPath(unit): UrlPath<String>,
+    body: Bytes,
+) -> Response {
+    let r = async {
+        authorize(&app, &headers)?;
+        let (tenant, method) = unit.rsplit_once(':').ok_or_else(|| {
+            invalid(format!(
+                "POST /admin/v1/units/{unit}: expected {{tenant}}:{{method}}"
+            ))
+        })?;
+        let body = if body.iter().all(u8::is_ascii_whitespace) {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice::<serde_json::Value>(&body)
+                .map_err(|e| invalid(format!("the body isn't JSON: {e}")))?
+        };
+        app.svc.unit_method(tenant, method, &body).await
+    };
+    respond(r.await)
+}
+
+async fn balancer_units(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
+    let r = async {
+        authorize(&app, &headers)?;
+        app.svc.balancer_units().await
     };
     respond(r.await)
 }

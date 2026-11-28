@@ -8,6 +8,7 @@
 //! |---|---|
 //! | The decision log | [`decisions`] |
 //! | Load collection | [`load`] |
+//! | Engine units over nodes: replica and home moves | [`nodes`] |
 //! | Capacity, utilization and pressure | [`model`] |
 //! | Constraints and `feasible()` | [`constraints`] |
 //! | `place()` and the rebalance planner | [`plan`] |
@@ -31,6 +32,7 @@ pub mod judge;
 pub mod load;
 pub mod model;
 pub mod mover;
+pub mod nodes;
 pub mod pins;
 pub mod plan;
 pub mod ratelimit;

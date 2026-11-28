@@ -321,6 +321,16 @@ pub fn start_placement(
         id,
         gateway_id,
         addr,
+        raft_addr: raft_from(|k| std::env::var(k).ok())
+            .ok()
+            .flatten()
+            .and_then(|r| {
+                r.peers
+                    .iter()
+                    .find(|(p, _)| *p == r.id)
+                    .map(|(_, a)| a.to_string())
+            })
+            .unwrap_or_default(),
         failure_domain: failure_domain_from_env().unwrap_or_default(),
         placement: placement_from_env(),
         state: "active".to_owned(),
@@ -416,6 +426,25 @@ async fn sweep_deleted_unplaced(
             let _ = tokio::task::spawn_blocking(move || drop_tenant_units(t)).await;
         }
     }
+}
+
+/// The Raft peers this node was started with (`SPRIGDB_ENGINE_RAFT_PEERS`),
+/// this node included; empty on a one-node engine.
+pub(crate) fn raft_peers() -> Vec<(u64, SocketAddr)> {
+    raft_from(|k| std::env::var(k).ok())
+        .ok()
+        .flatten()
+        .map(|r| r.peers)
+        .unwrap_or_default()
+}
+
+/// Gives the Raft transport the address of node `id` (a node added after
+/// this one started). `false` before replication runs.
+pub(crate) fn learn_raft_peer(id: u64, addr: SocketAddr) -> bool {
+    RAFT.get().is_some_and(|r| {
+        r.transport.set_peer(id, addr);
+        true
+    })
 }
 
 /// This node's Raft node, once replication started.
@@ -787,7 +816,11 @@ fn preferred(all: &[u64], unit: u64) -> Option<u64> {
     if crate::ops::replicate::short_of_copies(unit) {
         return None;
     }
-    preferred_any(all, unit).filter(|n| crate::ops::nodes::takes_leadership(*n))
+    // Nor is a node leaving the unit by a planned move: leadership handed
+    // away from it stays away.
+    preferred_any(all, unit).filter(|n| {
+        crate::ops::nodes::takes_leadership(*n) && !crate::ops::moves::leaving(unit, *n)
+    })
 }
 
 fn preferred_any(all: &[u64], unit: u64) -> Option<u64> {

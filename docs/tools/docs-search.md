@@ -89,7 +89,7 @@ has_operator_pages
 
 The rules:
 
-- Reads work: `SELECT` and `WITH`, and `DESCRIBE` and `SHOW COLUMNS` of `sprig_docs.chunks`. A statement may name `sprig_docs.chunks` once (a join of the docs with themselves is refused), read at most 1,000,000 rows and return 32 MiB; past that it fails with 1041.
+- Reads work: `SELECT` and `WITH`, and `DESCRIBE` and `SHOW COLUMNS` of `sprig_docs.chunks`. A statement may read one table once: a join of the docs with themselves, also through a CTE, a derived table or a subquery, is refused with 1041. It may read at most 1,000,000 rows and return 32 MiB (1041 past either), and it may run for at most 30 seconds (1969). `KILL QUERY` stops it (1317).
 - Writes and DDL fail with 1044, as writes to `information_schema` do on MySQL.
 - `USE sprig_docs` fails with 39051: name the table as `sprig_docs.chunks`.
 - One statement can't join the docs with your own tables: your tables aren't there (1146).

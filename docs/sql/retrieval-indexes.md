@@ -78,7 +78,7 @@ CREATE RETRIEVAL INDEX [IF NOT EXISTS] index_name
 Rules:
 
 - **Privileges:** `INDEX` on the table.
-- The table needs a primary key: hits are returned with it, and searches check each hit's row through it.
+- The table needs a primary key: hits are returned with it, and searches check each hit's row through it. A key with a `FLOAT` or `DOUBLE` column is refused (39997), because an approximate number can't name its row exactly.
 - The statement returns at once. The index starts in state `building`: the node that leads the tenant's data cuts and embeds the existing rows, at most `ai.embedding.backfill_rows_per_s` rows a second (500 by default), and follows new changes meanwhile. Searches during the build find the rows indexed so far. `SHOW RETRIEVAL INDEXES` shows the progress.
 - The index is kept up to date as the user who created it, so `CREATE RETRIEVAL INDEX` needs a login of a tenant user.
 - A row keeps at most `ai.retrieval.max_chunks_per_row` chunks (64); the rest of a longer text isn't indexed. Each chunk is embedded with its title, cut to the model's 512 tokens.

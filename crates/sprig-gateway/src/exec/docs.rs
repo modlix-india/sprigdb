@@ -43,7 +43,7 @@ impl PassSession {
     /// Answers a statement that names `sprig_docs`; `None` for any other.
     pub(super) async fn tenant_docs(
         &mut self,
-        _cx: &mut ExecCtx<'_>,
+        cx: &mut ExecCtx<'_>,
         text: &Bytes,
         more: bool,
         format: RowFormat,
@@ -88,7 +88,10 @@ impl PassSession {
             return self.fail(out, &e).await.map(Some);
         }
         let started = Instant::now();
-        let r = self.docs_rows(tenant, &analysis, text, &user, &host).await;
+        let handle = std::sync::Arc::clone(cx.session.handle());
+        let r = self
+            .docs_rows(tenant, &analysis, text, &user, &host, handle)
+            .await;
         let mut status = self.status();
         if more {
             status |= StatusFlags::MORE_RESULTS_EXISTS;
@@ -131,6 +134,7 @@ impl PassSession {
         text: &[u8],
         user: &str,
         host: &str,
+        handle: std::sync::Arc<crate::session::SessionHandle>,
     ) -> Result<Option<sprig_types::Rows>> {
         let svc = crate::docs::service()
             .ok_or_else(|| crate::docs::unavailable("this gateway has no tenant logins"))?;
@@ -160,14 +164,25 @@ impl PassSession {
                     let mysql = self.persona == sprig_proto_mysql::Persona::MySql84;
                     // Off the runtime's worker: a statement may read up to
                     // a million rows.
-                    let run = || crate::docs::memsql::query(&ix, &sql, mysql);
-                    if tokio::runtime::Handle::try_current().is_ok_and(|h| {
+                    // At most 30 s, and a KILL QUERY stops it at its next row.
+                    let guard = crate::docs::memsql::Guard::new(crate::docs::memsql::TIME_LIMIT);
+                    let watch = {
+                        let g = std::sync::Arc::clone(&guard);
+                        tokio::spawn(async move {
+                            handle.flags().query_killed().await;
+                            g.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                        })
+                    };
+                    let run = || crate::docs::memsql::query(&ix, &sql, mysql, &guard);
+                    let r = if tokio::runtime::Handle::try_current().is_ok_and(|h| {
                         h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
                     }) {
-                        crate::offload::block_in_place(run).map(Some)
+                        crate::offload::block_in_place(run)
                     } else {
-                        run().map(Some)
-                    }
+                        run()
+                    };
+                    watch.abort();
+                    r.map(Some)
                 }
             };
         }

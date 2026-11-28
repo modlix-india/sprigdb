@@ -105,6 +105,13 @@ key!(
     "Chunks a search of an engine database's retrieval index compares with the query's vector at most (an exact scan); a larger index answers from its keyword list alone, with warning 39827"
 );
 
+/// Whether `name` is a retrieval index's chunk table (`__sprig_rx_<id>`).
+#[must_use]
+pub fn is_chunk_table(name: &str) -> bool {
+    name.get(..TABLE_PREFIX.len())
+        .is_some_and(|p| p.eq_ignore_ascii_case(TABLE_PREFIX))
+}
+
 /// The chunk table of index `id`.
 #[must_use]
 pub fn table_name(id: u64) -> String {

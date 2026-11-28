@@ -128,6 +128,7 @@ pub mod traffic;
 pub mod tree;
 pub mod tree_settings;
 pub mod txn_resolver;
+pub mod unit_balance;
 pub mod users;
 pub mod workload_rollup;
 // AI providers in the Admin API and the payload purge.
@@ -609,6 +610,11 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
         .with_loop(Loop::new(doc_ttl_loop::DocTtlLoop))
         // Engine nodes gone past replication.dead_node_minutes.
         .with_loop(Loop::new(node_health::NodeHealthLoop::new(Some((
+            settings.live.clone(),
+            dc.clone(),
+        )))))
+        // Engine units and their leaderships spread over the nodes.
+        .with_loop(Loop::new(unit_balance::UnitBalanceLoop::new(Some((
             settings.live.clone(),
             dc.clone(),
         )))))

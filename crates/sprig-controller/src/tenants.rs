@@ -1067,6 +1067,8 @@ where
             learners: Vec::new(),
             home: p.home,
             generation: 0,
+            moving: None,
+            last_move: None,
         };
         let stored = units::place_once(&*self.dc_store, &desc, guard).await?;
         if let Some(dir) = &dir {

@@ -21,6 +21,8 @@ cargo deny check          # needs `cargo install cargo-deny`
 
 CI (`.github/workflows/ci.yml`) runs the same checks on every push.
 
+`cargo test` doesn't run live tests, the ones that need a running stack, a reference server, etcd or Docker. Each is marked `#[ignore = "live: needs …"]`, so it is listed as ignored. Run on purpose (`-- --ignored`) without its variables set, it fails rather than passing. [tools/live/README.md](../../tools/live/README.md) shows how to start a local engine stack and run the live suites.
+
 The `sprigdb` binary allocates memory with mimalloc by default. To use the platform allocator instead (glibc on Linux), build with `cargo build -p sprigdb --features system-alloc`. With glibc, the gateway's systemd unit sets no `MALLOC_ARENA_MAX`; add it in a unit drop-in if you want the cap.
 
 ## Run a role
@@ -189,7 +191,7 @@ One-way delays: mum1–fra1 30 ms, mum1–iad1 80 ms, fra1–iad1 60 ms, so a pi
 
 ## Integration tests
 
-Integration tests use `sprig-testkit` and skip themselves, with a message, unless the variable naming their service is set. Point them at the single-DC environment with:
+Integration tests use `sprig-testkit`. They are ignored by default (`#[ignore = "live: needs …"]`, naming the variables they read), and fail rather than skip when run with `--ignored` without those variables. Point the MariaDB-era ones at the single-DC environment with:
 
 ```sh
 export SPRIG_TEST_ETCD=http://127.0.0.1:2379
@@ -197,7 +199,7 @@ export SPRIG_TEST_MARIADB_SINGLE=mysql://root:sprig-dev-root@127.0.0.1:13301
 export SPRIG_TEST_MARIADB_REPLICATION=mysql://root:sprig-dev-root@127.0.0.1:13311,mysql://root:sprig-dev-root@127.0.0.1:13312,mysql://root:sprig-dev-root@127.0.0.1:13313
 export SPRIG_TEST_MARIADB_GALERA=mysql://root:sprig-dev-root@127.0.0.1:13321,mysql://root:sprig-dev-root@127.0.0.1:13322,mysql://root:sprig-dev-root@127.0.0.1:13323
 export SPRIG_TEST_DOCKER=1        # tests that start their own Compose projects
-cargo test --workspace
+cargo test --workspace -- --ignored
 ```
 
 A list holds the writer first. With `SPRIG_TEST_DOCKER=1`, clock-skew tests start throwaway MariaDB containers with `libfaketime` preloaded, from an image (`sprigdb-mariadb-faketime:<tag>`) they build once, which needs the network; the shared Compose servers' clocks are never skewed (faultd can't move one container's wall clock, see `sprig_testkit::faults::faketime`). `SPRIG_TEST_ENV_FILE=deploy/compose/env.3dc.toml` describes the three-DC layout instead (`sprig_testkit::Env`). `SPRIG_TEST_STRICT=1` turns a skip into a failure, as in CI; `SPRIG_TEST_KEEP=1` leaves Compose projects that tests start running after the test. CI runs in stages: S0 (format, lint, unit tests, `cargo deny`) on every push, S1 (integration tests against Compose) on pull requests and `main`, and S2 (the three-DC layout on MariaDB 11.8 and 12.3) nightly or on demand.

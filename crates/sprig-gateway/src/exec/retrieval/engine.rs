@@ -150,14 +150,18 @@ fn keep_nearest(mut v: Vec<Near>, k: usize) -> Vec<Near> {
 
 /// "After the chunk of row `r`" (its key columns, then `chunk_no`) in the
 /// chunk table's key order.
-fn keyset_after(keys: &[rx::KeyColumn], r: &[Option<Vec<u8>>]) -> String {
+fn keyset_after(keys: &[rx::KeyColumn], r: &[Option<Vec<u8>>], nbe: bool) -> String {
     let mut cols: Vec<(String, String)> = keys
         .iter()
         .enumerate()
         .map(|(i, k)| {
             (
                 quote(&rx::key_column(&k.name)),
-                k.literal(r.get(i).and_then(Option::as_deref)),
+                super::key_literal(
+                    k,
+                    k.text(r.get(i).and_then(Option::as_deref)).as_deref(),
+                    nbe,
+                ),
             )
         })
         .collect();
@@ -277,6 +281,15 @@ impl PassSession {
             }
             return Err(e);
         }
+        // The record says the table exists: the job never makes it again.
+        let mut tx = self.rx_records().await?;
+        if let Some(mut now) = rec::get_for_update(tx.as_mut(), id).await?
+            && !rec::dropping(&now)
+        {
+            now.progress["table"] = json!(true);
+            rec::put(tx.as_mut(), &now).await?;
+            tx.commit().await?;
+        }
         super::sync::wake();
         let tenant = self.tenant.as_deref().map_or(0, |ts| ts.tenant.0);
         tracing::info!(tenant, %db, %table, index = id, name = %n.name,
@@ -339,8 +352,9 @@ impl PassSession {
         let kc = kcols.join(", ");
         let t = format!("{}.{}", quote(&db), quote(&rx::table_name(ix.id)));
         let head = format!("{kc}, `chunk_no`, `title`, `text`");
-        let q_lit = string_literal(&call.query, false);
-        let m_lit = string_literal(&match_words(&call.query), false);
+        // Literals for the caller's own session (its NO_BACKSLASH_ESCAPES).
+        let q_lit = string_literal(&call.query, s.nbe);
+        let m_lit = string_literal(&match_words(&call.query), s.nbe);
         let and_filter = s
             .chunk_filter
             .as_deref()
@@ -355,11 +369,31 @@ impl PassSession {
         // `max_scan` chunks; a larger index answers without a vector list).
         let mut nearest: Option<Vec<Near>> = None;
         let mut vector_skipped = None;
-        if let Some(q) = &s.q_vec {
+        // The index's size decides, whatever the caller may see: its chunk
+        // count as the job keeps it (counted here for an index older than
+        // the count).
+        let total = match ix
+            .progress
+            .get("chunks")
+            .and_then(serde_json::Value::as_u64)
+        {
+            Some(n) => n,
+            None if s.q_vec.is_some() => self
+                .rx_internal_rows(cx, wire, &format!("SELECT COUNT(*) FROM {t}"))
+                .await?
+                .first()
+                .and_then(|r| r.first())
+                .and_then(Option::as_ref)
+                .and_then(|b| std::str::from_utf8(b).ok()?.parse().ok())
+                .unwrap_or(0),
+            None => 0,
+        };
+        if s.q_vec.is_some() && total > s.max_scan {
+            vector_skipped = Some(s.max_scan);
+        } else if let Some(q) = &s.q_vec {
             // Pages in key order, so at most a page of vectors is held.
             let mut best: Vec<Near> = Vec::new();
             let mut after: Option<String> = None;
-            let mut seen = 0u64;
             loop {
                 let mut conds: Vec<String> =
                     s.chunk_filter.iter().map(|f| format!("({f})")).collect();
@@ -381,18 +415,13 @@ impl PassSession {
                         ),
                     )
                     .await?;
-                seen += rows.len() as u64;
-                if seen > s.max_scan {
-                    vector_skipped = Some(s.max_scan);
-                    break;
-                }
                 best.extend(top_near(&keys, &rows, q, MAX_CANDIDATES));
                 best = keep_nearest(best, MAX_CANDIDATES);
                 if rows.len() < SCAN_PAGE {
                     nearest = Some(best);
                     break;
                 }
-                after = rows.last().map(|r| keyset_after(&keys, r));
+                after = rows.last().map(|r| keyset_after(&keys, r, s.nbe));
             }
         }
         let mut per_list = s.per_list.max(1);
@@ -474,7 +503,7 @@ impl PassSession {
                                     format!(
                                         "{} = {}",
                                         quote(&rx::key_column(&c.name)),
-                                        super::key_literal(c, v.as_deref(), false)
+                                        super::key_literal(c, v.as_deref(), s.nbe)
                                     )
                                 })
                                 .collect();
@@ -616,7 +645,7 @@ mod tests {
             Some(b"chunk".to_vec()),
         ];
         assert_eq!(
-            keyset_after(&keys, &r),
+            keyset_after(&keys, &r, false),
             "(`k_id` > 7) OR (`k_id` = 7 AND `k_b` > X'ab01') OR (`k_id` = 7 AND `k_b` = X'ab01' AND `chunk_no` > 3)"
         );
         let c = candidate(&keys, &r);

@@ -139,6 +139,10 @@ impl PassSession {
             if t.tenant.is_some() || !g.views.invoker_reads(t.def.db, &t.def.name) {
                 continue;
             }
+            // A chunk table: checked on its source by the retrieval code.
+            if ts.types.internal && sprig_ai::retrieval::is_chunk_table(&t.def.name) {
+                continue;
+            }
             let db_key = database_key(&t.db_name, ts.lower_case_table_names());
             // A stream: `SELECT` on it by name, or on its database.
             if t.stream.is_some() {

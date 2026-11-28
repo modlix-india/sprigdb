@@ -1072,14 +1072,11 @@ impl CheckCtx<'_> {
         {
             return Ok(());
         }
-        // Retrieval indexes' chunk tables: the gateway's own statements
-        // read and write them for a user of the database (searches check
-        // every hit on the source table through the user's session).
-        if name
-            .get(..sprig_ai::retrieval::TABLE_PREFIX.len())
-            .is_some_and(|p| p.eq_ignore_ascii_case(sprig_ai::retrieval::TABLE_PREFIX))
-            && self.p.sees_database(&key, Some(row.db_id))
-        {
+        // Retrieval indexes' chunk tables: only the gateway's own
+        // statements can name them, for a user the retrieval code has
+        // checked on the source table (a table-level grant is enough); every
+        // hit is checked again on the source through the user's session.
+        if sprig_ai::retrieval::is_chunk_table(name) {
             return Ok(());
         }
         let okey = object_key(ObjectKind::Table, name, self.lctn);

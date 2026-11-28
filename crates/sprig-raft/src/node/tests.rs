@@ -684,3 +684,99 @@ fn a_snapshot_that_fails_to_restore_is_refused_and_sent_again() {
         assert!(!c.node(lagging).is_closed());
     }
 }
+
+/// The toy machine whose `removed` calls back into its node while another
+/// thread waits to write the node's groups map: as the engine's does (its
+/// stream log's flush reads `Node::committed`) while `drop_group` runs.
+struct CallsBack {
+    inner: KvMachine,
+    group: GroupId,
+    node: Arc<std::sync::OnceLock<Node>>,
+    done: std::sync::mpsc::Sender<&'static str>,
+}
+
+impl StateMachine for CallsBack {
+    fn apply(&mut self, entries: &[Entry]) -> Result<(), RaftError> {
+        self.inner.apply(entries)
+    }
+    fn query(&self, q: &[u8]) -> Vec<u8> {
+        self.inner.query(q)
+    }
+    fn snapshot(&self) -> Result<Vec<u8>, RaftError> {
+        self.inner.snapshot()
+    }
+    fn restore(&mut self, index: u64, data: &[u8]) -> Result<(), RaftError> {
+        self.inner.restore(index, data)
+    }
+    fn removed(&mut self) {
+        let Some(node) = self.node.get().cloned() else {
+            return;
+        };
+        if self.group != 7 {
+            return;
+        }
+        // A writer queues for the groups map (another group dropped)...
+        let writer = {
+            let (node, done) = (node.clone(), self.done.clone());
+            std::thread::spawn(move || {
+                let _ = node.drop_group(8);
+                let _ = done.send("writer");
+            })
+        };
+        std::thread::sleep(Duration::from_millis(200));
+        // ...and this replica's clean-up reads the node again.
+        let _ = node.committed(self.group);
+        let _ = self.done.send("removed");
+        let _ = writer;
+    }
+}
+
+/// Dropping a departed replica's state never holds the node's groups lock
+/// while the state machine runs: the engine's clean-up reads the node
+/// again (`Node::committed`), and with a writer queued in between (another
+/// group dropped, a new one created) a second read on the same thread
+/// waits for the writer, which waits for the first read. A node hit this
+/// 10 s after a restart in the OCI kill loop (its stale replicas dropped
+/// while `drop_group` ran): every thread reading the map stopped.
+#[test]
+fn dropping_a_replicas_state_holds_no_node_lock() {
+    let node_cell: Arc<std::sync::OnceLock<Node>> = Arc::new(std::sync::OnceLock::new());
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (nc, tx2) = (Arc::clone(&node_cell), std::sync::Mutex::new(tx));
+    let mut c = Cluster {
+        net: MemNetwork::new(),
+        cfg: fast(),
+        members: BTreeMap::new(),
+        machines: Arc::new(move |g| {
+            Box::new(CallsBack {
+                inner: KvMachine::new(),
+                group: g,
+                node: Arc::clone(&nc),
+                done: lock(&tx2).clone(),
+            }) as Box<dyn StateMachine>
+        }),
+    };
+    c.start(1, MemLogStore::new());
+    let _ = node_cell.set(c.node(1).clone());
+    c.create(7, &[1]);
+    c.create(8, &[1]);
+    c.put(7, 1, 1);
+    assert_eq!(c.node(1).drop_group(7), Ok(true));
+    let mut got = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while got.len() < 2 {
+        let Ok(w) = rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) else {
+            // Deadlocked: its threads can't be stopped; leave them.
+            std::mem::forget(c);
+            panic!("the replica drop deadlocked on the node's lock (finished: {got:?})");
+        };
+        got.push(w);
+    }
+    got.sort_unstable();
+    assert_eq!(got, vec!["removed", "writer"]);
+    // A new replica of the dropped group may start once the drop is done.
+    until("group 7 created again", || {
+        c.node(1).create_group(7, &[1]).ok().map(|_| ())
+    });
+    assert!(!c.node(1).is_closed());
+}

@@ -708,7 +708,7 @@ async fn the_dba_tools_see_check_clauses_and_row_security_on_engine_tables() {
     assert!(r.contains("CHECK constraint"), "{r}");
     // The row-security state was read: customers is on, with a policy.
     let at = r
-        .find("\\\"table\\\":\\\"customers\\\"")
+        .find("\\\"table\\\":\\\"customers\\\",\\\"flagged")
         .unwrap_or_else(|| panic!("{r}"));
     let tail = &r[at..r.len().min(at + 200)];
     assert!(tail.contains("row_level_security\\\":\\\"on"), "{tail}");

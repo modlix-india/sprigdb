@@ -48,13 +48,17 @@ use sprig_sql::retrieval::Chunking;
 use tokio::sync::Notify;
 
 use crate::mongo::sql::SqlSession;
-use crate::node_engine::{self, UnitLeader};
 use crate::pipeline::SharedExecutor;
 use crate::table_changes::{self, Watched};
 use crate::tenant::TenantServices;
 
 /// The tick, in milliseconds (tests shorten it).
 pub(crate) const TICK_VAR: &str = "SPRIGDB_RETRIEVAL_TICK_MS";
+/// How often a tenant's chunk tables without an index are looked for.
+const SWEEP_EVERY: Duration = Duration::from_secs(60);
+/// How long a led tenant without retrieval indexes waits to be listed
+/// again.
+const LIST_IDLE: Duration = Duration::from_secs(30);
 /// Rows read per fill step.
 const FILL_ROWS: usize = 64;
 /// How long one round of one index may work before it lets others go.
@@ -79,6 +83,7 @@ fn running() -> &'static Mutex<HashSet<(u64, u64)>> {
 }
 
 /// Starts the job.
+#[allow(clippy::too_many_lines)] // the tick: led tenants, their indexes, the sweep
 pub(crate) fn spawn(
     svc: Arc<TenantServices>,
     login: Arc<sprig_auth::LoginService>,
@@ -89,43 +94,93 @@ pub(crate) fn spawn(
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .map_or(Duration::from_secs(1), Duration::from_millis);
-    let mut loads = svc.cache.loads();
+    let mut led = crate::led::Led::new(&svc);
     tokio::spawn(async move {
-        let mut tenants: HashSet<u64> = HashSet::new();
+        // Per led tenant: when its indexes were listed, and them.
+        let mut known: HashMap<u64, (Instant, Vec<(u64, u32)>)> = HashMap::new();
+        // Per led tenant: when its orphan chunk tables were last looked for.
+        let mut swept: HashMap<u64, Instant> = HashMap::new();
         let mut timer = tokio::time::interval(tick);
         timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 () = stop.cancelled() => return,
-                l = loads.recv() => {
-                    if let Ok(l) = l {
-                        tenants.insert(l.tenant.0);
-                    }
-                    continue;
-                }
-                () = wakeup().notified() => {}
+                _ = led.changed() => continue,
+                () = wakeup().notified() => known.clear(),
                 _ = timer.tick() => {}
             }
-            for &t in &tenants {
-                if !matches!(
-                    node_engine::tenant_leader(t),
-                    UnitLeader::Here | UnitLeader::Any
-                ) {
+            if led.take_lagged() {
+                known.clear();
+            }
+            let tenants = led.tenants(&svc).await;
+            let led_now: HashSet<u64> = tenants.iter().copied().collect();
+            known.retain(|t, _| led_now.contains(t));
+            for t in tenants {
+                // A tenant with indexes is listed again each tick; one
+                // without, every LIST_IDLE (a CREATE wakes the job).
+                let fresh = known
+                    .get(&t)
+                    .is_some_and(|(at, l)| l.is_empty() && at.elapsed() < LIST_IDLE);
+                if !fresh {
+                    match list(&svc, TenantId(t)).await {
+                        Ok(v) => {
+                            known.insert(t, (Instant::now(), v));
+                        }
+                        Err(e) => {
+                            tracing::debug!(tenant = t, error = %e, "retrieval job: indexes not read");
+                            continue;
+                        }
+                    }
+                }
+                let Some((_, ids)) = known.get(&t) else {
+                    continue;
+                };
+                if ids.is_empty() {
                     continue;
                 }
-                let Some(cat) = svc.cache.cached(TenantId(t)) else {
+                let ids = ids.clone();
+                let Ok(cat) = svc
+                    .cache
+                    .get(
+                        TenantId(t),
+                        sprig_catalog::cache::Freshness::Cached { min_version: 0 },
+                    )
+                    .await
+                else {
                     continue;
                 };
                 let Some(ecat) = crate::engine::catalog::of(&cat) else {
                     continue;
                 };
-                let ids = match list(&svc, TenantId(t)).await {
-                    Ok(v) => v,
-                    Err(e) => {
-                        tracing::debug!(tenant = t, error = %e, "retrieval job: indexes not read");
-                        continue;
+                // Chunk tables no index points to (left by a failure),
+                // dropped at most every SWEEP_EVERY.
+                if swept
+                    .get(&t)
+                    .is_none_or(|at: &Instant| at.elapsed() >= SWEEP_EVERY)
+                {
+                    swept.insert(t, Instant::now());
+                    let mine: HashSet<u64> = ids.iter().map(|(id, _)| *id).collect();
+                    let orphans: Vec<(String, String)> = ecat
+                        .by_name
+                        .keys()
+                        .filter_map(|(d, n)| {
+                            let id: u64 = n.strip_prefix(rx::TABLE_PREFIX)?.parse().ok()?;
+                            (!mine.contains(&id)).then_some((*d, n.clone()))
+                        })
+                        .filter_map(|(d, n)| Some((cat.databases.get(d)?.name.clone(), n)))
+                        .collect();
+                    if !orphans.is_empty() {
+                        let job = Job {
+                            svc: Arc::clone(&svc),
+                            login: Arc::clone(&login),
+                            executor: Arc::clone(&executor),
+                            tenant: TenantId(t),
+                            id: 0,
+                        };
+                        let cat = Arc::clone(&cat);
+                        tokio::spawn(async move { job.sweep(&cat, orphans).await });
                     }
-                };
+                }
                 let mut gone_dbs: Vec<u32> = Vec::new();
                 for (id, db) in ids {
                     if !ecat.dbs.contains(&DbId(db)) {
@@ -360,9 +415,77 @@ struct Round<'a> {
     delta: i64,
     /// Count the rows with chunks again at the next save.
     recount: bool,
+    /// Chunks written (+) or deleted (-) since the last save.
+    chunk_delta: i64,
     model: Arc<sprig_embed::Embedder>,
     svc: &'a TenantServices,
     tenant: TenantId,
+}
+
+/// When each index's counts were last taken in full: again on the first
+/// round of a process, after a failed round, and every [`RECOUNT_EVERY`].
+fn recounts() -> &'static Mutex<HashMap<(u64, u64), Instant>> {
+    static R: OnceLock<Mutex<HashMap<(u64, u64), Instant>>> = OnceLock::new();
+    R.get_or_init(Mutex::default)
+}
+
+/// How often an index's counts are taken in full.
+const RECOUNT_EVERY: Duration = Duration::from_secs(300);
+
+fn recount_due(tenant: u64, id: u64) -> bool {
+    recounts()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(&(tenant, id))
+        .is_none_or(|at| at.elapsed() >= RECOUNT_EVERY)
+}
+
+fn recounted(tenant: u64, id: u64) {
+    recounts()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert((tenant, id), Instant::now());
+}
+
+/// Takes `NO_BACKSLASH_ESCAPES` out of the session's `sql_mode` (the
+/// job's literals escape with backslashes).
+async fn clear_nbe(sql: &mut SqlSession) -> Result<()> {
+    let rows = sql
+        .query("SELECT @@SESSION.sql_mode")
+        .await
+        .map_err(|e| sql_failed("reading sql_mode", &e))?;
+    let mode = rows
+        .first()
+        .and_then(|r| r.first())
+        .and_then(Option::as_ref)
+        .map(|b| String::from_utf8_lossy(b).into_owned())
+        .unwrap_or_default();
+    if !mode.to_ascii_uppercase().contains("NO_BACKSLASH_ESCAPES") {
+        return Ok(());
+    }
+    let kept: Vec<&str> = mode
+        .split(',')
+        .filter(|m| !m.trim().eq_ignore_ascii_case("NO_BACKSLASH_ESCAPES"))
+        .filter(|m| m.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'))
+        .collect();
+    sql.exec(&format!("SET SESSION sql_mode = '{}'", kept.join(",")))
+        .await
+        .map(|_| ())
+        .map_err(|e| sql_failed("clearing NO_BACKSLASH_ESCAPES", &e))
+}
+
+/// A tenant user who may drop the tenant's tables (the first in id
+/// order), to clean up after an index whose creator is gone.
+fn admin_user(svc: &TenantServices, cat: &sprig_catalog::TenantCatalog) -> Option<u32> {
+    let auth = sprig_auth::TenantAuth::of(cat)?;
+    let mut ids: Vec<u32> = auth.users().map(|u| u.row.user_id.0).collect();
+    ids.sort_unstable();
+    ids.into_iter().find(|&u| {
+        crate::tenant::authz::grants_of(svc, cat, Some(sprig_common::ids::UserId(u))).allows(
+            sprig_auth::authz::Action::Drop,
+            sprig_auth::authz::Target::Tenant,
+        )
+    })
 }
 
 /// Records `e` as index `id`'s last error (`SHOW RETRIEVAL INDEXES`).
@@ -387,6 +510,11 @@ impl Job {
         let r = Box::pin(self.round_inner()).await;
         if let Err(e) = &r {
             note(&svc, tenant, id, &e.to_string()).await;
+            // The counts may have missed the failed step's writes.
+            recounts()
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&(tenant.0, id));
         }
         r
     }
@@ -394,9 +522,13 @@ impl Job {
     #[allow(clippy::too_many_lines)] // the round's steps, in order
     async fn round_inner(self) -> Result<()> {
         let svc = &*self.svc;
-        let Some(mut cat) = svc.cache.cached(self.tenant) else {
-            return Ok(());
-        };
+        let mut cat = svc
+            .cache
+            .get(
+                self.tenant,
+                sprig_catalog::cache::Freshness::Cached { min_version: 0 },
+            )
+            .await?;
         let mut tx = super::engine::writers(svc).begin(self.tenant).await?;
         let Some(ix) = rec::get(tx.as_mut(), self.id).await? else {
             return Ok(());
@@ -436,6 +568,16 @@ impl Job {
             forget_database(svc, self.tenant, ix.db_id).await?;
             return Ok(());
         }
+        if rec::dropping(&ix) || table.is_none() || def.is_none() {
+            // A DROP RETRIEVAL INDEX that didn't finish, or a source table
+            // that is gone: the index goes, as its creator or, when that
+            // user is gone too, a tenant administrator.
+            let sql = self.session(&cat, ix.created_by, true).await?;
+            return Self::forget(svc, self.tenant, sql, &ix, db.as_deref()).await;
+        }
+        let (Some(db), Some(table), Some(def)) = (db, table, def) else {
+            return Ok(());
+        };
         let Some(user) = ix.created_by else {
             return Err(sprig_ai::embedding::failed(
                 "retrieval index: it has no creator to run as; drop it and create it again",
@@ -443,38 +585,23 @@ impl Job {
         };
         // A filled index with no change since its token: nothing to do,
         // and no session is opened.
-        if let (Some(db), Some(d)) = (&db, &def)
-            && !rec::dropping(&ix)
-            && ix.progress.get("fill") == Some(&json!("done"))
-            && Self::idle(svc, self.tenant, &ix, db, d).await
+        if ix.progress.get("fill") == Some(&json!("done"))
+            && ix.progress.get("table") == Some(&json!(true))
+            && Self::idle(svc, self.tenant, &ix, &db, &def).await
         {
             return Ok(());
         }
-        let name = crate::inherited::tenant_name(svc, self.tenant).await?;
-        let principal = crate::triggers::principal_of(&self.login, self.tenant.0, &name, user)
-            .await
-            .map_err(|e| {
-                sprig_ai::embedding::failed(format!(
-                    "retrieval index: its creator (user {user}) can't run it: {e}"
-                ))
-            })?;
-        let sql = SqlSession::open(
-            &svc.sessions,
-            &self.executor,
-            &principal,
-            "retrieval",
-            0,
-            SocketAddr::from(([127, 0, 0, 1], 0)),
-            None,
-            64 << 20,
-        )?;
-        let (Some(db), Some(table), Some(def)) = (db.clone(), table, def) else {
-            // The source table is gone: so is the index.
-            return Self::forget(svc, self.tenant, sql, &ix, db.as_deref()).await;
-        };
-        if rec::dropping(&ix) {
-            // A DROP RETRIEVAL INDEX that didn't finish.
-            return Self::forget(svc, self.tenant, sql, &ix, Some(&db)).await;
+        let mut sql = self.session(&cat, Some(user), false).await?;
+        // The job's literals escape with backslashes.
+        if let Err(e) = clear_nbe(&mut sql).await {
+            sql.close().await;
+            return Err(e);
+        }
+        if ix.progress.get("table") != Some(&json!(true))
+            && let Err(e) = Self::ensure_table(svc, self.tenant, &mut sql, &ix, &db).await
+        {
+            sql.close().await;
+            return Err(e);
         }
         let _exempt = crate::tenant::rls::exempt_internal(
             sql.session_id(),
@@ -520,7 +647,8 @@ impl Job {
             svc,
             tenant: self.tenant,
             delta: 0,
-            recount: false,
+            recount: recount_due(self.tenant.0, self.id),
+            chunk_delta: 0,
         };
         let watched: HashMap<u32, Watched> = u32::try_from(r.ix.object_id)
             .ok()
@@ -533,6 +661,120 @@ impl Job {
         }
         r.sql.close().await;
         res
+    }
+
+    /// Drops chunk tables (database, table) that no index points to, as a
+    /// tenant administrator.
+    async fn sweep(self, cat: &sprig_catalog::TenantCatalog, orphans: Vec<(String, String)>) {
+        let mut sql = match self.session(cat, None, true).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!(tenant = self.tenant.0, error = %e, "orphan chunk tables not swept");
+                return;
+            }
+        };
+        // The records as they are now: an index made since the listing
+        // keeps its table.
+        let Ok(now) = list(&self.svc, self.tenant).await else {
+            sql.close().await;
+            return;
+        };
+        let live: HashSet<u64> = now.iter().map(|(id, _)| *id).collect();
+        for (db, table) in orphans {
+            if table
+                .strip_prefix(rx::TABLE_PREFIX)
+                .and_then(|i| i.parse::<u64>().ok())
+                .is_none_or(|id| live.contains(&id))
+            {
+                continue;
+            }
+            match sql
+                .exec(&format!(
+                    "DROP TABLE IF EXISTS {}.{}",
+                    quote(&db),
+                    quote(&table)
+                ))
+                .await
+            {
+                Ok(_) => tracing::info!(event = "retrieval.chunks.swept", tenant = self.tenant.0,
+                    db = %db, table = %table, "a chunk table no index points to was dropped"),
+                Err(e) => tracing::warn!(tenant = self.tenant.0, db = %db, table = %table,
+                    error = %e.message, "an orphan chunk table wasn't dropped"),
+            }
+        }
+        sql.close().await;
+    }
+
+    /// A session for the index's job: as `user` (its creator); with
+    /// `fallback`, when that user can't log in any more, as a tenant
+    /// administrator (to drop what the index left; audited).
+    async fn session(
+        &self,
+        cat: &sprig_catalog::TenantCatalog,
+        user: Option<u32>,
+        fallback: bool,
+    ) -> Result<SqlSession> {
+        let svc = &*self.svc;
+        let name = crate::inherited::tenant_name(svc, self.tenant).await?;
+        let mut why = "it has no creator".to_owned();
+        if let Some(u) = user {
+            match crate::triggers::principal_of(&self.login, self.tenant.0, &name, u).await {
+                Ok(p) => return self.open(&p),
+                Err(e) => why = format!("its creator (user {u}) can't run it: {e}"),
+            }
+        }
+        if fallback && let Some(admin) = admin_user(svc, cat) {
+            let p = crate::triggers::principal_of(&self.login, self.tenant.0, &name, admin).await?;
+            tracing::info!(target: "sprig_audit", event = "retrieval.run_as_admin",
+                tenant = self.tenant.0, index = self.id, user = admin, reason = %why,
+                "a retrieval index is cleaned up as a tenant administrator");
+            return self.open(&p);
+        }
+        Err(sprig_ai::embedding::failed(format!(
+            "retrieval index: {why}"
+        )))
+    }
+
+    fn open(&self, p: &crate::session::Principal) -> Result<SqlSession> {
+        SqlSession::open(
+            &self.svc.sessions,
+            &self.executor,
+            p,
+            "retrieval",
+            0,
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            None,
+            64 << 20,
+        )
+    }
+
+    /// Makes the chunk table, if it was never made (a crash between the
+    /// index's record and its CREATE), under the record's lock: a DROP
+    /// waits for it, and an index being dropped never gets one again.
+    async fn ensure_table(
+        svc: &TenantServices,
+        tenant: TenantId,
+        sql: &mut SqlSession,
+        ix: &RetrievalIndex,
+        db: &str,
+    ) -> Result<()> {
+        let mut tx = super::engine::writers(svc).begin(tenant).await?;
+        let Some(mut now) = rec::get_for_update(tx.as_mut(), ix.id).await? else {
+            return Err(SprigError::internal("the retrieval index was dropped"));
+        };
+        if rec::dropping(&now) {
+            return Err(SprigError::internal("the retrieval index is being dropped"));
+        }
+        if now.progress.get("table") == Some(&json!(true)) {
+            return Ok(());
+        }
+        let ddl = rx::create_engine_table_sql(db, ix.id, &ix.key_columns, &ix.filters);
+        sql.exec(&ddl)
+            .await
+            .map_err(|e| sql_failed("making the chunk table", &e))?;
+        now.progress["table"] = json!(true);
+        rec::put(tx.as_mut(), &now).await?;
+        tx.commit().await
     }
 
     /// Whether the table has no change after the index's token (the
@@ -674,10 +916,15 @@ impl Round<'_> {
     }
 
     async fn exec(&mut self, what: &str, q: &str) -> Result<()> {
+        self.exec_n(what, q).await.map(|_| ())
+    }
+
+    /// `q`'s affected rows.
+    async fn exec_n(&mut self, what: &str, q: &str) -> Result<u64> {
         self.sql
             .exec(q)
             .await
-            .map(|_| ())
+            .map(|d| d.affected)
             .map_err(|e| sql_failed(what, &e))
     }
 
@@ -686,22 +933,7 @@ impl Round<'_> {
     async fn work(&mut self, watched: &HashMap<u32, Watched>) -> Result<()> {
         let started = Instant::now();
         let mut fill_done = self.ix.progress.get("fill") == Some(&json!("done"));
-        // The job's literals escape with backslashes.
-        let _ = self
-            .sql
-            .exec("SET SESSION sql_mode = REPLACE(@@SESSION.sql_mode, 'NO_BACKSLASH_ESCAPES', '')")
-            .await;
-        if !fill_done {
-            // The chunk table, if a crash came between the index's record
-            // and its CREATE (or it was lost): made again, empty.
-            let ddl = rx::create_engine_table_sql(
-                &self.db,
-                self.ix.id,
-                &self.ix.key_columns,
-                &self.ix.filters,
-            );
-            self.exec("making the chunk table", &ddl).await?;
-        }
+
         while !fill_done && started.elapsed() < ROUND {
             let from: Option<Vec<Option<Vec<u8>>>> =
                 self.ix.progress.get("fill").and_then(J::as_array).map(|a| {
@@ -788,7 +1020,14 @@ impl Round<'_> {
                     // The log no longer holds the place: fill again.
                     tracing::warn!(index = self.ix.id, error = %e,
                         "retrieval index: changes lost; filling again");
-                    self.ix.progress = json!({"since_ms": super::engine::now_ms()});
+                    // Its old chunks go: a row deleted meanwhile has no
+                    // change left to clear them.
+                    self.exec(
+                        "emptying the chunk table",
+                        &format!("DELETE FROM {}", self.chunks()),
+                    )
+                    .await?;
+                    self.ix.progress = json!({"since_ms": super::engine::now_ms(), "table": true});
                     self.ix.state = State::Rebuilding;
                     self.recount = true;
                     self.count_and_save().await?;
@@ -797,26 +1036,36 @@ impl Round<'_> {
                 Err(e) => return Err(e),
             };
             let keys = self.ix.key_columns.clone();
-            let mut changed: Vec<Vec<Option<Vec<u8>>>> = Vec::new();
-            let mut seen: HashSet<String> = HashSet::new();
+            // Each changed key once, and whether its last change deleted it.
+            let mut changed: Vec<(Vec<Option<Vec<u8>>>, bool)> = Vec::new();
+            let mut at: HashMap<String, usize> = HashMap::new();
             for ev in &b.events {
-                if seen.insert(ev.key.to_string())
-                    && let Some(k) = event_key(&keys, &ev.key)
-                {
-                    changed.push(k);
+                let Some(k) = event_key(&keys, &ev.key) else {
+                    continue;
+                };
+                let deleted = ev.op == "d";
+                if let Some(&i) = at.get(&ev.key.to_string()) {
+                    changed[i].1 = deleted;
+                } else {
+                    at.insert(ev.key.to_string(), changed.len());
+                    changed.push((k, deleted));
                 }
             }
             rx::metrics::backlog(u64::try_from(changed.len()).unwrap_or(0));
             if !changed.is_empty() {
                 let step = Instant::now();
                 let n = changed.len();
-                let rows = self.read_keys(&changed).await?;
-                let found: HashSet<Vec<Option<String>>> =
-                    rows.iter().map(|r| self.key_text(&r.key)).collect();
-                let gone: Vec<Vec<Option<Vec<u8>>>> = changed
-                    .into_iter()
-                    .filter(|k| !found.contains(&self.key_text(k)))
-                    .collect();
+                let all: Vec<Vec<Option<Vec<u8>>>> = changed.iter().map(|c| c.0.clone()).collect();
+                let rows = self.read_keys(&all).await?;
+                // Gone: a key whose last change was a delete and which no
+                // row has now, each checked on its own (a key's text in the
+                // change event needn't be the row's: floats, exponents).
+                let mut gone = Vec::new();
+                for (k, deleted) in &changed {
+                    if *deleted && !self.exists(k).await? {
+                        gone.push(k.clone());
+                    }
+                }
                 self.apply(&rows, &gone).await?;
                 pace(step, n, self.rates.1).await;
             }
@@ -866,6 +1115,17 @@ impl Round<'_> {
             .collect()
     }
 
+    /// Whether the source has a row with key `k` now.
+    async fn exists(&mut self, k: &[Option<Vec<u8>>]) -> Result<bool> {
+        let cols = self.ix.key_columns.clone();
+        let q = format!(
+            "SELECT 1 FROM {} WHERE {} LIMIT 1",
+            self.source(),
+            key_eq(&cols, &|c| quote(&c.name), k)
+        );
+        Ok(!self.query("checking a deleted row", &q).await?.is_empty())
+    }
+
     /// The current rows of `keys`.
     async fn read_keys(&mut self, keys: &[Vec<Option<Vec<u8>>>]) -> Result<Vec<SrcRow>> {
         let cols = self.ix.key_columns.clone();
@@ -905,11 +1165,8 @@ impl Round<'_> {
                 pred.join(" OR ")
             );
             for r in self.query("reading chunk hashes", &q).await? {
-                let k: Vec<Option<String>> = keys
-                    .iter()
-                    .enumerate()
-                    .map(|(i, c)| c.text(r[i].as_deref()))
-                    .collect();
+                // In the same form as the rows' keys are looked up in.
+                let k = self.key_text(&r[..keys.len()]);
                 stored.insert(k, r[keys.len()].clone().unwrap_or_default());
             }
         }
@@ -993,11 +1250,13 @@ impl Round<'_> {
                 .and_then(|b| std::str::from_utf8(b).ok()?.parse().ok())
                 .unwrap_or(0);
             self.delta -= had;
-            self.exec(
-                "deleting chunks",
-                &format!("DELETE FROM {} WHERE {}", self.chunks(), pred.join(" OR ")),
-            )
-            .await?;
+            let n = self
+                .exec_n(
+                    "deleting chunks",
+                    &format!("DELETE FROM {} WHERE {}", self.chunks(), pred.join(" OR ")),
+                )
+                .await?;
+            self.chunk_delta -= i64::try_from(n).unwrap_or(0);
         }
         // Each row's chunks replaced in one transaction.
         let mut vi = 0usize;
@@ -1046,7 +1305,7 @@ impl Round<'_> {
             );
             self.exec("starting a write", "START TRANSACTION").await?;
             let res = async {
-                self.exec("deleting old chunks", &del).await?;
+                let gone = self.exec_n("deleting old chunks", &del).await?;
                 if !marks.is_empty() {
                     let ins = format!(
                         "INSERT INTO {} ({}) VALUES {}",
@@ -1059,12 +1318,19 @@ impl Round<'_> {
                         .await
                         .map_err(|e| sql_failed("writing chunks", &e))?;
                 }
-                self.exec("committing chunks", "COMMIT").await
+                self.exec("committing chunks", "COMMIT").await?;
+                Ok::<u64, SprigError>(gone)
             }
             .await;
-            if let Err(e) = res {
-                let _ = self.sql.exec("ROLLBACK").await;
-                return Err(e);
+            match res {
+                Ok(gone) => {
+                    self.chunk_delta +=
+                        i64::try_from(marks.len()).unwrap_or(0) - i64::try_from(gone).unwrap_or(0);
+                }
+                Err(e) => {
+                    let _ = self.sql.exec("ROLLBACK").await;
+                    return Err(e);
+                }
             }
             indexed += 1;
             written += u64::try_from(marks.len()).unwrap_or(0);
@@ -1080,21 +1346,37 @@ impl Round<'_> {
     async fn count_and_save(&mut self) -> Result<()> {
         if self.recount {
             let q = format!(
-                "SELECT COUNT(*) FROM {} WHERE `chunk_no` = 0",
+                "SELECT COUNT(*), SUM(CASE WHEN `chunk_no` = 0 THEN 1 ELSE 0 END) FROM {}",
                 self.chunks()
             );
-            if let Ok(r) = self.sql.query(&q).await
-                && let Some(n) = r
-                    .first()
-                    .and_then(|r| r.first())
-                    .and_then(Option::as_ref)
+            let num = |r: &Vec<Option<Vec<u8>>>, i: usize| -> Option<u64> {
+                r.get(i)?
+                    .as_ref()
                     .and_then(|b| std::str::from_utf8(b).ok()?.parse().ok())
+            };
+            if let Ok(rows) = self.sql.query(&q).await
+                && let Some(r) = rows.first()
+                && let Some(chunks) = num(r, 0)
             {
-                self.ix.rows_indexed = n;
+                self.ix.rows_indexed = num(r, 1).unwrap_or(0);
+                self.ix.progress["chunks"] = json!(chunks);
                 self.delta = 0;
+                self.chunk_delta = 0;
                 self.recount = false;
+                recounted(self.tenant.0, self.ix.id);
             }
         }
+        let chunks = i64::try_from(
+            self.ix
+                .progress
+                .get("chunks")
+                .and_then(J::as_u64)
+                .unwrap_or(0),
+        )
+        .unwrap_or(i64::MAX)
+            + self.chunk_delta;
+        self.ix.progress["chunks"] = json!(u64::try_from(chunks.max(0)).unwrap_or(0));
+        self.chunk_delta = 0;
         let n = i64::try_from(self.ix.rows_indexed).unwrap_or(i64::MAX) + self.delta;
         self.ix.rows_indexed = u64::try_from(n.max(0)).unwrap_or(0);
         self.delta = 0;

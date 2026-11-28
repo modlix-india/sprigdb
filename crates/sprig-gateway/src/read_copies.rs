@@ -100,6 +100,10 @@ async fn apply_settings(dir: &UnitDirectory, store: &dyn MetaStore) {
         if crate::ops::replicate::short_of_copies(g) {
             continue;
         }
+        // A replica move lists its target as a learner until it is done.
+        if d.moving.is_some() {
+            continue;
+        }
         let want = wanted(d.tenant).await;
         if d.learners.len() == want {
             continue;
@@ -246,8 +250,9 @@ fn reconcile(dir: &UnitDirectory) -> usize {
             continue;
         }
         let Some(d) = dir.get(g) else { continue };
-        if d.unit != g || crate::ops::replicate::short_of_copies(g) {
-            // (Re-replication owns the unit's learners meanwhile.)
+        // (Re-replication, or a replica move's leader, owns the unit's
+        // learners meanwhile.)
+        if d.unit != g || crate::ops::replicate::short_of_copies(g) || d.moving.is_some() {
             continue;
         }
         let Some(st) = node.status(g) else { continue };
@@ -311,6 +316,8 @@ mod tests {
             learners: Vec::new(),
             home: 1,
             generation: 1,
+            moving: None,
+            last_move: None,
         };
         let nodes = [
             node(1, "a"),

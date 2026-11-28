@@ -769,6 +769,20 @@ impl PassSession {
                 c.name, c.table
             )));
         }
+        // An approximate number can't name its row exactly: a change's key
+        // and the row's would differ in their last digits.
+        if engine::engine_db(&cat, db_id)
+            && let Some(k) = key_columns.iter().find(|k| {
+                let t = k.column_type.to_ascii_lowercase();
+                t.starts_with("float") || t.starts_with("double") || t.starts_with("real")
+            })
+        {
+            return Err(failed(format!(
+                "retrieval index {}: key column {} is {}; a retrieval index needs a primary key \
+                 without FLOAT or DOUBLE columns",
+                c.name, k.name, k.column_type
+            )));
+        }
         let new = NewIndex {
             db_id: db_id.0,
             name: c.name.clone(),
@@ -1089,7 +1103,7 @@ impl PassSession {
         wire: Wire,
         call: &Call,
     ) -> Result<(Found, &'static str)> {
-        let (ix, db, cat, _) = self.rx_find(call.db.clone(), &call.index).await?;
+        let (ix, db, cat, lctn) = self.rx_find(call.db.clone(), &call.index).await?;
         let Some(ix) = ix else {
             return Err(no_index(call.db.as_deref().unwrap_or(&db), &call.index));
         };
@@ -1151,6 +1165,18 @@ impl PassSession {
             }
         };
         if engine::engine_db(&cat, DbId(ix.db_id)) {
+            // The chunk table is read only for a user who may read the
+            // source table (any grant level).
+            if !self.rx_allowed(
+                &cat,
+                lctn,
+                &db,
+                DbId(ix.db_id),
+                ix.object_id,
+                Action::Select,
+            ) {
+                return Err(self.rx_denied("SELECT", &db, &table));
+            }
             let candidates = svc.settings.get(
                 &rx::CANDIDATES,
                 &cat.setting_ctx(&svc.dc),
@@ -1158,8 +1184,23 @@ impl PassSession {
             );
             let bound =
                 crate::pipeline::SessionExec::row_policy_binds(self, ix.object_id) != Some(false);
+            // The chunk filter runs in the caller's own session here.
+            let chunk_filter = match &call.filter {
+                None => None,
+                Some(f) => Some(
+                    sqlrx::compile_filter(
+                        f,
+                        &lex,
+                        &filter_names,
+                        &|c| quote(&rx::filter_column(c)),
+                        nbe,
+                    )
+                    .map_err(|m| sql_err(1054, m))?,
+                ),
+            };
+            let _ = shard_filter;
             let s = engine::EngineSearch {
-                chunk_filter: shard_filter,
+                chunk_filter,
                 table_filter,
                 q_vec,
                 per_list: usize::try_from(candidates).unwrap_or(40).max(1),

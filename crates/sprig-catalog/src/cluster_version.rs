@@ -180,6 +180,7 @@ mod tests {
             id,
             gateway_id: format!("gw-{id}"),
             addr: "127.0.0.1".into(),
+            raft_addr: String::new(),
             failure_domain: String::new(),
             placement: true,
             state: state.into(),
