@@ -77,7 +77,7 @@ pub use node::{GroupStatus, Node, NodeOptions, NodeStats, Observer, Waiter};
 pub use raft::eraftpb;
 pub use raft::prelude::{ConfChangeSingle, ConfChangeTransition, ConfChangeType, ConfChangeV2};
 pub use slot::Slot;
-pub use sm::{SnapshotExporter, StateMachine, StateMachineFactory};
+pub use sm::{SnapshotExporter, SnapshotImporter, StateMachine, StateMachineFactory};
 pub use transport::{MemNetwork, MemTransport, Transport, tcp};
 
 /// The index and term every group's log starts after: a new group's

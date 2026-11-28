@@ -274,9 +274,16 @@ fn a_ticket_lost_to_a_new_leader_fails_retryably() {
         .unwrap();
     t2.wait().unwrap();
     c.net.isolate(old, false);
+    // Retryable when the old leader heard of the new one before it noticed
+    // it had lost its majority (the new leader's entry replaced "lost");
+    // an unknown outcome when it stepped down on its own first (it can't
+    // tell then whether a majority holds the entry). Never a success.
     let e = t.wait().unwrap_err();
-    assert!(e.retryable, "{e}");
-    assert_eq!(e.code(), Some(SprigCode::ShardMoved));
+    match e.code() {
+        Some(SprigCode::ShardMoved) => assert!(e.retryable, "{e}"),
+        Some(SprigCode::CommitOutcomeUnknown) => assert!(!e.retryable, "{e}"),
+        _ => panic!("{e}"),
+    }
     assert!(!t.is_durable());
     // Every replica holds a, b and never "lost".
     let idx = c.propose(1, b"c");

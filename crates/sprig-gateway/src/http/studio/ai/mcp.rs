@@ -935,11 +935,12 @@ impl Backend for CoreBackend<'_> {
             return Err(invalid("the MCP server needs a tenant login"));
         };
         // The tenant's own settings, loaded (see `StudioState::load_tenant`).
-        self.core.studio.load_tenant(Some(tenant)).await?;
+        let cat = self.core.studio.load_tenant(Some(tenant)).await?;
         let settings = McpSettings::read(&GatewayLookup {
             st: &self.core.studio,
             tenant: Some(tenant),
             db: None,
+            cat,
         });
         Ok(Signed {
             who: Who {
@@ -978,6 +979,7 @@ impl McpEnv for CoreEnv {
             st: &self.core.studio,
             tenant: self.caller.principal.tenant,
             db,
+            cat: None,
         }
         .flag(&SHARE_DATA)
     }

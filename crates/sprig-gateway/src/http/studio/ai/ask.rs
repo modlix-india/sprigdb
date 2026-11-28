@@ -136,6 +136,8 @@ pub fn install(core: Arc<Core>) {
 struct GatewayEnv {
     core: Arc<Core>,
     caller: Caller,
+    /// The tenant's catalog as `load_tenant` returned it.
+    cat: Option<Arc<sprig_catalog::TenantCatalog>>,
 }
 
 #[async_trait]
@@ -146,6 +148,7 @@ impl AskEnv for GatewayEnv {
                 st: &self.core.studio,
                 tenant: self.caller.principal.tenant,
                 db,
+                cat: self.cat.clone(),
             },
             role,
         )
@@ -194,8 +197,8 @@ pub async fn ask(caller: Caller, req: &AskRequest, current: Option<&str>) -> Res
         )
     })?;
     // The tenant's own settings, loaded (see `StudioState::load_tenant`).
-    core.studio.load_tenant(caller.principal.tenant).await?;
-    ask_with(&GatewayEnv { core, caller }, req, current).await
+    let cat = core.studio.load_tenant(caller.principal.tenant).await?;
+    ask_with(&GatewayEnv { core, caller, cat }, req, current).await
 }
 
 /// [`ask`] over any [`AskEnv`].

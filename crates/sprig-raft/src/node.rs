@@ -297,6 +297,13 @@ struct Group {
     role: (u64, StateRole),
     /// Ticks each follower has waited for a snapshot.
     snap_wait: BTreeMap<NodeId, u32>,
+    /// A snapshot (file id, index) is being restored off the driver: the
+    /// group's Raft state stays as it was until its message is stepped
+    /// (no messages, ticks or elections meanwhile).
+    restoring: Option<(u64, u64)>,
+    /// The snapshot (file id, index) already restored off the driver, whose
+    /// message was just stepped: its ready installs it without restoring.
+    prerestored: Option<(u64, u64)>,
 }
 
 impl Group {
@@ -336,6 +343,17 @@ struct Inbox {
     dirty: BTreeSet<GroupId>,
     writes: Vec<GroupWrite>,
     created: Vec<Slot<Result<(), RaftError>>>,
+    /// Snapshots restored off the driver, whose messages wait to be stepped.
+    restored: Vec<Restored>,
+}
+
+/// A snapshot a restore thread finished ([`Node::start_restore`]).
+struct Restored {
+    cell: Arc<Cell>,
+    msg: Message,
+    id: u64,
+    index: u64,
+    outcome: Result<(), RaftError>,
 }
 
 /// One log write handed to the log writer thread.
@@ -431,6 +449,10 @@ struct Inner {
     /// [`RaftConfig::snapshot_bytes_per_second`], as changed since.
     snapshot_rate: AtomicU64,
     next_snapshot: AtomicU64,
+    /// Tests: each snapshot restore from a file waits this long first (ms).
+    restore_delay_ms: AtomicU64,
+    /// [`RaftConfig::whole_snapshot_peers`], as changed since.
+    whole_peers: Mutex<BTreeSet<NodeId>>,
     /// Groups whose departed replica's state is being dropped here
     /// ([`Node::drop_state_when_durable`]): no new replica of them starts
     /// until that is done. Taken before `groups`, never after.
@@ -536,6 +558,7 @@ impl Node {
         } else {
             crate::snapfile::Snaps::default()
         };
+        let whole: BTreeSet<NodeId> = opts.config.whole_snapshot_peers.iter().copied().collect();
         let inner = Arc::new(Inner {
             id: opts.id,
             logger: crate::logger::logger(opts.id),
@@ -561,6 +584,8 @@ impl Node {
             snaps,
             snapshot_rate: AtomicU64::new(rate),
             next_snapshot: AtomicU64::new(1),
+            restore_delay_ms: AtomicU64::new(0),
+            whole_peers: Mutex::new(whole),
             dropping: Mutex::new(BTreeSet::new()),
         });
         let node = Node { inner };
@@ -701,6 +726,8 @@ impl Node {
                 idle: 0,
                 role,
                 snap_wait: BTreeMap::new(),
+                restoring: None,
+                prerestored: None,
             }),
             progress: Arc::new(Progress::default()),
         });
@@ -1196,6 +1223,9 @@ impl Node {
         if g.raw.raft.state == StateRole::Leader {
             return Ok(());
         }
+        if g.restoring.is_some() {
+            return Err(RaftError::Busy("a snapshot is being restored"));
+        }
         if g.raw.raft.leader_id == raft::INVALID_ID {
             return Err(RaftError::NotLeader { leader: None });
         }
@@ -1215,6 +1245,9 @@ impl Node {
     pub fn campaign(&self, group: GroupId) -> Result<(), RaftError> {
         let cell = self.cell(group).ok_or(RaftError::NoGroup(group))?;
         let mut g = lock(&cell.g);
+        if g.restoring.is_some() {
+            return Err(RaftError::Busy("a snapshot is being restored"));
+        }
         self.wake_group(&mut g);
         g.raw.campaign()?;
         drop(g);
@@ -1569,7 +1602,10 @@ impl Node {
     fn has_work(&self) -> bool {
         let work = {
             let ib = lock(&self.inner.inbox);
-            !ib.frames.is_empty() || !ib.dirty.is_empty() || !ib.writes.is_empty()
+            !ib.frames.is_empty()
+                || !ib.dirty.is_empty()
+                || !ib.writes.is_empty()
+                || !ib.restored.is_empty()
         };
         work || self.persisted_waiting()
     }
@@ -1873,6 +1909,7 @@ impl Node {
             mut dirty,
             mut writes,
             mut created,
+            restored,
         } = std::mem::take(&mut *lock(&self.inner.inbox));
         let mut out: BTreeMap<NodeId, Vec<Item>> = BTreeMap::new();
         let mut early: BTreeMap<NodeId, Vec<Item>> = BTreeMap::new();
@@ -1882,6 +1919,9 @@ impl Node {
             self.take_persisted(now, &mut writes, &mut dirty)?;
         }
         bump(&self.inner.counters.frames_received, frames.len() as u64);
+        for r in restored {
+            self.on_restored(r, &mut dirty);
+        }
         for f in &frames {
             self.on_frame(f, now, &mut dirty, &mut out);
         }
@@ -2126,6 +2166,16 @@ impl Node {
                         continue;
                     };
                     let mut g = lock(&cell.g);
+                    // A group restoring a snapshot off the driver takes no
+                    // message until that snapshot's own is stepped: its
+                    // Raft state must stay the one the restore was checked
+                    // against. The leader sends again what it misses.
+                    if g.restoring.is_some() {
+                        continue;
+                    }
+                    if t == MessageType::MsgSnapshot && self.start_restore(&cell, &mut g, &m) {
+                        continue;
+                    }
                     let response = matches!(
                         t,
                         MessageType::MsgHeartbeatResponse | MessageType::MsgAppendResponse
@@ -2167,6 +2217,7 @@ impl Node {
                         let mut g = lock(&cell.g);
                         let r = &g.raw.raft;
                         if !g.quiesced
+                            && g.restoring.is_none()
                             && r.state == StateRole::Follower
                             && r.term == term
                             && r.leader_id == frame.from
@@ -2377,6 +2428,11 @@ impl Node {
                 lock(&self.inner.active).remove(&gid);
                 continue;
             }
+            // Frozen while a snapshot is restored off the driver: its
+            // election timer doesn't run (it hears nothing meanwhile).
+            if g.restoring.is_some() {
+                continue;
+            }
             for _ in 0..ticks {
                 g.raw.tick();
             }
@@ -2554,9 +2610,12 @@ impl Node {
             let snap = rd.snapshot().clone();
             let meta = snap.get_metadata().clone();
             let restored = match crate::snapfile::parse_token(&snap.data) {
+                // Restored off the driver before its message was stepped.
+                Some((id, _)) if g.prerestored == Some((id, meta.index)) => Ok(()),
                 Some((id, len)) => self.restore_file(&mut g, meta.index, id, len),
                 None => g.sm.restore(meta.index, &snap.data),
             };
+            g.prerestored = None;
             if let Err(e) = restored {
                 bump(&self.inner.counters.snapshot_restore_failures, 1);
                 tracing::error!(
@@ -2730,6 +2789,176 @@ impl Node {
         }
     }
 
+    /// Tests: every snapshot restore from a file first waits `d` (a large
+    /// unit's ingest, without the disk).
+    #[doc(hidden)]
+    pub fn set_restore_delay(&self, d: Duration) {
+        self.inner.restore_delay_ms.store(
+            u64::try_from(d.as_millis()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
+    fn restore_delay(&self) {
+        let ms = self.inner.restore_delay_ms.load(Ordering::Relaxed);
+        if ms > 0 {
+            std::thread::sleep(Duration::from_millis(ms));
+        }
+    }
+
+    /// Whether raft-rs, in the group's state now, would install snapshot
+    /// message `m` rather than ignore it: from a term it takes, above what
+    /// this replica committed, not already in its log, with this replica in
+    /// the snapshot's membership. Also: nothing committed here waits to be
+    /// applied (the restore replaces the state those entries would change).
+    fn would_install(&self, g: &Group, m: &Message) -> bool {
+        let r = &g.raw.raft;
+        let meta = m.get_snapshot().get_metadata();
+        let cs = meta.get_conf_state();
+        r.state != StateRole::Leader
+            && m.term >= r.term
+            && meta.index > r.raft_log.committed
+            && r.raft_log.term(meta.index).ok() != Some(meta.term)
+            && g.applied >= r.raft_log.committed
+            && cs
+                .get_voters()
+                .iter()
+                .chain(cs.get_learners())
+                .chain(cs.get_voters_outgoing())
+                .any(|id| *id == self.inner.id)
+    }
+
+    /// Starts restoring the state of snapshot message `m` (its file arrived
+    /// whole) on a thread of its own, so the driver goes on with the node's
+    /// other groups while a large unit is ingested. Until the restore ends
+    /// the group is frozen (see [`Group::restoring`]); then the driver
+    /// steps `m` and installs the snapshot without restoring it again
+    /// ([`Node::on_restored`]). Returns false when the snapshot isn't one to
+    /// restore that way (not a file, no off-driver restore for this state,
+    /// or raft-rs wouldn't take it now): the driver steps `m` as before.
+    fn start_restore(&self, cell: &Arc<Cell>, g: &mut Group, m: &Message) -> bool {
+        if !self.inner.cfg.restore_off_driver {
+            return false;
+        }
+        let Some((id, len)) = crate::snapfile::parse_token(&m.get_snapshot().data) else {
+            return false;
+        };
+        if !self.would_install(g, m) {
+            return false;
+        }
+        let Some(imp) = g.sm.importer() else {
+            return false;
+        };
+        let Some(mut inc) = self.inner.snaps.take(g.id, id, len) else {
+            return false;
+        };
+        // A path of its own: the leader may send the same snapshot again
+        // while it is restored, and its chunks go to the receiving path.
+        let own = self
+            .inner
+            .snaps
+            .dir
+            .join(format!("in-restoring-{}-{id}.snap", g.id));
+        if std::fs::rename(&inc.path, &own).is_err() {
+            return false;
+        }
+        inc.path = own;
+        let index = m.get_snapshot().get_metadata().index;
+        g.restoring = Some((id, index));
+        let (node, cell, msg, gid) = (self.clone(), Arc::clone(cell), m.clone(), g.id);
+        let spawned = std::thread::Builder::new()
+            .name(format!("sprig-raft-restore-{gid}"))
+            .spawn(move || {
+                let started = Instant::now();
+                node.restore_delay();
+                let outcome = std::fs::File::open(&inc.path)
+                    .map_err(|e| RaftError::Storage(format!("open a snapshot file: {e}")))
+                    .and_then(|f| {
+                        let mut r = std::io::BufReader::with_capacity(crate::snapfile::CHUNK, f);
+                        imp.import(index, &mut r)
+                    });
+                tracing::info!(
+                    group = gid,
+                    index,
+                    bytes = len,
+                    ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    ok = outcome.is_ok(),
+                    "raft: snapshot restored from its file off the driver"
+                );
+                drop(inc);
+                lock(&node.inner.inbox).restored.push(Restored {
+                    cell,
+                    msg,
+                    id,
+                    index,
+                    outcome,
+                });
+                node.inner.wake.notify_one();
+            });
+        if let Err(e) = spawned {
+            tracing::warn!(group = gid, error = %e, "raft: a snapshot restore thread didn't start; the leader sends it again");
+            g.restoring = None;
+        }
+        true
+    }
+
+    /// On the driver, after a restore thread finished: a failed restore is
+    /// refused (nothing of it was stepped, so the group still needs the
+    /// snapshot and its leader sends it again); a restored one has its
+    /// message stepped now, and the ready that follows installs it.
+    fn on_restored(&self, r: Restored, dirty: &mut BTreeSet<GroupId>) {
+        let mut g = lock(&r.cell.g);
+        let gid = g.id;
+        let same = self.cell(gid).is_some_and(|c| Arc::ptr_eq(&c, &r.cell));
+        if g.restoring != Some((r.id, r.index)) || !same {
+            if r.outcome.is_ok() {
+                tracing::warn!(
+                    group = gid,
+                    index = r.index,
+                    "raft: a snapshot restored off the driver belongs to a replica that is gone"
+                );
+            }
+            return;
+        }
+        g.restoring = None;
+        if let Err(e) = r.outcome {
+            bump(&self.inner.counters.snapshot_restore_failures, 1);
+            tracing::error!(
+                group = gid,
+                index = r.index,
+                error = %e,
+                "raft: snapshot restore failed; the replica keeps its log and waits for the snapshot again"
+            );
+            self.wake_group(&mut g);
+            dirty.insert(gid);
+            return;
+        }
+        if !self.would_install(&g, &r.msg) {
+            // Nothing moved the group meanwhile, so this can't happen; the
+            // state holds the snapshot while Raft doesn't know it, so the
+            // leader's next snapshot (which replaces the whole unit) is
+            // what puts them back in step.
+            bump(&self.inner.counters.snapshot_restore_failures, 1);
+            tracing::error!(
+                group = gid,
+                index = r.index,
+                "raft: a snapshot restored off the driver no longer fits the group; waiting for another"
+            );
+            self.wake_group(&mut g);
+            dirty.insert(gid);
+            return;
+        }
+        // A copy the leader sent again meanwhile isn't needed any more.
+        if let Some((_, len)) = crate::snapfile::parse_token(&r.msg.get_snapshot().data) {
+            drop(self.inner.snaps.take(gid, r.id, len));
+        }
+        g.prerestored = Some((r.id, r.index));
+        let _ = g.raw.step(r.msg);
+        self.check_role(&mut g);
+        self.wake_group(&mut g);
+        dirty.insert(gid);
+    }
+
     /// Restores `g` from the complete snapshot file `id` (`len` bytes); the
     /// file goes afterwards, whatever the outcome.
     fn restore_file(&self, g: &mut Group, index: u64, id: u64, len: u64) -> Result<(), RaftError> {
@@ -2742,6 +2971,7 @@ impl Node {
             .map_err(|e| RaftError::Storage(format!("open a snapshot file: {e}")))?;
         let mut r = std::io::BufReader::with_capacity(crate::snapfile::CHUNK, f);
         let started = Instant::now();
+        self.restore_delay();
         let out = g.sm.restore_from(index, &mut r);
         tracing::info!(
             group = g.id,
@@ -2955,6 +3185,49 @@ impl Node {
         }
     }
 
+    /// The peers that get snapshots whole, inside their message (nodes of
+    /// an older build that can't take chunks); every other peer gets them
+    /// in chunks. Set by whoever knows the peers' builds (the gateway, from
+    /// the node registry) and changed whenever they change.
+    pub fn set_whole_snapshot_peers(&self, peers: impl IntoIterator<Item = NodeId>) {
+        let new: BTreeSet<NodeId> = peers.into_iter().collect();
+        let mut cur = lock(&self.inner.whole_peers);
+        if *cur != new {
+            tracing::info!(node = self.inner.id, peers = ?new, "raft: peers that get snapshots whole, not in chunks");
+            *cur = new;
+        }
+    }
+
+    /// Sends `t`'s file inside its message, as builds before chunked
+    /// snapshots took them (see [`Node::set_whole_snapshot_peers`]): one
+    /// frame, so at most the transport's frame size. False when the file
+    /// can't be read or is too large for one frame.
+    fn send_whole(&self, t: &crate::snapfile::Transfer, pace: &mut crate::snapfile::Pace) -> bool {
+        let len = usize::try_from(t.file.len).unwrap_or(usize::MAX);
+        // The message's other fields and the frame's header fit in 1 MiB.
+        if len > crate::transport::tcp::MAX_FRAME - crate::snapfile::CHUNK {
+            tracing::warn!(
+                group = t.group,
+                to = t.to,
+                bytes = t.file.len,
+                "raft: a snapshot too large for one frame can't go to a node of an older build; it catches up once upgraded"
+            );
+            return false;
+        }
+        let Ok(data) = std::fs::read(&t.file.path) else {
+            return false;
+        };
+        if data.len() != len {
+            return false;
+        }
+        pace.wait(len, self.inner.snapshot_rate.load(Ordering::Relaxed));
+        let mut msg = t.msg.clone();
+        msg.mut_snapshot().data = data.into();
+        self.send_items(t.to, vec![Item::Raft(t.group, t.applied, msg)]);
+        bump(&self.inner.counters.snapshot_bytes_sent, len as u64);
+        true
+    }
+
     /// Sends `t`'s file in chunks, then its message. False when it stopped
     /// early (the node closed, the group left, a newer transfer to the same
     /// follower waits, or the file can't be read).
@@ -2964,6 +3237,9 @@ impl Node {
         pace: &mut crate::snapfile::Pace,
     ) -> bool {
         use std::io::Read as _;
+        if lock(&self.inner.whole_peers).contains(&t.to) {
+            return self.send_whole(t, pace);
+        }
         let Ok(mut f) = std::fs::File::open(&t.file.path) else {
             return false;
         };

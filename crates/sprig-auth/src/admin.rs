@@ -625,9 +625,19 @@ pub async fn set_clauses(
     user: UserId,
     clauses: AccountClauses,
 ) -> Result<Changed> {
-    with_user(cat, tenant, user, "ALTER USER", move |_, _, row| {
+    // `FAILED_LOGIN_ATTEMPTS` or `PASSWORD_LOCK_TIME` start the count
+    // again and end a temporary lock, as in MySQL.
+    let reset = clauses.failed_login_attempts.is_some() || clauses.password_lock_minutes.is_some();
+    let now = SystemTime::now();
+    with_user(cat, tenant, user, "ALTER USER", move |store, q, row| {
         clauses.apply(row);
-        Box::pin(async { Ok(()) })
+        let id = row.user_id;
+        Box::pin(async move {
+            if reset {
+                store.clear_login_lock(q, id, now).await?;
+            }
+            Ok(())
+        })
     })
     .await
 }

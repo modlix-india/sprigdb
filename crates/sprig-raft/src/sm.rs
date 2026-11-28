@@ -56,6 +56,13 @@ pub trait StateMachine: Send {
         self.restore(index, &data)
     }
 
+    /// Restores snapshots that came as files off the driver thread: `None`
+    /// (the default) restores them on the driver with
+    /// [`StateMachine::restore_from`].
+    fn importer(&self) -> Option<Arc<dyn SnapshotImporter>> {
+        None
+    }
+
     /// Whether the state survives a restart by itself (an engine with its
     /// own durable store). Volatile state machines (the default) are
     /// rebuilt from the snapshot record and the log, so the driver keeps a
@@ -89,6 +96,18 @@ pub trait SnapshotExporter: Send + Sync {
     /// # Errors
     /// The state could not be read, or the writer failed.
     fn export(&self, fixed: &mut dyn FnMut(), out: &mut dyn Write) -> Result<(), RaftError>;
+}
+
+/// Restores a group's snapshot on a thread other than the driver's (see
+/// [`StateMachine::importer`]). The driver applies nothing to the group
+/// meanwhile.
+pub trait SnapshotImporter: Send + Sync {
+    /// [`StateMachine::restore_from`]: replaces the state with the snapshot
+    /// taken at `index` read from `input`, durable before it returns.
+    ///
+    /// # Errors
+    /// As for [`StateMachine::restore_from`].
+    fn import(&self, index: u64, input: &mut dyn Read) -> Result<(), RaftError>;
 }
 
 /// Makes each group's state machine when the group is created or the node

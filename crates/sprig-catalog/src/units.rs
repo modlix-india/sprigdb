@@ -119,6 +119,23 @@ pub struct NodeRecord {
     /// Why `state` last changed (an operator's reason, or the loop's).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub reason: String,
+    /// Replication features its binary has ([`RAFT_SNAPSHOT_CHUNKS`]); a
+    /// record without one is a node of an older build.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub raft_features: Vec<String>,
+}
+
+/// The node takes unit snapshots in chunks ahead of their message. Leaders
+/// send a node without it each snapshot whole, inside its message, as
+/// builds before chunked snapshots did (a rolling upgrade).
+pub const RAFT_SNAPSHOT_CHUNKS: &str = "snapshot-chunks";
+
+impl NodeRecord {
+    /// Whether the node takes unit snapshots in chunks.
+    #[must_use]
+    pub fn takes_snapshot_chunks(&self) -> bool {
+        self.raft_features.iter().any(|f| f == RAFT_SNAPSHOT_CHUNKS)
+    }
 }
 
 impl Versioned for NodeRecord {

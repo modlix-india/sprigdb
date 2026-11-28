@@ -373,6 +373,52 @@ async fn identity_live() {
         t0.elapsed().max(t)
     );
 
+    // ---- 1b. A lock of days, and ALTER USER's lockout clauses end it ----
+    // `PASSWORD_LOCK_TIME 1` is a day (the SQL statement stores 1440
+    // minutes); MySQL's 3955 says so. `ALTER USER ... FAILED_LOGIN_ATTEMPTS`
+    // (or `PASSWORD_LOCK_TIME`) starts the count again and ends the lock.
+    let day = w.user("lockday", pw).await;
+    w.clauses(
+        day,
+        AccountClauses {
+            failed_login_attempts: Some(Some(3)),
+            password_lock_minutes: Some(Some(1440)),
+            ..AccountClauses::default()
+        },
+    )
+    .await;
+    for _ in 0..3 {
+        assert_eq!(code(&w.login(w.a, "lockday", "wrong").await), 1045);
+    }
+    let r = w.login(w.a, "lockday", pw).await;
+    eprintln!("IDENTITY: lockday: right password: {:?}", r.as_ref().err());
+    assert_eq!(code(&r), 3955);
+    let msg = r.as_ref().err().map(|e| e.1.clone()).unwrap_or_default();
+    assert!(msg.contains("blocked for 1 day(s)"), "{msg}");
+    // Still locked a while later: a day, not a minute.
+    tokio::time::sleep(Duration::from_secs(65)).await;
+    assert_eq!(code(&w.login(w.a, "lockday", pw).await), 3955);
+    w.clauses(
+        day,
+        AccountClauses {
+            failed_login_attempts: Some(Some(3)),
+            ..AccountClauses::default()
+        },
+    )
+    .await;
+    let t = World::until(
+        "ALTER USER FAILED_LOGIN_ATTEMPTS ends the lock",
+        Duration::from_secs(5),
+        move || async move { wr.login(wr.a, "lockday", pw).await.is_ok() },
+    )
+    .await;
+    eprintln!("IDENTITY: lockday: unlocked by ALTER USER FAILED_LOGIN_ATTEMPTS after {t:?}");
+    // The count started again: two failures don't lock.
+    for _ in 0..2 {
+        assert_eq!(code(&w.login(w.a, "lockday", "wrong").await), 1045);
+    }
+    assert_eq!(code(&w.login(w.a, "lockday", pw).await), 0);
+
     // ---- 2. Failure delays: after 3 failures in a row, 1 s, doubling ----
     // Delays live in gateway memory for 15 idle minutes, keyed by name:
     // a name of this run's own.

@@ -596,6 +596,14 @@ impl PassSession {
         Some((cat, current))
     }
 
+    /// Whether the session's tenant has no MariaDB cluster (an engine-only
+    /// tenant).
+    pub(super) fn engine_only(&self) -> bool {
+        self.tenant.as_deref().is_some_and(|ts| {
+            ts.principal.backend.cluster.as_str() == crate::tenant::locator::ENGINE_ONLY_CLUSTER
+        })
+    }
+
     /// Whether the session's tenant has no database at all and no MariaDB
     /// cluster: every statement it can run is the engine's (one that
     /// reads no table, transaction control).
@@ -3618,5 +3626,92 @@ mod analyze_tests {
         assert_eq!(a("ANALYZE TABLE t"), None);
         assert_eq!(a("ANALYZE FORMAT=JSON UPDATE t SET a = 1"), None);
         assert_eq!(a("ANALYZEX SELECT 1"), None);
+    }
+}
+
+/// The server's syntax error (1064) for `text` when the gateway's SQL parser
+/// can't read it, or `None` when it can: "... the right syntax to use near
+/// '<text from where the parser stopped, at most 80 characters>' at line
+/// <n>", as MariaDB (or MySQL, on the MySQL port) words it.
+pub(crate) fn syntax_error(text: &[u8], mysql: bool) -> Option<SprigError> {
+    let t = String::from_utf8_lossy(text);
+    let t = t.trim().trim_end_matches(';').trim_end();
+    let err = match Parser::parse_sql(&sprig_plan::dialect::SprigMySql, t) {
+        Ok(_) => return None,
+        Err(e) => e.to_string(),
+    };
+    // sqlparser names the place it stopped: "... at Line: L, Column: C".
+    let num = |key: &str| -> Option<usize> {
+        let at = err.rfind(key)? + key.len();
+        err[at..]
+            .trim_start()
+            .split(|c: char| !c.is_ascii_digit())
+            .next()?
+            .parse()
+            .ok()
+    };
+    let (line, col) = match (num("Line:"), num("Column:")) {
+        (Some(l), Some(c)) if l >= 1 && c >= 1 => (l, c),
+        _ => (1, 1),
+    };
+    let rest: String = t
+        .lines()
+        .skip(line - 1)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .chars()
+        .skip(col - 1)
+        .collect();
+    let rest = if rest.trim().is_empty() {
+        t.to_owned()
+    } else {
+        rest
+    };
+    let shown: String = rest.chars().take(80).collect();
+    Some(SprigError::standard(
+        1064,
+        *b"42000",
+        format!(
+            "You have an error in your SQL syntax; check the manual that corresponds to your {} \
+             server version for the right syntax to use near '{shown}' at line {line}",
+            if mysql { "MySQL" } else { "MariaDB" }
+        ),
+    ))
+}
+
+#[cfg(test)]
+mod syntax_error_tests {
+    use super::syntax_error;
+
+    #[test]
+    fn unparsable_text_is_the_servers_1064_near_where_parsing_stopped() {
+        let e = syntax_error(b"SELEC 1", false).expect("a syntax error");
+        assert!(
+            matches!(
+                e.kind,
+                sprig_common::ErrorKind::Standard { errno: 1064, .. }
+            ),
+            "{e:?}"
+        );
+        assert_eq!(
+            e.message,
+            "You have an error in your SQL syntax; check the manual that corresponds to your \
+             MariaDB server version for the right syntax to use near 'SELEC 1' at line 1"
+        );
+        let e = syntax_error(b"SELECT 1 FROM t WHERE ;", true).expect("a syntax error");
+        assert!(
+            e.message.contains("your MySQL server version"),
+            "{}",
+            e.message
+        );
+        assert!(e.message.ends_with("at line 1"), "{}", e.message);
+        let e = syntax_error(b"SELECT 1;\nSELEC 2", false).expect("a syntax error");
+        assert!(
+            e.message.contains("near 'SELEC 2' at line 2"),
+            "{}",
+            e.message
+        );
+        assert!(syntax_error(b"SELECT 1", false).is_none());
+        assert!(syntax_error(b"  select 1 ; ", true).is_none());
     }
 }

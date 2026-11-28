@@ -51,6 +51,9 @@ fn snapshots() {
     let node = raft.node();
     let mb = super::setting(&SNAPSHOT_MB_PER_SECOND);
     node.set_snapshot_rate(mb.saturating_mul(1 << 20));
+    if let Some(dir) = nodes::directory() {
+        node.set_whole_snapshot_peers(whole_snapshot_peers(&dir.all()));
+    }
     let s = node.stats();
     metrics::counter!("sprig_node_snapshot_bytes_sent_total").absolute(s.snapshot_bytes_sent);
     metrics::counter!("sprig_node_snapshot_bytes_received_total")
@@ -58,6 +61,19 @@ fn snapshots() {
     metrics::counter!("sprig_node_snapshots_built_total").absolute(s.snapshots_built);
     metrics::counter!("sprig_node_snapshot_restore_failures_total")
         .absolute(s.snapshot_restore_failures);
+}
+
+/// The nodes a leader here sends snapshots whole, inside their message:
+/// those whose record says their build can't take chunks (a rolling
+/// upgrade from a build before chunked snapshots). A node with no record
+/// known here yet gets chunks: a node writes its record when it starts.
+fn whole_snapshot_peers(
+    all: &std::collections::BTreeMap<u64, sprig_catalog::units::NodeRecord>,
+) -> Vec<u64> {
+    all.values()
+        .filter(|n| !n.is_lost() && !n.takes_snapshot_chunks())
+        .map(|n| n.id)
+        .collect()
 }
 
 /// One count of the node's units.
@@ -147,4 +163,49 @@ pub(super) fn start(stop: sprig_common::CancellationToken) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use sprig_catalog::units::NodeRecord;
+
+    fn node(id: u64, state: &str, features: &[&str]) -> NodeRecord {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "gateway_id": format!("gw{id}"),
+            "addr": "127.0.0.1",
+            "state": state,
+            "raft_features": features,
+        }))
+        .expect("a node record")
+    }
+
+    /// Nodes whose record names no chunked snapshots (an older build, or a
+    /// record written before the feature list existed) get snapshots whole;
+    /// lost nodes get none at all.
+    #[test]
+    fn nodes_of_an_older_build_get_snapshots_whole() {
+        let chunks = sprig_catalog::units::RAFT_SNAPSHOT_CHUNKS;
+        let all: BTreeMap<u64, NodeRecord> = [
+            node(1, "active", &[chunks]),
+            node(2, "active", &[]),
+            node(3, "draining", &["something-else"]),
+            node(4, "dead", &[]),
+        ]
+        .into_iter()
+        .map(|n| (n.id, n))
+        .collect();
+        assert_eq!(super::whole_snapshot_peers(&all), vec![2, 3]);
+        // The field round-trips; an old record without it reads as none.
+        let old: NodeRecord = serde_json::from_value(serde_json::json!({
+            "id": 5, "gateway_id": "gw5", "addr": "a", "state": "active"
+        }))
+        .expect("an old record");
+        assert!(!old.takes_snapshot_chunks());
+        let back: NodeRecord =
+            serde_json::from_str(&serde_json::to_string(&all[&1]).expect("json")).expect("back");
+        assert!(back.takes_snapshot_chunks());
+    }
 }

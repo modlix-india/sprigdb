@@ -337,6 +337,7 @@ pub fn start_placement(
         version: crate::ops::node_version(),
         since_ms: 0,
         reason: String::new(),
+        raft_features: vec![sprig_catalog::units::RAFT_SNAPSHOT_CHUNKS.to_owned()],
     };
     crate::ops::start(id, &dc, stop.clone());
     let store = Arc::clone(&dc);

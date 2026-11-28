@@ -340,6 +340,16 @@ impl crate::sm::SnapshotExporter for UnitExporter {
     }
 }
 
+impl crate::sm::SnapshotImporter for UnitExporter {
+    fn import(
+        &self,
+        index: u64,
+        input: &mut dyn std::io::Read,
+    ) -> std::result::Result<(), RaftError> {
+        self.snaps.ingest_from(self.unit, index, input)
+    }
+}
+
 /// One unit's view of the engine's state machine. Durable: the engine
 /// keeps its own applied index, so entries it already holds are not applied
 /// again after a restart.
@@ -395,6 +405,15 @@ impl StateMachine for UnitMachine {
         input: &mut dyn std::io::Read,
     ) -> std::result::Result<(), RaftError> {
         self.snaps.ingest_from(self.unit, index, input)
+    }
+
+    fn importer(&self) -> Option<Arc<dyn crate::sm::SnapshotImporter>> {
+        self.snaps.exports_off_driver().then(|| {
+            Arc::new(UnitExporter {
+                unit: self.unit,
+                snaps: Arc::clone(&self.snaps),
+            }) as Arc<dyn crate::sm::SnapshotImporter>
+        })
     }
 
     fn durable(&self) -> bool {

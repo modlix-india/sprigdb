@@ -187,6 +187,7 @@ mod tests {
             version: version.into(),
             since_ms: 0,
             reason: String::new(),
+            raft_features: Vec::new(),
         }
     }
 

@@ -4,10 +4,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::NodeId;
+
 /// How a node runs its groups. The defaults are the production values:
 /// 100 ms ticks, elections after 1 to 2 s of silence, heartbeats every
 /// 200 ms, a 900 ms lease used with a 100 ms margin.
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)] // independent switches, each documented
 pub struct RaftConfig {
     /// One Raft tick.
     pub tick: Duration,
@@ -82,6 +85,21 @@ pub struct RaftConfig {
     /// transfers together (0: no limit). [`crate::Node::set_snapshot_rate`]
     /// changes it while the node runs.
     pub snapshot_bytes_per_second: u64,
+    /// A follower restores a snapshot that came as a file on a thread of
+    /// its own ([`crate::StateMachine::importer`]: the engine's units), so
+    /// a large unit's ingest doesn't hold up the node's other groups; the
+    /// group itself takes no message until the restore ends. Off (the
+    /// default): restored on the driver. Not on by default yet: with it on,
+    /// a replica re-added and restarted in quick succession once found its
+    /// stream log refusing to open (its floor above the Raft log's commit
+    /// index), probably a node stopped while such a restore ran.
+    pub restore_off_driver: bool,
+    /// The peers that can't take a snapshot in chunks (a node of an older
+    /// build, during a rolling upgrade): this node sends them the file's
+    /// bytes inside the snapshot message, as older builds do.
+    /// [`crate::Node::set_whole_snapshot_peers`] changes it while the node
+    /// runs.
+    pub whole_snapshot_peers: Vec<NodeId>,
     /// The most bytes of messages one frame to a peer carries: a turn's
     /// messages to a peer that come to more go in several frames, in
     /// order (a follower catching up after a large snapshot gets up to
@@ -113,6 +131,8 @@ impl Default for RaftConfig {
             snapshot_off_driver: true,
             snapshot_dir: None,
             snapshot_bytes_per_second: 0,
+            restore_off_driver: false,
+            whole_snapshot_peers: Vec::new(),
             max_frame_bytes: 64 << 20,
         }
     }

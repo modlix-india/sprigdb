@@ -416,13 +416,15 @@ impl StudioState {
     }
 
     /// Loads `tenant`'s catalog into this gateway's cache at the directory's
-    /// latest versions (waiting for a load when this gateway is behind), so
-    /// [`Self::tenant_get`] reads the tenant's own settings rather than
-    /// falling back to this gateway's scopes. Paths whose answer depends on
-    /// a tenant-scoped setting (the AI assistants' `ai.enabled`,
-    /// `ai.share_data`, budgets) call it first: a gateway that doesn't lead
-    /// the tenant's unit may not have loaded it, or may hold a snapshot from
-    /// before the last setting change. Nothing to do without a tenant.
+    /// latest versions (waiting for a load when this gateway is behind) and
+    /// returns it. Paths whose answer depends on a tenant-scoped setting (the
+    /// AI assistants' `ai.enabled`, `ai.share_data`, budgets) call it first
+    /// and read their settings from the catalog it returns
+    /// ([`Self::tenant_get_in`]): a gateway that doesn't lead the tenant's
+    /// unit may not have loaded it, may hold a snapshot from before the last
+    /// setting change, or may drop its cached copy again when a replicated
+    /// change arrives, between this load and a later read of the cache.
+    /// `None` without a tenant.
     ///
     /// # Errors
     /// The cache's: 39070 when the catalog can't be loaded and nothing
@@ -430,11 +432,13 @@ impl StudioState {
     pub async fn load_tenant(
         &self,
         tenant: Option<sprig_common::ids::TenantId>,
-    ) -> Result<(), SprigError> {
-        if let (Some(svc), Some(tid)) = (&self.tenants, tenant) {
-            svc.cache.get(tid, sprig_catalog::Freshness::Latest).await?;
+    ) -> Result<Option<Arc<sprig_catalog::TenantCatalog>>, SprigError> {
+        match (&self.tenants, tenant) {
+            (Some(svc), Some(tid)) => Ok(Some(
+                svc.cache.get(tid, sprig_catalog::Freshness::Latest).await?,
+            )),
+            _ => Ok(None),
         }
-        Ok(())
     }
 
     /// A `studio.*` value for `tenant` (and its database `db`), from the
@@ -447,23 +451,35 @@ impl StudioState {
         tenant: Option<sprig_common::ids::TenantId>,
         db: Option<&str>,
     ) -> T {
-        if let (Some(svc), Some(tid)) = (&self.tenants, tenant)
-            && let Some(cat) = svc.cache.cached(tid)
-        {
-            let mut ctx = cat.setting_ctx(&svc.dc);
-            if let Some(d) = db
-                .filter(|d| !d.is_empty() && *d != "-")
-                .and_then(|d| cat.database(&d.to_lowercase()).or_else(|| cat.database(d)))
-            {
-                ctx = ctx.with_db(d.db_id);
-            }
-            return svc.settings.get(setting, &ctx, Some(&cat.settings));
-        }
-        match &self.source {
-            StudioSource::Live { live, dc } => {
+        let cached = match (&self.tenants, tenant) {
+            (Some(svc), Some(tid)) => svc.cache.cached(tid),
+            _ => None,
+        };
+        self.tenant_get_in(setting, cached.as_deref(), db)
+    }
+
+    /// [`Self::tenant_get`] over the catalog `cat` (one
+    /// [`Self::load_tenant`] returned), never re-read from the cache; this
+    /// gateway's scopes without one.
+    pub fn tenant_get_in<T: sprig_settings::SettingValue>(
+        &self,
+        setting: &'static Setting<T>,
+        cat: Option<&sprig_catalog::TenantCatalog>,
+        db: Option<&str>,
+    ) -> T {
+        match (cat, &self.tenants, &self.source) {
+            (Some(cat), Some(svc), _) => setting_in(&svc.settings, &svc.dc, cat, setting, db),
+            (Some(cat), None, StudioSource::Live { live, dc }) => setting_in(
+                &sprig_settings::Settings::new(live.clone()),
+                dc,
+                cat,
+                setting,
+                db,
+            ),
+            (_, _, StudioSource::Live { live, dc }) => {
                 live.snapshot().get(setting, &SettingCtx::process(dc))
             }
-            StudioSource::Fixed(..) => setting.default.clone(),
+            (_, _, StudioSource::Fixed(..)) => setting.default.clone(),
         }
     }
 
@@ -1487,6 +1503,26 @@ async fn set_password(
         200,
         &json!({ "user": user, "host": account_host, "changed": true }),
     ))
+}
+
+/// `setting` as `cat`'s tenant sees it in `dc` (and in its database `db`,
+/// when the catalog knows it): the tenant's and its ancestors' values over
+/// `settings`' dc and global ones.
+fn setting_in<T: sprig_settings::SettingValue>(
+    settings: &sprig_settings::Settings,
+    dc: &DcId,
+    cat: &sprig_catalog::TenantCatalog,
+    setting: &'static Setting<T>,
+    db: Option<&str>,
+) -> T {
+    let mut ctx = cat.setting_ctx(dc);
+    if let Some(d) = db
+        .filter(|d| !d.is_empty() && *d != "-")
+        .and_then(|d| cat.database(&d.to_lowercase()).or_else(|| cat.database(d)))
+    {
+        ctx = ctx.with_db(d.db_id);
+    }
+    settings.get(setting, &ctx, Some(&cat.settings))
 }
 
 fn passthrough(status: u16, body: Bytes) -> Response<Body> {

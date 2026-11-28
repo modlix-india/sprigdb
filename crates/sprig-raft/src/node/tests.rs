@@ -335,7 +335,13 @@ fn an_isolated_leaders_proposal_is_dropped_definitely() {
         .expect("propose");
     assert!(matches!(s.wait_timeout(WAIT), Some(Ok(_))));
     c.net.isolate(old, false);
-    assert_eq!(slot.wait_timeout(WAIT), Some(Err(RaftError::Dropped)));
+    // Dropped when the old leader heard of the new one first; unknown when
+    // it stepped down on its own (it lost its majority) before that.
+    let got = slot.wait_timeout(WAIT);
+    assert!(
+        matches!(got, Some(Err(RaftError::Dropped | RaftError::Unknown))),
+        "{got:?}"
+    );
     assert_eq!(c.get(1, 1), Some(2));
     let st = c.converged(1);
     assert_eq!(st.data()[&1], vec![1, 2]);

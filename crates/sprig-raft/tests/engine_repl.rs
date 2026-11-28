@@ -1357,3 +1357,167 @@ fn a_unit_of_several_gb_goes_in_chunks() {
         .unwrap_or(0);
     copy_to_a_new_replica("gb", mb, rate);
 }
+
+/// Node 4's settings with snapshots restored on its driver thread (the
+/// default).
+fn restore_on_driver(_id: u64) -> RaftConfig {
+    fast()
+}
+
+/// Snapshots restored off the driver thread.
+fn restore_off_driver(_id: u64) -> RaftConfig {
+    RaftConfig {
+        restore_off_driver: true,
+        ..fast()
+    }
+}
+
+/// While node 4 restores a large unit's snapshot (a 2 s restore), how long
+/// it takes, at worst, to apply each of its leader's commits to another
+/// unit it holds. Returns that, and whether the large unit's copy ended
+/// equal to the leader's.
+fn other_unit_lag_during_a_restore(name: &str, config: fn(u64) -> RaftConfig) -> Duration {
+    let mut c = Cluster::with_config(name, config);
+    let (ua, ub) = (
+        Engine::unit_of_tenant(TENANT + 30),
+        Engine::unit_of_tenant(TENANT + 31),
+    );
+    let l = lead_both(&c, ua, ub);
+    fill(&c, ua, TENANT + 30, 8);
+    let last = c.replicas[&l].node.node().committed(ua.0);
+    for id in VOTERS {
+        until("the log trimmed", || {
+            let r = &c.replicas[&id];
+            let _ = r.engine.checkpoint();
+            r.node
+                .node()
+                .log_first_index(ua.0)
+                .is_none_or(|f| f > last.saturating_sub(2))
+                .then_some(())
+        });
+    }
+    c.start(4);
+    // Node 4 first holds the small unit and follows it.
+    add_learner(&c, ub, 4);
+    c.put(ub, &key(TENANT + 31, 0), b"w");
+    let caught_up = |c: &Cluster| {
+        c.replicas[&4].engine.last_applied_of(ub) >= c.replicas[&l].engine.last_applied_of(ub)
+    };
+    until("node 4 following the small unit", || {
+        caught_up(&c).then_some(())
+    });
+    // Now its copy of the large unit comes as a snapshot, slow to restore.
+    c.replicas[&4]
+        .node
+        .node()
+        .set_restore_delay(Duration::from_secs(2));
+    let want = c.replicas[&l].engine.unit_checksum(ua).unwrap();
+    add_learner(&c, ua, 4);
+    let started = Instant::now();
+    let mut worst = Duration::ZERO;
+    let mut i = 1u64;
+    while c.replicas[&4].engine.unit_checksum(ua).unwrap() != want {
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "node 4 never restored the large unit"
+        );
+        c.put(ub, &key(TENANT + 31, i), b"w");
+        let t0 = Instant::now();
+        until("node 4 applying the small unit's commit", || {
+            caught_up(&c).then_some(())
+        });
+        worst = worst.max(t0.elapsed());
+        i += 1;
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    eprintln!(
+        "{name}: large unit restored on node 4 after {:?}; {i} commits to the other unit meanwhile, slowest applied there after {worst:?}",
+        started.elapsed()
+    );
+    // The copy follows later writes.
+    c.put(ua, &key(TENANT + 30, u64::MAX - 1), b"after");
+    until("the copy follows the log", || {
+        (c.try_get(4, &key(TENANT + 30, u64::MAX - 1))
+            .ok()?
+            .as_deref()
+            == Some(&b"after"[..]))
+        .then_some(())
+    });
+    worst
+}
+
+/// A follower restores a snapshot that came as a file on a thread of its
+/// own: while a slow restore of one unit runs, the node goes on applying
+/// another unit's commits. Restored on the driver (as before), the other
+/// unit waits for the whole restore.
+#[test]
+fn a_follower_restores_a_snapshot_off_its_driver() {
+    let before = other_unit_lag_during_a_restore("restore-on-driver", restore_on_driver);
+    assert!(
+        before >= Duration::from_millis(1500),
+        "on the driver the other unit waits for the restore ({before:?})"
+    );
+    let after = other_unit_lag_during_a_restore("restore-off-driver", restore_off_driver);
+    assert!(
+        after < Duration::from_millis(700),
+        "off the driver the other unit doesn't wait ({after:?})"
+    );
+}
+
+/// Node 4's peers send it snapshots whole, as to a node of an older build.
+fn whole_to_4(_id: u64) -> RaftConfig {
+    RaftConfig {
+        whole_snapshot_peers: vec![4],
+        ..fast()
+    }
+}
+
+/// A leader sends a node of an older build (one that can't take chunks) a
+/// snapshot whole, inside its message: the copy arrives with no chunk.
+#[test]
+fn a_node_of_an_older_build_gets_snapshots_whole() {
+    let mut c = Cluster::with_config("whole", whole_to_4);
+    let unit = Engine::unit_of_tenant(TENANT + 32);
+    c.replicas[&1].node.start_unit(unit, &VOTERS).unwrap();
+    let l = c.leader(unit);
+    fill(&c, unit, TENANT + 32, 4);
+    let last = c.replicas[&l].node.node().committed(unit.0);
+    for id in VOTERS {
+        until("the log trimmed", || {
+            let r = &c.replicas[&id];
+            let _ = r.engine.checkpoint();
+            r.node
+                .node()
+                .log_first_index(unit.0)
+                .is_none_or(|f| f > last.saturating_sub(2))
+                .then_some(())
+        });
+    }
+    c.start(4);
+    let before = c.replicas[&l].node.node().stats();
+    add_learner(&c, unit, 4);
+    let want = c.replicas[&l].engine.unit_checksum(unit).unwrap();
+    until("node 4's copy", || {
+        (c.replicas[&4].engine.unit_checksum(unit).unwrap() == want).then_some(())
+    });
+    let after = c.replicas[&l].node.node().stats();
+    assert!(
+        after.snapshot_bytes_sent - before.snapshot_bytes_sent >= 4 << 20,
+        "the snapshot went"
+    );
+    assert_eq!(
+        c.replicas[&4].node.node().stats().snapshot_bytes_received,
+        0,
+        "no chunk reached node 4"
+    );
+    // Once it can take chunks, the leader sends them.
+    c.replicas[&l].node.node().set_whole_snapshot_peers([]);
+    c.put(unit, &key(TENANT + 32, u64::MAX - 1), b"after");
+    until("the copy follows the log", || {
+        (c.try_get(4, &key(TENANT + 32, u64::MAX - 1))
+            .ok()?
+            .as_deref()
+            == Some(&b"after"[..]))
+        .then_some(())
+    });
+}

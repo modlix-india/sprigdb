@@ -130,6 +130,7 @@ mod tests {
             version: String::new(),
             since_ms: 0,
             reason: String::new(),
+            raft_features: Vec::new(),
         };
         dir.put(rec(91, NODE_ACTIVE));
         dir.put(rec(92, NODE_DRAINING));

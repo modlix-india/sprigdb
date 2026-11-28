@@ -2315,6 +2315,7 @@ impl PassSession {
         };
         // What the backend raised decides where the diagnostics area is.
         let mut diag_sink = super::engine_seam::diag::DiagSink::new(out);
+        let text = sql.clone();
         let step = Box::pin(self.forward_backend(
             cx,
             sql,
@@ -2326,6 +2327,17 @@ impl PassSession {
             &mut diag_sink,
         ))
         .await;
+        // A tenant without MariaDB: a statement nothing here could parse
+        // is a syntax error (1064, as the server would answer), not one
+        // that "needs MariaDB".
+        let step = step.map_err(|e| {
+            if e.code() == Some(sprig_common::SprigCode::NotOnEngine) && self.engine_only() {
+                super::engine_seam::syntax_error(&text, self.persona == Persona::MySql84)
+                    .unwrap_or(e)
+            } else {
+                e
+            }
+        });
         let (warnings, error) = (diag_sink.warnings, diag_sink.error.take());
         if let Some(e) = error {
             self.diag_set(self.diag_error(&e), 0);

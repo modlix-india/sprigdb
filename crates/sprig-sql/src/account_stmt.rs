@@ -563,10 +563,19 @@ fn user_options(p: &mut P<'_>) -> R<UserOptions> {
             o.clauses.failed_login_attempts =
                 Some(Some(u16::try_from(p.number()?).map_err(|_| p.err())?));
         } else if p.eat_word("PASSWORD_LOCK_TIME") {
+            // MySQL counts the lock in days (0 to 32767); the catalog keeps
+            // minutes, as `auth.password_lock_minutes` does.
             o.clauses.password_lock_minutes = Some(Some(if p.eat_word("UNBOUNDED") {
                 -1
             } else {
-                i32::try_from(p.number()?).map_err(|_| p.err())?
+                let days = p.number()?;
+                if days > 32_767 {
+                    return Err(p.err());
+                }
+                i32::try_from(days)
+                    .ok()
+                    .and_then(|d| d.checked_mul(1440))
+                    .ok_or_else(|| p.err())?
             }));
         } else if p.eat_word("ACCOUNT") {
             if p.eat_word("LOCK") {
@@ -1007,6 +1016,33 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    /// `PASSWORD_LOCK_TIME n` is n days, kept as minutes; MySQL's range.
+    #[test]
+    fn password_lock_time_counts_days() {
+        for (sql, want) in [
+            ("ALTER USER bob PASSWORD_LOCK_TIME 1", 1440),
+            ("ALTER USER bob PASSWORD_LOCK_TIME 3", 3 * 1440),
+            ("ALTER USER bob PASSWORD_LOCK_TIME 0", 0),
+            ("ALTER USER bob PASSWORD_LOCK_TIME 32767", 32_767 * 1440),
+        ] {
+            match parse_ok(sql) {
+                AccountStmt::AlterUser { options, .. } => {
+                    assert_eq!(
+                        options.clauses.password_lock_minutes,
+                        Some(Some(want)),
+                        "{sql}"
+                    );
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        let opts = LexOptions::for_persona(Persona::MySql84);
+        assert!(matches!(
+            parse(b"ALTER USER bob PASSWORD_LOCK_TIME 32768", &opts),
+            Some(Err(_))
+        ));
     }
 
     #[test]

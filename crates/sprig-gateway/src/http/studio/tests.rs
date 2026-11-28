@@ -62,3 +62,72 @@ fn the_shards_view_is_retired() {
         "Studio's routes still serve /v1/shards"
     );
 }
+
+/// Which client a session token belongs to: what decides whether a
+/// statement is recorded with caller studio (`Sql.Execute` and `Sql.Query`
+/// alike, through `SqlEngine::run_capped`). A Studio login's token says
+/// `studio`, a login with `client: "api"` says `api`, and Basic or an API
+/// key say nothing.
+#[test]
+fn session_tokens_name_their_client() {
+    use base64::Engine as _;
+    let token = |cli: &str| {
+        let b64 = |v: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v);
+        format!(
+            "Bearer {ACCESS_PREFIX}{}.{}.sig",
+            b64(r#"{"alg":"EdDSA"}"#),
+            b64(&format!(r#"{{"sub":"7:1","cli":"{cli}"}}"#))
+        )
+    };
+    assert_eq!(
+        session_client(Some(&token("studio"))).as_deref(),
+        Some("studio")
+    );
+    assert_eq!(session_client(Some(&token("api"))).as_deref(), Some("api"));
+    assert_eq!(session_client(Some("Basic YTpi")), None);
+    assert_eq!(session_client(Some("Bearer sprig_acme_k_s")), None);
+    assert_eq!(session_client(None), None);
+}
+
+/// A setting read from the catalog `load_tenant` returned is the tenant's
+/// even when this gateway's cache no longer holds the tenant (a replicated
+/// change dropped the slot between the load and the read): reading the
+/// cache again would fall back to this gateway's scopes, where the
+/// tenant's `ai.enabled` is off.
+#[tokio::test]
+async fn a_loaded_catalog_keeps_the_tenants_settings_when_the_cache_drops_it() {
+    use sprig_common::ids::TenantId;
+    use sprig_meta::{MemStore, Tier};
+    use sprig_settings::{Entry, Registry, SettingsStores, TenantScope, TenantSettings};
+    let registry = Registry::global().unwrap();
+    let dc = DcId::new("dc-a").unwrap();
+    let dc_store = Arc::new(MemStore::new(Tier::Dc(dc.clone())));
+    let global = Arc::new(dc_store.with_tier(Tier::Global));
+    let stores = SettingsStores::new(global, dc_store).unwrap();
+    let live = LiveSettings::start(registry, stores).unwrap();
+    live.ready().await;
+    // No tenant services: like a cache whose slot for the tenant is gone.
+    let st = StudioState::new(StudioSource::Live { live, dc }, None, None);
+    let tid = TenantId(7);
+    let mut rows = TenantSettings::builder(registry, tid, 3);
+    rows.put(
+        TenantScope::Tenant,
+        "ai.enabled",
+        Entry {
+            value: Some(sprig_settings::Value::Bool(true)),
+            bounds: None,
+        },
+    );
+    let mut cat = sprig_catalog::TenantCatalog::empty(registry, tid);
+    cat.settings = Arc::new(rows.build());
+    let enabled = &sprig_ai::settings::ENABLED;
+    assert!(
+        !st.tenant_get(enabled, Some(tid), None),
+        "the cache read falls back"
+    );
+    assert!(
+        st.tenant_get_in(enabled, Some(&cat), None),
+        "the loaded catalog answers"
+    );
+    assert!(!st.tenant_get_in(enabled, None, None));
+}

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { FormattedMessage, useIntl } from 'react-intl';
 import { useSession } from '../auth/session';
 import { Grid } from '../results/Grid';
@@ -9,6 +9,7 @@ import { pageQuery, readOnlyColumns, rereadFor, statementFor, type Change, type 
 import type { ColumnInfo } from '../catalog/snapshot';
 import { ImportDialog } from './ImportDialog';
 import { FilterBar } from './FilterBar';
+import { latestOnly } from './latest';
 import { ChevronRight, Plus, X } from '../icons';
 
 const PAGE = 100;
@@ -51,21 +52,30 @@ export function Browse({ db, table, cols, editable }: { db: string; table: strin
     setInserted([]);
     setConflicts([]);
   }, []);
+  // Every page load reads the filter and the pages as they are when it
+  // starts, and only the newest load's rows are shown: a reload after a
+  // save that is still running when the filter changes doesn't bring back
+  // the unfiltered rows.
+  const loads = useMemo(() => latestOnly(), []);
+  const filterNow = useRef(filter);
+  const startsNow = useRef(starts);
+  useEffect(() => {
+    filterNow.current = filter;
+    startsNow.current = starts;
+  }, [filter, starts]);
   const load = useCallback(
     (after: Cell[] | null) =>
-      fetchRows(db, pageQuery({ db, table, keyNames }, after, PAGE + 1, filter)).then(apply, (e: unknown) => setError(errorText(e))),
-    [db, table, keyNames, apply, filter],
+      loads.run(
+        () => fetchRows(db, pageQuery({ db, table, keyNames }, after, PAGE + 1, filterNow.current)),
+        apply,
+        (e: unknown) => setError(errorText(e)),
+      ),
+    [db, table, keyNames, apply, loads],
   );
   useEffect(() => {
-    let live = true;
-    fetchRows(db, pageQuery({ db, table, keyNames }, null, PAGE + 1, filter)).then(
-      (r) => live && apply(r),
-      (e: unknown) => live && setError(errorText(e)),
-    );
-    return () => {
-      live = false;
-    };
-  }, [db, table, keyNames, apply, filter]);
+    void load(null);
+    return () => loads.cancel();
+  }, [load, loads, filter]);
 
   const ref: TableRef = useMemo(() => {
     const generated = new Set(cols.filter((c) => c.generated).map((c) => c.name));
@@ -114,7 +124,7 @@ export function Browse({ db, table, cols, editable }: { db: string; table: strin
         return;
       }
       await commit(t);
-      await load(starts[starts.length - 1] ?? null);
+      await load(startsNow.current[startsNow.current.length - 1] ?? null);
     } catch (e) {
       await rollback(t).catch(() => undefined);
       setError(errorText(e));

@@ -179,17 +179,30 @@ pub struct GatewayLookup<'a> {
     st: &'a StudioState,
     tenant: Option<TenantId>,
     db: Option<&'a str>,
+    /// The tenant's catalog as [`StudioState::load_tenant`] returned it:
+    /// read instead of the cache, which may drop the tenant again between
+    /// the load and the read. `None`: the cache as it is.
+    cat: Option<Arc<sprig_catalog::TenantCatalog>>,
+}
+
+impl GatewayLookup<'_> {
+    fn get<T: sprig_settings::SettingValue>(&self, s: &'static Setting<T>) -> T {
+        match &self.cat {
+            Some(cat) => self.st.tenant_get_in(s, Some(cat), self.db),
+            None => self.st.tenant_get(s, self.tenant, self.db),
+        }
+    }
 }
 
 impl Lookup for GatewayLookup<'_> {
     fn flag(&self, s: &'static Setting<bool>) -> bool {
-        self.st.tenant_get(s, self.tenant, self.db)
+        self.get(s)
     }
     fn number(&self, s: &'static Setting<u64>) -> u64 {
-        self.st.tenant_get(s, self.tenant, self.db)
+        self.get(s)
     }
     fn text(&self, s: &'static Setting<std::borrow::Cow<'static, str>>) -> String {
-        self.st.tenant_get(s, self.tenant, self.db).to_string()
+        self.get(s).to_string()
     }
 }
 
@@ -204,11 +217,13 @@ pub(crate) fn whoami_json(st: &StudioState, tenant: Option<TenantId>, operator: 
         st,
         tenant,
         db: None,
+        cat: None,
     };
     let g = GatewayLookup {
         st,
         tenant: None,
         db: None,
+        cat: None,
     };
     let model = |l: &GatewayLookup<'_>, r: Role| TurnSettings::read(l, r).model;
     let roles = ai_roles(
@@ -481,12 +496,13 @@ async fn chat_route(
     };
     // The tenant's own settings, never this gateway's defaults for a tenant
     // whose catalog isn't loaded here (a replica that doesn't lead it).
-    core.studio.load_tenant(tenant).await?;
+    let cat = core.studio.load_tenant(tenant).await?;
     let settings = TurnSettings::read(
         &GatewayLookup {
             st: &core.studio,
             tenant,
             db: database.as_deref(),
+            cat,
         },
         Role::parse(asked.trim()).unwrap_or(Role::Data),
     );
