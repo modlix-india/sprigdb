@@ -319,8 +319,14 @@ impl GatewayHost {
         let mut checks: BTreeMap<String, Vec<String>> = BTreeMap::new();
         if let Ok(cs) = self
             .info_rows(format!(
-                "SELECT TABLE_NAME AS t, CHECK_CLAUSE AS c FROM information_schema.CHECK_CONSTRAINTS \
-                 WHERE CONSTRAINT_SCHEMA = {}",
+                // The table through TABLE_CONSTRAINTS: MySQL's
+                // CHECK_CONSTRAINTS has no TABLE_NAME (MariaDB's has).
+                "SELECT tc.TABLE_NAME AS t, cc.CHECK_CLAUSE AS c \
+                 FROM information_schema.CHECK_CONSTRAINTS cc \
+                 JOIN information_schema.TABLE_CONSTRAINTS tc \
+                 ON tc.CONSTRAINT_SCHEMA = cc.CONSTRAINT_SCHEMA AND tc.CONSTRAINT_NAME = cc.CONSTRAINT_NAME \
+                 AND tc.CONSTRAINT_TYPE = 'CHECK' \
+                 WHERE cc.CONSTRAINT_SCHEMA = {}",
                 quote_literal(db)
             ))
             .await

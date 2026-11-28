@@ -754,6 +754,39 @@ async fn hardening_on(addr: &str, db: &str, ck: &mut Checks, tag: &str) {
         fired == Ok(0) && bumped == Ok(0),
         || format!("trigger rows {fired:?}, bumped {bumped:?}"),
     );
+    // A client's UPDATE of that table fires the trigger and bumps `at`; the
+    // runner's write that follows (the new source's vector) does neither.
+    must(
+        &mut c,
+        "UPDATE trg SET body = 'changed by the user' WHERE id = 1",
+    )
+    .await;
+    let fired = one_i64(&mut c, "SELECT COUNT(*) FROM trg_log").await;
+    let until = Instant::now() + Duration::from_secs(30);
+    let mut refilled = false;
+    while Instant::now() < until {
+        refilled = one_i64(
+            &mut c,
+            "SELECT COUNT(*) FROM trg WHERE id = 1 AND VEC_DISTANCE_COSINE(emb, AI_EMBED(body)) <= 0.0001",
+        )
+        .await
+            == Ok(1);
+        if refilled {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    let fired_after = one_i64(&mut c, "SELECT COUNT(*) FROM trg_log").await;
+    let bumped = one_i64(
+        &mut c,
+        &format!("SELECT COUNT(*) FROM trg WHERE id = 1 AND at <> '{epoch}'"),
+    )
+    .await;
+    ck.ok(
+        &format!("{tag}: a client's UPDATE fires the trigger, the runner's refill doesn't"),
+        fired == Ok(1) && refilled && fired_after == Ok(1) && bumped == Ok(1),
+        || format!("{fired:?} {refilled} {fired_after:?} {bumped:?}"),
+    );
     // CREATE TABLE ... LIKE: the copy has its own records and is filled.
     let r = c.query_drop("CREATE TABLE trg_copy LIKE trg").await;
     must(

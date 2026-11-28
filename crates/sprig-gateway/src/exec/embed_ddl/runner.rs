@@ -4,9 +4,10 @@
 //! ```text
 //! spawn(services, login, sql engine): one task per process
 //!   every tick (1 s, or at once after a declaration here), for each tenant
-//!   whose catalog this process has loaded and whose unit is led here (or
-//!   has no single leader): its EngineColumn records (read again every
-//!   few seconds), and for each column one round:
+//!   whose unit this node leads (crate::led: whether or not a client of it
+//!   reached this process): its EngineColumn records (read again every few
+//!   seconds; a tenant with none, every ten), and for one that has some,
+//!   its catalog (loaded on demand) and for each column one round:
 //!     1. changes: the table's row changes in the node's change log after
 //!        the column's token (from its declaration time at first), at most
 //!        a few pages: the keys of inserted and updated rows (a deleted
@@ -67,6 +68,9 @@ use crate::tenant::TenantServices;
 
 /// How long a tenant's list of columns, as read, stands.
 const FRESH: Duration = Duration::from_secs(3);
+/// The same for a tenant that had none (declarations here wake the
+/// runner at once; one made through another node is seen within this).
+const IDLE_FRESH: Duration = Duration::from_secs(10);
 /// Change-log pages one round reads at most.
 const MAX_PAGES: usize = 8;
 /// Keys one round handles at most (changes, backfill and stale check).
@@ -322,7 +326,9 @@ pub(crate) fn spawn(
     engine: Arc<SqlEngine>,
     stop: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
-    let mut loads = svc.cache.loads();
+    // Every tenant whose unit this node leads, whether or not a client of
+    // it reached this process (crate::led).
+    let mut led = crate::led::Led::new(&svc);
     tokio::spawn(async move {
         let mut r = Runner {
             svc,
@@ -331,15 +337,19 @@ pub(crate) fn spawn(
             live: HashMap::new(),
             known: HashMap::new(),
         };
-        let mut tenants: BTreeSet<u64> = BTreeSet::new();
         let mut timer = tokio::time::interval(Duration::from_secs(1));
         timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 () = stop.cancelled() => return,
-                l = loads.recv() => {
-                    if let Ok(l) = l {
-                        tenants.insert(l.tenant.0);
+                t = led.changed() => {
+                    // A catalog load here: that tenant's columns are read
+                    // again (all of them after a lagged feed).
+                    match t {
+                        Some(t) => {
+                            r.known.remove(&t);
+                        }
+                        None => r.known.clear(),
                     }
                     continue;
                 }
@@ -348,8 +358,15 @@ pub(crate) fn spawn(
                 }
                 _ = timer.tick() => {}
             }
+            if led.take_lagged() {
+                r.known.clear();
+            }
+            let tenants = led.tenants(&r.svc).await;
+            let led_now: BTreeSet<u64> = tenants.iter().copied().collect();
+            r.known.retain(|t, _| led_now.contains(t));
+            r.live.retain(|(t, _), _| led_now.contains(t));
             let mut backlog = 0u64;
-            for &t in &tenants {
+            for t in tenants {
                 backlog += r.tenant(TenantId(t)).await;
             }
             metrics::backlog(backlog);
@@ -368,20 +385,18 @@ impl Runner {
             self.live.retain(|(tt, _), _| *tt != t.0);
             return 0;
         }
-        let Some(cat) = self.svc.cache.cached(t) else {
-            return 0;
-        };
-        if crate::engine::catalog::of(&cat).is_none() {
-            return 0;
-        }
-        let stale = self
-            .known
-            .get(&t.0)
-            .is_none_or(|k| k.1 != cat.version || k.0.elapsed() >= FRESH);
+        // The tenant's columns first (one scan of its records): a tenant
+        // without any needs no catalog here, and is read again less often.
+        let cached = self.svc.cache.cached(t).map(|c| c.version);
+        let stale = self.known.get(&t.0).is_none_or(|k| {
+            let every = if k.2.is_empty() { IDLE_FRESH } else { FRESH };
+            k.0.elapsed() >= every || cached.is_some_and(|v| v != k.1)
+        });
         if stale {
             match self.read_columns(t).await {
                 Ok(list) => {
-                    self.known.insert(t.0, (Instant::now(), cat.version, list));
+                    self.known
+                        .insert(t.0, (Instant::now(), cached.unwrap_or(0), list));
                 }
                 Err(e) => {
                     tracing::debug!(tenant = %t, error = %e, "embedded columns not read");
@@ -394,6 +409,29 @@ impl Runner {
             .get(&t.0)
             .map(|k| k.2.clone())
             .unwrap_or_default();
+        if cols.is_empty() {
+            self.live.retain(|(tt, _), _| *tt != t.0);
+            return 0;
+        }
+        // Its catalog, loaded on demand when no client brought it here.
+        let cat = match self.svc.cache.cached(t) {
+            Some(c) => c,
+            None => match self
+                .svc
+                .cache
+                .get(t, sprig_catalog::Freshness::Latest)
+                .await
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::debug!(tenant = %t, error = %e, "led tenant's catalog not loaded");
+                    return 0;
+                }
+            },
+        };
+        if crate::engine::catalog::of(&cat).is_none() {
+            return 0;
+        }
         let ids: HashSet<(u64, u64)> = cols.iter().map(|c| (t.0, c.id)).collect();
         self.live.retain(|k, _| k.0 != t.0 || ids.contains(k));
         let mut waiting = 0;

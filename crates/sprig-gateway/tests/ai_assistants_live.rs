@@ -662,3 +662,99 @@ async fn admin_conversations_are_their_operators_only() {
     let (st, _) = http("GET", &format!("/v1/ai/conversations/{id}"), None, None).await;
     assert!(st == 401 || st == 403, "{st}");
 }
+
+#[tokio::test]
+#[ignore = "live: needs SPRIG_TEST_AI_MYSQL, SPRIG_TEST_AI_HTTP, SPRIG_TEST_AI_USER, SPRIG_TEST_AI_PASSWORD and SPRIG_TEST_AI_STUB_LOG; tools/live/README.md"]
+async fn the_dba_tools_see_check_clauses_and_row_security_on_engine_tables() {
+    let mut c = conn().await;
+    setup(&mut c).await;
+    // A CHECK that alone makes a column look like an email address, and a
+    // table with row-level security on and one policy.
+    c.query_drop(
+        "CREATE TABLE contacts (id INT PRIMARY KEY, contact_info VARCHAR(100), \
+         CONSTRAINT contact_at CHECK (contact_info LIKE '%@%'))",
+    )
+    .await
+    .unwrap();
+    c.query_drop("CREATE POLICY own_rows ON customers FOR ALL TO PUBLIC USING (id = 1)")
+        .await
+        .unwrap();
+    c.query_drop("ALTER TABLE customers ENABLE ROW LEVEL SECURITY")
+        .await
+        .unwrap();
+    let (u, p) = me();
+    let ask = |tool: &str, args: Value| json!({"role": "dba", "database": "aic_live", "message": tool_msg(tool, &args)});
+    let result = |b: &str| {
+        b.lines()
+            .find(|l| l.contains("TOOL RESULT"))
+            .unwrap_or_else(|| panic!("no tool result in {b}"))
+            .to_owned()
+    };
+    let (st, b) = http(
+        "POST",
+        "/v1/ai/chat",
+        Some(&ask("sensitive_columns", json!({"db": "aic_live"}))),
+        Some((&u, &p)),
+    )
+    .await;
+    assert_eq!(st, 200, "{b}");
+    let r = result(&b);
+    assert!(!r.contains("\\\"error\\\""), "{r}");
+    // The CHECK clause was read: contact_info is flagged from it.
+    assert!(
+        r.contains("contact_info"),
+        "the CHECK clause wasn't read: {r}"
+    );
+    assert!(r.contains("CHECK constraint"), "{r}");
+    // The row-security state was read: customers is on, with a policy.
+    let at = r
+        .find("\\\"table\\\":\\\"customers\\\"")
+        .unwrap_or_else(|| panic!("{r}"));
+    let tail = &r[at..r.len().min(at + 200)];
+    assert!(tail.contains("row_level_security\\\":\\\"on"), "{tail}");
+    assert!(tail.contains("policies\\\":1"), "{tail}");
+    // test_policy reaches the tester on an engine table (it may refuse
+    // the user for its own reasons, but never for want of MariaDB).
+    c.query_drop("DROP USER IF EXISTS aicro").await.unwrap();
+    c.query_drop("CREATE USER aicro IDENTIFIED BY 'aicro-pw-1'")
+        .await
+        .unwrap();
+    c.query_drop("GRANT SELECT ON aic_live.* TO aicro")
+        .await
+        .unwrap();
+    let (st, b) = http(
+        "POST",
+        "/v1/ai/chat",
+        Some(&ask(
+            "test_policy",
+            json!({"db": "aic_live", "sql": "SELECT * FROM customers", "as_user": "aicro"}),
+        )),
+        Some((&u, &p)),
+    )
+    .await;
+    assert_eq!(st, 200, "{b}");
+    let r = result(&b);
+    eprintln!("test_policy: {}", &r[..r.len().min(400)]);
+    assert!(!r.contains("needs MariaDB") && !r.contains("39960"), "{r}");
+    c.query_drop("DROP USER aicro").await.unwrap();
+    // SHOW GRANTS works for the tenant-admin checks (glossary writes).
+    let (st, b) = http(
+        "POST",
+        "/v1/ai/glossary",
+        Some(&json!({"term": "aic revenue", "definition": "paid orders"})),
+        Some((&u, &p)),
+    )
+    .await;
+    assert!(st == 200 || st == 201, "{st} {b}");
+    let (_, l) = http("GET", "/v1/ai/glossary", None, Some((&u, &p))).await;
+    assert!(l.contains("aic revenue"), "{l}");
+    let (st, _) = http(
+        "POST",
+        "/v1/ai/glossary/aic%20revenue:delete",
+        None,
+        Some((&u, &p)),
+    )
+    .await;
+    assert_eq!(st, 200);
+    c.query_drop("DROP DATABASE aic_live").await.unwrap();
+}

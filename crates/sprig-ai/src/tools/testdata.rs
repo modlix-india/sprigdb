@@ -1691,8 +1691,13 @@ pub fn shape_queries(db: &str, table: &str) -> [String; 4] {
              ORDER BY CONSTRAINT_NAME, ORDINAL_POSITION"
         ),
         format!(
-            "SELECT CHECK_CLAUSE AS clause FROM information_schema.CHECK_CONSTRAINTS \
-             WHERE CONSTRAINT_SCHEMA = {d} AND TABLE_NAME = {t}"
+            // The table through TABLE_CONSTRAINTS: MySQL's CHECK_CONSTRAINTS
+            // has no TABLE_NAME (MariaDB's has).
+            "SELECT cc.CHECK_CLAUSE AS clause FROM information_schema.CHECK_CONSTRAINTS cc \
+             JOIN information_schema.TABLE_CONSTRAINTS tc \
+             ON tc.CONSTRAINT_SCHEMA = cc.CONSTRAINT_SCHEMA AND tc.CONSTRAINT_NAME = cc.CONSTRAINT_NAME \
+             AND tc.CONSTRAINT_TYPE = 'CHECK' \
+             WHERE cc.CONSTRAINT_SCHEMA = {d} AND tc.TABLE_NAME = {t}"
         ),
     ]
 }
