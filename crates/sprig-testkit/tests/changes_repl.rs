@@ -76,18 +76,28 @@ struct Cluster {
     dir: PathBuf,
     net: Arc<MemNetwork>,
     replicas: BTreeMap<u64, Replica>,
+    /// A stopped replica loses what its store held only in memory (the
+    /// store isn't flushed at close), as after `kill -9`: the engine
+    /// applies with the store's write-ahead log off, so the store comes
+    /// back behind the Raft log.
+    crash: bool,
 }
 
 type Record = (u64, u32, u64, Vec<u8>, Option<Vec<u8>>);
 
 impl Cluster {
     fn new() -> Self {
-        let dir = std::env::temp_dir().join(format!("sprig-chg-repl-{}", std::process::id()));
+        Self::with("sprig-chg-repl", false)
+    }
+
+    fn with(name: &str, crash: bool) -> Self {
+        let dir = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut c = Cluster {
             dir,
             net: MemNetwork::new(),
             replicas: BTreeMap::new(),
+            crash,
         };
         for id in VOTERS {
             c.start(id);
@@ -102,7 +112,20 @@ impl Cluster {
         cfg.checkpoint_interval = Duration::ZERO;
         cfg.log.sync = SyncMode::Off;
         cfg.replicated = true;
-        let engine = Engine::open(cfg).unwrap();
+        cfg.rocks.avoid_flush_on_close = self.crash;
+        // A restarted replica's previous engine may still be closing (its
+        // change log's flusher held it): its store's lock goes with it.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let engine = loop {
+            match Engine::open(cfg.clone()) {
+                Ok(e) => break e,
+                Err(e) if Instant::now() < deadline => {
+                    let _ = e;
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(e) => panic!("engine of replica {id}: {e}"),
+            }
+        };
         let store = EngineLogStore::open(d.join("raft"), SyncMode::Off, None).unwrap();
         let node = EngineNode::open(
             &engine,
@@ -249,4 +272,129 @@ fn every_replica_writes_the_same_change_log() {
     }
     let log2 = c.same_logs(unit, 100);
     assert_eq!(&log2[..80], &log[..]);
+}
+
+/// The records `n` puts write (each puts two keys).
+fn records_of(n: u64) -> usize {
+    usize::try_from(2 * n).unwrap()
+}
+
+/// Every committed change stays in every replica's change log across a
+/// crash of a replica (follower, then leader) under load. The engine applies
+/// with the store's write-ahead log off, so a replica comes back with its
+/// store behind its Raft log, and its change log's files ahead of the
+/// store: the records the change log cuts back at open must come again
+/// from the Raft log, and a reader that had read past them goes on from
+/// its place.
+#[test]
+fn a_replicas_crash_keeps_every_change() {
+    let mut c = Cluster::with("sprig-chg-crash", true);
+    let unit = Engine::unit_of_tenant(TENANT);
+    c.replicas[&1].node.start_unit(unit, &VOTERS).unwrap();
+    let mut n = 0u64;
+    for _ in 0..30 {
+        c.put(unit, n, b"a");
+        n += 1;
+    }
+    c.same_logs(unit, records_of(n));
+    for round in 0..2 {
+        let l = c.leader(unit);
+        let victim = if round == 0 {
+            VOTERS.into_iter().find(|id| *id != l).unwrap()
+        } else {
+            l
+        };
+        // The victim's change log has made its records durable (its
+        // manifest is ahead of the store, which holds nothing durable of
+        // the unit's applies since its last checkpoint); a consumer has
+        // read up to there.
+        c.replicas[&victim].changes.flush().unwrap();
+        let read = Cluster::records(&c.replicas[&victim], unit);
+        assert_eq!(read.len(), records_of(n), "round {round}");
+        let last = read.last().map(|r| Pos::after_entry(r.0)).unwrap();
+        let top = c.replicas[&victim].engine.last_applied_of(unit);
+        c.kill(victim);
+        for _ in 0..10 {
+            c.put(unit, n, b"b");
+            n += 1;
+        }
+        c.start(victim);
+        for _ in 0..10 {
+            c.put(unit, n, b"c");
+            n += 1;
+        }
+        let all = c.same_logs(unit, records_of(n));
+        // The store came back behind: the change log had to cut and
+        // replay (otherwise this round tested nothing).
+        let r = &c.replicas[&victim];
+        assert!(
+            r.engine.last_applied_of(unit) > top,
+            "round {round}: the victim applied the later entries"
+        );
+        // The consumer's place still holds: everything after it, once.
+        let mut rd = r.changes.reader(unit.0, last, None).unwrap();
+        let mut after = Vec::new();
+        loop {
+            let p = rd.read(1 << 20).unwrap();
+            after.extend(
+                p.changes
+                    .into_iter()
+                    .map(|c| (c.index, c.seq, c.cts, c.key, c.value)),
+            );
+            if p.at_end {
+                break;
+            }
+        }
+        let want: Vec<Record> = all
+            .iter()
+            .filter(|x| Pos::after_entry(x.0) > last)
+            .cloned()
+            .collect();
+        assert_eq!(
+            after, want,
+            "round {round}: a consumer's place after the crash"
+        );
+    }
+}
+
+/// A replica that gets the unit from a snapshot keeps the unit's change
+/// history through a crash right after the restore. The restore counts as
+/// done once the engine's store is flushed; the change log's part of the
+/// snapshot must be durable by then too, or a crash before its next flush
+/// leaves the replica without the history before the snapshot (readers
+/// there get "history lost"), records its leader still serves.
+#[test]
+fn a_restored_replica_keeps_the_change_history_through_a_crash() {
+    let mut c = Cluster::with("sprig-chg-snapcrash", true);
+    let unit = Engine::unit_of_tenant(TENANT);
+    c.replicas[&1].node.start_unit(unit, &VOTERS).unwrap();
+    for i in 0..20u64 {
+        c.put(unit, i, b"a");
+    }
+    c.same_logs(unit, 40);
+    // Every log is trimmed: a new replica needs the snapshot.
+    for r in c.replicas.values() {
+        r.changes.flush().unwrap();
+        r.engine.checkpoint().unwrap();
+    }
+    let dead = VOTERS.into_iter().find(|id| *id != c.leader(unit)).unwrap();
+    c.kill(dead);
+    c.start(4);
+    let l = c.leader(unit);
+    c.replicas[&l]
+        .node
+        .replace_replica(unit, dead, 4, WAIT)
+        .unwrap();
+    for i in 20..25u64 {
+        c.put(unit, i, b"b");
+    }
+    let before = c.same_logs(unit, 50);
+    // Node 4 crashes before its change log's next flush.
+    c.kill(4);
+    c.start(4);
+    for i in 25..30u64 {
+        c.put(unit, i, b"c");
+    }
+    let after = c.same_logs(unit, 60);
+    assert_eq!(&after[..50], &before[..]);
 }

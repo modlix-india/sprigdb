@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::task::{Context, Poll, Waker};
 
-use sprig_common::Result;
+use sprig_common::{Result, SprigError};
 
 use crate::log::Ticket;
 
@@ -255,7 +255,7 @@ impl DurableTicket {
     pub fn wait(&self) -> Result<()> {
         match self {
             DurableTicket::Ready => Ok(()),
-            DurableTicket::Log(t) => t.wait().map_err(|_| super::errors::outcome_lost()),
+            DurableTicket::Log(t) => t.wait().map_err(lost_or_unknown),
             DurableTicket::Watch(w, i) => w.wait_blocking(*i),
             DurableTicket::Many(ts) => ts.iter().try_for_each(DurableTicket::wait),
         }
@@ -272,9 +272,7 @@ impl DurableTicket {
                 if t.is_durable() {
                     return Ok(());
                 }
-                t.wait_async()
-                    .await
-                    .map_err(|_| super::errors::outcome_lost())
+                t.wait_async().await.map_err(lost_or_unknown)
             }
             DurableTicket::Watch(w, i) => {
                 WatchFuture {
@@ -290,6 +288,19 @@ impl DurableTicket {
                 Ok(())
             }
         }
+    }
+}
+
+/// A log ticket's failure as the client sees it: an entry the log knows
+/// was lost never committed (1213, retry it); one whose outcome the log
+/// can't know (its leader was cut off from the others and stepped down
+/// before it committed) may still commit, so it stays "outcome unknown"
+/// and is never reported as rolled back.
+fn lost_or_unknown(e: SprigError) -> SprigError {
+    if e.code() == Some(sprig_common::SprigCode::CommitOutcomeUnknown) {
+        e
+    } else {
+        super::errors::outcome_lost()
     }
 }
 

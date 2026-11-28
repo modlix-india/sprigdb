@@ -188,6 +188,19 @@ impl Barriers {
                 // No replica of the unit here: nothing was replicated to
                 // this node yet (a unit nobody wrote reads as empty).
                 Err(RaftError::NoGroup(_)) => return Ok(()),
+                // No leader known, and this replica can't hear a majority:
+                // no leader it could ask exists for it now (it is cut off),
+                // so waiting out the whole barrier only holds the reader.
+                Err(e @ RaftError::NotLeader { leader: None })
+                    if !self.node.hears_majority(unit.0) =>
+                {
+                    tracing::debug!(unit = unit.0, error = %e, "raft: read barrier: cut off from a majority");
+                    return Err(sprig_common::SprigError::new(
+                        sprig_common::SprigCode::ShardMoved,
+                        "this replica is cut off from a majority of the unit's replicas (no \
+                         leader reachable); retry",
+                    ));
+                }
                 Err(e) if e.is_retryable() => e,
                 Err(e) => return Err(e.into()),
                 // One attempt waits a short while only: a request sent to a

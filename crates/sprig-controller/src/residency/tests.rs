@@ -675,3 +675,74 @@ async fn feed_subscriptions_stay_inside_the_residency() {
     .unwrap();
     assert_eq!(b.state, "compliant", "{b:?}");
 }
+
+/// After a data centre's tags change, the loop recomputes every tenant
+/// homed there whose set depends on them: a parent with its own policy, a
+/// child with its own, and a grandchild that only inherits. A snapshot the
+/// loop read just before the change must not answer for any of them.
+#[tokio::test]
+async fn a_dc_retag_recomputes_every_tenant_of_the_tree() {
+    let w = world().await;
+    let dir = Directory::new(Arc::clone(&w.global));
+    let mut ids = Vec::new();
+    let mut parent = None;
+    for name in ["rp", "rpc", "rpcg"] {
+        let t = dir
+            .create(
+                &NewTenant {
+                    name: name.into(),
+                    parent,
+                    home_dc: dc("fra1"),
+                    placement_hint: None,
+                },
+                64,
+                SystemTime::now(),
+            )
+            .await
+            .unwrap()
+            .body()
+            .tenant_id;
+        dir.update(t, |b| {
+            b.state = TenantState::Active;
+            Ok(true)
+        })
+        .await
+        .unwrap();
+        ids.push(t);
+        parent = Some(t);
+    }
+    let lp = ResidencyLoop(Arc::new(residency(&w, "fra1")));
+    let eu = |apply| ResidencyRequest {
+        policy: Some(r#"jurisdiction = "EU""#.into()),
+        apply,
+        ..ResidencyRequest::default()
+    };
+    lp.0.set("rp", &eu(true)).await.unwrap();
+    lp.0.set("rpc", &eu(true)).await.unwrap();
+    // The loop has seen all three (compliant in fra1); its snapshot is warm.
+    for t in &ids {
+        assert_eq!(lp.0.reconcile_tenant(*t).await.unwrap(), Outcome::Done);
+    }
+    // fra1 leaves the EU.
+    let mut fra1 = rec("fra1", json!({"jurisdiction": "US", "country": "US"}));
+    fra1.dc_epoch = 2;
+    let key = sprig_meta::dclease::dc_key(&dc("fra1")).unwrap();
+    put(&*w.global, key.clone(), Record::new(fra1).encode().unwrap()).await;
+    let ev = crate::runtime::MetaEvent {
+        source: crate::runtime::Source::Global,
+        key,
+        kv: None,
+        mod_revision: 0,
+    };
+    let keys: BTreeSet<TenantId> = lp.keys_for(&ev).into_iter().collect();
+    assert_eq!(keys, ids.iter().copied().collect::<BTreeSet<_>>());
+    for t in &keys {
+        lp.0.reconcile_tenant(*t).await.unwrap();
+    }
+    for (t, name) in ids.iter().zip(["rp", "rpc", "rpcg"]) {
+        let e = home::read_home(&*w.global, *t).await.unwrap().unwrap();
+        let b = ResidencyBlock::of(&e.raw).unwrap();
+        assert_eq!(b.allowed(), set(&["ams1"]), "{name}: {b:?}");
+        assert_ne!(b.state, "compliant", "{name}: homed outside its set now");
+    }
+}

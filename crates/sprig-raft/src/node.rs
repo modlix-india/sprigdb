@@ -1045,6 +1045,23 @@ impl Node {
         self.read(group, Vec::new()).map(Some)
     }
 
+    /// Whether this replica hears from a majority of `group`'s voters (its
+    /// applied membership, itself included; both halves of a joint
+    /// configuration), by the node's liveness checks. A replica that hears
+    /// fewer can't reach any leader the group may have.
+    #[must_use]
+    pub fn hears_majority(&self, group: GroupId) -> bool {
+        let Some(cell) = self.cell(group) else {
+            return false;
+        };
+        let cs = lock(&cell.g).applied_conf.clone();
+        let alive = self.alive_peers();
+        let half = |ids: &[NodeId]| {
+            ids.is_empty() || ids.iter().filter(|id| alive.contains(id)).count() * 2 > ids.len()
+        };
+        half(&cs.voters) && half(&cs.voters_outgoing)
+    }
+
     /// A read barrier on any replica: the slot is set once this replica
     /// has applied everything the group's leader had committed when the
     /// barrier was asked (a `ReadIndex` the leader confirms with a quorum,
@@ -2288,6 +2305,19 @@ impl Node {
         let was_leader = g.role.1 == StateRole::Leader;
         if was_leader && role.1 != StateRole::Leader {
             self.release_snapshot_file(g);
+            // Stepped down in its own term with no successor known: it lost
+            // touch with a majority (raft-rs's quorum check). Its proposals
+            // that hadn't committed wait for no one here: they fail now with
+            // an unknown outcome (a majority may hold them, and a later
+            // leader may commit them), instead of waiting for the cut to
+            // heal. A leader that steps down because it heard of a newer
+            // term (an election, a transfer) keeps them: the new leader's
+            // entries soon commit them or replace them, and they resolve as
+            // applied or lost as before. Committed entries resolve as applied.
+            if role.0 == g.role.0 && g.raw.raft.leader_id == raft::INVALID_ID {
+                let committed = g.raw.raft.raft_log.committed;
+                fail_pending(g, committed + 1, &RaftError::Unknown);
+            }
         }
         if was_leader {
             self.inner

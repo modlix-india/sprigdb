@@ -5,7 +5,7 @@
 import { expect, test, type Page } from '@playwright/test';
 import AxeBuilder from '@axe-core/playwright';
 import { readFileSync } from 'node:fs';
-import { apiToken, DB, PASSWORD, SHOTS, signIn, sql, typeSql, openPage } from './fixtures';
+import { apiToken, DB, LOGIN, PASSWORD, SHOTS, signIn, sql, typeSql, openPage } from './fixtures';
 
 const T = 'acme';
 
@@ -228,7 +228,9 @@ test.describe.serial('Studio R0', () => {
     await expect(page.getByRole('row', { name: /studio\.max_result_rows/ })).toContainText('500');
   });
 
-  test('automatic indexing view', async ({ page }) => {
+  test('automatic indexing view', async ({ page, request }) => {
+    // Waits for a workload flush below: three times the usual time limit.
+    test.slow();
     await signIn(page);
     await openPage(page, 'Automatic indexing');
     await expect(page.getByRole('heading', { name: 'Automatic indexing' })).toBeVisible();
@@ -238,13 +240,43 @@ test.describe.serial('Studio R0', () => {
     await shot(page, 'indexing');
     await page.getByRole('tab', { name: 'Recommendations' }).click();
     await shot(page, 'indexing-recommendations');
-    // Workload.ListFingerprints: the statements this suite ran are there,
-    // Studio's marked as such; one fingerprint's series charts.
+    // Workload.ListFingerprints: this test's own Studio statements, so the
+    // step doesn't depend on which tests ran before it. They run as Studio
+    // runs them: a Studio session (a login without client "api", unlike the
+    // suite's setup token) on Sql.Query, the editor's route, so they are
+    // recorded with caller studio; an alias new on every run keeps their
+    // fingerprint apart from every other statement, earlier runs' included.
+    // They show once the gateway's workload flush has run
+    // (workload.flush_seconds).
+    const mark = `fp_seed_${Date.now().toString(36)}`;
+    const login = await request.post('/v1/auth/login', { data: { login: LOGIN, password: PASSWORD, refresh_transport: 'body' } });
+    expect(login.status()).toBe(200);
+    const studio = ((await login.json()) as { access_token: string }).access_token;
+    for (let i = 0; i < 3; i++) {
+      const r = await request.post(`/v1/databases/${DB}/sql:query`, {
+        headers: { authorization: `Bearer ${studio}` },
+        data: { sql: `SELECT COUNT(*) AS ${mark} FROM orders WHERE total > ${i}` },
+      });
+      expect(r.status()).toBe(200);
+    }
+    await expect
+      .poll(
+        async () => {
+          const r = await request.get('/v1/workload/fingerprints?hours=24&limit=100&source=studio', {
+            headers: { authorization: `Bearer ${token}` },
+          });
+          const body = (await r.json()) as { fingerprints?: { text: string }[] };
+          return (body.fingerprints ?? []).some((f) => f.text.includes(mark));
+        },
+        { timeout: 120_000, intervals: [2_000] },
+      )
+      .toBe(true);
     await page.getByRole('tab', { name: 'Fingerprints' }).click();
-    await expect(page.getByTestId('fingerprints').locator('tbody tr').first()).toBeVisible({ timeout: 90_000 });
+    await expect(page.getByTestId('fingerprints').locator('tbody tr').first()).toBeVisible();
     await page.getByLabel('Source').selectOption('studio');
-    await expect(page.getByTestId('fingerprints').locator('tbody tr').first()).toContainText('Studio', { timeout: 30_000 });
-    await page.getByTestId('fingerprints').getByRole('button', { name: /Latency series/ }).first().click();
+    const seeded = page.getByTestId('fingerprints').locator('tbody tr').filter({ hasText: mark });
+    await expect(seeded).toContainText('Studio');
+    await seeded.getByRole('button', { name: /Latency series/ }).click();
     await expect(page.getByRole('region', { name: 'Latency series' }).locator('tbody tr').first()).toBeVisible();
     await axe(page, 'indexing-fingerprints');
     await shot(page, 'indexing-fingerprints');

@@ -1599,78 +1599,93 @@ impl sprig_engine::snapshot::UnitSnapshotPart for SnapshotPart {
         let Some(inner) = self.0.upgrade() else {
             return Ok(());
         };
-        let u64_of = |input: &mut dyn io::Read| -> Result<u64> {
-            let mut b = [0u8; 8];
-            input
-                .read_exact(&mut b)
-                .map_err(|e| io_err("snapshot", &e))?;
-            Ok(u64::from_be_bytes(b))
-        };
-        let n = u64_of(input)?;
-        let st = inner.unit(unit.0);
-        let mut s = lock(&st);
-        if s.applied > index && !s.segs.is_empty() {
-            // Older than what the files here hold (a snapshot handed over
-            // late, when the log registered after the engine restored it):
-            // keep the newer segments.
-            tracing::info!(
-                unit = unit.0,
-                snapshot = index,
-                held = s.applied,
-                "change log: a unit snapshot older than the segments held here; kept them"
-            );
+        if !ingest_unit(&inner, unit, index, input)? {
             return Ok(());
         }
-        let _ = fs::remove_dir_all(&s.dir);
-        s.segs.clear();
-        s.fresh = false;
-        s.failed = false;
-        s.dirty = true;
-        if n == 0 {
-            s.applied = index;
-            s.lost_before = index + 1;
-            return Ok(());
-        }
-        let applied = u64_of(input)?;
-        s.max_cts = s.max_cts.max(u64_of(input)?);
-        s.lost_before = u64_of(input)?;
-        fs::create_dir_all(&s.dir).map_err(|e| io_err("snapshot", &e))?;
-        for _ in 0..n {
-            let base = u64_of(input)?;
-            let len = u64_of(input)?;
-            let created = i64::try_from(u64_of(input)?).unwrap_or(0);
-            let p = s.dir.join(Seg::name(base));
-            {
-                let mut f = File::create(&p).map_err(|e| io_err("snapshot", &e))?;
-                let mut left = len;
-                let mut buf = vec![0u8; 1 << 20];
-                while left > 0 {
-                    let k = usize::try_from(left.min(buf.len() as u64)).unwrap_or(0);
-                    input
-                        .read_exact(&mut buf[..k])
-                        .map_err(|e| io_err("snapshot", &e))?;
-                    f.write_all(&buf[..k]).map_err(|e| io_err("snapshot", &e))?;
-                    left -= k as u64;
-                }
-            }
-            let mut g = Seg::open(&p, base, len, created, inner.cfg.index_interval)
-                .map_err(|e| io_err("snapshot", &e))?;
-            g.synced = 0;
-            s.segs.push(g);
-        }
-        // Entries between the exporter's place and the snapshot's index
-        // come again from the log only above `index`: anything the files
-        // lack up to it is a gap.
-        if applied < index {
-            s.lost_before = index + 1;
-        }
-        s.applied = index.max(applied);
-        let top = s.applied;
-        if let Some(g) = s.segs.last_mut() {
-            g.cut_above(top).map_err(|e| io_err("snapshot", &e))?;
-        }
-        Ok(())
+        // Durable before the engine's store is: the restore that called
+        // this counts as done once the store is flushed, and the replica's
+        // log then starts after the snapshot. Files written but not synced
+        // and a manifest not yet written would be lost with a crash in the
+        // next flusher pass: the unit's history before the snapshot would
+        // be gone on this node (readers there: history lost).
+        ChangeLog { inner }.flush()
     }
+}
+
+/// [`SnapshotPart::ingest`]'s replacement of the unit's segments. False
+/// when the files here are newer than the snapshot and were kept.
+fn ingest_unit(inner: &Inner, unit: UnitId, index: u64, input: &mut dyn io::Read) -> Result<bool> {
+    let u64_of = |input: &mut dyn io::Read| -> Result<u64> {
+        let mut b = [0u8; 8];
+        input
+            .read_exact(&mut b)
+            .map_err(|e| io_err("snapshot", &e))?;
+        Ok(u64::from_be_bytes(b))
+    };
+    let n = u64_of(input)?;
+    let st = inner.unit(unit.0);
+    let mut s = lock(&st);
+    if s.applied > index && !s.segs.is_empty() {
+        // Older than what the files here hold (a snapshot handed over
+        // late, when the log registered after the engine restored it):
+        // keep the newer segments.
+        tracing::info!(
+            unit = unit.0,
+            snapshot = index,
+            held = s.applied,
+            "change log: a unit snapshot older than the segments held here; kept them"
+        );
+        return Ok(false);
+    }
+    let _ = fs::remove_dir_all(&s.dir);
+    s.segs.clear();
+    s.fresh = false;
+    s.failed = false;
+    s.dirty = true;
+    if n == 0 {
+        s.applied = index;
+        s.lost_before = index + 1;
+        return Ok(true);
+    }
+    let applied = u64_of(input)?;
+    s.max_cts = s.max_cts.max(u64_of(input)?);
+    s.lost_before = u64_of(input)?;
+    fs::create_dir_all(&s.dir).map_err(|e| io_err("snapshot", &e))?;
+    for _ in 0..n {
+        let base = u64_of(input)?;
+        let len = u64_of(input)?;
+        let created = i64::try_from(u64_of(input)?).unwrap_or(0);
+        let p = s.dir.join(Seg::name(base));
+        {
+            let mut f = File::create(&p).map_err(|e| io_err("snapshot", &e))?;
+            let mut left = len;
+            let mut buf = vec![0u8; 1 << 20];
+            while left > 0 {
+                let k = usize::try_from(left.min(buf.len() as u64)).unwrap_or(0);
+                input
+                    .read_exact(&mut buf[..k])
+                    .map_err(|e| io_err("snapshot", &e))?;
+                f.write_all(&buf[..k]).map_err(|e| io_err("snapshot", &e))?;
+                left -= k as u64;
+            }
+        }
+        let mut g = Seg::open(&p, base, len, created, inner.cfg.index_interval)
+            .map_err(|e| io_err("snapshot", &e))?;
+        g.synced = 0;
+        s.segs.push(g);
+    }
+    // Entries between the exporter's place and the snapshot's index
+    // come again from the log only above `index`: anything the files
+    // lack up to it is a gap.
+    if applied < index {
+        s.lost_before = index + 1;
+    }
+    s.applied = index.max(applied);
+    let top = s.applied;
+    if let Some(g) = s.segs.last_mut() {
+        g.cut_above(top).map_err(|e| io_err("snapshot", &e))?;
+    }
+    Ok(true)
 }
 
 /// Reads the whole file (tests).

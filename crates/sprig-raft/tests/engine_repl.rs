@@ -360,12 +360,18 @@ fn a_deposed_leaders_pending_commit_fails_retryable() {
     }
     assert!(w.is_some());
     c.net.isolate(l, false);
-    // Retryable: the transaction layer reports a lost commit as 1213.
+    // The cut-off leader stepped down without a successor it knew of, so
+    // its commit failed with an unknown outcome (it can't tell whether a
+    // majority holds the entry); had it heard of the new leader first, the
+    // commit would have failed as retryable (1213): the new leader's entry
+    // replaced it.
     let Err(err) = ta.wait() else {
         panic!("the lost commit fails");
     };
     assert!(
-        is_deadlock(&err) || err.code() == Some(sprig_common::SprigCode::ShardMoved),
+        is_deadlock(&err)
+            || err.code() == Some(sprig_common::SprigCode::ShardMoved)
+            || err.code() == Some(sprig_common::SprigCode::CommitOutcomeUnknown),
         "{err}"
     );
     assert!(gate.wait().is_err(), "the reply that read it fails too");
@@ -373,6 +379,66 @@ fn a_deposed_leaders_pending_commit_fails_retryable() {
     for id in VOTERS {
         assert_eq!(c.get(id, &k).as_deref(), Some(&b"v1"[..]));
     }
+}
+
+/// A commit waiting on a leader that is cut off from the other replicas
+/// fails once the leader steps down (it no longer hears from a majority),
+/// with an unknown outcome, instead of waiting until the cut heals: a
+/// client on a long-lived connection gets an answer in about an election
+/// timeout and reconnects to the new leader. A write proposed after the
+/// step-down is refused at once (retryable).
+#[test]
+fn a_cut_off_leaders_pending_commit_fails_before_the_heal() {
+    let c = Cluster::new("cutoff");
+    let unit = Engine::unit_of_tenant(TENANT + 9);
+    c.replicas[&1].node.start_unit(unit, &VOTERS).unwrap();
+    let k = key(TENANT + 9, 1);
+    c.put(unit, &k, b"v0");
+    let l = c.leader(unit);
+    let e = c.replicas[&l].engine.clone();
+    c.net.isolate(l, true);
+    let mut a = e.begin(TxnOptions::default()).unwrap();
+    a.put(k.clone(), Bytes::from_static(b"cut")).unwrap();
+    let ta = a
+        .commit()
+        .expect("the isolated leader still takes the proposal");
+    let cut = Instant::now();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let waiter = std::thread::spawn(move || {
+        let r = ta.wait();
+        let _ = tx.send(r);
+    });
+    let got = rx.recv_timeout(Duration::from_secs(5));
+    let took = cut.elapsed();
+    // The client's next statement there (a read) fails at once too: the
+    // node can't hear a majority, so no leader can confirm what it holds.
+    let read_took = got.is_ok().then(|| {
+        let t0 = Instant::now();
+        let r = e
+            .begin(TxnOptions::default())
+            .and_then(|mut t| t.get_snapshot(&k));
+        assert!(r.is_err(), "a read on the cut-off node succeeded: {r:?}");
+        t0.elapsed()
+    });
+    c.net.isolate(l, false);
+    waiter.join().unwrap();
+    let r = got.expect("the cut-off leader's commit was still waiting after 5 s");
+    let Err(err) = r else {
+        panic!("a commit no majority acknowledged succeeded");
+    };
+    assert_eq!(
+        err.code(),
+        Some(sprig_common::SprigCode::CommitOutcomeUnknown),
+        "{err}"
+    );
+    assert!(took < Duration::from_secs(3), "answered after {took:?}");
+    assert!(
+        read_took.is_some_and(|t| t < Duration::from_secs(1)),
+        "the next read waited {read_took:?}"
+    );
+    // Once healed, the replicas agree, whatever became of the write.
+    c.put(unit, &key(TENANT + 9, 2), b"after");
+    c.converged(unit);
 }
 
 /// A lost replica is replaced by a new node: it gets the unit from a

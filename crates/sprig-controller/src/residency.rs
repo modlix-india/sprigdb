@@ -42,6 +42,7 @@ pub mod policy;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::{self, Write as _};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
@@ -560,7 +561,13 @@ pub struct Residency {
     clock: Arc<dyn Clock>,
     moves: Option<Arc<DcMoves>>,
     states: Mutex<HashMap<TenantId, &'static str>>,
-    cache: Mutex<Option<(Instant, Arc<Snapshot>)>>,
+    /// The last snapshot read, when, and [`Residency::seen`] as it was
+    /// before the read began.
+    cache: Mutex<Option<(Instant, u64, Arc<Snapshot>)>>,
+    /// Watch events the loop has been handed: a snapshot read before the
+    /// latest one may predate the change it reports (a DC's new tags, a
+    /// policy), so it isn't reused.
+    seen: AtomicU64,
 }
 
 impl std::fmt::Debug for Residency {
@@ -599,6 +606,7 @@ impl Residency {
             moves,
             states: Mutex::new(HashMap::new()),
             cache: Mutex::new(None),
+            seen: AtomicU64::new(0),
         }
     }
 
@@ -622,9 +630,12 @@ impl Residency {
     }
 
     async fn snapshot(&self, fresh: bool) -> Result<Arc<Snapshot>> {
+        let seen = self.seen.load(Ordering::Acquire);
         if !fresh
-            && let Some((at, s)) = &*self.cache.lock().unwrap_or_else(PoisonError::into_inner)
+            && let Some((at, epoch, s)) =
+                &*self.cache.lock().unwrap_or_else(PoisonError::into_inner)
             && at.elapsed() < Duration::from_secs(1)
+            && *epoch == seen
         {
             return Ok(Arc::clone(s));
         }
@@ -637,7 +648,7 @@ impl Residency {
             allowed,
         });
         *self.cache.lock().unwrap_or_else(PoisonError::into_inner) =
-            Some((Instant::now(), Arc::clone(&s)));
+            Some((Instant::now(), seen, Arc::clone(&s)));
         Ok(s)
     }
 
@@ -1180,6 +1191,9 @@ impl Reconciler for ResidencyLoop {
     }
 
     fn keys_for(&self, ev: &MetaEvent) -> Vec<TenantId> {
+        // The reconciles this event queues read the stores again: a
+        // snapshot taken before it may not hold the change.
+        self.0.seen.fetch_add(1, Ordering::AcqRel);
         let dir = crate::tree::Directory::new(Arc::clone(&self.0.global));
         if let Some(t) = dir.tenant_of(&ev.key) {
             return vec![t];

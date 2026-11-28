@@ -488,14 +488,30 @@ async fn the_check_sees_a_write_under_another_tenants_prefix() {
     let n = Node::open();
     let c = vec!["SET".to_owned(), "k".to_owned(), mark(b)];
     n.redis(b, 0, &c).await;
-    let before = keys_of(&n.settled().await, b);
+    // The reply comes once the SET is durable; its apply may trail.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let before = loop {
+        let k = keys_of(&n.settled().await, b);
+        if !k.is_empty() || std::time::Instant::now() >= deadline {
+            break k;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
     assert!(!before.is_empty());
     // Tenant a's transaction, with a key that carries tenant b's id.
     let mut key = b.to_be_bytes().to_vec();
     key.extend_from_slice(b"\0\0\0\0\0\0\0\x01\x01\0\0stray");
     let mut t = n.raw.begin(TxnOptions::default()).unwrap();
     t.put(key, Bytes::from(mark(a))).unwrap();
-    let _ = t.commit().unwrap();
+    // Read back once the write is in the store: an acknowledged commit's
+    // apply may trail it by more than `settled`'s quiet window when the
+    // machine is busy, and the read would then see the store before it.
+    let c = t.commit().unwrap();
+    c.wait().unwrap();
+    c.log_ticket()
+        .expect("the stray write has a log entry")
+        .wait_applied()
+        .unwrap();
     let after = keys_of(&n.settled().await, b);
     assert!(
         before != after,

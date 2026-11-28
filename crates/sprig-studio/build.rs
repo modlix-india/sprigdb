@@ -59,7 +59,18 @@ fn main() {
     let mut version = String::from("none");
     let mut entries = Vec::new();
     if let Some(dist) = dist {
-        println!("cargo:rerun-if-changed={}", dist.display());
+        // A path that doesn't exist counts as changed on every build (and
+        // so would rebuild everything that embeds the assets). Without a
+        // build, watch the directory it would appear in, so a later
+        // `pnpm build` is still picked up; in a tree without Studio at all,
+        // only this script.
+        if dist.is_dir() {
+            println!("cargo:rerun-if-changed={}", dist.display());
+        } else if let Some(parent) = dist.parent().filter(|p| p.is_dir()) {
+            println!("cargo:rerun-if-changed={}", parent.display());
+        } else {
+            println!("cargo:rerun-if-changed=build.rs");
+        }
         if dist.join("index.html").is_file() {
             let mut files = Vec::new();
             walk(&dist, &mut files);
