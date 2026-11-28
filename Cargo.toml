@@ -242,6 +242,14 @@ unwrap_used = "warn"
 lto = "thin"
 codegen-units = 1
 
+# gemm-f16 (via candle, for sprig-embed) has inline fp16 assembly helpers that
+# only assemble once inlined into fp16-enabled callers. At opt-level 0 they are
+# emitted on their own and fail on aarch64 Linux ("instruction requires:
+# fullfp16"). Optimising this one crate in debug and test builds keeps the
+# ARMv8.0 baseline; release builds and shipped binaries are unchanged (SE488).
+[profile.dev.package.gemm-f16]
+opt-level = 1
+
 # raft-proto 0.7.0 with its generated protobuf code checked in: the crates.io
 # release generates it at build time with protoc 3.x and has no bundled protoc
 # for macOS on Apple silicon. Apache-2.0; see crates/sprig-raft/vendor/raft-proto/NOTICE.

@@ -2903,7 +2903,9 @@ async fn fan_in_sink_end_to_end() {
             .any(|(_, v, _)| v.starts_with(&format!("fs-{}-0", ms[0])) && v.len() < 12)
     );
     ok(&mut sys, "DROP SINK r9fsink.audit").await;
-    // CHANGES OF two tables, through their change topics.
+    // CHANGES OF two tables. An engine table's sink reads the table's own
+    // change feed, so it needs no change topic (the MariaDB-era tables
+    // needed `stream.change_topic = on` first and were refused without it).
     ok(
         &mut sys,
         "CREATE TABLE r9fsink.orders (id INT PRIMARY KEY, st VARCHAR(16))",
@@ -2912,23 +2914,6 @@ async fn fan_in_sink_end_to_end() {
     ok(
         &mut sys,
         "CREATE TABLE r9fsink.items (id INT PRIMARY KEY, n INT)",
-    )
-    .await;
-    let (code, msg) = sql(
-        &mut sys,
-        "CREATE SINK r9fsink.ch FROM CHANGES OF orders, items TO WEBHOOK CONNECTION hook",
-    )
-    .await
-    .unwrap_err();
-    println!("CHANGES OF without change topics: {code} {msg}");
-    ok(
-        &mut sys,
-        "ALTER TABLE r9fsink.orders SPRIG SET (stream.change_topic = on)",
-    )
-    .await;
-    ok(
-        &mut sys,
-        "ALTER TABLE r9fsink.items SPRIG SET (stream.change_topic = on)",
     )
     .await;
     ok(

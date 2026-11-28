@@ -96,7 +96,7 @@ The tools are the assistants' tools, as the role and `ai.mcp.tools` allow:
 | Role | Read tools | Proposal tools (with `propose`) |
 |---|---|---|
 | `data` (default) | `search_docs`, `catalog`, `describe`, `explain`, `column_stats`, `run_query`, `approvals` | `propose_sql`, `propose_tile`, `propose_glossary` |
-| `dba` | `search_docs`, `catalog`, `describe`, `explain`, `column_stats`, `workload`, `fingerprint`, `indexes`, `auto_indexes`, `settings`, `shards`, `advisor_runs`, `approvals`, `test_policy`, `compile_logic`, `decision_log`, `check_ddl`, `migration_check` | `propose_sql`, `propose_recommendation`, `propose_tile`, `propose_glossary`, `generate_rows` |
+| `dba` | `search_docs`, `catalog`, `describe`, `explain`, `column_stats`, `workload`, `fingerprint`, `indexes`, `auto_indexes`, `settings`, `approvals`, `test_policy`, `compile_logic`, `decision_log`, `check_ddl`, `migration_check` | `propose_sql`, `propose_recommendation`, `propose_tile`, `propose_glossary`, `generate_rows` |
 
 The administration assistant's tools are never offered over MCP. See [what the assistants can read](assistants.md#what-the-assistants-can-read) for what each read tool does.
 

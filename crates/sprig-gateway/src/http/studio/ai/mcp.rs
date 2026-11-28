@@ -934,6 +934,8 @@ impl Backend for CoreBackend<'_> {
         let (Some(tenant), Some(user)) = (caller.principal.tenant, caller.principal.user_id) else {
             return Err(invalid("the MCP server needs a tenant login"));
         };
+        // The tenant's own settings, loaded (see `StudioState::load_tenant`).
+        self.core.studio.load_tenant(Some(tenant)).await?;
         let settings = McpSettings::read(&GatewayLookup {
             st: &self.core.studio,
             tenant: Some(tenant),

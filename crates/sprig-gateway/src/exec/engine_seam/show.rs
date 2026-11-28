@@ -1118,6 +1118,10 @@ impl PassSession {
             show_auto_indexes: show_auto_indexes(ts, self.persona),
         };
         let mysql = self.persona == sprig_proto_mysql::packets::Persona::MySql84;
+        // No MariaDB to leave a query to: the planner's own error stands.
+        if ts.principal.backend.cluster.as_str() == crate::tenant::locator::ENGINE_ONLY_CLUSTER {
+            return crate::engine::infoschema::answer_or_error(text, &src, mysql);
+        }
         crate::engine::infoschema::answer(text, &src, mysql).map(Ok)
     }
 }

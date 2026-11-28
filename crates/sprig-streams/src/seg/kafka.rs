@@ -339,6 +339,9 @@ impl EngineStreams {
             compact: r
                 .compact
                 .unwrap_or(self.defaults.cleanup == Cleanup::Compact),
+            delete_retention_ms: r
+                .delete_retention_ms
+                .unwrap_or(Policy::default().delete_retention_ms),
             ..Policy::default()
         }
     }
@@ -974,6 +977,7 @@ impl Topics for RoutedTopics {
             retention_bytes: t.configs.retention_bytes,
             compact: t.configs.cleanup.map(|c| c == Cleanup::Compact),
             max_message_bytes: t.configs.max_message_bytes,
+            delete_retention_ms: None,
             created_ms: super::now_ms(),
         };
         if validate_only {

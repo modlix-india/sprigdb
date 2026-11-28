@@ -479,6 +479,9 @@ async fn chat_route(
     } else {
         caller.principal.tenant
     };
+    // The tenant's own settings, never this gateway's defaults for a tenant
+    // whose catalog isn't loaded here (a replica that doesn't lead it).
+    core.studio.load_tenant(tenant).await?;
     let settings = TurnSettings::read(
         &GatewayLookup {
             st: &core.studio,

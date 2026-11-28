@@ -8,7 +8,6 @@
 //! | `explain` | dba, data | read | stats |
 //! | `indexes`, `auto_indexes` | dba | read | schema |
 //! | `settings` | dba, admin | read | schema |
-//! | `shards`, `advisor_runs` | dba | read | stats |
 //! | `approvals` | admin, dba, data | read | schema |
 //! | `column_stats` | dba, data | read | stats |
 //! | `run_query` | data | read | rows |
@@ -267,22 +266,6 @@ pub fn specs() -> Vec<ToolSpec> {
             Read,
             DBA_ADMIN,
             Shares::Schema,
-        ),
-        spec(
-            "shards",
-            "How the tenant's sharded tables are split and placed, with shard sizes.",
-            obj(&[("db", db())], &[]),
-            Read,
-            DBA,
-            Shares::Stats,
-        ),
-        spec(
-            "advisor_runs",
-            "Recent runs of the shard and index advisors, with their verdicts.",
-            obj(&[], &[]),
-            Read,
-            DBA,
-            Shares::Stats,
         ),
         spec(
             "approvals",

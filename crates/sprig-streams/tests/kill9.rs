@@ -91,6 +91,7 @@ fn kill9_child() {
                         retention_bytes: None,
                         compact: None,
                         max_message_bytes: None,
+                        delete_retention_ms: None,
                         created_ms: 0,
                     },
                 )

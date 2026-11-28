@@ -583,6 +583,49 @@ pub(crate) fn named_1020(e: SprigError, table: &str) -> SprigError {
 }
 
 /// The store context of one statement on `plan`'s table.
+/// MariaDB's name for the type of the value `e` gives, for the checks a
+/// `UUID`, `INET4` or `INET6` column makes of its assignments
+/// (`assign::check_source`); `None` when it is a string or unknown here.
+fn source_type(def: &TableDef, e: &CExpr) -> Option<String> {
+    match e {
+        CExpr::Col(j) => assign::type_name(def.columns.get(*j)?.ty),
+        CExpr::Lit(d) => Some(
+            match d {
+                Datum::Int(i) if i32::try_from(*i).is_ok() => "int",
+                Datum::Int(_) => "bigint",
+                Datum::UInt(u) if i32::try_from(*u).is_ok() => "int",
+                Datum::UInt(u) if i64::try_from(*u).is_ok() => "bigint",
+                Datum::UInt(_) => "bigint unsigned",
+                Datum::Decimal(_) => "decimal",
+                Datum::Double(_) | Datum::Float(_) => "double",
+                Datum::Date(_) => "date",
+                Datum::DateTime(_) => "datetime",
+                Datum::Time(_) => "time",
+                _ => return None,
+            }
+            .to_owned(),
+        ),
+        CExpr::Exec(x) => assign::expr_type_name(x.maria.1.ty()),
+        _ => None,
+    }
+}
+
+/// A `UUID`, `INET4` or `INET6` column read straight into a column of
+/// another type: its text (the row holds the stored bytes), which the
+/// target converts as MariaDB converts the value (an `INET4` into an
+/// `INET6` as its mapped address, into a string as written).
+fn typed_read(def: &TableDef, e: &CExpr, target: &Column, v: Datum) -> Datum {
+    if let CExpr::Col(j) = e
+        && let Some(ColType::Fbt(f)) = def.columns.get(*j).map(|c| c.ty)
+        && !matches!(target.ty, ColType::Fbt(g) if g == f)
+        && let Datum::Bytes(b) = &v
+        && let Some(t) = f.text(b)
+    {
+        return Datum::Str(Bytes::from(t));
+    }
+    v
+}
+
 fn store_cx<'a>(plan: &'a Plan, env: Env, conds: &'a mut Vec<Condition>) -> Store<'a> {
     Store {
         env,
@@ -834,6 +877,13 @@ impl Engine {
                 .await?;
                 let (mut changed, n) = (0u64, matched.len());
                 let mut conds = Vec::new();
+                {
+                    let mut cx = store_cx(plan, a.env, &mut conds);
+                    for (ci, e) in sets {
+                        let c = &def.columns[*ci];
+                        assign::check_source(&mut cx, c, source_type(def, e).as_deref())?;
+                    }
+                }
                 let mut pace = Pace::default();
                 for (ri, (key, old)) in matched.into_iter().enumerate() {
                     pace.add(1).await;
@@ -847,7 +897,7 @@ impl Engine {
                             generated_given(plan, &def.columns[*ci], a, cx.conds)?;
                             continue;
                         }
-                        let v = expr::eval(e, &new, a)?;
+                        let v = typed_read(def, e, &def.columns[*ci], expr::eval(e, &new, a)?);
                         new[*ci] = assign::store(&mut cx, &def.columns[*ci], v)?;
                     }
                     // Generated columns follow the columns they read.
@@ -983,6 +1033,17 @@ impl Engine {
                 });
             }
         }
+        {
+            let mut cx = store_cx(plan, env, &mut conds);
+            for exprs in rows {
+                for (pos, e) in exprs.iter().enumerate() {
+                    if let Some(e) = e {
+                        let c = &def.columns[cols[pos]];
+                        assign::check_source(&mut cx, c, source_type(def, e).as_deref())?;
+                    }
+                }
+            }
+        }
         let mut pace = Pace::default();
         for (ri, exprs) in rows.iter().enumerate() {
             pace.add(1).await;
@@ -993,7 +1054,10 @@ impl Engine {
             let mut vals: Vec<Option<Datum>> = vec![None; def.columns.len()];
             for (pos, e) in exprs.iter().enumerate() {
                 if let Some(e) = e {
-                    vals[cols[pos]] = Some(expr::eval(e, &[], a)?);
+                    vals[cols[pos]] = Some(
+                        expr::eval(e, &[], a)
+                            .map_err(|err| expr::qualify_function(err, &plan.db_name))?,
+                    );
                 }
             }
             let mut row = Vec::with_capacity(def.columns.len());

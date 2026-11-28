@@ -193,6 +193,8 @@ pub async fn ask(caller: Caller, req: &AskRequest, current: Option<&str>) -> Res
             "this gateway can't run assistants (its HTTP side didn't start)",
         )
     })?;
+    // The tenant's own settings, loaded (see `StudioState::load_tenant`).
+    core.studio.load_tenant(caller.principal.tenant).await?;
     ask_with(&GatewayEnv { core, caller }, req, current).await
 }
 

@@ -1925,8 +1925,11 @@ impl PassSession {
                     &cat.setting_ctx(&svc.dc),
                     Some(&cat.settings),
                 ) == "on";
+                // The message is the publisher's data, stored in the
+                // target's home data center: the publisher's residency
+                // decides (as for broadcasts and stream publishes).
                 if strict {
-                    inherited::check_residency(&svc, tid, me, SprigCode::InheritResidency).await?;
+                    inherited::check_residency(&svc, me, tid, SprigCode::InheritResidency).await?;
                 }
                 if crate::amqp::queues::messages_on_engine(tid.0) {
                     // Inside a transaction, on the engine: the member's

@@ -401,6 +401,39 @@ impl Convert<'_> {
         Ok(out)
     }
 
+    /// The checks MariaDB makes of a changed column's types before any
+    /// row (a table with no rows is refused too): a `UUID`, `INET4` or
+    /// `INET6` column becoming a number, a date or time, `BIT` or another
+    /// of these types it can't take, or such a column made from one, is
+    /// 4078 (a warning outside strict mode, and the rows are converted
+    /// from their text).
+    fn types_check(&mut self) -> Result<()> {
+        for (j, s) in self.plan.src.iter().enumerate() {
+            let Src::Converted(i) = *s else {
+                continue;
+            };
+            let (c0, c1) = (&self.d0.columns[i], &self.d1.columns[j]);
+            let from = assign::type_name(c0.ty);
+            let mut cx = Store {
+                env: self.sess.env,
+                db: self.sess.db.as_bytes(),
+                table: &self.d1.name,
+                row: 1,
+                conds: &mut self.conds,
+            };
+            match (c0.ty, c1.ty) {
+                (_, ColType::Fbt(_)) => assign::check_source(&mut cx, c1, from.as_deref())?,
+                (ColType::Fbt(f), to) => {
+                    if let Some(to) = assign::type_name(to) {
+                        assign::refuse_cast(&mut cx, c1, f.name(), &to)?;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
     /// One value of column `c0` as column `c1` stores it.
     fn value(&mut self, c0: &Column, c1: &Column, v: &Datum, n: u64) -> Result<Datum> {
         let mysql = self.sess.env.mysql;
@@ -426,10 +459,18 @@ impl Convert<'_> {
             mysql,
         };
         let text = meta::text_in(c0, v, &self.sess.env, utf8).unwrap_or_default();
-        let input = if direct(c0.ty, c1.ty) {
-            v.clone()
-        } else {
-            Datum::Str(text.clone())
+        let input = match (c0.ty, Family::of(c1.ty), v) {
+            // A UUID or address into a byte string: its bytes as written.
+            (ColType::Fbt(f), Family::Binary, Datum::Bytes(b)) => {
+                Datum::Bytes(Bytes::from(f.written(b)))
+            }
+            // A byte string into one of them: its bytes, as an INSERT
+            // gives them (the type's length, else 1292).
+            (from, Family::Fixed, Datum::Bytes(_)) if Family::of(from) == Family::Binary => {
+                v.clone()
+            }
+            _ if direct(c0.ty, c1.ty) => v.clone(),
+            _ => Datum::Str(text.clone()),
         };
         let mut cx = Store {
             env: self.sess.env,
@@ -1067,6 +1108,11 @@ impl Engine {
                 now,
                 unchanged,
             };
+            // MariaDB checks the changed columns' types before any row.
+            if let Err(e) = cv.types_check() {
+                self.collect(tenant, object, &mut reserve).await?;
+                return Err(e);
+            }
             // An online build adds its index without entries: writes keep
             // it from the publish on, and the backfill writes the rest.
             let auto = ONLINE_BUILD.try_with(|()| ()).is_ok();

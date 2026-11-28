@@ -19,7 +19,6 @@
 //! | `/v1/library`, `/v1/library/saved[:delete]`, `/v1/library/history[:clear]`, `/v1/library/prefs` | The caller's saved queries, history and preferences ([`library`]) |
 //! | `/v1/dashboards...` | Dashboards and their tiles, run as the viewer ([`dashboards`]) |
 //! | `GET /v1/activity/schema`, `GET /v1/activity/grants` | Recent schema changes the caller can see; recent grants for user administrators ([`activity`]) |
-//! | `GET /v1/shards`, `/v1/shards/advisor[/{run}]` | The shards view: table groups, keys, maps, advisor runs ([`shards`]) |
 //! | `/v1/ai/...` | The AI assistants: chat (NDJSON), conversations, feedback, glossary ([`ai`]) |
 //! | `GET /v1/openapi.json` | The data API's document with these routes added |
 //!
@@ -57,7 +56,6 @@ pub mod policies;
 // The approvals inbox.
 pub mod recommendations;
 pub mod session;
-pub mod shards;
 pub mod workload;
 
 use std::sync::Arc;
@@ -416,10 +414,32 @@ impl StudioState {
         v
     }
 
+    /// Loads `tenant`'s catalog into this gateway's cache at the directory's
+    /// latest versions (waiting for a load when this gateway is behind), so
+    /// [`Self::tenant_get`] reads the tenant's own settings rather than
+    /// falling back to this gateway's scopes. Paths whose answer depends on
+    /// a tenant-scoped setting (the AI assistants' `ai.enabled`,
+    /// `ai.share_data`, budgets) call it first: a gateway that doesn't lead
+    /// the tenant's unit may not have loaded it, or may hold a snapshot from
+    /// before the last setting change. Nothing to do without a tenant.
+    ///
+    /// # Errors
+    /// The cache's: 39070 when the catalog can't be loaded and nothing
+    /// fresh is cached, 39072 for an unknown tenant.
+    pub async fn load_tenant(
+        &self,
+        tenant: Option<sprig_common::ids::TenantId>,
+    ) -> Result<(), SprigError> {
+        if let (Some(svc), Some(tid)) = (&self.tenants, tenant) {
+            svc.cache.get(tid, sprig_catalog::Freshness::Latest).await?;
+        }
+        Ok(())
+    }
+
     /// A `studio.*` value for `tenant` (and its database `db`), from the
     /// tenant's catalog settings and its ancestors', then dc and global. Falls
     /// back to this gateway's scopes when the tenant isn't in this gateway's
-    /// cache.
+    /// cache (see [`Self::load_tenant`]).
     pub fn tenant_get<T: sprig_settings::SettingValue>(
         &self,
         setting: &'static Setting<T>,
@@ -917,15 +937,6 @@ pub async fn handle(
                 return Err(req);
             };
             return Ok(crate::http::retrieval::search(core, info, req, &db, &index).await);
-        }
-        ("GET", p) if p == "/v1/shards" || p.starts_with("/v1/shards/") => {
-            match core
-                .caller(info, hdr(&req, "authorization"), None, hdr(&req, "host"))
-                .await
-            {
-                Err(e) => Err(e),
-                Ok(caller) => shards::route(core, &caller, p).await,
-            }
         }
         ("POST", p)
             if p.starts_with("/v1/cursors/")

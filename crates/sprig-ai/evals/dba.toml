@@ -418,50 +418,22 @@ must = ["ap_288", "maria", "replaced"]
 rubric = "Finds the decided item and reports who dismissed it, when, and the note."
 
 [[case]]
-id = "dba-19"
-tags = ["shards", "hot-shard", "recommendation"]
-message = "One of our shards seems much busier than the others. Should we do something?"
-context = "Database: shop"
-world = [
-  { tool = "shards", json = { tables = [{ table = "orders", key = "merchant_id", shards = [
-    { id = 11, bytes = "38 GB", writes_per_s = 140, split_threshold = "64 GB" },
-    { id = 12, bytes = "58 GB", writes_per_s = 2300, split_threshold = "64 GB", top_key = "one merchant_id holds 61% of the shard's writes" },
-    { id = 13, bytes = "35 GB", writes_per_s = 120, split_threshold = "64 GB" },
-  ] }] } },
-  { tool = "advisor_runs", json = { runs = [{ at = "2026-11-14T02:00Z", table = "orders", verdict = "split shard 12; one key dominates, so also consider a compound key (merchant_id, id)", confidence = "medium" }] } },
-]
-calls = [
-  { tool = "shards", args = { db = "shop" } },
-  { tool = "advisor_runs", args = {}, round = 1 },
-  { tool = "propose_recommendation", args = { kind = "shard_split", subject = "shop.orders shard 12", body = "Shard 12 is at 58 of 64 GB and takes 2300 writes/s, most from one merchant. Split it; a split alone won't spread one key, so review a compound distribution key." }, has = { body = ["shard 12"] } },
-]
-answer = """
-Shard 12 of `orders` is hot: 2300 writes/s against ~130 on its neighbours, and 58 of its 64 GB split threshold. One merchant_id accounts for 61% of its writes.
-I filed a recommendation to split shard 12; it has not run. Note a split alone can't spread a single key — the advisor (medium confidence) also suggests a compound key (merchant_id, id) for that.
-"""
-must = ["shard 12", "split", "merchant_id"]
-must_any = [["hasn't run", "has not run", "not run"]]
-rubric = "Identifies the hot shard and the dominating key, uses the advisor's verdict, files a split recommendation, explains that a split can't spread one key, says it hasn't run."
-
-[[case]]
 id = "dba-20"
-tags = ["shards", "advisor", "docs"]
+tags = ["sharding", "docs"]
 message = "The sharding advisor says to put order_items in the same table group as orders. What does that mean and why?"
 world = [
-  { tool = "advisor_runs", json = { runs = [{ at = "2026-11-13T02:00Z", table = "order_items", verdict = "join order_items to the orders table group on order_id: 94% of its statements join orders on order_id", confidence = "high" }] } },
   { tool = "search_docs", json = { hits = [{ page = "concepts/shards-and-table-groups", heading = "Table groups and distribution keys", text = "Tables in one table group share a distribution key, so rows with the same key live on the same shard and joins on that key run on one shard." }] }, sources = [{ kind = "docs", title = "Table groups and distribution keys", reference = "concepts/shards-and-table-groups#table-groups-and-distribution-keys" }] },
 ]
 calls = [
-  { tool = "advisor_runs", args = {} },
-  { tool = "search_docs", args = { query = "table group distribution key", audience = "dba" }, has = { query = ["table group"] }, round = 1 },
+  { tool = "search_docs", args = { query = "table group distribution key", audience = "dba" }, has = { query = ["table group"] } },
 ]
 answer = """
-A table group is a set of tables sharded by the same key, so rows with the same key live on the same shard. The advisor saw that 94% of order_items' statements join orders on `order_id` (high confidence); in one group, those joins run on a single shard instead of crossing shards.
+A table group is a set of tables sharded by the same key, so rows with the same key live on the same shard. In one group, joins of order_items to orders on `order_id` run on a single shard instead of crossing shards.
 See: Table groups and distribution keys (concepts/shards-and-table-groups#table-groups-and-distribution-keys).
 """
 must = ["order_id", "same shard"]
 cite = true
-rubric = "Explains table groups (shared distribution key, co-located rows, single-shard joins), ties it to the advisor's 94% join evidence, cites the docs."
+rubric = "Explains table groups (shared distribution key, co-located rows, single-shard joins) from the docs, ties it to joins on order_id, and cites the docs."
 
 [[case]]
 id = "dba-21"
@@ -1256,21 +1228,17 @@ id = "dba-57"
 tags = ["recommendation", "approvals", "sharding"]
 message = "We think orders should be sharded by merchant instead of customer, but the payments team has to agree. Put it somewhere we can decide later."
 context = "Database: shop"
-world = [
-  { tool = "shards", json = { groups = [{ id = 3, key = "customer_id", tables = ["customers", "orders", "order_items"], shards = 8 }] } },
-]
 calls = [
-  { tool = "shards", args = { db = "shop" } },
-  { tool = "propose_recommendation", args = { kind = "ai_dba_advice", subject = "shop: re-key orders by merchant", body = "orders is in group 3 keyed by customer_id with customers and order_items (8 shards). Re-keying by merchant_id would move orders out of the customer group: customer joins and transactions would then span shards. Decide with the payments team; a re-key runs online with sprigctl shard rekey." }, has = { body = ["merchant"] } },
+  { tool = "propose_recommendation", args = { kind = "ai_dba_advice", subject = "shop: re-key orders by merchant", body = "Consider keying orders by merchant_id instead of customer_id: merchant reports would stay together, customer joins could cross shards. Decide with the payments team." }, has = { body = ["merchant"] } },
 ]
 answer = """
-`orders` is in group 3, keyed by `customer_id`, with `customers` and `order_items` (8 shards). Keying it by merchant would split it from customers, so customer joins and transactions would span shards.
+Keying `orders` by merchant instead of customer keeps a merchant's orders together, but joins and transactions with `customers` could then cross shards.
 
 I proposed a recommendation for the approvals inbox, so the payments team can decide. When you accept it, it's filed as advice; it changes nothing by itself and has not run.
 """
-must = ["customer_id", "approvals"]
+must = ["merchant", "approvals"]
 must_any = [["hasn't run", "has not run", "not run", "changes nothing"]]
-rubric = "Reads the current group with shards, explains the trade-off of re-keying by merchant, files a propose_recommendation (advice for the approvals inbox) instead of a statement, and says it changes nothing by itself."
+rubric = "Explains the trade-off of re-keying by merchant, files a propose_recommendation (advice for the approvals inbox) instead of a statement, and says it changes nothing by itself."
 
 [[case]]
 id = "dba-58"

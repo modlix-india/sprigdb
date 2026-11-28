@@ -395,6 +395,7 @@ async fn create_topic(c: &Cluster, name: &str) -> bool {
         retention_bytes: None,
         compact: None,
         max_message_bytes: None,
+        delete_retention_ms: None,
         created_ms: 1,
     };
     matches!(

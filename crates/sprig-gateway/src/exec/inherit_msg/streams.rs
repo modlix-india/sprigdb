@@ -713,6 +713,7 @@ pub(super) const STREAM_OVERRIDABLE: &[&str] = &[
     "stream.retention_hours",
     "stream.retention_bytes",
     "stream.max_message_bytes",
+    "stream.tombstone_hours",
 ];
 
 /// Member `member`'s instance of stream definition `def` with the
@@ -760,6 +761,11 @@ pub(crate) async fn apply_settings(
     r.max_message_bytes = eff("stream.max_message_bytes")
         .and_then(|n| i32::try_from(n).ok())
         .or(tmpl.max_message_bytes);
+    // Compaction: how long the member's compacted instance keeps a
+    // tombstone (the cleanup policy itself is the definition's).
+    r.delete_retention_ms = eff("stream.tombstone_hours")
+        .map(|h| h.saturating_mul(3_600_000))
+        .or(tmpl.delete_retention_ms);
     if r == have {
         return Ok(false);
     }

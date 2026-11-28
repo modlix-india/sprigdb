@@ -293,17 +293,7 @@ fn fixed(cx: &mut Store<'_>, c: &Column, f: sprig_engine::row::Fbt, d: &Datum) -
                 Datum::Time(_) => "time",
                 _ => "datetime",
             };
-            return Err(SprigError::standard(
-                4078,
-                *b"HY000",
-                format!(
-                    "Cannot cast '{from}' as '{}' in assignment of `{}`.`{}`.`{}`",
-                    f.name(),
-                    String::from_utf8_lossy(cx.db),
-                    cx.table,
-                    c.name
-                ),
-            ));
+            return Err(cast_error(cx, c, f, from));
         }
     };
     if let Some(b) = stored {
@@ -324,6 +314,139 @@ fn fixed(cx: &mut Store<'_>, c: &Column, f: sprig_engine::row::Fbt, d: &Datum) -
         Datum::Null
     } else {
         Datum::Bytes(Bytes::from(vec![0u8; f.bytes()]))
+    })
+}
+
+/// 4078 `Cannot cast 'from' as 'uuid' in assignment of ...`.
+fn cast_error(cx: &Store<'_>, c: &Column, f: sprig_engine::row::Fbt, from: &str) -> SprigError {
+    SprigError::standard(
+        4078,
+        *b"HY000",
+        format!(
+            "Cannot cast '{from}' as '{}' in assignment of `{}`.`{}`.`{}`",
+            f.name(),
+            String::from_utf8_lossy(cx.db),
+            cx.table,
+            c.name
+        ),
+    )
+}
+
+/// Whether a value of type `from` (MariaDB's name for it) may be assigned
+/// to a `UUID`, `INET4` or `INET6` column of type `f`: the same type, or
+/// one address type into the other (an `INET4` as its mapped address; an
+/// `INET6` converted by value, 1292 when it is no IPv4 address). A `UUID`
+/// and an address, a number, a date or a time may not.
+fn fbt_takes(f: sprig_engine::row::Fbt, from: &str) -> bool {
+    use sprig_engine::row::Fbt;
+    let address = |n: &str| n == Fbt::Inet4.name() || n == Fbt::Inet6.name();
+    from == f.name() || (address(f.name()) && address(from))
+}
+
+/// MariaDB checks a `UUID`, `INET4` or `INET6` column's assignments by
+/// their types before any row (an `UPDATE` matching no row is refused
+/// too): 4078 for a value of type `from` (MariaDB's name for it, `None`
+/// for a string or a type the check doesn't know) that the column's type
+/// can't take, the statement's error in strict mode and a warning
+/// otherwise. Other columns take any type.
+///
+/// # Errors
+/// 4078 in strict mode.
+pub(crate) fn check_source(cx: &mut Store<'_>, c: &Column, from: Option<&str>) -> Result<()> {
+    let (ColType::Fbt(f), Some(from)) = (c.ty, from) else {
+        return Ok(());
+    };
+    if fbt_takes(f, from) {
+        return Ok(());
+    }
+    let e = cast_error(cx, c, f, from);
+    cx.warn(4078, *b"HY000", e.message)
+}
+
+/// 4078 `Cannot cast 'from' as 'to' in assignment of ...` for column `c`
+/// (a `UUID`, `INET4` or `INET6` value into a column of type `to`): the
+/// statement's error in strict mode, else a warning.
+///
+/// # Errors
+/// 4078 in strict mode.
+pub(crate) fn refuse_cast(cx: &mut Store<'_>, c: &Column, from: &str, to: &str) -> Result<()> {
+    let m = format!(
+        "Cannot cast '{from}' as '{to}' in assignment of `{}`.`{}`.`{}`",
+        String::from_utf8_lossy(cx.db),
+        cx.table,
+        c.name
+    );
+    cx.warn(4078, *b"HY000", m)
+}
+
+/// MariaDB's name for the type of column type `ty` in 4078, for the types
+/// [`check_source`] refuses or lets through by name; `None` for strings,
+/// binaries, `ENUM`, `SET` and `JSON` (they convert as text).
+pub(crate) fn type_name(ty: ColType) -> Option<String> {
+    Some(match ty {
+        ColType::Int { bytes, unsigned } => {
+            let base = match bytes {
+                1 => "tinyint",
+                2 => "smallint",
+                3 => "mediumint",
+                4 => "int",
+                _ => "bigint",
+            };
+            if unsigned {
+                format!("{base} unsigned")
+            } else {
+                base.to_owned()
+            }
+        }
+        ColType::Decimal { .. } => "decimal".into(),
+        ColType::Float => "float".into(),
+        ColType::Double => "double".into(),
+        ColType::Date => "date".into(),
+        ColType::DateTime { .. } => "datetime".into(),
+        ColType::Timestamp { .. } => "timestamp".into(),
+        ColType::Time { .. } => "time".into(),
+        ColType::Year => "year".into(),
+        ColType::Bit { .. } => "bit".into(),
+        ColType::Fbt(f) => f.name().into(),
+        _ => return None,
+    })
+}
+
+/// MariaDB's name in 4078 for a value the expression engine typed `t`;
+/// `None` for strings, binaries and `NULL`.
+pub(crate) fn expr_type_name(t: &sprig_exec::ExprType) -> Option<String> {
+    use sprig_exec::Kind;
+    if let Some(f) = t.fbt {
+        return Some(f.name().into());
+    }
+    let int = |base: &str| {
+        if t.unsigned {
+            format!("{base} unsigned")
+        } else {
+            base.to_owned()
+        }
+    };
+    Some(match t.kind {
+        Kind::Int => match t.width {
+            1 => int("tinyint"),
+            2 => int("smallint"),
+            3 => int("mediumint"),
+            4 => int("int"),
+            8 => int("bigint"),
+            // A computed integer: as wide as its digits.
+            _ if t.len > 11 || t.unsigned => int("bigint"),
+            _ => "int".into(),
+        },
+        Kind::Decimal => "decimal".into(),
+        Kind::Double => "double".into(),
+        Kind::Float => "float".into(),
+        Kind::Date => "date".into(),
+        Kind::DateTime => "datetime".into(),
+        Kind::Timestamp => "timestamp".into(),
+        Kind::Time => "time".into(),
+        Kind::Year => "year".into(),
+        Kind::Bit => "bit".into(),
+        Kind::Str | Kind::Null => return None,
     })
 }
 

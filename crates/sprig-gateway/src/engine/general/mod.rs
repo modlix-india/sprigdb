@@ -251,9 +251,10 @@ fn names_table(stmt: &Statement) -> bool {
     let _ = sqlparser::ast::Visit::visit(stmt, &mut ctes);
     let mut found = false;
     let _ = sqlparser::ast::visit_relations(stmt, |n: &sqlparser::ast::ObjectName| {
+        // A common table expression, or `DUAL` (no table at all).
         let cte = match n.0.as_slice() {
             [sqlparser::ast::ObjectNamePart::Identifier(i)] => {
-                ctes.0.contains(&i.value.to_lowercase())
+                ctes.0.contains(&i.value.to_lowercase()) || crate::engine::plan::is_dual(i)
             }
             _ => false,
         };

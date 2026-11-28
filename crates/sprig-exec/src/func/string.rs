@@ -842,7 +842,11 @@ pub(crate) fn strcmp(a: Node, b: Node, env: Env<'_>) -> Result<Node> {
 /// `COLLATION(x)`, `CHARSET(x)` and `COERCIBILITY(x)`: what the type
 /// derivation decided, for the argument as it stands.
 pub(crate) fn describe(name: &str, a: Node, env: Env<'_>) -> Node {
-    let dtc = if a.ty.kind == Kind::Str || a.ty.kind == Kind::Null {
+    let dtc = if a.ty.fbt.is_some() {
+        // MariaDB's `UUID`, `INET4` and `INET6` describe themselves as
+        // `latin1_swedish_ci`, held as loosely as numbers are.
+        Dtc::new(Collation::Latin1SwedishCi, Derivation::Numeric)
+    } else if a.ty.kind == Kind::Str || a.ty.kind == Kind::Null {
         Dtc::of(&a.ty, env.conn())
     } else {
         // A number is held as loosely as numbers are, except where a

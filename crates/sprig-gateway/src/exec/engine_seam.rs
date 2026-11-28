@@ -541,10 +541,33 @@ impl PassSession {
             current,
             backslash: !self.lex_opts().0.no_backslash_escapes,
         };
-        match plan::bind_insert_rows(&bcx, &ins, &rows.rows, rows.columns.len())? {
-            Some(p) => Ok((Box::new(p), rows.no_index)),
-            None => Err(not_on_engine("INSERT ... SELECT")),
+        let Some(p) = plan::bind_insert_rows(&bcx, &ins, &rows.rows, rows.columns.len())? else {
+            return Err(not_on_engine("INSERT ... SELECT"));
+        };
+        // A `UUID`, `INET4` or `INET6` column checks the query's column
+        // types first (4078): a strict session's statement fails before
+        // any row. (Outside strict mode the rows' own conversions warn.)
+        if let crate::engine::plan::Op::Insert { cols, .. } = &p.op {
+            let mut env = sv.env;
+            if ins.ignore {
+                env.strict = false;
+            }
+            let mut conds = Vec::new();
+            let mut st = crate::engine::assign::Store {
+                env,
+                db: &p.db_name,
+                table: &p.table.name,
+                row: 1,
+                conds: &mut conds,
+            };
+            for (pos, c) in rows.columns.iter().enumerate() {
+                if let Some(col) = cols.get(pos).and_then(|ci| p.table.columns.get(*ci)) {
+                    let from = crate::engine::assign::expr_type_name(&c.ty);
+                    crate::engine::assign::check_source(&mut st, col, from.as_deref())?;
+                }
+            }
         }
+        Ok((Box::new(p), rows.no_index))
     }
 
     /// The temporary tables' generation prepared statement `stmt` was

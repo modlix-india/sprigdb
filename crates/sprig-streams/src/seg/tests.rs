@@ -432,10 +432,16 @@ async fn offsets_and_groups_are_engine_records() {
         retention_bytes: None,
         compact: Some(true),
         max_message_bytes: None,
+        delete_retention_ms: Some(5 * 3_600_000),
         created_ms: 1,
     };
     let made = r.create(5, t.clone()).await.unwrap().unwrap();
     assert_eq!(made.stream_id, 1);
+    // A compacted stream's tombstone time is kept with it.
+    assert_eq!(
+        r.topics(5).unwrap()[0].delete_retention_ms,
+        Some(5 * 3_600_000)
+    );
     assert!(r.create(5, t.clone()).await.unwrap().is_none());
     let mut t2 = t.clone();
     t2.name = "db.t".into();

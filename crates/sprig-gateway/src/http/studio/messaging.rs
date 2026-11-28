@@ -263,13 +263,21 @@ async fn groups(
     })?;
     // The stream as its record names it: the catalog's spelling of the
     // database, and the stream's own (the URL's may differ in case).
-    let topic = match eng.topic(tid.0, &format!("{db_name}.{name}"))? {
-        Some(t) => Some(t),
-        None => eng.topics(tid.0)?.into_iter().find(|t| {
-            t.name
-                .split_once('.')
-                .is_some_and(|(d, s)| d == db_name && s.eq_ignore_ascii_case(name))
-        }),
+    let topic = if let Some(t) = eng.topic(tid.0, &format!("{db_name}.{name}"))? {
+        Some(t)
+    } else {
+        let all = eng.topics(tid.0)?;
+        let names: Vec<&str> = all.iter().map(|t| t.name.as_str()).collect();
+        let i = stream_without_case(&names, &db_name, name).map_err(|found| {
+            SprigError::new(
+                SprigCode::StreamNotFound,
+                format!(
+                    "'{db}.{name}' could be any of {}: name the stream exactly",
+                    found.join(", ")
+                ),
+            )
+        })?;
+        i.map(|i| all[i].clone())
     };
     let Some(topic) = topic else {
         return Err(SprigError::new(
@@ -337,6 +345,27 @@ async fn groups(
             "groups": groups.into_values().collect::<Vec<_>>(),
         }),
     ))
+}
+
+/// The stream of `db` whose name is `name` without case, among stream
+/// records named `<database>.<stream>`: its index, `None` when there is
+/// none, or every match when more than one differs only in case (the
+/// caller asks for the exact name then).
+fn stream_without_case(names: &[&str], db: &str, name: &str) -> Result<Option<usize>, Vec<String>> {
+    let hits: Vec<usize> = names
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| {
+            n.split_once('.')
+                .is_some_and(|(d, s)| d == db && s.eq_ignore_ascii_case(name))
+        })
+        .map(|(i, _)| i)
+        .collect();
+    match hits.as_slice() {
+        [] => Ok(None),
+        [i] => Ok(Some(*i)),
+        _ => Err(hits.iter().map(|&i| names[i].to_owned()).collect()),
+    }
 }
 
 /// `ms` since the epoch as UTC `YYYY-MM-DD HH:MM:SS` (what the view showed
@@ -670,6 +699,26 @@ mod tests {
         assert!(!is_messaging_path("/v1/databases/shop/sql:query"));
         assert_eq!(decode("a%20b%2Fc"), "a b/c");
         assert_eq!(decode("%zz%"), "%zz%");
+    }
+
+    #[test]
+    fn streams_are_found_without_case_unless_ambiguous() {
+        let names = [
+            "shop.Orders",
+            "shop.events",
+            "Shop.audit",
+            "shop.Audit",
+            "shop.AUDIT",
+        ];
+        assert_eq!(stream_without_case(&names, "shop", "orders"), Ok(Some(0)));
+        assert_eq!(stream_without_case(&names, "shop", "EVENTS"), Ok(Some(1)));
+        // Another database's stream doesn't count.
+        assert_eq!(stream_without_case(&names, "shop", "nothing"), Ok(None));
+        // Two of shop's streams differ only in case: refused, both named.
+        assert_eq!(
+            stream_without_case(&names, "shop", "audit"),
+            Err(vec!["shop.Audit".to_owned(), "shop.AUDIT".to_owned()])
+        );
     }
 
     #[test]

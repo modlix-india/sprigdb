@@ -9,7 +9,7 @@ source: the metric macros in the source tree, and docs/metrics-help.toml
 
 Every metric SprigDB records, as exported on each process's telemetry port (`/metrics`, Prometheus text) and through OTLP. Counters end in `_total`; durations are histograms in seconds.
 
-493 metrics in 56 groups.
+498 metrics in 56 groups.
 
 ## `sprig_advisor_*`
 
@@ -529,10 +529,15 @@ Every metric SprigDB records, as exported on each process's telemetry port (`/me
 | `sprig_node_forwarded_connections_total` | counter | `protocol`, `result` | sprig-gateway | Client connections this node handed to the node leading their tenant's unit at the login message (`NodeForward.Splice` on the peer listener); `protocol` is the listener's protocol, `result` is `ok`, `unreachable`, `refused` or `redirect_loop`. Unit: count. |
 | `sprig_node_leader_transfers_total` | counter | `reason` | sprig-gateway | Unit leaderships this node handed to another voter because it is draining, stopping or its clock is out of bounds; `reason` is `drain` or `clock`. Unit: count. |
 | `sprig_node_leaders` | gauge | - | sprig-gateway | Engine units this node leads. Unit: units. |
+| `sprig_node_locator_corrections_total` | counter | `reason` | sprig-gateway | Forwarded connections this node sent on to another node than the one it tried first: `reason` is `not_leader` when the node tried named the unit's leader (a redirect followed) and `no_leader` when it held a copy of the tenant's unit but knew no leader (cut off, or an election running), so another voter was tried. Unit: count. |
 | `sprig_node_replication_lag_entries` | gauge | - | sprig-gateway | The largest gap, over the units this node leads, between the commit index and a voter's matched index. Unit: entries. |
 | `sprig_node_rereplication_seconds` | histogram | - | sprig-gateway | How long one re-replication took on the unit's leader: the new copy added as a learner, sent a snapshot and the log, and made a voter in place of the lost one. Unit: seconds. |
 | `sprig_node_rereplications_total` | counter | `result` | sprig-gateway | Units whose copy on a dead or removed node this node (their leader) replaced on another node; `result` is `ok` or `failed` (retried). Unit: count. |
 | `sprig_node_sessions_moved_total` | counter | - | sprig-gateway | Sessions marked to close at their next safe point because another node now leads their tenant's unit (39502 ER_SPRIG_SESSION_MOVED; clients reconnect). Unit: count. |
+| `sprig_node_snapshot_bytes_received_total` | counter | - | sprig-gateway | Unit snapshot bytes this node received in chunks (a new or lagging copy of a unit it holds). Unit: bytes. |
+| `sprig_node_snapshot_bytes_sent_total` | counter | - | sprig-gateway | Unit snapshot bytes this node sent in chunks to new or lagging copies of the units it leads, paced by replication.snapshot_mb_per_second. Unit: bytes. |
+| `sprig_node_snapshot_restore_failures_total` | counter | - | sprig-gateway | Unit snapshots this node received but could not restore: each was refused (the copy keeps its log and its leader sends the snapshot again). Unit: count. |
+| `sprig_node_snapshots_built_total` | counter | - | sprig-gateway | Unit snapshots this node built into files off its Raft driver thread, for copies that needed one. Unit: count. |
 | `sprig_node_stale_replicas_dropped_total` | counter | - | sprig-gateway | Copies this node dropped because their unit's descriptor no longer lists it (its units were re-replicated while it was dead or removed). Unit: count. |
 | `sprig_node_state` | gauge | `state` | sprig-gateway | 1 for this node's registry state (`state`: active, draining, dead, removed). Unit: none. |
 | `sprig_node_units` | gauge | - | sprig-gateway | Engine units this node holds a copy of. Unit: units. |

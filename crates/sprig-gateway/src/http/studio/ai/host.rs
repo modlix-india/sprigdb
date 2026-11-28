@@ -10,9 +10,9 @@
 //!   which is rolled back; `run_query` is capped at its `limit` and at
 //!   `studio.statement_timeout_ms`. `sprig_ai`'s checks have already
 //!   refused anything that isn't one read.
-//! - **Routes** that Studio already serves (workload, shards, the
-//!   approvals inbox, logic compile, the policy tester, automatic indexes)
-//!   are called with the same caller, so their own checks apply.
+//! - **Routes** that Studio already serves (workload, the approvals inbox,
+//!   logic compile, the policy tester, automatic indexes) are called with
+//!   the same caller, so their own checks apply.
 //! - Results come back unreduced; the egress gate reduces them.
 
 use std::fmt::Write as _;
@@ -1016,15 +1016,6 @@ impl ToolHost for GatewayHost {
                 ))
             }
             "settings" => self.settings(input).await,
-            "shards" | "advisor_runs" => {
-                let path = if spec.name == "shards" {
-                    "/v1/shards"
-                } else {
-                    "/v1/shards/advisor"
-                };
-                let r = super::super::shards::route(&self.core, &self.caller, path).await?;
-                Ok(ToolOutput::json(reply_json(r).await?))
-            }
             "approvals" => {
                 let mut q = Vec::new();
                 match s(input, "state") {

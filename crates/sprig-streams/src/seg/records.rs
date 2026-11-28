@@ -61,6 +61,10 @@ pub struct TopicRecord {
     pub compact: Option<bool>,
     /// `max.message.bytes`, when set.
     pub max_message_bytes: Option<i32>,
+    /// `delete.retention.ms` (how long a compacted stream keeps a
+    /// tombstone), when set; records written before it existed have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delete_retention_ms: Option<i64>,
     /// Created (ms).
     pub created_ms: i64,
 }

@@ -980,6 +980,35 @@ fn exec_expr_in(
     exec_expr_with(def, e, value, value, None)
 }
 
+/// 1305 for a function only MariaDB has, named as the statement writes it
+/// (the expression engine names it in upper case), as MySQL's message
+/// does; other errors as they are.
+fn as_written(mut err: sprig_exec::SqlError, e: &sqlparser::ast::Expr) -> sprig_exec::SqlError {
+    let Some(name) = err
+        .message
+        .strip_prefix("FUNCTION ")
+        .and_then(|m| m.strip_suffix(" does not exist"))
+        .map(str::to_owned)
+    else {
+        return err;
+    };
+    let mut written = None;
+    let _ = sqlparser::ast::visit_expressions(e, |x| {
+        if let sqlparser::ast::Expr::Function(f) = x
+            && let [sqlparser::ast::ObjectNamePart::Identifier(i)] = f.name.0.as_slice()
+            && i.value.eq_ignore_ascii_case(&name)
+        {
+            written = Some(i.value.clone());
+            return std::ops::ControlFlow::Break(());
+        }
+        std::ops::ControlFlow::Continue(())
+    });
+    if let Some(w) = written {
+        err.message = format!("FUNCTION {w} does not exist");
+    }
+    err
+}
+
 fn exec_expr_with(
     def: &TableDef,
     e: &sqlparser::ast::Expr,
@@ -1010,7 +1039,7 @@ fn exec_expr_with(
             Err(err) if value && matches!(err.code, 1064 | 1305) && !out.is_empty() => {
                 let first = out[0].clone();
                 out.push(first);
-                mysql_refused = Some(err);
+                mysql_refused = Some(as_written(err, e));
                 continue;
             }
             Err(err) => return Err(err.message),
@@ -1031,7 +1060,7 @@ fn exec_expr_with(
             Err(err) if value && matches!(err.code, 1064 | 1305) && !out.is_empty() => {
                 let first = out[0].clone();
                 out.push(first);
-                mysql_refused = Some(err);
+                mysql_refused = Some(as_written(err, e));
                 continue;
             }
             Err(err) => return Err(err.message),

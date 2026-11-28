@@ -1700,6 +1700,61 @@ async fn mariadb_compares_json_values_with_strings_and_keeps_booleans() {
 }
 
 #[tokio::test]
+async fn uuid_and_address_assignments_check_their_types_as_mariadb_does() {
+    let (e, f, _d) = shop().await;
+    write(
+        &e,
+        &f,
+        "INSERT INTO addrs (id, u, a, b) VALUES \
+         (1, '123e4567-e89b-12d3-a456-426614174000', '1.2.3.4', '::1')",
+    )
+    .await;
+    let try_write = |sql: &'static str| {
+        let (e, f) = (&e, &f);
+        async move {
+            let p = plan::bind(&cx(f), &parse(sql))
+                .unwrap()
+                .expect("a single-table statement");
+            e.run(TENANT.0, &p, &[], false, TxnOptions::default()).await
+        }
+    };
+    // Another family's column, a number: refused by type, before any row
+    // (the second statement matches none).
+    for (sql, want) in [
+        ("UPDATE addrs SET u = a", "Cannot cast 'inet4' as 'uuid'"),
+        (
+            "UPDATE addrs SET u = b WHERE id = 99",
+            "Cannot cast 'inet6' as 'uuid'",
+        ),
+        ("UPDATE addrs SET a = u", "Cannot cast 'uuid' as 'inet4'"),
+        (
+            "UPDATE addrs SET u = 5 WHERE id = 99",
+            "Cannot cast 'int' as 'uuid'",
+        ),
+        (
+            "UPDATE addrs SET u = 5.5 WHERE id = 99",
+            "Cannot cast 'decimal' as 'uuid'",
+        ),
+    ] {
+        let err = try_write(sql).await.unwrap_err();
+        assert!(err.to_string().contains(want), "{sql}: {err}");
+    }
+    // One address type into the other converts by value: an INET4 as its
+    // mapped address; an INET6 that is no IPv4 address is 1292.
+    try_write("UPDATE addrs SET b = a").await.unwrap();
+    let got = select(&e, &f, "SELECT b FROM addrs WHERE id = 1", &[])
+        .await
+        .unwrap();
+    assert_eq!(got.join(","), "::ffff:1.2.3.4");
+    write(&e, &f, "UPDATE addrs SET b = '::1'").await;
+    let err = try_write("UPDATE addrs SET a = b").await.unwrap_err();
+    assert!(
+        err.to_string().contains("Incorrect inet4 value: '::1'"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
 async fn uuid_and_address_columns_order_compare_and_convert_as_mariadb_does() {
     let (e, f, _d) = shop().await;
     write(

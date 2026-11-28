@@ -184,6 +184,7 @@ pub fn plan(
                     retention_bytes: None,
                     compact: c.cleanup.map(|x| x == Cleanup::Compact),
                     max_message_bytes: None,
+                    delete_retention_ms: None,
                     created_ms: super::now_ms(),
                 },
                 if_not_exists: c.if_not_exists,

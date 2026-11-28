@@ -9,7 +9,7 @@ source: the settings registry (sprig-settings)
 
 Every setting SprigDB declares, with its default, the scopes that may set it, hard bounds and when a change applies. Settings resolve from the most specific scope: object, database, tenant and its ancestors, cluster, data center, global, then the built-in default. Read them with `SHOW SPRIG SETTINGS`, change them with `ALTER TENANT|DATABASE|TABLE … SPRIG SET (key = value)` or `sprigctl settings`.
 
-715 settings in 60 groups.
+716 settings in 60 groups.
 
 ## `advisor`
 
@@ -788,6 +788,7 @@ Every setting SprigDB declares, with its default, the scopes that may set it, ha
 |---|---|---|---|---|---|---|
 | `replication.dead_node_minutes` | float | `5` | dc, global (operator only) | 0 to 10080 | live | Minutes a node may be gone before its units are re-replicated elsewhere |
 | `replication.max_offset_ms` | int | `250` | dc, global (operator only) | 10 to 10000 | live | Largest clock offset between nodes; above half a node warns, above 80% it leads nothing |
+| `replication.snapshot_mb_per_second` | int | `160` | dc, global (operator only) | 0 to 100000 | live | MB per second a node sends unit snapshots at, over all its transfers (0: no limit) |
 
 ## `residency`
 

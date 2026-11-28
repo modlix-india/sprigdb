@@ -1509,6 +1509,20 @@ fn text_number_warning(x: &Datum, y: &Datum, sx: Side, sy: Side, cx: &CmpCx, a: 
     });
 }
 
+/// MySQL's 1305 for a function it doesn't have names it in database
+/// `db` (`FUNCTION db.f does not exist`); other errors as they are.
+pub(crate) fn qualify_function(mut e: SprigError, db: &[u8]) -> SprigError {
+    if matches!(
+        e.kind,
+        sprig_common::ErrorKind::Standard { errno: 1305, .. }
+    ) && let Some(name) = e.message.strip_prefix("FUNCTION ")
+        && !name.contains('.')
+    {
+        e.message = format!("FUNCTION {}.{name}", String::from_utf8_lossy(db));
+    }
+    e
+}
+
 /// The value of `e` for `row`.
 #[allow(clippy::too_many_lines)] // one arm per expression kind
 pub(crate) fn eval(e: &CExpr, row: &[Datum], a: &Args<'_>) -> Result<Datum> {
@@ -1518,6 +1532,11 @@ pub(crate) fn eval(e: &CExpr, row: &[Datum], a: &Args<'_>) -> Result<Datum> {
             if a.env.mysql
                 && let Some(err) = &x.mysql_refused
             {
+                // A function MySQL doesn't have: its own 1305 (the
+                // statement names the database: `qualify_function`).
+                if err.code == 1305 {
+                    return Err(SprigError::standard(1305, *b"42000", err.message.clone()));
+                }
                 return Err(super::general::sql_error(err.clone()));
             }
             let (session, c) = if a.env.mysql { &x.mysql } else { &x.maria };

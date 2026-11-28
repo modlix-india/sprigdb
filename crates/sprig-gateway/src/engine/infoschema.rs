@@ -2179,14 +2179,88 @@ pub(crate) fn answer(sql: &str, src: &Source<'_>, mysql: bool) -> Option<Answer>
     match try_answer(sql, src, mysql) {
         Ok(a) => Some(a),
         Err(why) => {
-            tracing::info!(why, sql, "information_schema: left to the backend");
+            tracing::info!(why = %why, sql, "information_schema: left to the backend");
             None
         }
     }
 }
 
+/// [`answer`] for a tenant with no MariaDB, which has no backend to leave
+/// the query to: a query the planner refuses with one of the servers'
+/// errors (an unknown column, say) gets that error, worded as the port's
+/// server words it. `None` as for [`answer`].
+pub(crate) fn answer_or_error(
+    sql: &str,
+    src: &Source<'_>,
+    mysql: bool,
+) -> Option<sprig_common::Result<Answer>> {
+    match try_answer(sql, src, mysql) {
+        Ok(a) => Some(Ok(a)),
+        Err(Unanswered {
+            error: Some(mut e), ..
+        }) => {
+            if mysql && e.code == 1054 {
+                e.message = mysql_clause_words(&e.message);
+            }
+            Some(Err(super::general::sql_error(e)))
+        }
+        Err(why) => {
+            tracing::info!(why = %why, sql, "information_schema: not answered");
+            None
+        }
+    }
+}
+
+/// MariaDB's clause names in a 1054 message as MySQL writes them (the
+/// name layer's statement is planned under MariaDB's rules on both ports).
+fn mysql_clause_words(message: &str) -> String {
+    const WORDS: [(&str, &str); 6] = [
+        ("in 'SELECT'", "in 'field list'"),
+        ("in 'WHERE'", "in 'where clause'"),
+        ("in 'ON'", "in 'on clause'"),
+        ("in 'GROUP BY'", "in 'group statement'"),
+        ("in 'HAVING'", "in 'having clause'"),
+        ("in 'ORDER BY'", "in 'order clause'"),
+    ];
+    for (maria, my) in WORDS {
+        if let Some(head) = message.strip_suffix(maria) {
+            return format!("{head}{my}");
+        }
+    }
+    message.to_owned()
+}
+
+/// Why the engine didn't answer a query: a note for the log, and the
+/// planner's or executor's error when it gave one.
+#[derive(Debug)]
+struct Unanswered {
+    why: String,
+    error: Option<sprig_exec::SqlError>,
+}
+
+impl std::fmt::Display for Unanswered {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.why)
+    }
+}
+
+impl From<String> for Unanswered {
+    fn from(why: String) -> Self {
+        Self { why, error: None }
+    }
+}
+
+impl From<&str> for Unanswered {
+    fn from(why: &str) -> Self {
+        Self {
+            why: why.to_owned(),
+            error: None,
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines)] // build, plan, run, describe: one pass
-fn try_answer(sql: &str, src: &Source<'_>, mysql: bool) -> Result<Answer, String> {
+fn try_answer(sql: &str, src: &Source<'_>, mysql: bool) -> Result<Answer, Unanswered> {
     use sqlparser::dialect::MySqlDialect;
     use sqlparser::parser::Parser;
     let simplified = simplify(sql);
@@ -2305,16 +2379,16 @@ fn try_answer(sql: &str, src: &Source<'_>, mysql: bool) -> Result<Answer, String
     let session = sprig_exec::Session::new(sprig_exec::Persona::MariaDb);
     let storage: Arc<dyn sprig_plan::access::Storage> = Arc::new(db.clone());
     let planner = sprig_plan::Planner::new(&db, storage, &session);
-    let mut plan = planner
-        .plan(stmt, &[])
-        .map_err(|e| format!("plan: {}", e.message))?;
+    let mut plan = planner.plan(stmt, &[]).map_err(|e| Unanswered {
+        why: format!("plan: {}", e.message),
+        error: Some(e),
+    })?;
     let mut ctx = sprig_exec::Ctx::with_params(&session, &[]);
     let mut rows = Vec::new();
-    while let Some(r) = plan
-        .source
-        .next(&mut ctx)
-        .map_err(|e| format!("run: {}", e.message))?
-    {
+    while let Some(r) = plan.source.next(&mut ctx).map_err(|e| Unanswered {
+        why: format!("run: {}", e.message),
+        error: Some(e),
+    })? {
         rows.push(r);
     }
     // Every result column must be one of the tables' own columns.

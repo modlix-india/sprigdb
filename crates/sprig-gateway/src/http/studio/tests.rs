@@ -46,3 +46,19 @@ fn origin_checks() {
     assert!(same_origin(&cfg, false, host, Some("null"), Some("same-origin")).is_ok());
     assert!(same_origin(&cfg, false, host, Some("null"), None).is_err());
 }
+
+/// The shards view was MariaDB's (table groups, shard maps, the advisor)
+/// and its routes are gone: neither Studio's routes nor the data API's
+/// route table claims `/v1/shards`, so the gateway answers 404 "no route".
+#[test]
+fn the_shards_view_is_retired() {
+    for p in ["/v1/shards", "/v1/shards/advisor", "/v1/shards/advisor/3"] {
+        assert!(sprig_api::rest::find("GET", p).is_none(), "{p}");
+        assert!(!sprig_api::rest::path_known(p), "{p}");
+    }
+    let src = include_str!("mod.rs");
+    assert!(
+        !src.contains("\"/v1/shards"),
+        "Studio's routes still serve /v1/shards"
+    );
+}
